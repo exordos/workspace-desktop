@@ -16,6 +16,8 @@ pub enum IconName {
     Search, // Лупа для поиска.
     Close,  // Крестик для закрытия.
     Attach, // Скрепка для вложения.
+    Check,  // Галочка выбора.
+    Block,  // Значок отключённой учётной записи.
 }
 
 impl IconName {
@@ -35,11 +37,20 @@ impl IconName {
             Handle::from_memory(&include_bytes!("../../assets/icons/attach.svg")[..])
         });
 
+        static CHECK: LazyLock<Handle> = LazyLock::new(|| {
+            Handle::from_memory(&include_bytes!("../../assets/icons/check.svg")[..])
+        });
+        static BLOCK: LazyLock<Handle> = LazyLock::new(|| {
+            Handle::from_memory(&include_bytes!("../../assets/icons/block.svg")[..])
+        });
+
         match self {
             Self::Plus => &PLUS,
             Self::Search => &SEARCH,
             Self::Close => &CLOSE,
             Self::Attach => &ATTACH,
+            Self::Check => &CHECK,
+            Self::Block => &BLOCK,
         }
     }
 }

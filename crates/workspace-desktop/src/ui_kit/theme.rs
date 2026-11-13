@@ -1,5 +1,5 @@
 //! Задаёт светлую и тёмную палитры Workspace.
-//! Здесь собраны базовая тема Iced и дополнительные цвета для кнопок и иконок.
+//! Здесь собраны базовая тема Iced и дополнительные цвета для кнопок, иконок и индикаторов.
 
 use iced::theme::Palette;
 use iced::{Color, Theme};
@@ -55,6 +55,34 @@ pub(super) fn text_muted(theme: &Theme) -> Color {
     } else {
         Color::from_rgb8(0x8d, 0x9b, 0xae)
     }
+}
+
+/// Возвращает цвет счётчика непрочитанного в активном разговоре.
+pub(super) fn unread_badge_color(theme: &Theme) -> Color {
+    if theme.extended_palette().is_dark {
+        Color::from_rgb8(0x6f, 0x8f, 0xda)
+    } else {
+        theme.palette().primary
+    }
+}
+
+/// Возвращает цвет счётчика непрочитанного в приглушённом разговоре.
+pub(super) fn muted_badge_color(theme: &Theme) -> Color {
+    if theme.extended_palette().is_dark {
+        Color::from_rgb8(0x64, 0x6f, 0x7f)
+    } else {
+        Color::from_rgb8(0x9c, 0xa9, 0xbb)
+    }
+}
+
+/// Возвращает цвет индикатора «В сети».
+pub(super) fn presence_online_color() -> Color {
+    Color::from_rgb8(0x26, 0xc0, 0x38)
+}
+
+/// Возвращает цвет индикатора «Отошёл».
+pub(super) fn presence_away_color() -> Color {
+    Color::from_rgb8(0xff, 0x89, 0x00)
 }
 
 /// Создаёт тему Iced с палитрой Blue Mist для заданного режима.

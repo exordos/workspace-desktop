@@ -165,6 +165,15 @@ pub fn button_with<'a, Message: Clone + 'a>(
             button_style(theme, variant, appearance, status)
         });
 
+    keyboard_button(inner, on_press, keyboard_pressed)
+}
+
+/// Добавляет кнопке фокус и активацию с клавиатуры. Стиль читает состояние нажатия из общей ячейки.
+pub(super) fn keyboard_button<'a, Message: Clone + 'a>(
+    inner: Button<'a, Message>,
+    on_press: Option<Message>,
+    keyboard_pressed: Rc<Cell<bool>>,
+) -> Element<'a, Message> {
     Element::new(KeyboardButton {
         inner,
         on_press,

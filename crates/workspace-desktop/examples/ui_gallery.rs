@@ -1,12 +1,14 @@
 //! Открывает демонстрационное окно для ручной проверки UI-кита.
-//! Здесь хранятся настройки примеров и собираются вкладки с элементами управления и иконками.
+//! Здесь хранятся настройки примеров и собираются вкладки с элементами управления, иконками и индикаторами.
 
 use iced::keyboard::{self, Key, key::Named};
-use iced::widget::{column, container, operation, row, scrollable, text, toggler};
+use iced::widget::{column, container, operation, row, scrollable, text};
 use iced::{Element, Event, Fill, Subscription, Task, Theme, event};
 use workspace_desktop::ui_kit::{
-    ButtonAppearance, ButtonOptions, ButtonSize, ButtonVariant, IconName, IconTone, ThemeMode,
-    button, button_with, icon, text_input, workspace_theme,
+    BadgeSize, BadgeTone, ButtonAppearance, ButtonOptions, ButtonSize, ButtonVariant, IconName,
+    IconTone, PresenceSize, PresenceStatus, SelectionSize, ThemeMode, button, button_with, icon,
+    mention_badge, presence_indicator, selection_checkbox, selection_indicator, switch, text_input,
+    unread_count_badge, workspace_theme,
 };
 
 /// Определяет открытый раздел галереи.
@@ -14,7 +16,8 @@ use workspace_desktop::ui_kit::{
 enum GalleryTab {
     #[default]
     Controls, // Кнопки и текстовое поле.
-    Icons, // Примеры иконок.
+    Icons,      // Каталог иконок.
+    Indicators, // Выбор, переключатели, статусы присутствия и бейджи.
 }
 
 /// Хранит настройки галереи и состояние примеров.
@@ -26,6 +29,8 @@ struct Gallery {
     tab: GalleryTab,                   // Открытый раздел галереи.
     icon_tone: IconTone,               // Выбранный способ окраски иконок.
     icon_size: u32,                    // Сторона иконок в логических пикселях.
+    selected: bool,                    // Отмечен ли демонстрационный чекбокс.
+    switch_on: bool,                   // Включён ли демонстрационный переключатель.
 }
 
 impl Default for Gallery {
@@ -39,6 +44,8 @@ impl Default for Gallery {
             tab: GalleryTab::default(),
             icon_tone: IconTone::default(),
             icon_size: 24,
+            selected: false,
+            switch_on: true,
         }
     }
 }
@@ -55,6 +62,8 @@ enum Message {
     TabChanged(GalleryTab),    // Вкладка, которую нужно открыть.
     IconToneChanged(IconTone), // Новый способ окраски иконок.
     IconSizeChanged(u32),      // Новый размер иконок в логических пикселях.
+    SelectionChanged(bool),    // Чекбокс передал новую отметку.
+    SwitchChanged(bool),       // Переключатель передал новое положение.
 }
 
 impl Gallery {
@@ -63,6 +72,8 @@ impl Gallery {
         match message {
             Message::ThemeChanged(dark) => self.dark = dark,
             Message::InputChanged(value) => self.input = value,
+            Message::SelectionChanged(selected) => self.selected = selected,
+            Message::SwitchChanged(on) => self.switch_on = on,
             Message::TabChanged(tab) => {
                 self.tab = tab;
                 return operation::snap_to("gallery-content", scrollable::RelativeOffset::START);
@@ -109,6 +120,7 @@ impl Gallery {
         let tabs = [
             ("Компоненты", GalleryTab::Controls),
             ("Иконки", GalleryTab::Icons),
+            ("Выбор и статусы", GalleryTab::Indicators),
         ]
         .into_iter()
         .fold(row![].spacing(12), |row, (label, tab)| {
@@ -119,16 +131,23 @@ impl Gallery {
             ))
         });
         let content = match self.tab {
-            GalleryTab::Controls => self.controls(),
+            GalleryTab::Controls | GalleryTab::Indicators => {
+                let controls = match self.tab {
+                    GalleryTab::Indicators => self.indicators(),
+                    _ => self.controls(),
+                };
+                scrollable(container(controls).padding([16, 28]).center_x(Fill))
+                    .id("gallery-content")
+                    .height(Fill)
+                    .into()
+            }
             GalleryTab::Icons => self.icons(),
         };
         column![
             container(
                 column![
                     text("Workspace UI Kit").size(28),
-                    toggler(self.dark)
-                        .label("Тёмная тема")
-                        .on_toggle(Message::ThemeChanged),
+                    switch("Тёмная тема", self.dark, Some(Message::ThemeChanged)),
                     tabs,
                 ]
                 .spacing(16)
@@ -136,9 +155,7 @@ impl Gallery {
             )
             .padding([20, 28])
             .center_x(Fill),
-            scrollable(container(content).padding([16, 28]).center_x(Fill))
-                .id("gallery-content")
-                .height(Fill),
+            content,
         ]
         .into()
     }
@@ -245,7 +262,87 @@ impl Gallery {
             .into()
     }
 
-    /// Показывает примеры иконок с выбором размера и цвета.
+    /// Показывает чекбоксы, переключатели, статусы присутствия и счётчики.
+    fn indicators(&self) -> Element<'_, Message> {
+        use BadgeSize::{Regular, Small};
+        use BadgeTone::{Muted, Unread};
+        use PresenceSize::{Lg, Md, Sm, Xs};
+        use PresenceStatus::{Away, Deactivated, Offline, Online};
+
+        let selection = column![
+            text("Индикатор выбора").size(20),
+            row![
+                text("16 px"),
+                selection_indicator(SelectionSize::Small, false),
+                selection_indicator(SelectionSize::Small, true),
+                text("20 px"),
+                selection_indicator(SelectionSize::Large, false),
+                selection_indicator(SelectionSize::Large, true),
+            ]
+            .spacing(12)
+            .align_y(iced::Center),
+            selection_checkbox(
+                "Выбрать участника",
+                SelectionSize::Small,
+                self.selected,
+                Some(Message::SelectionChanged),
+            ),
+            selection_checkbox(
+                "Недоступный чекбокс",
+                SelectionSize::Large,
+                true,
+                None::<fn(bool) -> Message>,
+            ),
+        ]
+        .spacing(12);
+
+        let switches = column![
+            text("Переключатель").size(20),
+            switch("Уведомления", self.switch_on, Some(Message::SwitchChanged)),
+            switch("Недоступен (выключен)", false, None::<fn(bool) -> Message>),
+            switch("Недоступен (включён)", true, None::<fn(bool) -> Message>),
+        ]
+        .spacing(12);
+
+        let presence = [
+            ("В сети", Online, Lg),
+            ("Отошёл", Away, Md),
+            ("Не в сети", Offline, Sm),
+            ("Деактивирован", Deactivated, Xs),
+        ]
+        .into_iter()
+        .fold(row![].spacing(16), |row, (label, status, size)| {
+            row.push(
+                row![presence_indicator(status, size, false), text(label)]
+                    .spacing(6)
+                    .align_y(iced::Center),
+            )
+        });
+
+        let badges = row![
+            unread_count_badge(7, Unread, Small),
+            unread_count_badge(0, Unread, Small),
+            unread_count_badge(32, Muted, Regular),
+            unread_count_badge(1_200, Unread, Regular),
+            mention_badge(Small),
+            mention_badge(Regular),
+        ]
+        .spacing(12)
+        .align_y(iced::Center);
+
+        column![
+            selection,
+            switches,
+            column![text("Присутствие").size(20), presence.wrap()].spacing(12),
+            column![text("Бейджи").size(20), badges].spacing(12),
+        ]
+        .spacing(22)
+        .width(Fill)
+        .max_width(760)
+        .into()
+    }
+
+    /// Показывает каталог SVG с поиском и выбором размера, формы и цвета.
     fn icons(&self) -> Element<'_, Message> {
         let tones = [
             ("Основной", IconTone::Inherit),
