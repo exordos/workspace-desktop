@@ -23,6 +23,9 @@ use workspace_core::runtime::{EventSource, EventStream, Runtime, SourceError, So
 use workspace_core::storage::{Cursor, Message, Storage};
 use workspace_core::sync::{Event, Sync as EventSync, SyncChange, SyncUpdate};
 
+#[path = "support/direct_history.rs"]
+mod direct_history;
+
 const SERVER: &str = "https://workspace.test";
 
 /// Хранилища аккаунтов и секретов в памяти с управляемыми сбоями.
@@ -150,11 +153,12 @@ impl IamClient for TestIam {
     /// Выдаёт заготовленный токен с выбранным проектом.
     fn select_project(
         &self,
-        _server: &str,
+        server: &str,
         token: &str,
         project: &str,
     ) -> Result<IamToken, IamError> {
-        let mut issued = project_token(token, "sign-in", None);
+        let access = if server == SERVER { "sign-in" } else { token };
+        let mut issued = project_token(token, access, None);
         issued.project_id = Some(project.into());
         Ok(issued)
     }
@@ -218,9 +222,14 @@ impl Fixture {
 
     /// Проходит оба шага входа и возвращает контекст тестового пользователя.
     fn login(&self, user: &str) -> OwnerContext {
+        self.login_at(SERVER, user)
+    }
+
+    /// Создаёт сессию для указанного адреса тестового сервера.
+    fn login_at(&self, server: &str, user: &str) -> OwnerContext {
         let attempt = self
             .auth
-            .begin_login(SERVER, user, "password", None)
+            .begin_login(server, user, "password", None)
             .unwrap();
         self.auth.complete_login(attempt.id, "project").unwrap()
     }

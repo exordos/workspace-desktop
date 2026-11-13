@@ -13,10 +13,17 @@ use uuid::Uuid;
 use crate::{
     context::OwnerContext,
     runtime::SourceError,
-    storage::{Cursor, HistoryChange, HistoryMetadata, HistoryTime, Message, MessagePlacement},
+    storage::{
+        Cursor, HistoryChange, HistoryEdge, HistoryMessage, HistoryMetadata, HistoryTime, Message,
+        MessagePlacement,
+    },
     sync::Event,
 };
 
+use super::history::OpenHistoryError;
+
+const MESSAGES_PATH: &str = "/api/workspace/v1/messenger/messages/";
+const WINDOW_LIMIT: &str = "50";
 const EPOCH_PATH: &str = "/api/workspace/v1/epoch/";
 const EVENTS_PATH: &str = "/api/workspace/v1/events/";
 const ALL_CHATS_FOLDER_ID: &str = "00000000-0000-0000-0000-000000000000";
@@ -129,6 +136,129 @@ impl RestClient {
             return Err(SourceError::InvalidResponse);
         }
         Ok(topic.notification_mode.allows(stream.notification_mode))
+    }
+
+    /// Подтверждает, что личный разговор виден владельцу токена.
+    pub(super) async fn check_direct_access(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        stream: Uuid,
+    ) -> Result<(), OpenHistoryError> {
+        let request = self.request(owner, token, &format!("{STREAMS_PATH}/{stream}"))?;
+        let response = request.send().await.map_err(request_error)?;
+        if matches!(
+            response.status(),
+            StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+        ) {
+            return Err(OpenHistoryError::AccessLost);
+        }
+        check_status(response.status())?;
+        let row: WireStream = response.json().await.map_err(request_error)?;
+        if parse_uuid(&row.uuid) != Some(stream)
+            || !matches_owner(owner, row.project_id.as_deref(), row.user_uuid.as_deref())
+        {
+            return Err(SourceError::InvalidResponse.into());
+        }
+        if !row.private
+            || row
+                .direct_user_uuid
+                .as_deref()
+                .and_then(parse_uuid)
+                .is_none()
+        {
+            return Err(OpenHistoryError::AccessLost);
+        }
+        Ok(())
+    }
+
+    /// Проверяет, что целевое текстовое сообщение ещё доступно в этом разговоре.
+    pub(super) async fn direct_anchor(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        stream: Uuid,
+        anchor: Uuid,
+    ) -> Result<HistoryMessage, OpenHistoryError> {
+        let request = self.request(owner, token, &format!("{MESSAGES_PATH}{anchor}"))?;
+        let response = request.send().await.map_err(request_error)?;
+        match response.status() {
+            StatusCode::NOT_FOUND => {
+                // API скрывает недоступные сообщения за 404. Перечитываем доступ к чату.
+                self.check_direct_access(owner, token, stream).await?;
+                return Err(OpenHistoryError::MessageMissing);
+            }
+            StatusCode::FORBIDDEN => return Err(OpenHistoryError::AccessLost),
+            status => check_status(status)?,
+        }
+        let row: WireHistoryMessage = response.json().await.map_err(request_error)?;
+        if row.uuid != anchor || row.stream_uuid != stream {
+            return Err(OpenHistoryError::MessageMissing);
+        }
+        row.into_history(owner, stream)?
+            .ok_or(OpenHistoryError::MessageMissing)
+    }
+
+    /// Читает соседние страницы по публичному UUID и сохраняет маркер каждого края.
+    pub(super) async fn direct_pages(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        stream: Uuid,
+        anchor: Uuid,
+    ) -> Result<(DirectPage, DirectPage), OpenHistoryError> {
+        tokio::try_join!(
+            self.direct_page(owner, token, stream, anchor, "desc"),
+            self.direct_page(owner, token, stream, anchor, "asc")
+        )
+    }
+
+    /// Запрашивает страницу с одной стороны от сообщения.
+    async fn direct_page(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        stream: Uuid,
+        anchor: Uuid,
+        direction: &str,
+    ) -> Result<DirectPage, OpenHistoryError> {
+        let response = self
+            .request(owner, token, MESSAGES_PATH)?
+            .query(&[
+                ("stream_uuid", stream.to_string().as_str()),
+                ("page_marker", anchor.to_string().as_str()),
+                ("page_limit", WINDOW_LIMIT),
+                ("sort_key", "created_at"),
+                ("sort_dir", direction),
+            ])
+            .send()
+            .await
+            .map_err(request_error)?;
+        match response.status() {
+            StatusCode::FORBIDDEN => return Err(OpenHistoryError::AccessLost),
+            StatusCode::NOT_FOUND => {
+                self.check_direct_access(owner, token, stream).await?;
+                return Err(OpenHistoryError::MessageMissing);
+            }
+            status => check_status(status)?,
+        }
+        let edge = match response.headers().get("X-Pagination-Marker") {
+            None => HistoryEdge::End,
+            Some(marker) => HistoryEdge::More(
+                marker
+                    .to_str()
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .ok_or(SourceError::InvalidResponse)?
+                    .to_owned(),
+            ),
+        };
+        let rows: Vec<WireHistoryMessage> = response.json().await.map_err(request_error)?;
+        let messages = rows
+            .into_iter()
+            .filter_map(|row| row.into_history(owner, stream).transpose())
+            .collect::<Result<_, _>>()?;
+        Ok(DirectPage { messages, edge })
     }
 
     /// Загружает и проверяет одну страницу событий строго после заданной позиции.
@@ -290,6 +420,66 @@ struct WirePayload {
     topic_uuid: Option<String>, // Идентификатор темы внутри разговора.
     created_at: Option<String>, // Серверное время создания сообщения.
     updated_at: Option<String>, // Серверное время последней правки.
+}
+
+/// Текстовые записи и серверная граница одной страницы.
+pub(super) struct DirectPage {
+    pub(super) messages: Vec<HistoryMessage>, // Сообщения поддерживаемого формата.
+    pub(super) edge: HistoryEdge,             // Серверный маркер продолжения или конец истории.
+}
+
+/// Поля ответа ресурса messages, используемые для записи истории.
+#[derive(Deserialize)]
+struct WireHistoryMessage {
+    uuid: Uuid,                 // Публичный идентификатор сообщения.
+    stream_uuid: Uuid,          // Разговор сообщения.
+    topic_uuid: Uuid,           // Тема внутри разговора.
+    project_id: Option<String>, // Проект из ответа.
+    user_uuid: Option<String>,  // Владелец проекции из ответа.
+    author_uuid: Uuid,          // Автор сообщения.
+    created_at: String,         // Серверное время создания.
+    updated_at: Option<String>, // Серверное время последней правки.
+    payload: WireMessageBody,   // Формат и содержимое сообщения.
+}
+
+impl WireHistoryMessage {
+    /// Проверяет область ответа и преобразует обычный Markdown в запись истории.
+    fn into_history(
+        self,
+        owner: &OwnerContext,
+        stream: Uuid,
+    ) -> Result<Option<HistoryMessage>, SourceError> {
+        if self.stream_uuid != stream
+            || !matches_owner(owner, self.project_id.as_deref(), self.user_uuid.as_deref())
+        {
+            return Err(SourceError::InvalidResponse);
+        }
+        if self.payload.kind != "markdown" {
+            return Ok(None);
+        }
+        let text = match self.payload.content {
+            Some(Value::String(text)) => text,
+            _ => return Err(SourceError::InvalidResponse),
+        };
+        let created_at =
+            HistoryTime::parse(&self.created_at).ok_or(SourceError::InvalidResponse)?;
+        let updated_at = self
+            .updated_at
+            .as_deref()
+            .map(|value| HistoryTime::parse(value).ok_or(SourceError::InvalidResponse))
+            .transpose()?;
+        Ok(Some(HistoryMessage {
+            id: self.uuid,
+            stream_id: self.stream_uuid,
+            topic_id: self.topic_uuid,
+            text,
+            metadata: HistoryMetadata {
+                author_id: Some(self.author_uuid),
+                created_at,
+                updated_at,
+            },
+        }))
+    }
 }
 
 /// Тело сообщения в ответе сервера.
