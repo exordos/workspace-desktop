@@ -49,6 +49,7 @@ mod platform {
 
     use futures::executor::block_on;
     use workspace_core::auth::{Auth, AuthError, IamError, Service, SessionStatus};
+    use workspace_core::bootstrap;
     use workspace_core::context::AccountId;
     use workspace_core::iam_http::WorkspaceIamHttp;
     use workspace_core::messenger::MessengerSource;
@@ -130,33 +131,21 @@ mod platform {
                         let mut interrupt = tokio::signal::unix::signal(
                             tokio::signal::unix::SignalKind::interrupt(),
                         )?;
-                        let (stop, stopped) = tokio::sync::oneshot::channel();
-                        let restore = async {
-                            tokio::select! {
-                                _ = interrupt.recv() => Ok::<(), Box<dyn Error>>(()),
-                                restored = auth.restore() => {
-                                    restored?;
-                                    if auth.snapshot().is_empty() {
-                                        return Err("No saved Workspace accounts.".into());
-                                    }
-                                    interrupt.recv().await;
-                                    Ok(())
-                                }
-                            }
-                        };
-                        let run = runtime.run(async {
-                            let _ = stopped.await;
-                        });
-                        tokio::pin!(run);
-                        tokio::select! {
-                            result = &mut run => result?,
-                            restored = restore => {
-                                let _ = stop.send(());
-                                run.await?;
+                        bootstrap::run(
+                            runtime,
+                            None,
+                            async {
+                                interrupt.recv().await;
+                            },
+                            |restored| {
                                 restored?;
-                            }
-                        }
-                        Ok::<(), Box<dyn Error>>(())
+                                if auth.snapshot().is_empty() {
+                                    return Err("No saved Workspace accounts.".into());
+                                }
+                                Ok::<(), Box<dyn Error>>(())
+                            },
+                        )
+                        .await
                     })?;
             }
             Command::Logout(id) => {

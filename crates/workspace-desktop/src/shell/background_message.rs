@@ -9,15 +9,17 @@ use std::{path::Path, time::Duration};
 use futures::StreamExt;
 use iced::advanced::subscription::into_recipes;
 use iced::advanced::widget::{Id, Operation};
-use iced::{Font, Pixels, Rectangle, Size};
+use iced::{Font, Pixels, Rectangle, Size, mouse};
 use iced_runtime::Action;
+use iced_runtime::core::clipboard;
 use iced_runtime::task::into_stream;
 use iced_runtime::user_interface::{Cache, UserInterface};
 use tokio::time::timeout;
 use uuid::Uuid;
 use workspace_core::auth::{SecretStore, StoreError};
+use workspace_core::bootstrap;
 use workspace_core::messenger::MessengerSource;
-use workspace_core::runtime::Runtime;
+use workspace_core::runtime::{Runtime, RuntimeError};
 use workspace_core::storage::Storage;
 
 use super::*;
@@ -102,6 +104,11 @@ impl Operation for RenderedText {
 }
 
 impl RenderedText {
+    /// Проверяет, что окно показывает указанную подпись.
+    fn contains(&self, label: &str) -> bool {
+        self.0.iter().any(|(_, text)| text == label)
+    }
+
     /// Строит разметку оболочки программным рендерером без открытия окна.
     fn from_shell(shell: &Shell, renderer: &mut iced::Renderer) -> Self {
         let mut ui = UserInterface::build(
@@ -345,14 +352,16 @@ async fn wait_for_position(storage: &Storage, owner: &OwnerContext, version: u64
 }
 
 /// Прогоняет тот же сценарий для любой среды, предоставляющей два аккаунта и личный чат.
-async fn background_message_scenario(workspace: &impl TestWorkspace) {
+async fn background_message_scenario(workspace: &impl TestWorkspace, check_catalog_retry: bool) {
     let profile = tempfile::tempdir().unwrap();
     let (auth, foreground, background) = timeout(DEADLINE, workspace.accounts(profile.path()))
         .await
         .expect("адаптер не подготовил тестовые аккаунты");
     let storage = Arc::new(Storage::open(profile.path().join("messenger.sqlite3")).unwrap());
     let sync = Arc::new(Sync::new(auth.clone(), storage.clone()));
-    let runtime = Runtime::new(sync.clone(), vec![Arc::new(workspace.source())]).unwrap();
+    let messenger = Arc::new(workspace.source());
+    let (catalog, catalog_startup) = bootstrap::chat_catalog(messenger.catalog(storage.clone()));
+    let runtime = Runtime::new(sync.clone(), vec![messenger]).unwrap();
     let (subscribed, ready) = oneshot::channel();
     let (stop, stopped) = oneshot::channel::<()>();
     let notifications = RecordedNotifications::default();
@@ -363,6 +372,7 @@ async fn background_message_scenario(workspace: &impl TestWorkspace) {
             (background.account_id.clone(), "Аккаунт B".to_owned()),
         ]),
         sync.clone(),
+        Arc::new(catalog),
         Some(foreground.account_id.clone()),
         subscribed,
         Box::new(notifications.clone()),
@@ -373,10 +383,17 @@ async fn background_message_scenario(workspace: &impl TestWorkspace) {
             .map(|recipe| recipe.stream(Box::pin(futures::stream::pending()))),
     );
     timeout(DEADLINE, ready).await.unwrap().unwrap();
-    let worker = tokio::spawn(runtime.run(async {
-        let _ = stopped.await;
-    }));
-    timeout(DEADLINE, auth.restore()).await.unwrap().unwrap();
+    let worker = tokio::spawn(bootstrap::run(
+        runtime,
+        Some(catalog_startup),
+        async {
+            let _ = stopped.await;
+        },
+        |restored| {
+            restored.expect("Bootstrap не восстановил сохранённые аккаунты");
+            Ok::<(), RuntimeError>(())
+        },
+    ));
 
     timeout(DEADLINE, async {
         while ![&foreground, &background].iter().all(|owner| {
@@ -398,6 +415,79 @@ async fn background_message_scenario(workspace: &impl TestWorkspace) {
     .expect("оболочка не получила оба начальных счётчика");
 
     let mut renderer = iced::Renderer::new(Font::DEFAULT, Pixels(16.0));
+    if check_catalog_retry {
+        timeout(DEADLINE, async {
+            while !shell
+                .chats
+                .get(&foreground)
+                .is_some_and(|list| list.status == ChatListStatus::Failed)
+                || !shell
+                    .chats
+                    .get(&background)
+                    .is_some_and(|list| list.status == ChatListStatus::Ready)
+            {
+                next_update(
+                    &mut shell,
+                    &mut events,
+                    "ошибка каталога A и готовность каталога B",
+                )
+                .await;
+            }
+        })
+        .await
+        .expect("Bootstrap не завершил попытку для обоих аккаунтов");
+        let failed = RenderedText::from_shell(&shell, &mut renderer);
+        assert!(failed.contains("Не удалось загрузить чаты"));
+        assert!(failed.contains("Повторить"));
+        let _ = shell.update(Message::Select(background.account_id.clone()));
+        let other = RenderedText::from_shell(&shell, &mut renderer);
+        assert!(other.contains("Канал B"));
+        assert!(other.contains("Алиса"));
+        assert!(!other.contains("Повторить"));
+        let _ = shell.update(Message::Select(foreground.account_id.clone()));
+        let mut ui = UserInterface::build(
+            shell.view(),
+            Size::new(620.0, 360.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        let (bounds, _) = failed
+            .0
+            .iter()
+            .find(|(_, label)| label == "Повторить")
+            .unwrap();
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+            mouse::Cursor::Available(bounds.center()),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        drop(ui);
+        assert!(matches!(messages.as_slice(), [Message::RetryChats]));
+        let _ = shell.update(messages.remove(0));
+        timeout(DEADLINE, async {
+            while !shell
+                .chats
+                .get(&foreground)
+                .is_some_and(|list| list.status == ChatListStatus::Ready)
+            {
+                next_update(&mut shell, &mut events, "загрузка каталога A после повтора").await;
+            }
+        })
+        .await
+        .expect("список чатов A не загрузился после повтора");
+        let loaded = RenderedText::from_shell(&shell, &mut renderer);
+        assert!(loaded.contains("Канал A"));
+        assert!(loaded.contains("Борис"));
+        assert!(loaded.contains("# Планы"));
+        assert!(!loaded.contains("Канал B"));
+        assert!(!loaded.contains("Повторить"));
+    }
     let before = RenderedText::from_shell(&shell, &mut renderer);
     assert!(before.shows_selected("Аккаунт A"));
     let foreground_count = before.badge_count("Аккаунт A");
@@ -524,11 +614,12 @@ async fn notification_click_scenario(
     assert!(RenderedText::from_shell(shell, renderer).shows_selected("Аккаунт B"));
 }
 
-/// Запускает общий сценарий с локальным HTTPS- и WebSocket-сервером.
+/// Проверяет повтор загрузки каталога и фоновое уведомление через локальный HTTPS и WebSocket.
 #[tokio::test]
 async fn background_message_updates_iced_badge_and_notifies_once() {
     let workspace = mock::MockWorkspace::start().await;
-    background_message_scenario(&workspace).await;
+    workspace.fail_next_catalog();
+    background_message_scenario(&workspace, true).await;
 }
 
 /// Запускает тот же сценарий на явно указанном тестовом Workspace.
@@ -536,5 +627,5 @@ async fn background_message_updates_iced_badge_and_notifies_once() {
 #[ignore = "отправляет сообщение на выделенный тестовый Workspace"]
 async fn live_workspace_background_message_updates_iced_badge_and_notifies_once() {
     let workspace = live::LiveWorkspace::from_environment();
-    background_message_scenario(&workspace).await;
+    background_message_scenario(&workspace, false).await;
 }

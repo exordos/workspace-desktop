@@ -4,6 +4,10 @@
 - `crates/workspace-desktop` подключает системные адаптеры и содержит UI-компоненты Iced.
 - [Архитектура](docs/plans/workspace-desktop-architecture.md) и [контракт авторизации](docs/plans/modules/auth.md) описывают границы модулей.
 
+## Запуск приложения
+
+Окно и команда `workspace-auth sync` запускают фоновую работу через `workspace_core::bootstrap::run`. Порядок начальной загрузки описывай в [Bootstrap](docs/plans/workspace-desktop-architecture.md#bootstrap), а запросы, обработку и хранение данных оставляй в модуле, который ими владеет.
+
 ## Комментарии к коду
 
 Пиши комментарии на русском простыми словами. Читатель без опыта в Rust должен понимать, зачем нужен код и что в нём происходит.

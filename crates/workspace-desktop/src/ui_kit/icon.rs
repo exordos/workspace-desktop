@@ -18,6 +18,7 @@ pub enum IconName {
     Attach,        // Скрепка для вложения.
     Check,         // Галочка выбора.
     Block,         // Значок отключённой учётной записи.
+    ChatBubbleOutline, // Контур чата для строки канала.
     Profile,       // Заглушка аватара.
     VolumeUp,      // Настройка громкости.
     ChevronRight,  // Стрелка перехода вправо.
@@ -50,6 +51,9 @@ impl IconName {
             Handle::from_memory(&include_bytes!("../../assets/icons/block.svg")[..])
         });
 
+        static CHAT_BUBBLE_OUTLINE: LazyLock<Handle> = LazyLock::new(|| {
+            Handle::from_memory(&include_bytes!("../../assets/icons/chat_bubble_outline.svg")[..])
+        });
         static PROFILE: LazyLock<Handle> = LazyLock::new(|| {
             Handle::from_memory(&include_bytes!("../../assets/icons/profile.svg")[..])
         });
@@ -76,6 +80,7 @@ impl IconName {
             Self::Attach => &ATTACH,
             Self::Check => &CHECK,
             Self::Block => &BLOCK,
+            Self::ChatBubbleOutline => &CHAT_BUBBLE_OUTLINE,
             Self::Profile => &PROFILE,
             Self::VolumeUp => &VOLUME_UP,
             Self::ChevronRight => &CHEVRON_RIGHT,

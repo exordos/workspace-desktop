@@ -1,7 +1,7 @@
 //! Читает начальную позицию и страницы журнала мессенджера по HTTPS.
 //! Здесь же разбирается общий формат событий, который используют HTTP и WebSocket.
 
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use reqwest::{
     Certificate, Client, RequestBuilder, StatusCode, Url, header::ACCEPT, redirect::Policy,
@@ -22,8 +22,8 @@ const EVENTS_PATH: &str = "/api/workspace/v1/events/";
 const ALL_CHATS_FOLDER_ID: &str = "00000000-0000-0000-0000-000000000000";
 const ALL_CHATS_PATH: &str =
     "/api/workspace/v1/messenger/folders/00000000-0000-0000-0000-000000000000";
-const STREAMS_PATH: &str = "/api/workspace/v1/messenger/streams";
-const TOPICS_PATH: &str = "/api/workspace/v1/messenger/stream_topics";
+pub(super) const STREAMS_PATH: &str = "/api/workspace/v1/messenger/streams";
+pub(super) const TOPICS_PATH: &str = "/api/workspace/v1/messenger/stream_topics";
 const PAGE_LIMIT: usize = 100;
 
 /// HTTP-клиент для чтения журнала мессенджера.
@@ -67,6 +67,42 @@ impl RestClient {
         let folder: WireFolder =
             get_json(self.request(owner, access_token, ALL_CHATS_PATH)?).await?;
         folder.into_count(owner)
+    }
+
+    /// Читает все страницы каталога по маркерам продолжения от сервера.
+    pub(super) async fn collection<T: DeserializeOwned>(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        path: &str,
+    ) -> Result<Vec<T>, SourceError> {
+        let mut rows = Vec::new();
+        let mut seen = HashSet::new();
+        let mut marker: Option<String> = None;
+        loop {
+            let mut request = self
+                .request(owner, token, path)?
+                .query(&[("page_limit", PAGE_LIMIT)]);
+            if let Some(marker) = &marker {
+                request = request.query(&[("page_marker", marker)]);
+            }
+            let response = request.send().await.map_err(request_error)?;
+            check_status(response.status())?;
+            marker = response
+                .headers()
+                .get("X-Pagination-Marker")
+                .map(|value| value.to_str().map(str::to_owned))
+                .transpose()
+                .map_err(|_| SourceError::InvalidResponse)?;
+            let mut page: Vec<T> = response.json().await.map_err(request_error)?;
+            rows.append(&mut page);
+            let Some(next) = &marker else {
+                return Ok(rows);
+            };
+            if next.is_empty() || !seen.insert(next.clone()) {
+                return Err(SourceError::InvalidResponse);
+            }
+        }
     }
 
     /// Проверяет принадлежность к личному разговору и применяет настройки его уведомлений.

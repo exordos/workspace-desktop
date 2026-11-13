@@ -29,10 +29,11 @@ mod macos {
 
     use tokio::sync::oneshot;
     use workspace_core::auth::Auth;
+    use workspace_core::bootstrap;
     use workspace_core::context::AccountId;
     use workspace_core::iam_http::WorkspaceIamHttp;
     use workspace_core::messenger::MessengerSource;
-    use workspace_core::runtime::Runtime;
+    use workspace_core::runtime::{Runtime, RuntimeError};
     use workspace_core::storage::Storage;
     use workspace_core::sync::Sync;
     use workspace_desktop::platform::{JsonAccountStore, MacKeychain, state_directory};
@@ -66,15 +67,18 @@ mod macos {
             Arc::new(MacKeychain),
         );
         let storage = Arc::new(Storage::open(directory.join("messenger.sqlite3"))?);
+        let messenger = Arc::new(MessengerSource::new()?);
+        let (chat_catalog, catalog_startup) =
+            bootstrap::chat_catalog(messenger.catalog(storage.clone()));
+        let chat_catalog = Arc::new(chat_catalog);
         let sync = Arc::new(Sync::new(auth.clone(), storage));
-        let runtime = Runtime::new(sync.clone(), vec![Arc::new(MessengerSource::new()?)])?;
+        let runtime = Runtime::new(sync.clone(), vec![messenger])?;
         let executor = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         let (stop, mut stopped) = oneshot::channel();
         let (subscribed, subscription_ready) = oneshot::channel();
         let subscribed = Mutex::new(Some(subscribed));
-        let background_auth = auth.clone();
         let worker = thread::Builder::new()
             .name("workspace-sync".into())
             .spawn(move || {
@@ -87,19 +91,20 @@ mod macos {
                         }
                         _ = &mut stopped => return Ok(()),
                     }
-                    let run = runtime.run(async {
-                        let _ = stopped.await;
-                    });
-                    tokio::pin!(run);
-                    tokio::select! {
-                        result = &mut run => result,
-                        restored = background_auth.restore() => {
+                    bootstrap::run(
+                        runtime,
+                        Some(catalog_startup),
+                        async {
+                            let _ = stopped.await;
+                        },
+                        |restored| {
                             if let Err(error) = restored {
                                 log::error!("Could not restore Workspace accounts: {error}");
                             }
-                            run.await
-                        }
-                    }
+                            Ok::<(), RuntimeError>(())
+                        },
+                    )
+                    .await
                 });
                 result
                     .inspect_err(|error| log::error!("Workspace synchronization stopped: {error}"))
@@ -111,6 +116,7 @@ mod macos {
                     auth.clone(),
                     options.labels.clone(),
                     sync.clone(),
+                    chat_catalog.clone(),
                     options.active.clone(),
                     subscribed
                         .lock()

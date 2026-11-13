@@ -7,7 +7,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
 };
@@ -48,6 +48,7 @@ const PROJECT: &str = "10000000-0000-4000-8000-000000000003";
 const ORGANIZATION: &str = "10000000-0000-4000-8000-000000000004";
 const DIRECT: &str = "10000000-0000-4000-8000-000000000005";
 const TOPIC: &str = "10000000-0000-4000-8000-000000000006";
+const CHANNEL: &str = "10000000-0000-4000-8000-000000000007";
 const ALL_CHATS: &str = "00000000-0000-0000-0000-000000000000";
 const EPOCH: &str = "integration-test";
 const NEXT_EPOCH: &str = "integration-test-next";
@@ -65,6 +66,11 @@ pub(super) struct MockWorkspace {
 }
 
 impl MockWorkspace {
+    /// Возвращает ошибку для следующего запроса списка чатов аккаунта A.
+    pub(super) fn fail_next_catalog(&self) {
+        self.journal.fail_catalog.store(true, Ordering::Relaxed);
+    }
+
     /// Добавляет изменение в журнал B и доставляет его через WSS.
     pub(super) fn send_history_change(&self, object: &str, action: &str, payload: Value) -> u64 {
         let mut entries = self.journal.entries.lock().unwrap();
@@ -227,6 +233,7 @@ struct Journal {
     entries: Mutex<Vec<Value>>,     // События получателя в порядке версий.
     live: broadcast::Sender<Value>, // Поток новых событий после установки сокета.
     recovery: AtomicU8,             // 0 — исходный журнал, 1 — обрезанный, 2 — новая эпоха для B.
+    fail_catalog: AtomicBool,       // Нужно ли вернуть ошибку при следующей загрузке каталога A.
 }
 
 impl Default for Journal {
@@ -236,6 +243,7 @@ impl Default for Journal {
             entries: Mutex::new(Vec::new()),
             live: broadcast::channel(16).0,
             recovery: AtomicU8::new(0),
+            fail_catalog: AtomicBool::new(false),
         }
     }
 }
@@ -346,6 +354,47 @@ fn handle(mut request: Request<Incoming>, journal: Arc<Journal>) -> Response<Ful
     let event_count = if user == BACKGROUND { entries.len() } else { 0 };
     let path = request.uri().path();
     let value = match path {
+        "/api/workspace/v1/messenger/streams/" => {
+            if user == FOREGROUND && journal.fail_catalog.swap(false, Ordering::Relaxed) {
+                return response(StatusCode::SERVICE_UNAVAILABLE, Value::Null);
+            }
+            assert_eq!(query_value(request.uri(), "page_limit"), Some("100"));
+            let name = if user == FOREGROUND {
+                "Канал A"
+            } else {
+                "Канал B"
+            };
+            if query_value(request.uri(), "page_marker") == Some(DIRECT) {
+                json!([{
+                    "uuid": CHANNEL, "user_uuid": user, "project_id": PROJECT,
+                    "name": name, "private": false, "is_archived": false,
+                }])
+            } else {
+                let peer = if user == FOREGROUND {
+                    BACKGROUND
+                } else {
+                    FOREGROUND
+                };
+                let mut page = response(
+                    StatusCode::OK,
+                    json!([{
+                        "uuid": DIRECT, "user_uuid": user, "project_id": PROJECT,
+                        "name": "Личный чат", "private": true, "is_archived": false, "direct_user_uuid": peer,
+                    }]),
+                );
+                page.headers_mut()
+                    .insert("X-Pagination-Marker", HeaderValue::from_static(DIRECT));
+                return page;
+            }
+        }
+        "/api/workspace/v1/messenger/stream_topics/" => json!([{
+            "uuid": TOPIC, "stream_uuid": CHANNEL, "user_uuid": user, "project_id": PROJECT,
+            "name": "Планы",
+        }]),
+        "/api/workspace/v1/users/" => json!([
+            {"uuid": FOREGROUND, "username": "alice", "first_name": "Алиса"},
+            {"uuid": BACKGROUND, "username": "bob", "first_name": "Борис"},
+        ]),
         "/api/workspace/v1/epoch/" => json!({
             "epoch_generation": epoch, "epoch_version": base + event_count as u64,
         }),

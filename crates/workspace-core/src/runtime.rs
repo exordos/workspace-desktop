@@ -12,7 +12,7 @@ use tokio::{
 };
 
 use crate::{
-    auth::{AuthError, Service, SessionSnapshot, SessionStatus},
+    auth::{Auth, AuthError, Service, SessionSnapshot, SessionStatus},
     context::{OwnerContext, SessionGeneration},
     storage::{Cursor, StorageError},
     sync::{Event, Sync, SyncError},
@@ -118,6 +118,11 @@ impl Runtime {
             sync,
             sources: by_id,
         })
+    }
+
+    /// Даёт Bootstrap ту же авторизацию, за которой следят фоновые задачи.
+    pub(crate) fn auth(&self) -> &Auth {
+        self.sync.auth()
     }
 
     /// Следит за сессиями и управляет задачами до сигнала остановки.

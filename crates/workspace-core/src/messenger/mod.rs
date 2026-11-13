@@ -1,6 +1,7 @@
 //! Подключает журнал мессенджера к фоновой синхронизации.
 //! Сначала источник догоняет журнал по HTTP, затем читает новые события через WebSocket.
 
+pub mod catalog;
 mod rest;
 mod socket;
 
@@ -30,6 +31,11 @@ pub struct MessengerSource {
 }
 
 impl MessengerSource {
+    /// Подключает каталог чатов к тому же HTTPS-клиенту, что и поток событий.
+    pub fn catalog(&self, storage: Arc<crate::storage::Storage>) -> catalog::Catalog {
+        catalog::Catalog::new(self.rest.clone(), storage)
+    }
+
     /// Создаёт источник и подготавливает HTTP-клиент.
     pub fn new() -> Result<Self, SourceError> {
         Ok(Self {

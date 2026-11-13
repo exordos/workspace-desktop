@@ -12,21 +12,24 @@ use iced::widget::{Column, column, container, operation, row, scrollable, text};
 use iced::{Alignment, Element, Event, Fill, Subscription, Task, Theme, event, window};
 use tokio::sync::{broadcast, oneshot};
 use workspace_core::auth::{Auth, SessionSnapshot, SessionStatus};
+use workspace_core::bootstrap::{ChatCatalog, ChatListStatus, ChatLists};
 use workspace_core::context::{AccountId, OwnerContext, SessionGeneration};
 use workspace_core::notification_target::{NotificationTarget, NotificationTargetError};
 use workspace_core::sync::{Sync, SyncChange, SyncUpdate};
 
 use crate::platform::notifications::{NotificationClick, NotificationError, Notifications};
 use crate::ui_kit::{
-    BadgeSize, BadgeTone, ButtonVariant, ThemeMode, button, unread_count_badge, workspace_theme,
+    BadgeSize, BadgeTone, ButtonVariant, IconName, IconTone, ThemeMode, button, icon,
+    unread_count_badge, workspace_theme,
 };
 
 /// Состояние окна, которое Iced меняет в ответ на действия пользователя и события `core`.
 pub struct Shell {
     accounts: Accounts,                            // Список аккаунтов и текущий выбор.
-    labels: HashMap<AccountId, String>,            // Читаемые имена для известных идентификаторов.
-    sources: Sources,                              // Входные потоки авторизации и мессенджера.
-    notifications: Box<dyn NotificationDelivery>,  // Получатель запросов оболочки на баннер.
+    chats: ChatLists, // Каталог каждого владельца и состояние загрузки.
+    labels: HashMap<AccountId, String>, // Читаемые имена для известных идентификаторов.
+    sources: Sources, // Входные потоки авторизации и мессенджера.
+    notifications: Box<dyn NotificationDelivery>, // Получатель запросов оболочки на баннер.
     notification_error: Option<NotificationError>, // Причина, по которой ОС не показала баннер.
     navigation_revision: u64, // Номер последнего клика по баннеру или выбора аккаунта.
 }
@@ -43,9 +46,11 @@ pub struct AccountSummary {
 pub enum Message {
     Select(AccountId),                                   // Пользователь выбрал аккаунт.
     Snapshot(Vec<AccountSummary>),                       // Свежий список сессий и счётчиков.
-    Synced(SyncUpdate),                                  // Синхронизация завершила запись события.
+    Chats(ChatLists),                                    // Свежие состояния загрузки каталогов.
+    RetryChats,         // Пользователь просит повторить загрузку списка.
+    Synced(SyncUpdate), // Синхронизация завершила запись события.
     NotificationFinished(Result<(), NotificationError>), // Результат обращения к ОС.
-    NotificationClicked(NotificationClick),              // macOS передала цель нажатого баннера.
+    NotificationClicked(NotificationClick), // macOS передала цель нажатого баннера.
     NotificationResolved {
         revision: u64,                 // Номер действия, которое запустило проверку.
         generation: SessionGeneration, // Вход, к которому относился баннер.
@@ -111,6 +116,7 @@ impl Shell {
         auth: Auth,
         labels: HashMap<AccountId, String>,
         sync: Arc<Sync>,
+        catalog: Arc<ChatCatalog>,
         preferred_account: Option<AccountId>,
         subscribed: oneshot::Sender<()>,
     ) -> Self {
@@ -118,6 +124,7 @@ impl Shell {
             auth,
             labels,
             sync,
+            catalog,
             preferred_account,
             subscribed,
             Box::new(Notifications::new()),
@@ -129,6 +136,7 @@ impl Shell {
         auth: Auth,
         labels: HashMap<AccountId, String>,
         sync: Arc<Sync>,
+        catalog: Arc<ChatCatalog>,
         preferred_account: Option<AccountId>,
         subscribed: oneshot::Sender<()>,
         notifications: Box<dyn NotificationDelivery>,
@@ -139,10 +147,12 @@ impl Shell {
                 preferred: preferred_account,
                 ..Accounts::default()
             },
+            chats: ChatLists::new(),
             labels,
             sources: Sources(Arc::new(SourceData {
                 auth,
                 sync,
+                catalog,
                 subscribed: Mutex::new(Some(subscribed)),
                 clicks: Mutex::new(clicks),
             })),
@@ -165,6 +175,18 @@ impl Shell {
                 self.accounts.select(account);
             }
             Message::Snapshot(accounts) => self.accounts.replace(accounts),
+            Message::Chats(chats) => self.chats = chats,
+            Message::RetryChats => {
+                if let Some(current) = self.accounts.current()
+                    && current.session.status == SessionStatus::Active
+                {
+                    let session = &current.session;
+                    self.sources
+                        .0
+                        .catalog
+                        .retry(session.context.clone(), session.generation);
+                }
+            }
             Message::Synced(update) => match update.change {
                 SyncChange::Unread(count) => self.accounts.set_unread(&update, count),
                 SyncChange::MessengerReset => self.accounts.replace(self.sources.0.snapshot()),
@@ -234,10 +256,69 @@ impl Shell {
             },
         );
         let mut content = column![text("Аккаунты").size(22), rows, text(current)].spacing(16);
+        if let Some(current) = self.accounts.current()
+            && current.session.status == SessionStatus::Active
+        {
+            content = content.push(self.chat_list(&current.session));
+        }
         if self.notification_error.is_some() {
             content = content.push(text("Системные уведомления недоступны").size(13));
         }
         scrollable(container(content).padding(24).width(Fill)).into()
+    }
+
+    /// Показывает список выбранного входа, его темы и действие после ошибки.
+    fn chat_list(&self, session: &SessionSnapshot) -> Element<'_, Message> {
+        let mut list = column![text("Чаты").size(18)].spacing(8);
+        let state = self
+            .chats
+            .get(&session.context)
+            .filter(|state| state.generation == session.generation);
+        match state.map(|state| state.status) {
+            Some(ChatListStatus::Failed) => {
+                list = list.push(
+                    row![
+                        text("Не удалось загрузить чаты"),
+                        button(
+                            "Повторить",
+                            ButtonVariant::Neutral,
+                            Some(Message::RetryChats)
+                        ),
+                    ]
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                );
+            }
+            Some(ChatListStatus::Ready) => {}
+            _ => list = list.push(text("Загрузка чатов…")),
+        }
+        if let Some(chats) = state.and_then(|state| state.chats.as_deref()) {
+            if chats.is_empty() && state.is_some_and(|state| state.status == ChatListStatus::Ready)
+            {
+                list = list.push(text("У вас пока нет чатов"));
+            }
+            for chat in chats {
+                let symbol = if chat.direct {
+                    IconName::Profile
+                } else {
+                    IconName::ChatBubbleOutline
+                };
+                list = list.push(
+                    row![
+                        icon(symbol, 20, IconTone::Inherit),
+                        text(&chat.name).width(Fill),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                );
+                for topic in &chat.topics {
+                    list = list.push(
+                        container(text(format!("# {}", topic.name)).width(Fill)).padding([0, 30]),
+                    );
+                }
+            }
+        }
+        list.into()
     }
 
     /// Рисует кнопку аккаунта и число из последнего подтверждённого снимка.
@@ -441,8 +522,9 @@ struct Sources(Arc<SourceData>); // Одна и та же ссылка сохр�
 
 /// Источники изменений сессий и сохранённых счётчиков.
 struct SourceData {
-    auth: Auth,      // Снимки действующих и восстанавливаемых сессий.
-    sync: Arc<Sync>, // Сводки SQLite и события после записи.
+    auth: Auth,                // Снимки действующих и восстанавливаемых сессий.
+    sync: Arc<Sync>,           // Сводки SQLite и события после записи.
+    catalog: Arc<ChatCatalog>, // Состояния списков и команда повтора.
     subscribed: Mutex<Option<oneshot::Sender<()>>>, // Разрешает фоновому потоку запустить восстановление.
     clicks: Mutex<Option<mpsc::Receiver<NotificationClick>>>, // Очередь системных нажатий для подписки Iced.
 }
@@ -458,6 +540,16 @@ impl Sources {
     /// Объединяет события синхронизации и снимки авторизации в один поток Iced.
     fn events(&self) -> impl Stream<Item = Message> + use<> {
         let source = self.0.clone();
+        let catalog = stream::unfold(
+            (source.catalog.subscribe(), true),
+            |(mut catalog, initial)| async move {
+                if !initial {
+                    catalog.changed().await.ok()?;
+                }
+                let chats = catalog.borrow_and_update().clone();
+                Some((Message::Chats(chats), (catalog, false)))
+            },
+        );
         let clicks = source
             .clicks
             .lock()
@@ -497,7 +589,7 @@ impl Sources {
         });
         stream::select(
             stream::select(sessions, synced),
-            stream::iter(clicks).flatten(),
+            stream::select(catalog, stream::iter(clicks).flatten()),
         )
     }
 }

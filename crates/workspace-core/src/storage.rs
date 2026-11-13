@@ -95,6 +95,8 @@ pub enum StorageError {
     InvalidHistoryPage, // Страница не подходит по области, направлению или формату.
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error), // Исходная ошибка SQLite.
+    #[error("the cached chat list has an invalid format")]
+    Catalog(#[from] serde_json::Error), // Не удалось прочитать или записать снимок списка чатов.
 }
 
 /// Локальное хранилище сообщений, счётчиков и позиций чтения.
@@ -103,6 +105,37 @@ pub struct Storage {
 }
 
 impl Storage {
+    /// Читает сохранённый список чатов этого владельца. Отсутствие записи означает первый запуск.
+    pub(crate) fn chat_catalog(
+        &self,
+        owner: &OwnerContext,
+    ) -> Result<Option<String>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        Ok(connection.query_row(
+            "SELECT snapshot FROM messenger_catalog
+             WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3 AND project_id = ?4 AND user_id = ?5",
+            params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id],
+            |row| row.get(0),
+        ).optional()?)
+    }
+
+    /// Целиком заменяет сохранённый список чатов указанного владельца.
+    pub(crate) fn save_chat_catalog(
+        &self,
+        owner: &OwnerContext,
+        snapshot: &str,
+    ) -> Result<(), StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        connection.execute(
+            "INSERT INTO messenger_catalog (account_id, server, organization_id, project_id, user_id, snapshot)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (account_id, server, organization_id, project_id, user_id)
+             DO UPDATE SET snapshot = excluded.snapshot",
+            params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id, snapshot],
+        )?;
+        Ok(())
+    }
+
     /// Открывает базу по пути и создаёт таблицы при необходимости.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         Self::initialize(Connection::open(path)?)
@@ -150,6 +183,15 @@ impl Storage {
                 message_id TEXT NOT NULL,
                 conversation_id TEXT NOT NULL,
                 PRIMARY KEY (account_id, server, organization_id, project_id, user_id, message_id)
+            );
+            CREATE TABLE IF NOT EXISTS messenger_catalog (
+                account_id TEXT NOT NULL,
+                server TEXT NOT NULL,
+                organization_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                snapshot TEXT NOT NULL,
+                PRIMARY KEY (account_id, server, organization_id, project_id, user_id)
             );
             CREATE TABLE IF NOT EXISTS messenger_unread (
                 account_id TEXT NOT NULL,
