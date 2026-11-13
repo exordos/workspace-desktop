@@ -1,29 +1,42 @@
 //! Открывает демонстрационное окно для ручной проверки UI-кита.
-//! Здесь хранятся настройки примеров и собираются вкладки с элементами управления, иконками и индикаторами.
+//! Здесь хранятся настройки примеров и собираются вкладки с кнопками, полями, иконками и индикаторами.
 
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{column, container, operation, row, scrollable, text};
 use iced::{Element, Event, Fill, Subscription, Task, Theme, event};
 use workspace_desktop::ui_kit::{
-    BadgeSize, BadgeTone, ButtonAppearance, ButtonOptions, ButtonSize, ButtonVariant, IconName,
-    IconTone, PresenceSize, PresenceStatus, SelectionSize, ThemeMode, button, button_with, icon,
-    mention_badge, presence_indicator, selection_checkbox, selection_indicator, switch, text_input,
+    BadgeSize, BadgeTone, ButtonAppearance, ButtonOptions, ButtonSize, ButtonVariant, FieldSize,
+    IconName, IconTone, PresenceSize, PresenceStatus, SelectionSize, ThemeMode, button,
+    button_with, form_field, icon, mention_badge, presence_indicator, search_input,
+    selection_checkbox, selection_indicator, switch, text_input, text_input_with_error,
     unread_count_badge, workspace_theme,
 };
+
+const FIELD_EXAMPLES: [(FieldSize, &str); 2] = [
+    (FieldSize::Compact, "chat-search-compact"),
+    (FieldSize::Regular, "chat-search-regular"),
+];
+
+/// Хранит значения полей для одного размера.
+struct FieldExample {
+    title: String, // Название темы в примере с проверкой.
+    query: String, // Поисковый запрос в примере с очисткой.
+}
 
 /// Определяет открытый раздел галереи.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum GalleryTab {
     #[default]
-    Controls, // Кнопки и текстовое поле.
+    Controls, // Варианты кнопок.
     Icons,      // Каталог иконок.
     Indicators, // Выбор, переключатели, статусы присутствия и бейджи.
+    Fields,     // Поля формы и поиск.
 }
 
 /// Хранит настройки галереи и состояние примеров.
 struct Gallery {
     dark: bool,                        // Признак включённой тёмной темы.
-    input: String,                     // Текст демонстрационного поля ввода.
+    fields: [FieldExample; 2],         // Значения примеров в порядке FIELD_EXAMPLES.
     last_button: Option<&'static str>, // Подпись последней нажатой кнопки. `None` до первого нажатия.
     button_presses: usize,             // Количество нажатий демонстрационных кнопок.
     tab: GalleryTab,                   // Открытый раздел галереи.
@@ -38,7 +51,10 @@ impl Default for Gallery {
     fn default() -> Self {
         Self {
             dark: false,
-            input: String::new(),
+            fields: std::array::from_fn(|_| FieldExample {
+                title: "Чат!".to_owned(),
+                query: String::new(),
+            }),
             last_button: None,
             button_presses: 0,
             tab: GalleryTab::default(),
@@ -53,9 +69,11 @@ impl Default for Gallery {
 /// Передаёт действия пользователя из виджетов в галерею.
 #[derive(Debug, Clone)]
 enum Message {
-    ThemeChanged(bool),          // Новое состояние тёмной темы.
-    InputChanged(String),        // Новый текст демонстрационного поля.
-    ButtonPressed(&'static str), // Подпись нажатой кнопки.
+    ThemeChanged(bool),              // Новое состояние тёмной темы.
+    InputChanged(usize, String),     // Индекс примера и новое название темы.
+    ChatQueryChanged(usize, String), // Индекс примера и новый запрос.
+    ChatQueryCleared(usize),         // Индекс примера, в котором очищают поиск.
+    ButtonPressed(&'static str),     // Подпись нажатой кнопки.
     MoveFocus {
         backwards: bool, // Переход к предыдущему элементу по Shift+Tab.
     },
@@ -71,7 +89,12 @@ impl Gallery {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::ThemeChanged(dark) => self.dark = dark,
-            Message::InputChanged(value) => self.input = value,
+            Message::InputChanged(index, value) => self.fields[index].title = value,
+            Message::ChatQueryChanged(index, query) => self.fields[index].query = query,
+            Message::ChatQueryCleared(index) => {
+                self.fields[index].query.clear();
+                return operation::focus(FIELD_EXAMPLES[index].1);
+            }
             Message::SelectionChanged(selected) => self.selected = selected,
             Message::SwitchChanged(on) => self.switch_on = on,
             Message::TabChanged(tab) => {
@@ -121,6 +144,7 @@ impl Gallery {
             ("Компоненты", GalleryTab::Controls),
             ("Иконки", GalleryTab::Icons),
             ("Выбор и статусы", GalleryTab::Indicators),
+            ("Поля", GalleryTab::Fields),
         ]
         .into_iter()
         .fold(row![].spacing(12), |row, (label, tab)| {
@@ -130,19 +154,15 @@ impl Gallery {
                 Message::TabChanged(tab),
             ))
         });
-        let content = match self.tab {
-            GalleryTab::Controls | GalleryTab::Indicators => {
-                let controls = match self.tab {
-                    GalleryTab::Indicators => self.indicators(),
-                    _ => self.controls(),
-                };
-                scrollable(container(controls).padding([16, 28]).center_x(Fill))
-                    .id("gallery-content")
-                    .height(Fill)
-                    .into()
-            }
+        let section = match self.tab {
+            GalleryTab::Controls => self.controls(),
+            GalleryTab::Indicators => self.indicators(),
+            GalleryTab::Fields => self.fields(),
             GalleryTab::Icons => self.icons(),
         };
+        let content = scrollable(container(section).padding([16, 28]).center_x(Fill))
+            .id("gallery-content")
+            .height(Fill);
         column![
             container(
                 column![
@@ -160,7 +180,7 @@ impl Gallery {
         .into()
     }
 
-    /// Показывает варианты кнопок и текстового поля для ручной проверки.
+    /// Показывает варианты кнопок для ручной проверки.
     fn controls(&self) -> Element<'_, Message> {
         use ButtonAppearance::{Filled, Ghost, Outline};
         use ButtonSize::{Large, Medium, Small};
@@ -247,19 +267,65 @@ impl Gallery {
         ]
         .spacing(12);
 
-        let inputs = column![
-            text("Поля ввода").size(20),
-            text_input("Введите текст", &self.input, Some(Message::InputChanged)),
-            text_input("", "Недоступное поле", None::<fn(String) -> Message>),
-        ]
-        .spacing(12)
-        .max_width(360);
+        buttons.width(Fill).max_width(760).into()
+    }
 
-        column![buttons, inputs]
-            .spacing(28)
-            .width(Fill)
-            .max_width(760)
-            .into()
+    /// Показывает оба размера полей с проверкой ввода и очисткой поиска.
+    fn fields(&self) -> Element<'_, Message> {
+        row(FIELD_EXAMPLES
+            .iter()
+            .enumerate()
+            .map(|(index, &(size, search_id))| self.field_example(index, size, search_id)))
+        .spacing(24)
+        .wrap()
+        .into()
+    }
+
+    /// Собирает примеры полей одного размера с отдельными значениями и фокусом поиска.
+    fn field_example(
+        &self,
+        index: usize,
+        size: FieldSize,
+        search_id: &'static str,
+    ) -> Element<'_, Message> {
+        let example = &self.fields[index];
+        let invalid = example.title.contains('!');
+        let field = form_field(
+            "Название темы",
+            text_input_with_error(
+                "Введите название",
+                &example.title,
+                size,
+                Some(move |value| Message::InputChanged(index, value)),
+                invalid,
+            ),
+            Some("Например, «Обсуждение макетов»."),
+            invalid.then_some("Уберите восклицательный знак из названия."),
+        );
+        let disabled = form_field(
+            "Название канала",
+            text_input("", "Команда", size, None::<fn(String) -> Message>),
+            Some("Название может изменить администратор."),
+            None,
+        );
+        let search = search_input(
+            search_id,
+            "Поиск по чатам",
+            &example.query,
+            size,
+            Some(move |query| Message::ChatQueryChanged(index, query)),
+            Message::ChatQueryCleared(index),
+        );
+
+        column![
+            text(format!("{} px", size.height())).size(20),
+            field,
+            disabled,
+            search
+        ]
+        .spacing(16)
+        .width(320)
+        .into()
     }
 
     /// Показывает чекбоксы, переключатели, статусы присутствия и счётчики.
