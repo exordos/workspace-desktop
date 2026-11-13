@@ -69,7 +69,7 @@ pub fn input_selector<'a, Message: Clone + 'a>(
     });
 
     let arrows = [IconName::ChevronDown, IconName::ChevronUp].map(|name| {
-        container(icon(name, 16, IconTone::Muted))
+        container(icon(name, 16, IconTone::Muted, None))
             .center(u32::from(ARROW_SIZE))
             .into()
     });

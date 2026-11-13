@@ -182,7 +182,7 @@ fn avatar_face<'a, Message: 'a>(
             avatar_text(initials, text_size).into()
         }
         AvatarContent::Initials(_) | AvatarContent::Placeholder => {
-            icon(IconName::Profile, diameter / 2, IconTone::Muted)
+            icon(IconName::Profile, diameter / 2, IconTone::Muted, None)
         }
     };
     circle(content, diameter, stroke_width, selected, grouped)

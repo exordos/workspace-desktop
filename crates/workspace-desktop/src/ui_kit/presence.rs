@@ -44,7 +44,10 @@ pub fn presence_indicator<Message: 'static>(
             PresenceSize::Xs | PresenceSize::Sm => 12,
             PresenceSize::Md | PresenceSize::Lg => 14,
         };
-        (icon(IconName::Block, icon_size, IconTone::Muted), icon_size)
+        (
+            icon(IconName::Block, icon_size, IconTone::Muted, None),
+            icon_size,
+        )
     } else {
         (space().into(), diameter)
     };

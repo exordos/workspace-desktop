@@ -322,7 +322,7 @@ fn option_row<'a, Message: Clone + 'a>(
         );
     }
     let check: Element<'_, Message> = if selected {
-        icon(IconName::Check, 16, IconTone::Accent)
+        icon(IconName::Check, 16, IconTone::Accent, None)
     } else {
         container(Space::new()).width(16).height(16).into()
     };

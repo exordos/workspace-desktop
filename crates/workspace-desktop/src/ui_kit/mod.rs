@@ -27,7 +27,7 @@ pub use badge::{BadgeSize, BadgeTone, mention_badge, unread_count_badge};
 pub use button::{ButtonAppearance, ButtonOptions, ButtonSize, ButtonVariant, button, button_with};
 pub use field_size::FieldSize;
 pub use form_field::form_field;
-pub use icon::{IconName, IconTone, icon};
+pub use icon::{IconName, IconTone, IconVariant, icon};
 pub use input_selector::{InputSelectorOptions, input_selector};
 pub use listbox::{ListboxOption, listbox};
 pub use member_row::{member_row, member_row_content};

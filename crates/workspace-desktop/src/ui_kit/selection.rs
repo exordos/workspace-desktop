@@ -72,7 +72,7 @@ fn indicator<'a, Message: 'a>(
         SelectionSize::Large => (20, 9),
     };
     let content: Element<'a, Message> = if selected {
-        icon(IconName::Check, check_size, IconTone::Inherit)
+        icon(IconName::Check, check_size, IconTone::Inherit, None)
     } else {
         space().into()
     };

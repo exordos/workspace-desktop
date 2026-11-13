@@ -45,9 +45,14 @@ pub fn search_input<'a, Message: Clone + 'a>(
             left: f32::from(size.horizontal_padding()),
         });
 
-    let mut actions = row![icon(IconName::Search, search_icon_size, IconTone::Muted)]
-        .spacing(ACTION_SPACING)
-        .align_y(Center);
+    let mut actions = row![icon(
+        IconName::Search,
+        search_icon_size,
+        IconTone::Muted,
+        None
+    )]
+    .spacing(ACTION_SPACING)
+    .align_y(Center);
     if show_clear {
         actions = actions.push(clear_button(clear_button_size, on_clear));
     }
@@ -66,7 +71,7 @@ pub fn search_input<'a, Message: Clone + 'a>(
 fn clear_button<'a, Message: Clone + 'a>(size: u32, on_clear: Message) -> Element<'a, Message> {
     let keyboard_pressed = Rc::new(Cell::new(false));
     let pressed_for_style = Rc::clone(&keyboard_pressed);
-    let glyph = container(icon(IconName::Close, 14, IconTone::Inherit))
+    let glyph = container(icon(IconName::Close, 14, IconTone::Inherit, None))
         .center_x(size)
         .center_y(size);
     let inner = button(glyph)

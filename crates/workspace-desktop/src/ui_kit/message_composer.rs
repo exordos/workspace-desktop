@@ -105,7 +105,7 @@ fn send_button<'a, Message: Clone + 'a>(on_send: Option<Message>) -> Element<'a,
     let keyboard_pressed = Rc::new(Cell::new(false));
     let pressed_for_style = Rc::clone(&keyboard_pressed);
     let enabled = on_send.is_some();
-    let glyph = container(icon(IconName::Send, 20, IconTone::Inherit))
+    let glyph = container(icon(IconName::Send, 20, IconTone::Inherit, None))
         .center_x(40)
         .center_y(40);
     let inner = button(glyph)

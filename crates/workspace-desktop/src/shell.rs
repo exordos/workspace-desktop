@@ -305,7 +305,7 @@ impl Shell {
                 };
                 list = list.push(
                     row![
-                        icon(symbol, 20, IconTone::Inherit),
+                        icon(symbol, 20, IconTone::Inherit, None),
                         text(&chat.name).width(Fill),
                     ]
                     .spacing(10)

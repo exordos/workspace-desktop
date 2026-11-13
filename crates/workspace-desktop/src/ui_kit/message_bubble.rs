@@ -92,16 +92,16 @@ pub fn message_bubble<'a, Message: 'a>(
 /// Собирает отметку доставки из иконок Workspace.
 fn delivery_mark<'a, Message: 'a>(delivery: MessageDelivery) -> Element<'a, Message> {
     match delivery {
-        MessageDelivery::Sending => icon(IconName::Schedule, 14, IconTone::Muted),
-        MessageDelivery::Sent => icon(IconName::Check, 14, IconTone::Muted),
-        MessageDelivery::Failed => icon(IconName::Warning, 14, IconTone::Danger),
+        MessageDelivery::Sending => icon(IconName::Schedule, 14, IconTone::Muted, None),
+        MessageDelivery::Sent => icon(IconName::Check, 14, IconTone::Muted, None),
+        MessageDelivery::Failed => icon(IconName::Warning, 14, IconTone::Danger, None),
         MessageDelivery::Delivered | MessageDelivery::Read => {
             let tone = if delivery == MessageDelivery::Read {
                 IconTone::Accent
             } else {
                 IconTone::Muted
             };
-            let tick = || icon(IconName::Check, 11, tone);
+            let tick = || icon(IconName::Check, 11, tone, None);
             stack![
                 space().width(15).height(14),
                 pin(tick()).y(2),

@@ -62,7 +62,7 @@ fn trigger<'a, Message: 'a>(
     container(
         row![
             container(label).width(Fill).clip(true),
-            icon(chevron, 16, IconTone::Muted),
+            icon(chevron, 16, IconTone::Muted, None),
         ]
         .spacing(8)
         .align_y(Center),

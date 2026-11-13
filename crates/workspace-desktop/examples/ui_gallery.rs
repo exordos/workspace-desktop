@@ -3,16 +3,16 @@
 
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::text_editor::{self, Content};
-use iced::widget::{column, container, operation, row, scrollable, text};
+use iced::widget::{Column, column, container, operation, row, scrollable, text};
 use iced::{Element, Event, Fill, Subscription, Task, Theme, event};
 use workspace_desktop::ui_kit::{
     AvatarContent, AvatarDecoration, AvatarPhoto, AvatarSize, BadgeSize, BadgeTone,
     ButtonAppearance, ButtonOptions, ButtonSize, ButtonVariant, FieldSize, IconName, IconTone,
-    InputSelectorOptions, ListboxOption, MessageComposerOptions, MessageDelivery, MessageDirection,
-    PanelMenuRowOptions, PresenceSize, PresenceStatus, SelectionSize, ThemeMode, avatar,
-    avatar_group, button, button_with, form_field, icon, input_selector, listbox, member_row,
-    member_row_content, mention_badge, message_bubble, message_composer, panel_menu_row,
-    presence_indicator, search_input, select, selectable_row, selection_checkbox,
+    IconVariant, InputSelectorOptions, ListboxOption, MessageComposerOptions, MessageDelivery,
+    MessageDirection, PanelMenuRowOptions, PresenceSize, PresenceStatus, SelectionSize, ThemeMode,
+    avatar, avatar_group, button, button_with, form_field, icon, input_selector, listbox,
+    member_row, member_row_content, mention_badge, message_bubble, message_composer,
+    panel_menu_row, presence_indicator, search_input, select, selectable_row, selection_checkbox,
     selection_indicator, switch, text_input, text_input_with_error, unread_count_badge,
     workspace_theme,
 };
@@ -61,6 +61,8 @@ struct Gallery {
     tab: GalleryTab,                   // Открытый раздел галереи.
     icon_tone: IconTone,               // Выбранный способ окраски иконок.
     icon_size: u32,                    // Сторона иконок в логических пикселях.
+    icon_variant: IconVariant,         // Выбранная форма для иконок, у которых есть пара SVG.
+    icon_query: String,                // Строка фильтра по именам иконок.
     selected: bool,                    // Отмечен ли демонстрационный чекбокс.
     switch_on: bool,                   // Включён ли демонстрационный переключатель.
     avatar_photo: AvatarPhoto,         // Искусственное изображение для проверки обрезки аватара.
@@ -87,6 +89,8 @@ impl Default for Gallery {
             tab: GalleryTab::default(),
             icon_tone: IconTone::default(),
             icon_size: 24,
+            icon_variant: IconVariant::default(),
+            icon_query: String::new(),
             selected: false,
             switch_on: true,
             avatar_photo: example_avatar_photo(),
@@ -131,6 +135,8 @@ enum Message {
     TabChanged(GalleryTab),                // Вкладка, которую нужно открыть.
     IconToneChanged(IconTone),             // Новый способ окраски иконок.
     IconSizeChanged(u32),                  // Новый размер иконок в логических пикселях.
+    IconVariantChanged(IconVariant),       // Новая форма иконок.
+    IconQueryChanged(String),              // Новый фильтр списка иконок.
     SelectionChanged(bool),                // Чекбокс передал новую отметку.
     SwitchChanged(bool),                   // Переключатель передал новое положение.
     MemberSelectionChanged(bool),          // Новая отметка в строке выбора участника.
@@ -171,6 +177,11 @@ impl Gallery {
             }
             Message::IconToneChanged(tone) => self.icon_tone = tone,
             Message::IconSizeChanged(size) => self.icon_size = size,
+            Message::IconVariantChanged(variant) => self.icon_variant = variant,
+            Message::IconQueryChanged(query) => {
+                self.icon_query = query;
+                return operation::snap_to("gallery-content", scrollable::RelativeOffset::START);
+            }
             Message::ButtonPressed(label) => {
                 self.last_button = Some(label);
                 self.button_presses += 1;
@@ -235,9 +246,14 @@ impl Gallery {
             GalleryTab::Messages => self.messages(),
             GalleryTab::Icons => self.icons(),
         };
-        let content = scrollable(container(section).padding([16, 28]).center_x(Fill))
-            .id("gallery-content")
-            .height(Fill);
+        let content = if self.tab == GalleryTab::Icons {
+            section
+        } else {
+            scrollable(container(section).padding([16, 28]).center_x(Fill))
+                .id("gallery-content")
+                .height(Fill)
+                .into()
+        };
         column![
             container(
                 column![
@@ -556,7 +572,7 @@ impl Gallery {
                     trailing: Some(
                         row![
                             text("По умолчанию").size(12),
-                            icon(IconName::ChevronRight, 16, IconTone::Muted)
+                            icon(IconName::ChevronRight, 16, IconTone::Muted, None)
                         ]
                         .spacing(6)
                         .align_y(iced::Center)
@@ -571,7 +587,7 @@ impl Gallery {
                 PanelMenuRowOptions {
                     icon: Some(IconName::Settings),
                     subtitle: Some("Тема, расположение папок и плотность списка чатов."),
-                    trailing: Some(icon(IconName::ChevronRight, 16, IconTone::Muted)),
+                    trailing: Some(icon(IconName::ChevronRight, 16, IconTone::Muted, None)),
                     ..PanelMenuRowOptions::default()
                 },
                 Some(Message::PanelActionPressed("Настройка оформления")),
@@ -793,7 +809,7 @@ impl Gallery {
     /// Показывает каталог SVG с поиском и выбором размера, формы и цвета.
     fn icons(&self) -> Element<'_, Message> {
         let tones = [
-            ("Основной", IconTone::Inherit),
+            ("По умолчанию", IconTone::Inherit),
             ("Приглушённый", IconTone::Muted),
             ("Акцентный", IconTone::Accent),
             ("Опасное действие", IconTone::Danger),
@@ -815,44 +831,93 @@ impl Gallery {
                     Message::IconSizeChanged(size),
                 ))
             });
-        let previews = [
-            ("Plus", IconName::Plus),
-            ("Search", IconName::Search),
-            ("Close", IconName::Close),
-            ("Attach", IconName::Attach),
-        ]
-        .into_iter()
-        .fold(row![].spacing(12), |row, (label, name)| {
-            row.push(
-                container(
-                    column![
-                        container(icon(name, self.icon_size, self.icon_tone))
-                            .center_x(Fill)
-                            .center_y(64),
-                        text(label).size(13),
-                    ]
-                    .align_x(iced::Center),
-                )
-                .width(120)
-                .padding([8, 12])
-                .style(container::rounded_box),
-            )
-        });
+        let query = self.icon_query.trim().to_ascii_lowercase();
+        let mut matches: Vec<_> = IconName::ALL
+            .iter()
+            .copied()
+            .filter(|name| match name {
+                IconName::HomeFilled => false,
+                IconName::Home => IconName::HomeFilled.as_str().contains(&query),
+                _ => name.as_str().to_ascii_lowercase().contains(&query),
+            })
+            .collect();
+        matches.sort_unstable_by_key(|name| name.as_str().to_ascii_lowercase());
+        let previews: Element<'_, Message> = if matches.is_empty() {
+            text("Иконки не найдены").into()
+        } else {
+            row(matches.into_iter().map(|name| {
+                container(column![
+                    container(icon(
+                        name,
+                        self.icon_size,
+                        self.icon_tone,
+                        Some(self.icon_variant),
+                    ))
+                    .center_x(Fill)
+                    .center_y(64),
+                    container(text(name.as_str()).size(13).center())
+                        .center_x(Fill)
+                        .center_y(38),
+                ])
+                .width(128)
+                .padding([8, 6])
+                .style(container::rounded_box)
+                .into()
+            }))
+            .spacing(12)
+            .wrap()
+            .into()
+        };
 
-        column![
+        let settings = column![
             column![text("Цвет"), tones.wrap()].spacing(8),
             column![text("Размер, px"), sizes.wrap()].spacing(8),
-            previews.wrap(),
-            column![
-                text("В кнопке · 16 px · цвет подписи").size(14),
-                add_button()
+            row![
+                text("Форма Home"),
+                option_button(
+                    "Outline",
+                    self.icon_variant == IconVariant::Outline,
+                    Message::IconVariantChanged(IconVariant::Outline)
+                ),
+                option_button(
+                    "Filled",
+                    self.icon_variant == IconVariant::Filled,
+                    Message::IconVariantChanged(IconVariant::Filled)
+                ),
             ]
-            .spacing(8),
-            text(format!("Нажатий на кнопки: {}", self.button_presses)).size(14),
+            .spacing(8)
+            .align_y(iced::Center)
+            .wrap(),
+            text_input(
+                "Поиск по имени",
+                &self.icon_query,
+                FieldSize::Regular,
+                Some(Message::IconQueryChanged)
+            ),
         ]
-        .width(Fill)
-        .max_width(760)
-        .spacing(20)
+        .spacing(12);
+        let catalog = Column::new()
+            .push(
+                row![
+                    add_button(),
+                    text(format!("Нажатий: {}", self.button_presses)).size(14),
+                ]
+                .spacing(12)
+                .align_y(iced::Center),
+            )
+            .push(previews)
+            .spacing(16)
+            .width(Fill)
+            .max_width(760);
+
+        column![
+            container(settings.width(Fill).max_width(760))
+                .padding([0, 28])
+                .center_x(Fill),
+            scrollable(container(catalog).padding([12, 28]).center_x(Fill))
+                .id("gallery-content")
+                .height(Fill),
+        ]
         .into()
     }
 }
@@ -885,7 +950,7 @@ fn add_button() -> Element<'static, Message> {
     button_with(
         "Добавить",
         ButtonOptions {
-            leading_icon: Some(icon(IconName::Plus, 16, IconTone::Inherit)),
+            leading_icon: Some(icon(IconName::Plus, 16, IconTone::Inherit, None)),
             ..ButtonOptions::default()
         },
         Some(Message::ButtonPressed("Добавить")),

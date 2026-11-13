@@ -81,7 +81,7 @@ pub fn panel_menu_row<'a, Message: Clone + 'a>(
 
     let mut content = row![].width(Fill).spacing(8).align_y(Center);
     if let Some(name) = leading {
-        let glyph = icon(name, 22, IconTone::Inherit);
+        let glyph = icon(name, 22, IconTone::Inherit, None);
         content = content.push(container(glyph).center(32).style(move |theme: &Theme| {
             let tint = if danger {
                 theme.palette().danger
