@@ -12,12 +12,18 @@ use super::theme::text_muted;
 /// Имя иконки, по которому виджет выбирает встроенный SVG.
 #[derive(Debug, Clone, Copy)]
 pub enum IconName {
-    Plus,   // Знак добавления.
-    Search, // Лупа для поиска.
-    Close,  // Крестик для закрытия.
-    Attach, // Скрепка для вложения.
-    Check,  // Галочка выбора.
-    Block,  // Значок отключённой учётной записи.
+    Plus,          // Знак добавления.
+    Search,        // Лупа для поиска.
+    Close,         // Крестик для закрытия.
+    Attach,        // Скрепка для вложения.
+    Check,         // Галочка выбора.
+    Block,         // Значок отключённой учётной записи.
+    Profile,       // Заглушка аватара.
+    VolumeUp,      // Настройка громкости.
+    ChevronRight,  // Стрелка перехода вправо.
+    Settings,      // Шестерёнка настроек.
+    Language,      // Настройка языка.
+    LogoutCompact, // Выход из аккаунта.
 }
 
 impl IconName {
@@ -44,6 +50,25 @@ impl IconName {
             Handle::from_memory(&include_bytes!("../../assets/icons/block.svg")[..])
         });
 
+        static PROFILE: LazyLock<Handle> = LazyLock::new(|| {
+            Handle::from_memory(&include_bytes!("../../assets/icons/profile.svg")[..])
+        });
+        static VOLUME_UP: LazyLock<Handle> = LazyLock::new(|| {
+            Handle::from_memory(&include_bytes!("../../assets/icons/volume_up.svg")[..])
+        });
+        static CHEVRON_RIGHT: LazyLock<Handle> = LazyLock::new(|| {
+            Handle::from_memory(&include_bytes!("../../assets/icons/chevron-right.svg")[..])
+        });
+        static SETTINGS: LazyLock<Handle> = LazyLock::new(|| {
+            Handle::from_memory(&include_bytes!("../../assets/icons/settings.svg")[..])
+        });
+        static LANGUAGE: LazyLock<Handle> = LazyLock::new(|| {
+            Handle::from_memory(&include_bytes!("../../assets/icons/language.svg")[..])
+        });
+        static LOGOUT_COMPACT: LazyLock<Handle> = LazyLock::new(|| {
+            Handle::from_memory(&include_bytes!("../../assets/icons/logout_compact.svg")[..])
+        });
+
         match self {
             Self::Plus => &PLUS,
             Self::Search => &SEARCH,
@@ -51,6 +76,12 @@ impl IconName {
             Self::Attach => &ATTACH,
             Self::Check => &CHECK,
             Self::Block => &BLOCK,
+            Self::Profile => &PROFILE,
+            Self::VolumeUp => &VOLUME_UP,
+            Self::ChevronRight => &CHEVRON_RIGHT,
+            Self::Settings => &SETTINGS,
+            Self::Language => &LANGUAGE,
+            Self::LogoutCompact => &LOGOUT_COMPACT,
         }
     }
 }

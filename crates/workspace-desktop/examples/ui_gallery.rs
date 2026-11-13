@@ -1,13 +1,15 @@
 //! Открывает демонстрационное окно для ручной проверки UI-кита.
-//! Здесь хранятся настройки примеров и собираются вкладки с кнопками, полями, иконками и индикаторами.
+//! Здесь хранятся настройки примеров и собираются вкладки с компонентами.
 
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{column, container, operation, row, scrollable, text};
 use iced::{Element, Event, Fill, Subscription, Task, Theme, event};
 use workspace_desktop::ui_kit::{
-    BadgeSize, BadgeTone, ButtonAppearance, ButtonOptions, ButtonSize, ButtonVariant, FieldSize,
-    IconName, IconTone, PresenceSize, PresenceStatus, SelectionSize, ThemeMode, button,
-    button_with, form_field, icon, mention_badge, presence_indicator, search_input,
+    AvatarContent, AvatarDecoration, AvatarPhoto, AvatarSize, BadgeSize, BadgeTone,
+    ButtonAppearance, ButtonOptions, ButtonSize, ButtonVariant, FieldSize, IconName, IconTone,
+    PanelMenuRowOptions, PresenceSize, PresenceStatus, SelectionSize, ThemeMode, avatar,
+    avatar_group, button, button_with, form_field, icon, member_row, member_row_content,
+    mention_badge, panel_menu_row, presence_indicator, search_input, selectable_row,
     selection_checkbox, selection_indicator, switch, text_input, text_input_with_error,
     unread_count_badge, workspace_theme,
 };
@@ -31,12 +33,13 @@ enum GalleryTab {
     Icons,      // Каталог иконок.
     Indicators, // Выбор, переключатели, статусы присутствия и бейджи.
     Fields,     // Поля формы и поиск.
+    Rows,       // Аватары, карточки и строки действий.
 }
 
 /// Хранит настройки галереи и состояние примеров.
 struct Gallery {
-    dark: bool,                        // Признак включённой тёмной темы.
-    fields: [FieldExample; 2],         // Значения примеров в порядке FIELD_EXAMPLES.
+    dark: bool,                              // Признак включённой тёмной темы.
+    fields: [FieldExample; 2],               // Значения примеров в порядке FIELD_EXAMPLES.
     last_button: Option<&'static str>, // Подпись последней нажатой кнопки. `None` до первого нажатия.
     button_presses: usize,             // Количество нажатий демонстрационных кнопок.
     tab: GalleryTab,                   // Открытый раздел галереи.
@@ -44,6 +47,9 @@ struct Gallery {
     icon_size: u32,                    // Сторона иконок в логических пикселях.
     selected: bool,                    // Отмечен ли демонстрационный чекбокс.
     switch_on: bool,                   // Включён ли демонстрационный переключатель.
+    avatar_photo: AvatarPhoto,         // Искусственное изображение для проверки обрезки аватара.
+    member_selected: bool,             // Отмечен ли участник в примере выбора.
+    last_panel_action: Option<&'static str>, // Подпись последнего действия панели.
 }
 
 impl Default for Gallery {
@@ -62,6 +68,9 @@ impl Default for Gallery {
             icon_size: 24,
             selected: false,
             switch_on: true,
+            avatar_photo: example_avatar_photo(),
+            member_selected: false,
+            last_panel_action: None,
         }
     }
 }
@@ -77,11 +86,13 @@ enum Message {
     MoveFocus {
         backwards: bool, // Переход к предыдущему элементу по Shift+Tab.
     },
-    TabChanged(GalleryTab),    // Вкладка, которую нужно открыть.
-    IconToneChanged(IconTone), // Новый способ окраски иконок.
-    IconSizeChanged(u32),      // Новый размер иконок в логических пикселях.
-    SelectionChanged(bool),    // Чекбокс передал новую отметку.
-    SwitchChanged(bool),       // Переключатель передал новое положение.
+    TabChanged(GalleryTab),           // Вкладка, которую нужно открыть.
+    IconToneChanged(IconTone),        // Новый способ окраски иконок.
+    IconSizeChanged(u32),             // Новый размер иконок в логических пикселях.
+    SelectionChanged(bool),           // Чекбокс передал новую отметку.
+    SwitchChanged(bool),              // Переключатель передал новое положение.
+    MemberSelectionChanged(bool),     // Новая отметка в строке выбора участника.
+    PanelActionPressed(&'static str), // Подпись нажатой строки действия.
 }
 
 impl Gallery {
@@ -97,6 +108,8 @@ impl Gallery {
             }
             Message::SelectionChanged(selected) => self.selected = selected,
             Message::SwitchChanged(on) => self.switch_on = on,
+            Message::MemberSelectionChanged(selected) => self.member_selected = selected,
+            Message::PanelActionPressed(action) => self.last_panel_action = Some(action),
             Message::TabChanged(tab) => {
                 self.tab = tab;
                 return operation::snap_to("gallery-content", scrollable::RelativeOffset::START);
@@ -145,6 +158,7 @@ impl Gallery {
             ("Иконки", GalleryTab::Icons),
             ("Выбор и статусы", GalleryTab::Indicators),
             ("Поля", GalleryTab::Fields),
+            ("Аватары и строки", GalleryTab::Rows),
         ]
         .into_iter()
         .fold(row![].spacing(12), |row, (label, tab)| {
@@ -153,11 +167,13 @@ impl Gallery {
                 self.tab == tab,
                 Message::TabChanged(tab),
             ))
-        });
+        })
+        .wrap();
         let section = match self.tab {
             GalleryTab::Controls => self.controls(),
             GalleryTab::Indicators => self.indicators(),
             GalleryTab::Fields => self.fields(),
+            GalleryTab::Rows => self.rows(),
             GalleryTab::Icons => self.icons(),
         };
         let content = scrollable(container(section).padding([16, 28]).center_x(Fill))
@@ -408,6 +424,148 @@ impl Gallery {
         .into()
     }
 
+    /// Показывает аватары разных размеров, выбираемые строки и действия панели.
+    fn rows(&self) -> Element<'_, Message> {
+        use AvatarContent::{Initials, Photo, Placeholder};
+        use AvatarDecoration::{Presence, Selection};
+        use AvatarSize::{Large, Medium, Profile, Small};
+
+        let avatars = row![
+            avatar(Small, Initials("МЛ"), Some(Selection(false))),
+            avatar(Small, Initials("АК"), Some(Selection(true))),
+            avatar(
+                Medium,
+                Initials("ВН"),
+                Some(Presence(PresenceStatus::Online))
+            ),
+            avatar(Large, Placeholder, Some(Presence(PresenceStatus::Away))),
+            avatar(Profile, Photo(self.avatar_photo.clone()), None),
+            avatar_group(
+                &[
+                    Initials("МЛ"),
+                    Photo(self.avatar_photo.clone()),
+                    Placeholder
+                ],
+                4
+            ),
+        ]
+        .spacing(16)
+        .align_y(iced::Center)
+        .wrap();
+
+        let members = column![
+            member_row(
+                avatar(
+                    Medium,
+                    Initials("ВН"),
+                    Some(Presence(PresenceStatus::Online))
+                ),
+                "Вера Новикова",
+                Some("Дизайн интерфейсов"),
+                Some(text("Владелец").size(12).into()),
+            ),
+            selectable_row(
+                member_row_content(
+                    avatar(Small, Initials("АК"), Some(Selection(self.member_selected))),
+                    "Александра Константинова-Воронцова",
+                    Some("Команда исследования и разработки"),
+                    None,
+                ),
+                self.member_selected,
+                Some(Message::MemberSelectionChanged(!self.member_selected)),
+            ),
+            selectable_row(
+                member_row_content(
+                    avatar(Small, Placeholder, Some(Selection(true))),
+                    "Участник уже добавлен",
+                    None,
+                    None,
+                ),
+                true,
+                None,
+            ),
+        ]
+        .spacing(6)
+        .width(Fill)
+        .max_width(340);
+
+        let panels = column![
+            panel_menu_row(
+                "Звуки уведомлений",
+                PanelMenuRowOptions {
+                    icon: Some(IconName::VolumeUp),
+                    trailing: Some(
+                        row![
+                            text("По умолчанию").size(12),
+                            icon(IconName::ChevronRight, 16, IconTone::Muted)
+                        ]
+                        .spacing(6)
+                        .align_y(iced::Center)
+                        .into()
+                    ),
+                    ..PanelMenuRowOptions::default()
+                },
+                Some(Message::PanelActionPressed("Звуки уведомлений")),
+            ),
+            panel_menu_row(
+                "Настройка оформления списка чатов",
+                PanelMenuRowOptions {
+                    icon: Some(IconName::Settings),
+                    subtitle: Some("Тема, расположение папок и плотность списка чатов."),
+                    trailing: Some(icon(IconName::ChevronRight, 16, IconTone::Muted)),
+                    ..PanelMenuRowOptions::default()
+                },
+                Some(Message::PanelActionPressed("Настройка оформления")),
+            ),
+            panel_menu_row(
+                "Язык",
+                PanelMenuRowOptions {
+                    icon: Some(IconName::Language),
+                    compact: true,
+                    trailing: Some(text("Русский").size(12).into()),
+                    ..PanelMenuRowOptions::default()
+                },
+                None,
+            ),
+            panel_menu_row(
+                "Выйти",
+                PanelMenuRowOptions {
+                    icon: Some(IconName::LogoutCompact),
+                    danger: true,
+                    ..PanelMenuRowOptions::default()
+                },
+                Some(Message::PanelActionPressed("Выйти")),
+            ),
+            text(match self.last_panel_action {
+                Some(action) => format!("Последнее действие: {action}"),
+                None => "Действие ещё не выбрано".to_owned(),
+            })
+            .size(12),
+        ]
+        .spacing(6)
+        .width(Fill)
+        .max_width(340);
+
+        column![
+            text("Аватары").size(20),
+            avatars,
+            row![
+                column![text("Участники").size(20), members]
+                    .spacing(12)
+                    .max_width(340),
+                column![text("Действия панели").size(20), panels]
+                    .spacing(12)
+                    .max_width(340),
+            ]
+            .spacing(24)
+            .wrap(),
+        ]
+        .spacing(18)
+        .width(Fill)
+        .max_width(760)
+        .into()
+    }
+
     /// Показывает каталог SVG с поиском и выбором размера, формы и цвета.
     fn icons(&self) -> Element<'_, Message> {
         let tones = [
@@ -508,6 +666,25 @@ fn add_button() -> Element<'static, Message> {
         },
         Some(Message::ButtonPressed("Добавить")),
     )
+}
+
+/// Создаёт тестовое изображение для проверки круглой обрезки и масштабирования.
+fn example_avatar_photo() -> AvatarPhoto {
+    let mut pixels = Vec::new();
+    for y in 0..64 {
+        for x in 0..80 {
+            // Рисуем два полукруга и контрастный фон, чтобы были заметны края обрезки.
+            let head = (x - 40) * (x - 40) + (y - 23) * (y - 23) < 11 * 11;
+            let shoulders = (x - 40) * (x - 40) + (y - 65) * (y - 65) < 25 * 25;
+            let color = match (head, shoulders) {
+                (true, _) => [0xff, 0xd0, 0xac, 0xff],
+                (_, true) => [0x30, 0x55, 0x79, 0xff],
+                _ => [0x79, 0x98 + y as u8, 0xaf + x as u8, 0xff],
+            };
+            pixels.extend_from_slice(&color);
+        }
+    }
+    AvatarPhoto::from_rgba(80, 64, pixels).expect("размер примера совпадает с числом пикселей")
 }
 
 /// Запускает окно Iced с темой, обработкой действий и подпиской на клавиатуру.

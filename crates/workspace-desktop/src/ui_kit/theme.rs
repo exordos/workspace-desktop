@@ -57,6 +57,15 @@ pub(super) fn text_muted(theme: &Theme) -> Color {
     }
 }
 
+/// Возвращает цвет второстепенного текста для текущей темы.
+pub(super) fn text_secondary(theme: &Theme) -> Color {
+    if theme.extended_palette().is_dark {
+        Color::from_rgb8(0x9a, 0xa8, 0xb8)
+    } else {
+        Color::from_rgb8(0x66, 0x75, 0x8a)
+    }
+}
+
 /// Возвращает цвет счётчика непрочитанного в активном разговоре.
 pub(super) fn unread_badge_color(theme: &Theme) -> Color {
     if theme.extended_palette().is_dark {
