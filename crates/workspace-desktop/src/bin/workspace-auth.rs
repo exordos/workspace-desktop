@@ -5,6 +5,7 @@ const USAGE: &str = "Usage: workspace-auth <command>\n\
   login <https://workspace-server>   Sign in and select a project\n\
   status                            Restore and list saved accounts\n\
   verify <account-id>               Verify access to Workspace Messenger\n\
+  sync                               Sync Messenger until Ctrl-C\n\
   logout <account-id>               Sign out locally and delete the saved secret";
 
 fn main() -> ExitCode {
@@ -45,12 +46,17 @@ mod platform {
     use workspace_core::auth::{Auth, AuthError, IamError, Service, SessionStatus};
     use workspace_core::context::AccountId;
     use workspace_core::iam_http::WorkspaceIamHttp;
+    use workspace_core::messenger::MessengerSource;
+    use workspace_core::runtime::Runtime;
+    use workspace_core::storage::Storage;
+    use workspace_core::sync::Sync;
     use workspace_desktop::platform::{JsonAccountStore, MacKeychain};
 
     enum Command<'a> {
         Login(&'a str),
         Status,
         Verify(AccountId),
+        Sync,
         Logout(AccountId),
     }
 
@@ -59,11 +65,13 @@ mod platform {
             [name, server] if name == "login" => Command::Login(server),
             [name] if name == "status" => Command::Status,
             [name, id] if name == "verify" => Command::Verify(AccountId(id.clone())),
+            [name] if name == "sync" => Command::Sync,
             [name, id] if name == "logout" => Command::Logout(AccountId(id.clone())),
             _ => return Err(super::USAGE.into()),
         };
         let iam = Arc::new(WorkspaceIamHttp::new());
-        let accounts = Arc::new(JsonAccountStore::open(&state_directory()?)?);
+        let directory = state_directory()?;
+        let accounts = Arc::new(JsonAccountStore::open(&directory)?);
         let auth = Auth::new(iam.clone(), accounts, Arc::new(MacKeychain));
 
         match command {
@@ -102,12 +110,70 @@ mod platform {
                 iam.verify_messenger(&context, &token)?;
                 println!("Workspace Messenger accepted the project's credentials.");
             }
+            Command::Sync => {
+                log::set_logger(&SyncLog).expect("logger initialized once");
+                log::set_max_level(log::LevelFilter::Info);
+                let storage = Arc::new(Storage::open(directory.join("messenger.sqlite3"))?);
+                let sync = Arc::new(Sync::new(auth.clone(), storage));
+                let runtime = Runtime::new(sync, vec![Arc::new(MessengerSource::new()?)])?;
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(async {
+                        let mut interrupt = tokio::signal::unix::signal(
+                            tokio::signal::unix::SignalKind::interrupt(),
+                        )?;
+                        let (stop, stopped) = tokio::sync::oneshot::channel();
+                        let restore = async {
+                            tokio::select! {
+                                _ = interrupt.recv() => Ok::<(), Box<dyn Error>>(()),
+                                restored = auth.restore() => {
+                                    restored?;
+                                    if auth.snapshot().is_empty() {
+                                        return Err("No saved Workspace accounts.".into());
+                                    }
+                                    interrupt.recv().await;
+                                    Ok(())
+                                }
+                            }
+                        };
+                        let run = runtime.run(async {
+                            let _ = stopped.await;
+                        });
+                        tokio::pin!(run);
+                        tokio::select! {
+                            result = &mut run => result?,
+                            restored = restore => {
+                                let _ = stop.send(());
+                                run.await?;
+                                restored?;
+                            }
+                        }
+                        Ok::<(), Box<dyn Error>>(())
+                    })?;
+            }
             Command::Logout(id) => {
                 auth.logout(&id)?;
                 println!("Workspace account signed out locally.");
             }
         }
         Ok(())
+    }
+
+    struct SyncLog;
+
+    impl log::Log for SyncLog {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.target().starts_with("workspace_core::")
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                eprintln!("{}", record.args());
+            }
+        }
+
+        fn flush(&self) {}
     }
 
     fn state_directory() -> Result<PathBuf, Box<dyn Error>> {

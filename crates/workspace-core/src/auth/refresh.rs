@@ -1,3 +1,6 @@
+//! Продлевает сессию и выдаёт токен доступа для запросов.
+//! Здесь рассчитываются сроки токенов, объединяются параллельные обновления и сохраняются новые секреты.
+
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,15 +16,18 @@ use crate::context::{OwnerContext, SessionGeneration};
 const REFRESH_SKEW: Duration = Duration::from_secs(60);
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 
+/// Результат одного обновления, которого могут ждать несколько запросов.
 pub(super) type RefreshFlight = Shared<BoxFuture<'static, Result<(), AuthError>>>;
 
+/// Ответ IAM с рассчитанными сроками действия токена доступа.
 pub(super) struct TimedToken {
-    token: IamToken,
-    expires_at: Instant,
-    refresh_at: Instant,
+    token: IamToken,     // Токены и данные владельца, которые прислал IAM.
+    expires_at: Instant, // Момент, после которого токен доступа использовать нельзя.
+    refresh_at: Instant, // Момент, с которого пора запросить новый токен.
 }
 
 impl TimedToken {
+    /// Проверяет владельца и срок токена, затем рассчитывает время обновления и истечения.
     pub(super) fn new(
         token: IamToken,
         context: &OwnerContext,
@@ -52,16 +58,19 @@ impl TimedToken {
         })
     }
 
+    /// Забирает новый токен обновления из ответа, оставляя вместо него `None`.
     pub(super) fn take_replacement_refresh(&mut self) -> Option<String> {
         self.token.refresh_token.take()
     }
 
+    /// Возвращает ссылку на новый токен обновления, если IAM его выдал.
     pub(super) fn replacement_refresh(&self) -> Option<&String> {
         self.token.refresh_token.as_ref()
     }
 }
 
 impl AccountState {
+    /// Устанавливает токен, сбрасывает задержку повторов и помечает сессию активной.
     pub(super) fn install(&mut self, mut token: TimedToken) {
         if let Some(refresh_token) = token.take_replacement_refresh() {
             self.refresh_token = Some(refresh_token);
@@ -72,6 +81,7 @@ impl AccountState {
         self.token_version += 1;
     }
 
+    /// Возвращает токен доступа, пока не закончился его срок.
     fn valid_access(&self, now: Instant) -> Option<String> {
         self.access
             .as_ref()
@@ -79,6 +89,7 @@ impl AccountState {
             .map(|token| token.token.access_token.clone())
     }
 
+    /// Возвращает токен доступа, пока не настало время обновления.
     fn token_before_refresh(&self, now: Instant) -> Option<String> {
         self.access
             .as_ref()
@@ -88,6 +99,34 @@ impl AccountState {
 }
 
 impl Auth {
+    /// Сбрасывает отклонённый токен, если сессия и версия токена ещё те же.
+    pub(crate) fn reject_access_token(
+        &self,
+        context: &OwnerContext,
+        generation: SessionGeneration,
+        version: u64,
+    ) {
+        let Ok(slot) = self.account_slot(&context.account_id) else {
+            return;
+        };
+        let mut state = slot.lock().unwrap();
+        if state.generation == generation
+            && state.token_version == version
+            && state.status == SessionStatus::Active
+            && state.record.as_ref().map(|record| &record.context) == Some(context)
+            && state.access.take().is_some()
+        {
+            // The next token version starts a new worker and resets its transport backoff.
+            let retry_at = self.inner.clock.now() + RETRY_DELAY;
+            state.retry_at = Some(
+                state
+                    .retry_at
+                    .map_or(retry_at, |current| current.max(retry_at)),
+            );
+        }
+    }
+
+    /// Выдаёт действующий токен доступа для текущей сессии, при необходимости обновляя его.
     pub async fn access_token(
         &self,
         context: &OwnerContext,
@@ -100,6 +139,7 @@ impl Auth {
             .await
     }
 
+    /// Выдаёт токен для конкретного поколения сессии и проверяет его после ожидания обновления.
     pub(crate) async fn access_token_for_generation(
         &self,
         context: &OwnerContext,
@@ -153,6 +193,7 @@ impl Auth {
         }
     }
 
+    /// Проверяет, что за время ожидания сессию не заменили и из неё не вышли.
     fn check_generation(
         state: &AccountState,
         generation: SessionGeneration,
@@ -164,6 +205,7 @@ impl Auth {
         }
     }
 
+    /// Возвращает уже запущенное обновление или запускает одно новое для аккаунта.
     pub(super) fn refresh_flight(
         &self,
         slot: &Arc<Mutex<AccountState>>,
@@ -201,6 +243,7 @@ impl Auth {
         Ok(flight)
     }
 
+    /// Получает или берёт из памяти ответ IAM и применяет его только к той же сессии.
     fn run_refresh(
         &self,
         slot: &Mutex<AccountState>,
@@ -240,6 +283,7 @@ impl Auth {
         }
     }
 
+    /// Читает токен обновления из памяти или хранилища и запрашивает новый токен у IAM.
     fn request_refresh(
         &self,
         record: &super::AccountRecord,
@@ -263,6 +307,7 @@ impl Auth {
         Ok((token, refresh_token))
     }
 
+    /// Сохраняет замену токена обновления перед тем, как сделать новый токен доступа доступным.
     fn commit_refresh(
         &self,
         state: &mut AccountState,
@@ -281,6 +326,7 @@ impl Auth {
         Ok(())
     }
 
+    /// Назначает время повтора и публикует статус с учётом срока старого токена.
     fn record_temporary_failure(&self, state: &mut AccountState, context: &OwnerContext) {
         let now = self.inner.clock.now();
         state.retry_at = Some(now + RETRY_DELAY);

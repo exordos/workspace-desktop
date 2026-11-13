@@ -117,12 +117,12 @@ impl Storage {
             .optional()?)
     }
 
-    pub(crate) fn apply_message(
+    pub(crate) fn apply(
         &self,
         owner: &OwnerContext,
         source: &str,
-        cursor: Cursor,
-        message: Message,
+        cursor: &Cursor,
+        message: Option<&Message>,
     ) -> Result<ApplyOutcome, StorageError> {
         let epoch_version = i64::try_from(cursor.epoch_version)
             .map_err(|_| StorageError::CursorVersionOutOfRange)?;
@@ -138,22 +138,24 @@ impl Storage {
             }
         }
 
-        transaction.execute(
-            "INSERT INTO sync_messages
+        if let Some(message) = message {
+            transaction.execute(
+                "INSERT INTO sync_messages
                  (account_id, server, organization_id, project_id, user_id, message_id, text)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT (account_id, server, organization_id, project_id, user_id, message_id)
              DO NOTHING",
-            params![
-                owner.account_id.0,
-                owner.server,
-                owner.organization_id,
-                owner.project_id,
-                owner.user_id,
-                message.id,
-                message.text,
-            ],
-        )?;
+                params![
+                    owner.account_id.0,
+                    owner.server,
+                    owner.organization_id,
+                    owner.project_id,
+                    owner.user_id,
+                    message.id,
+                    message.text,
+                ],
+            )?;
+        }
         transaction.execute(
             "INSERT INTO sync_cursors
                  (account_id, server, organization_id, project_id, user_id,
@@ -214,6 +216,16 @@ mod tests {
     use super::*;
     use crate::context::AccountId;
 
+    fn apply_message(
+        storage: &Storage,
+        owner: &OwnerContext,
+        source: &str,
+        cursor: Cursor,
+        message: Message,
+    ) -> Result<ApplyOutcome, StorageError> {
+        storage.apply(owner, source, &cursor, Some(&message))
+    }
+
     const SOURCE: &str = "messenger";
 
     fn owner() -> OwnerContext {
@@ -247,24 +259,23 @@ mod tests {
         let first = message("first", "First");
         let position = cursor("epoch-a", 10);
         assert_eq!(
-            storage
-                .apply_message(&owner, SOURCE, position.clone(), first.clone())
-                .unwrap(),
+            apply_message(&storage, &owner, SOURCE, position.clone(), first.clone()).unwrap(),
             ApplyOutcome::Applied
         );
         assert_eq!(
-            storage
-                .apply_message(
-                    &owner,
-                    SOURCE,
-                    position.clone(),
-                    message("second", "Duplicate")
-                )
-                .unwrap(),
+            apply_message(
+                &storage,
+                &owner,
+                SOURCE,
+                position.clone(),
+                message("second", "Duplicate")
+            )
+            .unwrap(),
             ApplyOutcome::Duplicate
         );
         assert!(matches!(
-            storage.apply_message(
+            apply_message(
+                &storage,
                 &owner,
                 SOURCE,
                 cursor("epoch-b", 11),
@@ -284,9 +295,14 @@ mod tests {
         let owner = owner();
         let first = cursor("epoch", 1);
         let second = cursor("epoch", 2);
-        storage
-            .apply_message(&owner, SOURCE, first.clone(), message("one", "One"))
-            .unwrap();
+        apply_message(
+            &storage,
+            &owner,
+            SOURCE,
+            first.clone(),
+            message("one", "One"),
+        )
+        .unwrap();
         storage
             .connection
             .lock()
@@ -299,7 +315,7 @@ mod tests {
 
         let pending = message("two", "Two");
         assert!(matches!(
-            storage.apply_message(&owner, SOURCE, second.clone(), pending.clone()),
+            apply_message(&storage, &owner, SOURCE, second.clone(), pending.clone()),
             Err(StorageError::Sqlite(_))
         ));
         assert_eq!(storage.cursor(&owner, SOURCE).unwrap(), Some(first));
@@ -311,9 +327,7 @@ mod tests {
             .unwrap()
             .execute_batch("DROP TRIGGER reject_cursor")
             .unwrap();
-        storage
-            .apply_message(&owner, SOURCE, second.clone(), pending.clone())
-            .unwrap();
+        apply_message(&storage, &owner, SOURCE, second.clone(), pending.clone()).unwrap();
         assert_eq!(storage.cursor(&owner, SOURCE).unwrap(), Some(second));
         assert_eq!(storage.message(&owner, "two").unwrap(), Some(pending));
     }
@@ -323,11 +337,17 @@ mod tests {
         let storage = Storage::in_memory().unwrap();
         let owner = owner();
         let last = cursor("epoch", i64::MAX as u64);
-        storage
-            .apply_message(&owner, SOURCE, last.clone(), message("last", "Last"))
-            .unwrap();
+        apply_message(
+            &storage,
+            &owner,
+            SOURCE,
+            last.clone(),
+            message("last", "Last"),
+        )
+        .unwrap();
         assert!(matches!(
-            storage.apply_message(
+            apply_message(
+                &storage,
                 &owner,
                 SOURCE,
                 cursor("epoch", last.epoch_version + 1),

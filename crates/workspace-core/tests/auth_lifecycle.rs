@@ -482,7 +482,9 @@ impl EventSource for TestSource {
     fn connect(&self, session: SourceSession) -> BoxFuture<'_, Result<EventStream, SourceError>> {
         Box::pin(async move {
             let (send, receive) = async_mpsc::channel(4);
-            self.0.send((session, send)).map_err(|_| SourceError)?;
+            self.0
+                .send((session, send))
+                .map_err(|_| SourceError::Temporary)?;
             let stream = futures::stream::unfold(receive, |mut receive| async move {
                 receive.recv().await.map(|event| (event, receive))
             });
@@ -492,13 +494,17 @@ impl EventSource for TestSource {
 }
 
 fn incoming(version: u64, text: &str) -> Event {
-    Event {
+    incoming_with_id(version, "shared-message-id", text)
+}
+
+fn incoming_with_id(version: u64, id: &str, text: &str) -> Event {
+    Event::MessageCreated {
         cursor: Cursor {
             epoch_generation: "test-epoch".into(),
             epoch_version: version,
         },
         message: Message {
-            id: "shared-message-id".into(),
+            id: id.into(),
             text: text.into(),
         },
     }
@@ -551,21 +557,20 @@ async fn runtime_tracks_two_accounts_and_resumes_from_the_committed_cursor() {
     send_a.send(Ok(event_a.clone())).await.unwrap();
     send_b.send(Ok(event_b.clone())).await.unwrap();
     wait_for(|| {
-        sync.cursor(&a, "messenger").unwrap().as_ref() == Some(&event_a.cursor)
-            && sync.cursor(&b, "messenger").unwrap().as_ref() == Some(&event_b.cursor)
+        sync.cursor(&a, "messenger").unwrap().as_ref() == Some(event_a.cursor())
+            && sync.cursor(&b, "messenger").unwrap().as_ref() == Some(event_b.cursor())
     })
     .await;
     assert_eq!(
-        storage.message(&a, &event_a.message.id).unwrap(),
-        Some(event_a.message.clone())
+        storage.message(&a, &event_a.message().unwrap().id).unwrap(),
+        Some(event_a.message().unwrap().clone())
     );
     assert_eq!(
-        storage.message(&b, &event_b.message.id).unwrap(),
-        Some(event_b.message.clone())
+        storage.message(&b, &event_b.message().unwrap().id).unwrap(),
+        Some(event_b.message().unwrap().clone())
     );
 
-    let mut next_a = incoming(5, "next A");
-    next_a.message.id = "next-message-id".into();
+    let next_a = incoming_with_id(5, "next-message-id", "next A");
     let fault = rusqlite::Connection::open(&db_path).unwrap();
     fault
         .execute_batch(
@@ -578,14 +583,17 @@ async fn runtime_tracks_two_accounts_and_resumes_from_the_committed_cursor() {
         sync.apply(&a, generation_a, "messenger", next_a.clone()),
         Err(workspace_core::sync::SyncError::Storage(_)),
     ));
-    assert_eq!(storage.message(&a, &next_a.message.id).unwrap(), None);
+    assert_eq!(
+        storage.message(&a, &next_a.message().unwrap().id).unwrap(),
+        None
+    );
     assert_eq!(
         sync.cursor(&a, "messenger").unwrap().as_ref(),
-        Some(&event_a.cursor)
+        Some(event_a.cursor())
     );
     assert_eq!(
         sync.cursor(&b, "messenger").unwrap().as_ref(),
-        Some(&event_b.cursor)
+        Some(event_b.cursor())
     );
     fault.execute_batch("DROP TRIGGER fail_cursor").unwrap();
 
@@ -604,7 +612,7 @@ async fn runtime_tracks_two_accounts_and_resumes_from_the_committed_cursor() {
         .unwrap();
     assert_eq!(reconnected.context, a);
     assert_eq!(reconnected.generation, generation_a);
-    assert_eq!(reconnected.cursor.as_ref(), Some(&event_a.cursor));
+    assert_eq!(reconnected.cursor.as_ref(), Some(event_a.cursor()));
     assert_eq!(reconnected.access_token, "refreshed");
     assert!(send_a.is_closed());
     assert!(!send_b.is_closed());
@@ -622,10 +630,9 @@ async fn runtime_tracks_two_accounts_and_resumes_from_the_committed_cursor() {
         .unwrap();
     assert_eq!(restored_b.context, b);
     assert_ne!(restored_b.generation, generation_b);
-    assert_eq!(restored_b.cursor.as_ref(), Some(&event_b.cursor));
+    assert_eq!(restored_b.cursor.as_ref(), Some(event_b.cursor()));
 
-    let mut stale_b = incoming(8, "stale B");
-    stale_b.message.id = "stale-message-id".into();
+    let stale_b = incoming_with_id(8, "stale-message-id", "stale B");
     assert!(matches!(
         sync.apply(&b, generation_b, "messenger", stale_b.clone()),
         Err(workspace_core::sync::SyncError::Auth(
@@ -633,7 +640,7 @@ async fn runtime_tracks_two_accounts_and_resumes_from_the_committed_cursor() {
         )),
     ));
     send_a_new.send(Ok(next_a.clone())).await.unwrap();
-    wait_for(|| sync.cursor(&a, "messenger").unwrap().as_ref() == Some(&next_a.cursor)).await;
+    wait_for(|| sync.cursor(&a, "messenger").unwrap().as_ref() == Some(next_a.cursor())).await;
 
     shutdown.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), worker)
@@ -645,22 +652,29 @@ async fn runtime_tracks_two_accounts_and_resumes_from_the_committed_cursor() {
     assert!(send_b_new.is_closed());
     let reopened = Storage::open(&db_path).unwrap();
     assert_eq!(
-        reopened.message(&a, &next_a.message.id).unwrap(),
-        Some(next_a.message)
+        reopened.message(&a, &next_a.message().unwrap().id).unwrap(),
+        Some(next_a.message().unwrap().clone())
     );
     assert_eq!(
-        reopened.message(&b, &event_b.message.id).unwrap(),
-        Some(event_b.message)
+        reopened
+            .message(&b, &event_b.message().unwrap().id)
+            .unwrap(),
+        Some(event_b.message().unwrap().clone())
     );
     assert_eq!(
         reopened.cursor(&a, "messenger").unwrap(),
-        Some(next_a.cursor)
+        Some(next_a.cursor().clone())
     );
     assert_eq!(
         reopened.cursor(&b, "messenger").unwrap(),
-        Some(event_b.cursor)
+        Some(event_b.cursor().clone())
     );
-    assert_eq!(reopened.message(&b, &stale_b.message.id).unwrap(), None);
+    assert_eq!(
+        reopened
+            .message(&b, &stale_b.message().unwrap().id)
+            .unwrap(),
+        None
+    );
 }
 
 #[tokio::test]
@@ -699,6 +713,51 @@ async fn runtime_recovers_after_temporary_iam_failure_on_reconnect() {
     assert_eq!(reconnected.generation, initial.generation);
     assert!(reconnected.token_version > initial.token_version);
     assert_eq!(reconnected.access_token, "recovered");
+    shutdown.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn runtime_refreshes_a_token_rejected_before_expiry() {
+    let fixture = Fixture::new(|user, _| Ok(project_token(user, "replacement", None)));
+    let owner = fixture.login("a");
+    let storage = Arc::new(Storage::in_memory().unwrap());
+    let sync = Arc::new(EventSync::new(fixture.auth.clone(), storage));
+    let (connections, mut receive) = async_mpsc::unbounded_channel();
+    let runtime = Runtime::new(sync, vec![Arc::new(TestSource(connections))]).unwrap();
+    let (shutdown, stopped) = oneshot::channel();
+    let worker = tokio::spawn(runtime.run(async {
+        let _ = stopped.await;
+    }));
+
+    let (initial, stream) = tokio::time::timeout(Duration::from_secs(5), receive.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    stream.send(Err(SourceError::Unauthorized)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), stream.closed())
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), receive.recv())
+            .await
+            .is_err()
+    );
+    assert_eq!(fixture.iam.refreshes.load(Ordering::SeqCst), 0);
+
+    let (replacement, _stream) = tokio::time::timeout(Duration::from_secs(5), receive.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replacement.context, owner);
+    assert_eq!(replacement.generation, initial.generation);
+    assert_eq!(replacement.token_version, initial.token_version + 1);
+    assert_eq!(replacement.access_token, "replacement");
+    assert_eq!(fixture.iam.refreshes.load(Ordering::SeqCst), 1);
     shutdown.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), worker)
         .await

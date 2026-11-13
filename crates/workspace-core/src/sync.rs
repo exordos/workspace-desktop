@@ -11,9 +11,24 @@ use crate::{
 pub use crate::storage::ApplyOutcome;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Event {
-    pub cursor: Cursor,
-    pub message: Message,
+pub enum Event {
+    MessageCreated { cursor: Cursor, message: Message },
+    Checkpoint(Cursor),
+}
+
+impl Event {
+    pub fn cursor(&self) -> &Cursor {
+        match self {
+            Self::MessageCreated { cursor, .. } | Self::Checkpoint(cursor) => cursor,
+        }
+    }
+
+    pub fn message(&self) -> Option<&Message> {
+        match self {
+            Self::MessageCreated { message, .. } => Some(message),
+            Self::Checkpoint(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -51,7 +66,7 @@ impl Sync {
     ) -> Result<ApplyOutcome, SyncError> {
         let outcome = self.auth.with_active_generation(owner, generation, || {
             self.storage
-                .apply_message(owner, source, event.cursor, event.message)
+                .apply(owner, source, event.cursor(), event.message())
         })??;
         Ok(outcome)
     }

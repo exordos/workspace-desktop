@@ -21,8 +21,18 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<Event, SourceError>> + Send>>;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-#[error("event source is unavailable")]
-pub struct SourceError;
+pub enum SourceError {
+    #[error("event source is unavailable")]
+    Temporary,
+    #[error("event source rejected the session token")]
+    Unauthorized,
+    #[error("event source denied access to this project")]
+    Forbidden,
+    #[error("event source returned an invalid response")]
+    InvalidResponse,
+    #[error("saved source cursor expired and requires recovery")]
+    CursorPruned,
+}
 
 pub struct SourceSession {
     pub context: OwnerContext,
@@ -268,13 +278,14 @@ impl Worker {
         };
         let mut stream = match until_cancelled(cancelled, self.source.connect(session)).await {
             Some(Ok(stream)) => stream,
-            Some(Err(_)) => return Ok(ConnectionEnd::Retry),
+            Some(Err(error)) => return Ok(self.source_failure(error)),
             None => return Ok(ConnectionEnd::Stopped),
         };
         loop {
             let event = match until_cancelled(cancelled, stream.next()).await {
                 Some(Some(Ok(event))) => event,
-                Some(Some(Err(_)) | None) => return Ok(ConnectionEnd::Retry),
+                Some(Some(Err(error))) => return Ok(self.source_failure(error)),
+                Some(None) => return Ok(ConnectionEnd::Retry),
                 None => return Ok(ConnectionEnd::Stopped),
             };
             let sync = self.sync.clone();
@@ -288,11 +299,30 @@ impl Worker {
                 Ok(_) => *delay = INITIAL_RETRY_DELAY,
                 Err(SyncError::Auth(_)) => return Ok(ConnectionEnd::Stopped),
                 Err(SyncError::Storage(
-                    StorageError::EpochChanged | StorageError::CursorVersionOutOfRange,
+                    error @ (StorageError::EpochChanged | StorageError::CursorVersionOutOfRange),
                 )) => {
+                    log::warn!("{} paused: {error}", self.key.source);
                     return Ok(ConnectionEnd::CursorRejected);
                 }
                 Err(SyncError::Storage(_)) => return Ok(ConnectionEnd::Retry),
+            }
+        }
+    }
+
+    fn source_failure(&self, error: SourceError) -> ConnectionEnd {
+        match error {
+            SourceError::Unauthorized => {
+                self.sync.auth().reject_access_token(
+                    &self.key.context,
+                    self.session.generation,
+                    self.session.token_version,
+                );
+                ConnectionEnd::Retry
+            }
+            SourceError::Temporary => ConnectionEnd::Retry,
+            SourceError::CursorPruned | SourceError::InvalidResponse | SourceError::Forbidden => {
+                log::warn!("{} paused: {error}", self.key.source);
+                ConnectionEnd::CursorRejected
             }
         }
     }
