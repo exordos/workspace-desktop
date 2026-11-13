@@ -18,6 +18,7 @@ use workspace_core::auth::{
     SecretStore, Service, SessionStatus, StoreError,
 };
 use workspace_core::context::{AccountId, OwnerContext};
+use workspace_core::notification_target::{NotificationTarget, NotificationTargetError};
 use workspace_core::runtime::{EventSource, EventStream, Runtime, SourceError, SourceSession};
 use workspace_core::storage::{Cursor, Message, Storage};
 use workspace_core::sync::{Event, Sync as EventSync, SyncChange, SyncUpdate};
@@ -709,6 +710,111 @@ fn messenger_updates_are_committed_deduplicated_and_scoped_to_the_session() {
     );
     assert!(updates.try_recv().is_err());
     assert_eq!(reopened.unread(&second).unwrap(), Some(30));
+}
+
+/// Проверяет, что клик открывает только сохранённую цель в исходной действующей сессии.
+#[test]
+fn notification_target_requires_matching_session_conversation_and_message() {
+    let fixture = Fixture::new(|_, _| unreachable!());
+    let first = fixture.login("first");
+    let second = fixture.login("second");
+    let generation = |owner: &OwnerContext| {
+        fixture
+            .auth
+            .snapshot()
+            .into_iter()
+            .find(|session| session.context == *owner)
+            .unwrap()
+            .generation
+    };
+    let second_generation = generation(&second);
+    let sync = EventSync::new(
+        fixture.auth.clone(),
+        Arc::new(Storage::in_memory().unwrap()),
+    );
+    let cursor = Cursor {
+        epoch_generation: "test-epoch".into(),
+        epoch_version: 1,
+    };
+    let message = Message {
+        id: "direct-message".into(),
+        text: "hello".into(),
+    };
+    // То же сообщение видно обоим участникам, но уведомление получил только второй.
+    sync.apply(
+        &first,
+        generation(&first),
+        "messenger",
+        Event::MessageCreated {
+            cursor: cursor.clone(),
+            message: message.clone(),
+        },
+    )
+    .unwrap();
+    sync.apply(
+        &second,
+        second_generation,
+        "messenger",
+        Event::IncomingDirectMessage {
+            cursor,
+            message,
+            conversation_id: "direct-conversation".into(),
+        },
+    )
+    .unwrap();
+
+    let target = NotificationTarget {
+        context: second.clone(),
+        conversation_id: "direct-conversation".into(),
+        message_id: "direct-message".into(),
+    };
+    assert_eq!(
+        sync.resolve_notification_target(target.clone(), second_generation)
+            .unwrap(),
+        target
+    );
+    let wrong_account = NotificationTarget {
+        context: first.clone(),
+        ..target.clone()
+    };
+    assert!(matches!(
+        sync.resolve_notification_target(wrong_account, generation(&first)),
+        Err(NotificationTargetError::UnknownTarget)
+    ));
+    let wrong_project = NotificationTarget {
+        context: OwnerContext {
+            project_id: "other-project".into(),
+            ..second.clone()
+        },
+        ..target.clone()
+    };
+    assert!(matches!(
+        sync.resolve_notification_target(wrong_project, second_generation),
+        Err(NotificationTargetError::Auth(AuthError::SessionUnavailable))
+    ));
+    for wrong_target in [
+        NotificationTarget {
+            conversation_id: "other-conversation".into(),
+            ..target.clone()
+        },
+        NotificationTarget {
+            message_id: "other-message".into(),
+            ..target.clone()
+        },
+    ] {
+        assert!(matches!(
+            sync.resolve_notification_target(wrong_target, second_generation),
+            Err(NotificationTargetError::UnknownTarget)
+        ));
+    }
+
+    fixture.auth.logout(&second.account_id).unwrap();
+    assert_eq!(fixture.login("second"), second);
+    assert_ne!(generation(&second), second_generation);
+    assert!(matches!(
+        sync.resolve_notification_target(target, second_generation),
+        Err(NotificationTargetError::Auth(AuthError::SessionUnavailable))
+    ));
 }
 
 /// Ждёт, пока условие выполнится, и ограничивает время ожидания.

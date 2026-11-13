@@ -9,6 +9,7 @@ use tokio::sync::broadcast;
 use crate::{
     auth::{Auth, AuthError},
     context::{OwnerContext, SessionGeneration},
+    notification_target::{NotificationTarget, NotificationTargetError},
     storage::{Cursor, Message, Storage, StorageError},
 };
 
@@ -124,6 +125,24 @@ impl Sync {
         self.updates.subscribe()
     }
 
+    /// Проверяет цель клика в действующей сессии и возвращает подтверждённый адрес сообщения.
+    pub fn resolve_notification_target(
+        &self,
+        target: NotificationTarget,
+        generation: SessionGeneration,
+    ) -> Result<NotificationTarget, NotificationTargetError> {
+        let exists = self
+            .auth
+            .with_active_generation(&target.context, generation, || {
+                self.storage.contains_notification_target(&target)
+            })??;
+        if exists {
+            Ok(target)
+        } else {
+            Err(NotificationTargetError::UnknownTarget)
+        }
+    }
+
     /// Записывает событие, пока поколение сессии остаётся действующим.
     /// Проверка сессии и запись защищены одной блокировкой аккаунта.
     pub fn apply(
@@ -145,9 +164,20 @@ impl Sync {
                 Event::UnreadChanged { count, .. } => Some(*count),
                 _ => None,
             };
-            let saved =
-                self.storage
-                    .apply(owner, source, event.cursor(), event.message(), unread)?;
+            let conversation = match &event {
+                Event::IncomingDirectMessage {
+                    conversation_id, ..
+                } => Some(conversation_id.as_str()),
+                _ => None,
+            };
+            let saved = self.storage.apply(
+                owner,
+                source,
+                event.cursor(),
+                event.message(),
+                unread,
+                conversation,
+            )?;
             if let Some(count) = unread.filter(|_| saved.unread_changed) {
                 self.publish(owner, generation, SyncChange::Unread(count));
             }

@@ -6,15 +6,17 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use futures::stream::{self, Stream, StreamExt};
+use futures::{channel::mpsc, future::BoxFuture};
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{Column, column, container, operation, row, scrollable, text};
-use iced::{Alignment, Element, Event, Fill, Subscription, Task, Theme, event};
+use iced::{Alignment, Element, Event, Fill, Subscription, Task, Theme, event, window};
 use tokio::sync::{broadcast, oneshot};
 use workspace_core::auth::{Auth, SessionSnapshot, SessionStatus};
-use workspace_core::context::{AccountId, OwnerContext};
+use workspace_core::context::{AccountId, OwnerContext, SessionGeneration};
+use workspace_core::notification_target::{NotificationTarget, NotificationTargetError};
 use workspace_core::sync::{Sync, SyncChange, SyncUpdate};
 
-use crate::platform::notifications::{NotificationError, Notifications};
+use crate::platform::notifications::{NotificationClick, NotificationError, Notifications};
 use crate::ui_kit::{
     BadgeSize, BadgeTone, ButtonVariant, ThemeMode, button, unread_count_badge, workspace_theme,
 };
@@ -24,8 +26,9 @@ pub struct Shell {
     accounts: Accounts,                            // Список аккаунтов и текущий выбор.
     labels: HashMap<AccountId, String>,            // Читаемые имена для известных идентификаторов.
     sources: Sources,                              // Входные потоки авторизации и мессенджера.
-    notifications: Notifications,                  // Адаптер системных баннеров.
+    notifications: Box<dyn NotificationDelivery>,  // Получатель запросов оболочки на баннер.
     notification_error: Option<NotificationError>, // Причина, по которой ОС не показала баннер.
+    navigation_revision: u64, // Номер последнего клика по баннеру или выбора аккаунта.
 }
 
 /// Снимок сессии и сохранённое значение счётчика «Все чаты».
@@ -42,6 +45,12 @@ pub enum Message {
     Snapshot(Vec<AccountSummary>),                       // Свежий список сессий и счётчиков.
     Synced(SyncUpdate),                                  // Синхронизация завершила запись события.
     NotificationFinished(Result<(), NotificationError>), // Результат обращения к ОС.
+    NotificationClicked(NotificationClick),              // macOS передала цель нажатого баннера.
+    NotificationResolved {
+        revision: u64,                 // Номер действия, которое запустило проверку.
+        generation: SessionGeneration, // Вход, к которому относился баннер.
+        result: Result<NotificationTarget, Arc<NotificationTargetError>>, // Проверенная цель или причина отказа.
+    },
     MoveFocus(bool), // Перейти назад по Shift+Tab или вперёд по Tab.
 }
 
@@ -53,6 +62,49 @@ struct Accounts {
     preferred: Option<AccountId>,   // Аккаунт, который нужно открыть при восстановлении.
 }
 
+/// Принимает запросы оболочки на системный баннер и сообщает результат.
+trait NotificationDelivery {
+    /// Запрашивает разрешение на показ баннеров.
+    fn prepare(&self) -> BoxFuture<'static, Result<(), NotificationError>>;
+
+    /// Передаёт баннер с заданным идентификатором получателю.
+    fn show(
+        &self,
+        id: &str,
+        title: &str,
+        body: &str,
+        click: &NotificationClick,
+    ) -> BoxFuture<'static, Result<(), NotificationError>>;
+
+    /// Передаёт подписке оболочки очередь нажатий из системы.
+    fn take_clicks(&self) -> Option<mpsc::Receiver<NotificationClick>> {
+        None
+    }
+}
+
+impl NotificationDelivery for Notifications {
+    /// Просит разрешение через системный адаптер.
+    fn prepare(&self) -> BoxFuture<'static, Result<(), NotificationError>> {
+        Box::pin(self.prepare())
+    }
+
+    /// Отправляет запрос через системный адаптер.
+    fn show(
+        &self,
+        id: &str,
+        title: &str,
+        body: &str,
+        click: &NotificationClick,
+    ) -> BoxFuture<'static, Result<(), NotificationError>> {
+        Box::pin(self.show(id, title, body, &click.target, click.generation))
+    }
+
+    /// Забирает очередь нажатий из системного адаптера.
+    fn take_clicks(&self) -> Option<mpsc::Receiver<NotificationClick>> {
+        self.take_clicks()
+    }
+}
+
 impl Shell {
     /// Создаёт окно на главном потоке. Подписка прочитает сохранённые сессии и счётчики.
     pub fn new(
@@ -62,6 +114,26 @@ impl Shell {
         preferred_account: Option<AccountId>,
         subscribed: oneshot::Sender<()>,
     ) -> Self {
+        Self::with_notifications(
+            auth,
+            labels,
+            sync,
+            preferred_account,
+            subscribed,
+            Box::new(Notifications::new()),
+        )
+    }
+
+    /// Собирает оболочку с переданным получателем уведомлений.
+    fn with_notifications(
+        auth: Auth,
+        labels: HashMap<AccountId, String>,
+        sync: Arc<Sync>,
+        preferred_account: Option<AccountId>,
+        subscribed: oneshot::Sender<()>,
+        notifications: Box<dyn NotificationDelivery>,
+    ) -> Self {
+        let clicks = notifications.take_clicks();
         Self {
             accounts: Accounts {
                 preferred: preferred_account,
@@ -72,9 +144,11 @@ impl Shell {
                 auth,
                 sync,
                 subscribed: Mutex::new(Some(subscribed)),
+                clicks: Mutex::new(clicks),
             })),
-            notifications: Notifications::new(),
+            notifications,
             notification_error: None,
+            navigation_revision: 0,
         }
     }
 
@@ -86,14 +160,20 @@ impl Shell {
     /// Обрабатывает выбор аккаунта, новые счётчики и запросы на баннеры.
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Select(account) => self.accounts.select(account),
+            Message::Select(account) => {
+                self.navigation_revision += 1;
+                self.accounts.select(account);
+            }
             Message::Snapshot(accounts) => self.accounts.replace(accounts),
             Message::Synced(update) => match update.change {
                 SyncChange::Unread(count) => self.accounts.set_unread(&update, count),
-                SyncChange::IncomingDirectMessage { ref message_id, .. } => {
+                SyncChange::IncomingDirectMessage {
+                    ref conversation_id,
+                    ref message_id,
+                } => {
                     // Авторизация может активировать сессию до того, как её снимок дошёл до окна.
                     self.accounts.replace(self.sources.0.snapshot());
-                    return self.notify(&update, message_id);
+                    return self.notify(&update, conversation_id, message_id);
                 }
             },
             Message::NotificationFinished(result) => {
@@ -102,6 +182,12 @@ impl Shell {
                     log::warn!("Не удалось отправить уведомление macOS: {error}");
                 }
             }
+            Message::NotificationClicked(click) => return self.open_notification(click),
+            Message::NotificationResolved {
+                revision,
+                generation,
+                result,
+            } => self.finish_open_notification(revision, generation, result),
             Message::MoveFocus(true) => return operation::focus_previous(),
             Message::MoveFocus(false) => return operation::focus_next(),
         }
@@ -187,7 +273,12 @@ impl Shell {
     }
 
     /// Передаёт ОС событие фоновой сессии, которая всё ещё активна.
-    fn notify(&self, update: &SyncUpdate, message_id: &str) -> Task<Message> {
+    fn notify(
+        &self,
+        update: &SyncUpdate,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Task<Message> {
         if !self.accounts.is_background(update)
             || !self
                 .sources
@@ -202,7 +293,17 @@ impl Shell {
         let account = &update.context.account_id;
         let id = format!("{}/{}/{}", account.0, update.context.project_id, message_id);
         let body = format!("Аккаунт {}", self.label(account));
-        let request = self.notifications.show(&id, "Новое сообщение", &body);
+        let click = NotificationClick {
+            target: NotificationTarget {
+                context: update.context.clone(),
+                conversation_id: conversation_id.to_owned(),
+                message_id: message_id.to_owned(),
+            },
+            generation: update.generation,
+        };
+        let request = self
+            .notifications
+            .show(&id, "Новое сообщение", &body, &click);
         Task::perform(
             async move {
                 let result = request.await;
@@ -213,6 +314,59 @@ impl Shell {
             },
             Message::NotificationFinished,
         )
+    }
+
+    /// Поднимает окно и передаёт цель в core на исполнителе задач Iced.
+    fn open_notification(&mut self, click: NotificationClick) -> Task<Message> {
+        self.navigation_revision += 1;
+        let revision = self.navigation_revision;
+        let sync = self.sources.0.sync.clone();
+        let NotificationClick { target, generation } = click;
+        let raise = window::oldest().then(|window| {
+            window.map_or_else(Task::none, |id| {
+                window::minimize(id, false).chain(window::gain_focus(id))
+            })
+        });
+        let resolve = Task::perform(
+            async move {
+                sync.resolve_notification_target(target, generation)
+                    .map_err(Arc::new)
+            },
+            move |result| Message::NotificationResolved {
+                revision,
+                generation,
+                result,
+            },
+        );
+        Task::batch([raise, resolve])
+    }
+
+    /// Применяет ответ core, если пользователь всё ещё ждёт этот переход и сессия активна.
+    fn finish_open_notification(
+        &mut self,
+        revision: u64,
+        generation: SessionGeneration,
+        result: Result<NotificationTarget, Arc<NotificationTargetError>>,
+    ) {
+        if revision != self.navigation_revision {
+            return;
+        }
+        let target = match result {
+            Ok(target) => target,
+            Err(error) => {
+                log::warn!("Цель уведомления Workspace недоступна: {error}");
+                return;
+            }
+        };
+        self.accounts.replace(self.sources.0.snapshot());
+        if self.accounts.summaries.iter().any(|summary| {
+            summary.session.context == target.context
+                && summary.session.generation == generation
+                && summary.session.status == SessionStatus::Active
+        }) {
+            self.accounts.select(target.context.account_id);
+            log::info!("Core подтвердил аккаунт, чат и сообщение из уведомления");
+        }
     }
 }
 
@@ -289,6 +443,7 @@ struct SourceData {
     auth: Auth,      // Снимки действующих и восстанавливаемых сессий.
     sync: Arc<Sync>, // Сводки SQLite и события после записи.
     subscribed: Mutex<Option<oneshot::Sender<()>>>, // Разрешает фоновому потоку запустить восстановление.
+    clicks: Mutex<Option<mpsc::Receiver<NotificationClick>>>, // Очередь системных нажатий для подписки Iced.
 }
 
 impl Hash for Sources {
@@ -302,6 +457,12 @@ impl Sources {
     /// Объединяет события синхронизации и снимки авторизации в один поток Iced.
     fn events(&self) -> impl Stream<Item = Message> + use<> {
         let source = self.0.clone();
+        let clicks = source
+            .clicks
+            .lock()
+            .unwrap()
+            .take()
+            .map(|receiver| receiver.map(Message::NotificationClicked));
         // Сначала подключаемся к потоку событий, чтобы видеть запись, которая завершится во время чтения снимка.
         let updates = source.sync.subscribe();
         let sessions = source.auth.subscribe().map({
@@ -333,7 +494,10 @@ impl Sources {
                 return Some((message, (source, updates)));
             }
         });
-        stream::select(sessions, synced)
+        stream::select(
+            stream::select(sessions, synced),
+            stream::iter(clicks).flatten(),
+        )
     }
 }
 

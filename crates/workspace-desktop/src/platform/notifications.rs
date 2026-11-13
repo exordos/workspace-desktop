@@ -1,7 +1,11 @@
-//! Даёт оболочке общий способ проверить разрешение и отправить баннер. В macOS запрос обрабатывает центр уведомлений.
+//! Даёт оболочке общий способ проверить разрешение, отправить баннер и получить клик по нему.
 
 use std::fmt;
 use std::future::Future;
+
+use futures::channel::mpsc;
+use workspace_core::context::SessionGeneration;
+use workspace_core::notification_target::NotificationTarget;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -32,6 +36,13 @@ impl fmt::Display for NotificationError {
 
 impl std::error::Error for NotificationError {}
 
+/// Цель нажатого баннера и номер входа, для которого он был показан.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NotificationClick {
+    pub target: NotificationTarget, // Аккаунт, проект, разговор и сообщение из исходного события.
+    pub generation: SessionGeneration, // Номер входа, чтобы отсеять баннеры завершённой сессии.
+}
+
 /// Системный адаптер, который оболочка хранит на протяжении работы окна.
 #[derive(Default)]
 pub struct Notifications {
@@ -46,6 +57,14 @@ impl Notifications {
             #[cfg(target_os = "macos")]
             macos: macos::Center::new(),
         }
+    }
+
+    /// Один раз передаёт оболочке поток кликов. Центр может принять клик до подписки.
+    pub fn take_clicks(&self) -> Option<mpsc::Receiver<NotificationClick>> {
+        #[cfg(target_os = "macos")]
+        return self.macos.as_ref()?.take_clicks();
+        #[cfg(not(target_os = "macos"))]
+        None
     }
 
     /// Запрашивает разрешение заранее, чтобы первое сообщение сразу могло показать баннер.
@@ -68,14 +87,23 @@ impl Notifications {
         id: &str,
         title: &str,
         body: &str,
+        target: &NotificationTarget,
+        generation: SessionGeneration,
     ) -> impl Future<Output = Result<(), NotificationError>> + Send + 'static {
         #[cfg(target_os = "macos")]
-        let delivery = self
-            .macos
-            .as_ref()
-            .map(|center| center.show(id, title, body));
+        let delivery = self.macos.as_ref().map(|center| {
+            center.show(
+                id,
+                title,
+                body,
+                NotificationClick {
+                    target: target.clone(),
+                    generation,
+                },
+            )
+        });
         #[cfg(not(target_os = "macos"))]
-        let _ = (id, title, body);
+        let _ = (id, title, body, target, generation);
 
         async move {
             #[cfg(target_os = "macos")]

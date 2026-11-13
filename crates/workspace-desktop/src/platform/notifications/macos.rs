@@ -1,29 +1,37 @@
-//! Подключает центр уведомлений macOS, проверяет разрешение и запрашивает показ баннера.
-//! Обработчик в конце файла нужен для показа уведомлений, пока окно приложения активно.
+//! Подключает центр уведомлений macOS, отправляет баннер и передаёт оболочке нажатие.
+//! Цели баннеров хранятся в памяти процесса, а macOS получает только идентификатор запроса.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::ptr::NonNull;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use block2::{Block, RcBlock};
-use futures::channel::oneshot;
+use futures::channel::{mpsc, oneshot};
 use objc2::rc::Retained;
 use objc2::runtime::{Bool, ProtocolObject};
 use objc2::{ClassType, DeclaredClass, declare_class, mutability};
-use objc2_foundation::{NSBundle, NSError, NSObject, NSObjectProtocol, NSString};
+use objc2_foundation::{NSBundle, NSError, NSObject, NSObjectProtocol, NSString, NSUUID};
 use objc2_user_notifications::{
     UNAuthorizationOptions, UNAuthorizationStatus, UNErrorCode, UNErrorDomain,
-    UNMutableNotificationContent, UNNotification, UNNotificationPresentationOptions,
-    UNNotificationRequest, UNNotificationSetting, UNNotificationSettings, UNUserNotificationCenter,
+    UNMutableNotificationContent, UNNotification, UNNotificationDefaultActionIdentifier,
+    UNNotificationPresentationOptions, UNNotificationRequest, UNNotificationResponse,
+    UNNotificationSetting, UNNotificationSettings, UNUserNotificationCenter,
     UNUserNotificationCenterDelegate,
 };
 
-use super::NotificationError;
+use super::{NotificationClick, NotificationError};
+
+const RECENT_NOTIFICATIONS: usize = 128;
+const CLICK_BUFFER: usize = 32;
 
 /// Соединение с центром уведомлений и обработчик, который живёт вместе с ним.
 pub(super) struct Center {
     center: Retained<UNUserNotificationCenter>, // Общий центр уведомлений приложения.
-    _delegate: Retained<ForegroundDelegate>,    // Центр держит слабую ссылку на обработчик.
+    _delegate: Retained<NotificationDelegate>,  // Центр держит слабую ссылку на обработчик.
+    prefix: String, // Случайный префикс идентификаторов этой копии приложения.
+    clicks: Arc<Mutex<ClickQueue>>, // Цели баннеров и канал к оболочке, общие с обработчиком.
+    click_receiver: Mutex<Option<mpsc::Receiver<NotificationClick>>>, // Поток, который оболочка забирает один раз.
 }
 
 impl Center {
@@ -37,13 +45,25 @@ impl Center {
             return None;
         }
         let center = unsafe { UNUserNotificationCenter::currentNotificationCenter() };
-        let delegate: Retained<ForegroundDelegate> =
-            unsafe { objc2::msg_send_id![ForegroundDelegate::class(), new] };
+        let (sender, receiver) = mpsc::channel(CLICK_BUFFER);
+        let clicks = Arc::new(Mutex::new(ClickQueue {
+            targets: VecDeque::new(),
+            sender,
+        }));
+        let delegate = NotificationDelegate::new(Arc::clone(&clicks));
         unsafe { center.setDelegate(Some(ProtocolObject::from_ref(&*delegate))) };
         Some(Self {
             center,
             _delegate: delegate,
+            prefix: NSUUID::UUID().UUIDString().to_string(),
+            clicks,
+            click_receiver: Mutex::new(Some(receiver)),
         })
+    }
+
+    /// Передаёт оболочке очередь, которая уже принимает нажатия от macOS.
+    pub(super) fn take_clicks(&self) -> Option<mpsc::Receiver<NotificationClick>> {
+        self.click_receiver.lock().ok()?.take()
     }
 
     /// Проверяет разрешение и просит его, если пользователь ещё не принимал решение.
@@ -63,9 +83,12 @@ impl Center {
         id: &str,
         title: &str,
         body: &str,
+        target: NotificationClick,
     ) -> impl Future<Output = Result<(), NotificationError>> + Send + 'static {
         let (sender, receiver) = oneshot::channel();
-        let (id, title, body) = (id.to_owned(), title.to_owned(), body.to_owned());
+        let id = format!("{}/{id}", self.prefix);
+        let (title, body) = (title.to_owned(), body.to_owned());
+        let clicks = Arc::clone(&self.clicks);
         self.with_alert_permission(move |permission| {
             if let Err(error) = permission {
                 let _ = sender.send(Err(error));
@@ -83,8 +106,18 @@ impl Center {
                     None,
                 )
             };
+            // Цель должна появиться до отправки запроса: macOS может показать баннер сразу.
+            if let Ok(mut queue) = clicks.lock() {
+                queue.remember(id.clone(), target);
+            }
             let callback = RcBlock::new(once(move |error: *mut NSError| {
-                let _ = sender.send(system_result(unsafe { error.as_ref() }));
+                let result = system_result(unsafe { error.as_ref() });
+                if result.is_err()
+                    && let Ok(mut queue) = clicks.lock()
+                {
+                    queue.forget(&id);
+                }
+                let _ = sender.send(result);
             }));
             unsafe {
                 center.addNotificationRequest_withCompletionHandler(&request, Some(&callback))
@@ -114,6 +147,42 @@ impl Center {
             self.center
                 .getNotificationSettingsWithCompletionHandler(&callback)
         };
+    }
+}
+
+/// Хранит цели последних отправленных баннеров и передаёт известные клики приложению.
+struct ClickQueue {
+    targets: VecDeque<(String, NotificationClick)>, // Цели по идентификатору запроса, от старой к новой.
+    sender: mpsc::Sender<NotificationClick>, // Канал к подписке оболочки, допускает отправку до запуска окна.
+}
+
+impl ClickQueue {
+    /// Запоминает цель по идентификатору, ограничивая память для старых баннеров.
+    fn remember(&mut self, id: String, click: NotificationClick) {
+        self.forget(&id);
+        if self.targets.len() == RECENT_NOTIFICATIONS {
+            self.targets.pop_front();
+        }
+        self.targets.push_back((id, click));
+    }
+
+    /// Убирает цель баннера, отправку которого система отклонила.
+    fn forget(&mut self, id: &str) {
+        self.targets.retain(|(key, _)| key != id);
+    }
+
+    /// Передаёт цель один раз. Неизвестные идентификаторы игнорирует.
+    fn dispatch(&mut self, id: &str) {
+        let Some(position) = self.targets.iter().position(|(key, _)| key == id) else {
+            return;
+        };
+        if self
+            .sender
+            .try_send(self.targets[position].1.clone())
+            .is_ok()
+        {
+            self.targets.remove(position);
+        }
     }
 }
 
@@ -178,20 +247,22 @@ fn system_result(error: Option<&NSError>) -> Result<(), NotificationError> {
 }
 
 declare_class!(
-    /// Передаёт macOS решение о показе уведомления при активном приложении.
-    struct ForegroundDelegate;
+    /// Управляет показом баннера в активном окне и получает его нажатие от macOS.
+    struct NotificationDelegate;
 
-    // У обработчика нет изменяемого состояния. macOS может вызвать его в любом потоке.
-    unsafe impl ClassType for ForegroundDelegate {
+    // macOS вызывает обработчик из разных потоков. Общая очередь защищена Mutex.
+    unsafe impl ClassType for NotificationDelegate {
         type Super = NSObject;
         type Mutability = mutability::Immutable;
         const NAME: &'static str = "WorkspaceDesktopNotificationDelegate";
     }
 
-    impl DeclaredClass for ForegroundDelegate {}
-    unsafe impl NSObjectProtocol for ForegroundDelegate {}
+    impl DeclaredClass for NotificationDelegate {
+        type Ivars = Arc<Mutex<ClickQueue>>;
+    }
+    unsafe impl NSObjectProtocol for NotificationDelegate {}
 
-    unsafe impl UNUserNotificationCenterDelegate for ForegroundDelegate {
+    unsafe impl UNUserNotificationCenterDelegate for NotificationDelegate {
         /// Просит показать баннер и добавить его в историю центра уведомлений.
         #[allow(non_snake_case)]
         #[method(userNotificationCenter:willPresentNotification:withCompletionHandler:)]
@@ -206,5 +277,84 @@ declare_class!(
                     | UNNotificationPresentationOptions::UNNotificationPresentationOptionList,
             ));
         }
+
+        /// Передаёт клик по баннеру, игнорирует закрытие и всегда отвечает системе.
+        #[allow(non_snake_case)]
+        #[method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:)]
+        fn userNotificationCenter_didReceiveNotificationResponse_withCompletionHandler(
+            &self,
+            _center: &UNUserNotificationCenter,
+            response: &UNNotificationResponse,
+            completion: &Block<dyn Fn()>,
+        ) {
+            let action = unsafe { response.actionIdentifier() };
+            if *action == *unsafe { UNNotificationDefaultActionIdentifier } {
+                let id = unsafe { response.notification().request().identifier() };
+                if let Ok(mut queue) = self.ivars().lock() {
+                    queue.dispatch(&id.to_string());
+                }
+            }
+            completion.call(());
+        }
     }
 );
+
+impl NotificationDelegate {
+    /// Создаёт обработчик с общей очередью, которую может читать любой поток macOS.
+    fn new(clicks: Arc<Mutex<ClickQueue>>) -> Retained<Self> {
+        let delegate = Self::alloc().set_ivars(clicks);
+        // NSObject не требует дополнительных аргументов для init.
+        unsafe { objc2::msg_send_id![super(delegate), init] }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::{StreamExt, executor::block_on};
+    use workspace_core::{
+        context::{AccountId, OwnerContext, SessionGeneration},
+        notification_target::NotificationTarget,
+    };
+
+    /// Проверяет, что системный делегат зарегистрировал обработчик нажатия, а очередь сохраняет цель.
+    #[test]
+    fn registers_activation_and_buffers_the_exact_target_once() {
+        let (sender, mut receiver) = mpsc::channel(CLICK_BUFFER);
+        let clicks = Arc::new(Mutex::new(ClickQueue {
+            targets: VecDeque::new(),
+            sender,
+        }));
+        let delegate = NotificationDelegate::new(Arc::clone(&clicks));
+        assert!(delegate.respondsToSelector(objc2::sel!(
+            userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:
+        )));
+
+        let click = NotificationClick {
+            target: NotificationTarget {
+                context: OwnerContext {
+                    account_id: AccountId("recipient".into()),
+                    server: "https://workspace.example.test".into(),
+                    organization_id: "organization".into(),
+                    project_id: "project".into(),
+                    user_id: "user".into(),
+                },
+                conversation_id: "conversation".into(),
+                message_id: "message".into(),
+            },
+            generation: SessionGeneration(42),
+        };
+        {
+            let mut queue = delegate.ivars().lock().unwrap();
+            queue.remember("current-process/banner".into(), click.clone());
+            queue.dispatch("previous-process/banner");
+            queue.dispatch("current-process/banner");
+            queue.dispatch("current-process/banner");
+        }
+        drop(delegate);
+        drop(clicks);
+
+        assert_eq!(block_on(receiver.next()), Some(click));
+        assert_eq!(block_on(receiver.next()), None);
+    }
+}

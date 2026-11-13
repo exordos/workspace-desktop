@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use thiserror::Error;
 
-use crate::context::OwnerContext;
+use crate::{context::OwnerContext, notification_target::NotificationTarget};
 
 /// Позиция в журнале событий, с которой можно продолжить чтение.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -97,6 +97,16 @@ impl Storage {
                 text TEXT NOT NULL,
                 PRIMARY KEY (account_id, server, organization_id, project_id, user_id, message_id)
             );
+            CREATE TABLE IF NOT EXISTS messenger_notification_targets (
+                account_id TEXT NOT NULL,
+                server TEXT NOT NULL,
+                organization_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                PRIMARY KEY (account_id, server, organization_id, project_id, user_id, message_id)
+            );
             CREATE TABLE IF NOT EXISTS messenger_unread (
                 account_id TEXT NOT NULL,
                 server TEXT NOT NULL,
@@ -112,6 +122,34 @@ impl Storage {
         Ok(Self {
             connection: Mutex::new(connection),
         })
+    }
+
+    /// Проверяет, что сообщение сохранилось и синхронизация связала его с этим разговором.
+    pub(crate) fn contains_notification_target(
+        &self,
+        target: &NotificationTarget,
+    ) -> Result<bool, StorageError> {
+        let owner = &target.context;
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        Ok(connection.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM messenger_notification_targets AS target
+                 JOIN sync_messages USING (account_id, server, organization_id, project_id, user_id, message_id)
+                 WHERE target.account_id = ?1 AND target.server = ?2 AND target.organization_id = ?3
+                   AND target.project_id = ?4 AND target.user_id = ?5 AND target.message_id = ?6
+                   AND target.conversation_id = ?7
+             )",
+            params![
+                owner.account_id.0,
+                owner.server,
+                owner.organization_id,
+                owner.project_id,
+                owner.user_id,
+                target.message_id,
+                target.conversation_id,
+            ],
+            |row| row.get(0),
+        )?)
     }
 
     /// Читает позицию указанного источника для аккаунта и проекта. `None`, если её ещё нет.
@@ -192,6 +230,7 @@ impl Storage {
         cursor: &Cursor,
         message: Option<&Message>,
         unread: Option<u32>,
+        notification_conversation: Option<&str>,
     ) -> Result<AppliedEvent, StorageError> {
         let epoch_version = i64::try_from(cursor.epoch_version)
             .map_err(|_| StorageError::CursorVersionOutOfRange)?;
@@ -231,6 +270,25 @@ impl Storage {
         } else {
             false
         };
+        // Цель уведомления доступна вместе с новым сообщением и его курсором.
+        if message_inserted
+            && let (Some(message), Some(conversation_id)) = (message, notification_conversation)
+        {
+            transaction.execute(
+                "INSERT INTO messenger_notification_targets
+                 (account_id, server, organization_id, project_id, user_id, message_id, conversation_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    owner.account_id.0,
+                    owner.server,
+                    owner.organization_id,
+                    owner.project_id,
+                    owner.user_id,
+                    message.id,
+                    conversation_id,
+                ],
+            )?;
+        }
         let unread_changed = match unread {
             Some(count) => write_unread(
                 &transaction,
@@ -383,7 +441,7 @@ mod tests {
         message: Message,
     ) -> Result<ApplyOutcome, StorageError> {
         storage
-            .apply(owner, source, &cursor, Some(&message), None)
+            .apply(owner, source, &cursor, Some(&message), None, None)
             .map(|saved| saved.outcome)
     }
 
