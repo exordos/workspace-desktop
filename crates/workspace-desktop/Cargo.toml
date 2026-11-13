@@ -11,16 +11,24 @@ iced = { version = "0.14.0", default-features = false, features = ["advanced", "
 rpassword = "7"
 serde_json = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "signal", "time"] }
+tokio = { version = "1", features = ["rt", "signal", "sync", "time"] }
 workspace-core = { path = "../workspace-core" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = { version = "0.5", optional = true }
+objc2 = { version = "0.5", optional = true }
+objc2-foundation = { version = "0.2", features = ["NSBundle"], optional = true }
+objc2-user-notifications = { version = "0.2", features = ["UNError", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationSettings", "UNNotificationTrigger", "UNUserNotificationCenter", "block2"], optional = true }
 security-framework = "3"
 
 [features]
 default = ["ui-kit"]
-ui-kit = ["dep:iced"]
+ui-kit = ["dep:iced", "dep:block2", "dep:objc2", "dep:objc2-foundation", "dep:objc2-user-notifications"]
 
 [[example]]
 name = "ui_gallery"
+required-features = ["ui-kit"]
+
+[[bin]]
+name = "workspace-desktop"
 required-features = ["ui-kit"]

@@ -1,5 +1,5 @@
-//! Хранит сообщения и позиции чтения в SQLite.
-//! Сначала описаны данные и таблицы, затем чтение и запись. В конце проверяются повтор событий и откат записи.
+//! Хранит сообщения, счётчики и позиции чтения в SQLite.
+//! Сначала описаны данные и таблицы, затем чтение и запись.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -23,11 +23,25 @@ pub struct Message {
     pub text: String, // Текст сообщения.
 }
 
+/// Число непрочитанных и позиция журнала, до которой оно уже учитывает изменения.
+struct StoredUnread {
+    count: u32,               // Готовое число непрочитанных сообщений.
+    epoch_generation: String, // Метка журнала источника.
+    epoch_version: i64,       // Номер события или позиция перед чтением из REST.
+}
+
 /// Результат обработки события в локальной базе.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApplyOutcome {
-    Applied,   // Позиция обновилась. Сообщение сохранено, если оно было в событии.
+    Applied,   // Изменение обработано. Событие журнала также обновило позицию чтения.
     Duplicate, // Эта позиция уже обработана или находится позади сохранённой.
+}
+
+/// Результаты одной транзакции. Помогают опубликовать только записанные изменения.
+pub(crate) struct AppliedEvent {
+    pub outcome: ApplyOutcome,  // Была ли сохранена позиция источника.
+    pub message_inserted: bool, // Появилась ли новая строка с сообщением.
+    pub unread_changed: bool,   // Изменилось ли число непрочитанных.
 }
 
 /// Причины, по которым локальная база не смогла прочитать или записать данные.
@@ -43,7 +57,7 @@ pub enum StorageError {
     Sqlite(#[from] rusqlite::Error), // Исходная ошибка SQLite.
 }
 
-/// Локальное хранилище сообщений и позиций чтения.
+/// Локальное хранилище сообщений, счётчиков и позиций чтения.
 pub struct Storage {
     connection: Mutex<Connection>, // Соединение с SQLite. Блокировка выдаёт его по одному запросу за раз.
 }
@@ -59,7 +73,7 @@ impl Storage {
         Self::initialize(Connection::open_in_memory()?)
     }
 
-    /// Подготавливает таблицы сообщений и позиций для переданного соединения.
+    /// Подготавливает таблицы сообщений, счётчиков и позиций для переданного соединения.
     fn initialize(connection: Connection) -> Result<Self, StorageError> {
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS sync_cursors (
@@ -82,6 +96,17 @@ impl Storage {
                 message_id TEXT NOT NULL,
                 text TEXT NOT NULL,
                 PRIMARY KEY (account_id, server, organization_id, project_id, user_id, message_id)
+            );
+            CREATE TABLE IF NOT EXISTS messenger_unread (
+                account_id TEXT NOT NULL,
+                server TEXT NOT NULL,
+                organization_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                count INTEGER NOT NULL CHECK (count >= 0),
+                epoch_generation TEXT NOT NULL,
+                epoch_version INTEGER NOT NULL CHECK (epoch_version >= 0),
+                PRIMARY KEY (account_id, server, organization_id, project_id, user_id)
             );",
         )?;
         Ok(Self {
@@ -129,7 +154,36 @@ impl Storage {
             .optional()?)
     }
 
-    /// Записывает сообщение и позицию одной транзакцией.
+    /// Читает последнее подтверждённое сервером число непрочитанных.
+    pub fn unread(&self, owner: &OwnerContext) -> Result<Option<u32>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        Ok(read_unread(&connection, owner)?.map(|saved| saved.count))
+    }
+
+    /// Записывает снимок REST, сохраняя текущую позицию чтения журнала.
+    pub(crate) fn apply_unread_baseline(
+        &self,
+        owner: &OwnerContext,
+        cursor: &Cursor,
+        count: u32,
+    ) -> Result<bool, StorageError> {
+        let epoch_version = i64::try_from(cursor.epoch_version)
+            .map_err(|_| StorageError::CursorVersionOutOfRange)?;
+        let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = write_unread(
+            &transaction,
+            owner,
+            &cursor.epoch_generation,
+            epoch_version,
+            count,
+            true,
+        )?;
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    /// Записывает изменение и позицию одной транзакцией.
     /// Пропускает повторную позицию и возвращает ошибку при смене метки журнала.
     pub(crate) fn apply(
         &self,
@@ -137,7 +191,8 @@ impl Storage {
         source: &str,
         cursor: &Cursor,
         message: Option<&Message>,
-    ) -> Result<ApplyOutcome, StorageError> {
+        unread: Option<u32>,
+    ) -> Result<AppliedEvent, StorageError> {
         let epoch_version = i64::try_from(cursor.epoch_version)
             .map_err(|_| StorageError::CursorVersionOutOfRange)?;
         let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
@@ -148,11 +203,15 @@ impl Storage {
                 return Err(StorageError::EpochChanged);
             }
             if previous.epoch_version >= cursor.epoch_version {
-                return Ok(ApplyOutcome::Duplicate);
+                return Ok(AppliedEvent {
+                    outcome: ApplyOutcome::Duplicate,
+                    message_inserted: false,
+                    unread_changed: false,
+                });
             }
         }
 
-        if let Some(message) = message {
+        let message_inserted = if let Some(message) = message {
             transaction.execute(
                 "INSERT INTO sync_messages
                  (account_id, server, organization_id, project_id, user_id, message_id, text)
@@ -168,8 +227,21 @@ impl Storage {
                     message.id,
                     message.text,
                 ],
-            )?;
-        }
+            )? != 0
+        } else {
+            false
+        };
+        let unread_changed = match unread {
+            Some(count) => write_unread(
+                &transaction,
+                owner,
+                &cursor.epoch_generation,
+                epoch_version,
+                count,
+                false,
+            )?,
+            None => false,
+        };
         transaction.execute(
             "INSERT INTO sync_cursors
                  (account_id, server, organization_id, project_id, user_id,
@@ -189,8 +261,79 @@ impl Storage {
             ],
         )?;
         transaction.commit()?;
-        Ok(ApplyOutcome::Applied)
+        Ok(AppliedEvent {
+            outcome: ApplyOutcome::Applied,
+            message_inserted,
+            unread_changed,
+        })
     }
+}
+
+/// Читает число и позицию счётчика в рамках аккаунта и проекта.
+fn read_unread(
+    connection: &Connection,
+    owner: &OwnerContext,
+) -> Result<Option<StoredUnread>, StorageError> {
+    Ok(connection
+        .query_row(
+            "SELECT count, epoch_generation, epoch_version FROM messenger_unread
+             WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
+               AND project_id = ?4 AND user_id = ?5",
+            params![
+                owner.account_id.0,
+                owner.server,
+                owner.organization_id,
+                owner.project_id,
+                owner.user_id
+            ],
+            |row| {
+                Ok(StoredUnread {
+                    count: row.get(0)?,
+                    epoch_generation: row.get(1)?,
+                    epoch_version: row.get(2)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// Записывает число из более свежего снимка. Возвращает, изменилось ли отображаемое число.
+fn write_unread(
+    connection: &Connection,
+    owner: &OwnerContext,
+    epoch_generation: &str,
+    epoch_version: i64,
+    count: u32,
+    from_rest: bool,
+) -> Result<bool, StorageError> {
+    let previous = read_unread(connection, owner)?;
+    if let Some(saved) = &previous
+        && saved.epoch_generation == epoch_generation
+        && (saved.epoch_version > epoch_version
+            || (saved.epoch_version == epoch_version && !from_rest))
+    {
+        // Ответ REST уже учитывает события до позиции, которую прочитали перед запросом.
+        return Ok(false);
+    }
+    connection.execute(
+        "INSERT INTO messenger_unread
+         (account_id, server, organization_id, project_id, user_id, count, epoch_generation, epoch_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT (account_id, server, organization_id, project_id, user_id)
+         DO UPDATE SET count = excluded.count, epoch_generation = excluded.epoch_generation,
+                       epoch_version = excluded.epoch_version",
+        params![
+            owner.account_id.0,
+            owner.server,
+            owner.organization_id,
+            owner.project_id,
+            owner.user_id,
+            count,
+            epoch_generation,
+            epoch_version,
+        ],
+    )?;
+    Ok(previous.is_none_or(|saved| saved.count != count))
 }
 
 /// Читает позицию через переданное соединение, в том числе внутри транзакции.
@@ -239,7 +382,9 @@ mod tests {
         cursor: Cursor,
         message: Message,
     ) -> Result<ApplyOutcome, StorageError> {
-        storage.apply(owner, source, &cursor, Some(&message))
+        storage
+            .apply(owner, source, &cursor, Some(&message), None)
+            .map(|saved| saved.outcome)
     }
 
     const SOURCE: &str = "messenger";

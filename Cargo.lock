@@ -4249,9 +4249,13 @@ dependencies = [
 name = "workspace-desktop"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "futures",
  "iced",
  "log",
+ "objc2 0.5.3",
+ "objc2-foundation 0.2.2",
+ "objc2-user-notifications",
  "rpassword",
  "security-framework",
  "serde_json",

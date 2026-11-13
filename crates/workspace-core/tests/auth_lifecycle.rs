@@ -20,7 +20,7 @@ use workspace_core::auth::{
 use workspace_core::context::{AccountId, OwnerContext};
 use workspace_core::runtime::{EventSource, EventStream, Runtime, SourceError, SourceSession};
 use workspace_core::storage::{Cursor, Message, Storage};
-use workspace_core::sync::{Event, Sync as EventSync};
+use workspace_core::sync::{Event, Sync as EventSync, SyncChange, SyncUpdate};
 
 const SERVER: &str = "https://workspace.test";
 
@@ -548,6 +548,167 @@ fn incoming_with_id(version: u64, id: &str, text: &str) -> Event {
             text: text.into(),
         },
     }
+}
+
+/// Проверяет восстановление счётчика, порядок снимков, повторы сообщений и выход из сессии.
+#[test]
+fn messenger_updates_are_committed_deduplicated_and_scoped_to_the_session() {
+    let fixture = Fixture::new(|_, _| unreachable!());
+    let first = fixture.login("first");
+    let second = fixture.login("second");
+    let generation = |owner: &OwnerContext| {
+        fixture
+            .auth
+            .snapshot()
+            .into_iter()
+            .find(|s| s.context == *owner)
+            .unwrap()
+            .generation
+    };
+    let first_generation = generation(&first);
+    let second_generation = generation(&second);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sync.sqlite3");
+    let storage = Arc::new(Storage::open(&path).unwrap());
+    let sync = EventSync::new(fixture.auth.clone(), storage.clone());
+    let mut updates = sync.subscribe();
+    let cursor = |version| Cursor {
+        epoch_generation: "test-epoch".into(),
+        epoch_version: version,
+    };
+
+    // Существующая база уже содержит курсор, но ещё не содержит счётчики.
+    sync.apply(
+        &first,
+        first_generation,
+        "messenger",
+        Event::Checkpoint(cursor(10)),
+    )
+    .unwrap();
+    sync.apply(
+        &first,
+        first_generation,
+        "messenger",
+        Event::UnreadBaseline {
+            cursor: cursor(10),
+            count: 4,
+        },
+    )
+    .unwrap();
+    sync.apply(
+        &second,
+        second_generation,
+        "messenger",
+        Event::UnreadBaseline {
+            cursor: cursor(5),
+            count: 29,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        updates.try_recv().unwrap(),
+        SyncUpdate {
+            context: first.clone(),
+            generation: first_generation,
+            change: SyncChange::Unread(4)
+        }
+    );
+    assert_eq!(
+        updates.try_recv().unwrap(),
+        SyncUpdate {
+            context: second.clone(),
+            generation: second_generation,
+            change: SyncChange::Unread(29)
+        }
+    );
+    assert_eq!(sync.cursor(&first, "messenger").unwrap(), Some(cursor(10)));
+    assert_eq!(sync.cursor(&second, "messenger").unwrap(), None);
+
+    sync.apply(
+        &second,
+        second_generation,
+        "messenger",
+        Event::UnreadChanged {
+            cursor: cursor(5),
+            count: 28,
+        },
+    )
+    .unwrap();
+    assert_eq!(sync.cursor(&second, "messenger").unwrap(), Some(cursor(5)));
+    assert_eq!(sync.unread(&second).unwrap(), Some(29));
+    assert!(updates.try_recv().is_err());
+
+    let live = |version| Event::IncomingDirectMessage {
+        cursor: cursor(version),
+        message: Message {
+            id: "direct-message".into(),
+            text: "hello".into(),
+        },
+        conversation_id: "conversation".into(),
+    };
+    sync.apply(&second, second_generation, "messenger", live(6))
+        .unwrap();
+    assert_eq!(
+        updates.try_recv().unwrap(),
+        SyncUpdate {
+            context: second.clone(),
+            generation: second_generation,
+            change: SyncChange::IncomingDirectMessage {
+                conversation_id: "conversation".into(),
+                message_id: "direct-message".into()
+            },
+        }
+    );
+    assert!(
+        storage
+            .message(&second, "direct-message")
+            .unwrap()
+            .is_some()
+    );
+    sync.apply(&second, second_generation, "messenger", live(6))
+        .unwrap();
+    sync.apply(&second, second_generation, "messenger", live(7))
+        .unwrap();
+    assert!(updates.try_recv().is_err());
+
+    sync.apply(
+        &second,
+        second_generation,
+        "messenger",
+        Event::UnreadChanged {
+            cursor: cursor(8),
+            count: 30,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        updates.try_recv().unwrap(),
+        SyncUpdate {
+            context: second.clone(),
+            generation: second_generation,
+            change: SyncChange::Unread(30)
+        }
+    );
+    assert_eq!(sync.cursor(&second, "messenger").unwrap(), Some(cursor(8)));
+    let reopened = Storage::open(&path).unwrap();
+    assert_eq!(reopened.unread(&first).unwrap(), Some(4));
+    assert_eq!(reopened.unread(&second).unwrap(), Some(30));
+
+    fixture.auth.logout(&second.account_id).unwrap();
+    assert!(
+        sync.apply(
+            &second,
+            second_generation,
+            "messenger",
+            Event::UnreadChanged {
+                cursor: cursor(9),
+                count: 31
+            }
+        )
+        .is_err()
+    );
+    assert!(updates.try_recv().is_err());
+    assert_eq!(reopened.unread(&second).unwrap(), Some(30));
 }
 
 /// Ждёт, пока условие выполнится, и ограничивает время ожидания.

@@ -9,6 +9,12 @@ use std::sync::Mutex;
 use workspace_core::auth::{AccountRecord, AccountStore, StoreError};
 use workspace_core::context::AccountId;
 
+#[cfg(target_os = "macos")]
+mod profile;
+
+#[cfg(target_os = "macos")]
+pub use profile::state_directory;
+
 /// Хранилище записей аккаунтов в одном JSON-файле.
 pub struct JsonAccountStore {
     path: PathBuf,         // Путь к файлу с записями аккаунтов.
@@ -116,6 +122,9 @@ mod keychain;
 
 #[cfg(target_os = "macos")]
 pub use keychain::MacKeychain;
+
+#[cfg(feature = "ui-kit")]
+pub mod notifications;
 
 #[cfg(test)]
 mod tests {

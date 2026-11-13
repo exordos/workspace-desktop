@@ -45,7 +45,6 @@ mod platform {
 mod platform {
     use std::error::Error;
     use std::io::{self, IsTerminal, Write};
-    use std::path::PathBuf;
     use std::sync::Arc;
 
     use futures::executor::block_on;
@@ -56,7 +55,7 @@ mod platform {
     use workspace_core::runtime::Runtime;
     use workspace_core::storage::Storage;
     use workspace_core::sync::Sync;
-    use workspace_desktop::platform::{JsonAccountStore, MacKeychain};
+    use workspace_desktop::platform::{JsonAccountStore, MacKeychain, state_directory};
 
     /// Команды, которые утилита умеет выполнять.
     enum Command<'a> {
@@ -186,18 +185,6 @@ mod platform {
 
         /// Завершает вывод журнала. Собственного буфера у него нет.
         fn flush(&self) {}
-    }
-
-    /// Определяет каталог приложения для аккаунтов и локальной базы.
-    fn state_directory() -> Result<PathBuf, Box<dyn Error>> {
-        if let Some(directory) = std::env::var_os("WORKSPACE_AUTH_STATE_DIR") {
-            if directory.is_empty() {
-                return Err("WORKSPACE_AUTH_STATE_DIR must name a directory".into());
-            }
-            return Ok(PathBuf::from(directory));
-        }
-        let home = std::env::var_os("HOME").ok_or("Home directory unavailable")?;
-        Ok(PathBuf::from(home).join("Library/Application Support/Workspace Desktop/auth"))
     }
 
     /// Спрашивает данные для входа и даёт выбрать доступный проект.

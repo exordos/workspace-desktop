@@ -1,9 +1,10 @@
 //! Связывает получение событий с локальной базой.
-//! Проверяет действующую сессию перед записью сообщения или позиции чтения.
+//! Проверяет сессию перед записью и публикует изменения для оболочки после записи.
 
 use std::sync::Arc;
 
 use thiserror::Error;
+use tokio::sync::broadcast;
 
 use crate::{
     auth::{Auth, AuthError},
@@ -13,12 +14,43 @@ use crate::{
 
 pub use crate::storage::ApplyOutcome;
 
+/// Изменение, которое оболочка показывает для одного аккаунта и проекта.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncUpdate {
+    pub context: OwnerContext, // Аккаунт и проект, получившие изменение.
+    pub generation: SessionGeneration, // Вход, для которого изменение ещё актуально.
+    pub change: SyncChange,    // Новое значение счётчика или цель уведомления.
+}
+
+/// Изменения после записи в локальную базу.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SyncChange {
+    Unread(u32), // Готовое число непрочитанных в папке «Все чаты».
+    IncomingDirectMessage {
+        conversation_id: String, // Идентификатор личного разговора на сервере.
+        message_id: String,      // Идентификатор нового сообщения.
+    },
+}
+
 /// Изменение, которое источник передаёт для сохранения.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
     MessageCreated {
         cursor: Cursor,   // Позиция, которую сохраняем вместе с сообщением.
         message: Message, // Новое сообщение для локальной базы.
+    },
+    IncomingDirectMessage {
+        cursor: Cursor,          // Позиция нового события после готовности WebSocket.
+        message: Message,        // Входящее непрочитанное сообщение для локальной базы.
+        conversation_id: String, // Проверенный идентификатор личного разговора.
+    },
+    UnreadChanged {
+        cursor: Cursor, // Позиция события обновления папки в журнале.
+        count: u32,     // Новый счётчик папки «Все чаты».
+    },
+    UnreadBaseline {
+        cursor: Cursor, // Позиция сервера перед чтением счётчика. Курсор сообщений не меняется.
+        count: u32,     // Счётчик, загруженный отдельным запросом при подключении.
     },
     Checkpoint(Cursor), // Новая позиция чтения без сообщения.
 }
@@ -27,15 +59,21 @@ impl Event {
     /// Возвращает позицию, до которой нужно продвинуть чтение после записи.
     pub fn cursor(&self) -> &Cursor {
         match self {
-            Self::MessageCreated { cursor, .. } | Self::Checkpoint(cursor) => cursor,
+            Self::MessageCreated { cursor, .. }
+            | Self::IncomingDirectMessage { cursor, .. }
+            | Self::UnreadChanged { cursor, .. }
+            | Self::UnreadBaseline { cursor, .. }
+            | Self::Checkpoint(cursor) => cursor,
         }
     }
 
     /// Возвращает сообщение, если оно есть в событии.
     pub fn message(&self) -> Option<&Message> {
         match self {
-            Self::MessageCreated { message, .. } => Some(message),
-            Self::Checkpoint(_) => None,
+            Self::MessageCreated { message, .. } | Self::IncomingDirectMessage { message, .. } => {
+                Some(message)
+            }
+            Self::UnreadChanged { .. } | Self::UnreadBaseline { .. } | Self::Checkpoint(_) => None,
         }
     }
 }
@@ -52,13 +90,18 @@ pub enum SyncError {
 /// Проверяет право сессии на запись и передаёт события в хранилище.
 pub struct Sync {
     auth: Auth,            // Авторизация для проверки владельца и поколения сессии.
-    storage: Arc<Storage>, // Общая локальная база сообщений и позиций.
+    storage: Arc<Storage>, // Общая локальная база сообщений, позиций и счётчиков.
+    updates: broadcast::Sender<SyncUpdate>, // Канал изменений. Оформление окна получает их после записи.
 }
 
 impl Sync {
     /// Создаёт синхронизацию с указанной авторизацией и базой.
     pub fn new(auth: Auth, storage: Arc<Storage>) -> Self {
-        Self { auth, storage }
+        Self {
+            auth,
+            storage,
+            updates: broadcast::channel(128).0,
+        }
     }
 
     /// Даёт фоновой задаче доступ к авторизации и состояниям сессий.
@@ -71,6 +114,16 @@ impl Sync {
         Ok(self.storage.cursor(owner, source)?)
     }
 
+    /// Возвращает сохранённый счётчик. `None` означает, что сервер его ещё не прислал.
+    pub fn unread(&self, owner: &OwnerContext) -> Result<Option<u32>, SyncError> {
+        Ok(self.storage.unread(owner)?)
+    }
+
+    /// Подписывает оболочку на изменения. После пропуска событий счётчик можно перечитать.
+    pub fn subscribe(&self) -> broadcast::Receiver<SyncUpdate> {
+        self.updates.subscribe()
+    }
+
     /// Записывает событие, пока поколение сессии остаётся действующим.
     /// Проверка сессии и запись защищены одной блокировкой аккаунта.
     pub fn apply(
@@ -80,10 +133,50 @@ impl Sync {
         source: &str,
         event: Event,
     ) -> Result<ApplyOutcome, SyncError> {
-        let outcome = self.auth.with_active_generation(owner, generation, || {
-            self.storage
-                .apply(owner, source, event.cursor(), event.message())
-        })??;
-        Ok(outcome)
+        self.auth.with_active_generation(owner, generation, || {
+            if let Event::UnreadBaseline { cursor, count } = &event {
+                if self.storage.apply_unread_baseline(owner, cursor, *count)? {
+                    self.publish(owner, generation, SyncChange::Unread(*count));
+                }
+                return Ok(ApplyOutcome::Applied);
+            }
+
+            let unread = match &event {
+                Event::UnreadChanged { count, .. } => Some(*count),
+                _ => None,
+            };
+            let saved =
+                self.storage
+                    .apply(owner, source, event.cursor(), event.message(), unread)?;
+            if let Some(count) = unread.filter(|_| saved.unread_changed) {
+                self.publish(owner, generation, SyncChange::Unread(count));
+            }
+            if saved.message_inserted
+                && let Event::IncomingDirectMessage {
+                    message,
+                    conversation_id,
+                    ..
+                } = event
+            {
+                self.publish(
+                    owner,
+                    generation,
+                    SyncChange::IncomingDirectMessage {
+                        conversation_id,
+                        message_id: message.id,
+                    },
+                );
+            }
+            Ok(saved.outcome)
+        })?
+    }
+
+    /// Публикует изменение под блокировкой действующей сессии после записи в базу.
+    fn publish(&self, owner: &OwnerContext, generation: SessionGeneration, change: SyncChange) {
+        let _ = self.updates.send(SyncUpdate {
+            context: owner.clone(),
+            generation,
+            change,
+        });
     }
 }

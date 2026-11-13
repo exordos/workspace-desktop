@@ -25,7 +25,7 @@ use crate::{
     sync::Event,
 };
 
-use super::rest::{validate_cursor, wire_event, workspace_origin};
+use super::rest::{IncomingMessage, validate_cursor, wire_event, workspace_origin};
 
 const EVENTS_PATH: &str = "/api/workspace/v1/events/ws";
 const EVENTS_PROTOCOL: &str = "workspace.events.v1";
@@ -36,8 +36,8 @@ const MAX_EVENT_BYTES: usize = 4 * 1024 * 1024;
 
 /// Кадр, который WebSocket передаёт источнику мессенджера.
 pub(super) enum SocketFrame {
-    Event(Event), // Событие журнала для передачи в синхронизацию.
-    Ready,        // Сервер сообщил, что поток готов.
+    Event(Event, Option<IncomingMessage>), // Событие и данные для возможного уведомления.
+    Ready(Cursor),                         // Позиция сервера после завершения догрузки.
 }
 
 /// Поток кадров WebSocket. После ошибки чтение завершается.
@@ -139,7 +139,7 @@ impl SocketState {
             match self.read_message().await? {
                 Message::Text(text) => {
                     let frame = parse_text(&text, &self.context, &self.epoch)?;
-                    if matches!(frame, SocketFrame::Ready) {
+                    if matches!(frame, SocketFrame::Ready(_)) {
                         if self.ready {
                             return Err(SourceError::InvalidResponse);
                         }
@@ -198,17 +198,22 @@ fn parse_text(text: &str, context: &OwnerContext, epoch: &str) -> Result<SocketF
         if marker.epoch_generation != epoch {
             return Err(SourceError::CursorPruned);
         }
-        return Ok(SocketFrame::Ready);
+        let cursor = Cursor {
+            epoch_generation: marker.epoch_generation,
+            epoch_version: marker.epoch_version,
+        };
+        validate_cursor(&cursor)?;
+        return Ok(SocketFrame::Ready(cursor));
     }
-    Ok(SocketFrame::Event(wire_event(value, context, epoch)?))
+    let (event, incoming) = wire_event(value, context, epoch)?;
+    Ok(SocketFrame::Event(event, incoming))
 }
 
 /// Данные служебного кадра, которым сервер подтверждает готовность потока.
 #[derive(Deserialize)]
 struct ReadyMarker {
     epoch_generation: String, // Метка журнала, которую сервер подтвердил.
-    #[serde(rename = "epoch_version")]
-    _epoch_version: u64, // Номер позиции из ответа. Проверяется при разборе, но не сохраняется.
+    epoch_version: u64,       // Номер последнего события, которое сервер передал до готовности.
 }
 
 /// Переводит код закрытия WebSocket в ошибку источника.
@@ -291,7 +296,10 @@ mod tests {
                 &owner,
                 "one",
             ),
-            Ok(SocketFrame::Ready)
+            Ok(SocketFrame::Ready(Cursor {
+                epoch_version: 124,
+                ..
+            }))
         ));
         assert!(matches!(
             parse_text(
