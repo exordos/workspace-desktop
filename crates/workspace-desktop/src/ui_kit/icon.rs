@@ -12,19 +12,24 @@ use super::theme::text_muted;
 /// Имя иконки, по которому виджет выбирает встроенный SVG.
 #[derive(Debug, Clone, Copy)]
 pub enum IconName {
-    Plus,          // Знак добавления.
-    Search,        // Лупа для поиска.
-    Close,         // Крестик для закрытия.
-    Attach,        // Скрепка для вложения.
-    Check,         // Галочка выбора.
-    Block,         // Значок отключённой учётной записи.
+    Plus,              // Знак добавления.
+    Search,            // Лупа для поиска.
+    Close,             // Крестик для закрытия.
+    Attach,            // Скрепка для вложения.
+    Check,             // Галочка выбора.
+    Block,             // Значок отключённой учётной записи.
     ChatBubbleOutline, // Контур чата для строки канала.
-    Profile,       // Заглушка аватара.
-    VolumeUp,      // Настройка громкости.
-    ChevronRight,  // Стрелка перехода вправо.
-    Settings,      // Шестерёнка настроек.
-    Language,      // Настройка языка.
-    LogoutCompact, // Выход из аккаунта.
+    Profile,           // Заглушка аватара.
+    VolumeUp,          // Настройка громкости.
+    ChevronRight,      // Стрелка перехода вправо.
+    Settings,          // Шестерёнка настроек.
+    Language,          // Настройка языка.
+    ChevronDown,       // Стрелка раскрытия списка.
+    ChevronUp,         // Стрелка сворачивания списка.
+    Schedule,          // Ожидание отправки сообщения.
+    Send,              // Отправка сообщения.
+    Warning,           // Ошибка отправки сообщения.
+    LogoutCompact,     // Выход из аккаунта.
 }
 
 impl IconName {
@@ -73,6 +78,26 @@ impl IconName {
             Handle::from_memory(&include_bytes!("../../assets/icons/logout_compact.svg")[..])
         });
 
+        static CHEVRON_DOWN: LazyLock<Handle> = LazyLock::new(|| {
+            Handle::from_memory(&include_bytes!("../../assets/icons/chevron-down.svg")[..])
+        });
+
+        static CHEVRON_UP: LazyLock<Handle> = LazyLock::new(|| {
+            Handle::from_memory(&include_bytes!("../../assets/icons/chevron-up.svg")[..])
+        });
+
+        static SCHEDULE: LazyLock<Handle> = LazyLock::new(|| {
+            Handle::from_memory(&include_bytes!("../../assets/icons/schedule.svg")[..])
+        });
+
+        static SEND: LazyLock<Handle> = LazyLock::new(|| {
+            Handle::from_memory(&include_bytes!("../../assets/icons/send.svg")[..])
+        });
+
+        static WARNING: LazyLock<Handle> = LazyLock::new(|| {
+            Handle::from_memory(&include_bytes!("../../assets/icons/warning.svg")[..])
+        });
+
         match self {
             Self::Plus => &PLUS,
             Self::Search => &SEARCH,
@@ -86,6 +111,11 @@ impl IconName {
             Self::ChevronRight => &CHEVRON_RIGHT,
             Self::Settings => &SETTINGS,
             Self::Language => &LANGUAGE,
+            Self::ChevronDown => &CHEVRON_DOWN,
+            Self::ChevronUp => &CHEVRON_UP,
+            Self::Schedule => &SCHEDULE,
+            Self::Send => &SEND,
+            Self::Warning => &WARNING,
             Self::LogoutCompact => &LOGOUT_COMPACT,
         }
     }

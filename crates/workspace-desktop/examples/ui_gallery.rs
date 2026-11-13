@@ -2,16 +2,19 @@
 //! Здесь хранятся настройки примеров и собираются вкладки с компонентами.
 
 use iced::keyboard::{self, Key, key::Named};
+use iced::widget::text_editor::{self, Content};
 use iced::widget::{column, container, operation, row, scrollable, text};
 use iced::{Element, Event, Fill, Subscription, Task, Theme, event};
 use workspace_desktop::ui_kit::{
     AvatarContent, AvatarDecoration, AvatarPhoto, AvatarSize, BadgeSize, BadgeTone,
     ButtonAppearance, ButtonOptions, ButtonSize, ButtonVariant, FieldSize, IconName, IconTone,
+    InputSelectorOptions, ListboxOption, MessageComposerOptions, MessageDelivery, MessageDirection,
     PanelMenuRowOptions, PresenceSize, PresenceStatus, SelectionSize, ThemeMode, avatar,
-    avatar_group, button, button_with, form_field, icon, member_row, member_row_content,
-    mention_badge, panel_menu_row, presence_indicator, search_input, selectable_row,
-    selection_checkbox, selection_indicator, switch, text_input, text_input_with_error,
-    unread_count_badge, workspace_theme,
+    avatar_group, button, button_with, form_field, icon, input_selector, listbox, member_row,
+    member_row_content, mention_badge, message_bubble, message_composer, panel_menu_row,
+    presence_indicator, search_input, select, selectable_row, selection_checkbox,
+    selection_indicator, switch, text_input, text_input_with_error, unread_count_badge,
+    workspace_theme,
 };
 
 const FIELD_EXAMPLES: [(FieldSize, &str); 2] = [
@@ -19,10 +22,21 @@ const FIELD_EXAMPLES: [(FieldSize, &str); 2] = [
     (FieldSize::Regular, "chat-search-regular"),
 ];
 
+const SELECTOR_EXAMPLES: [(FieldSize, &str); 2] = [
+    (FieldSize::Compact, "timezone-input-compact"),
+    (FieldSize::Regular, "timezone-input-regular"),
+];
+
 /// Хранит значения полей для одного размера.
 struct FieldExample {
     title: String, // Название темы в примере с проверкой.
     query: String, // Поисковый запрос в примере с очисткой.
+}
+
+/// Хранит независимые значения селекторов одного размера.
+struct SelectorExample {
+    selected: Option<String>, // Значение из готового списка.
+    value: String,            // Введённый текст или значение подсказки.
 }
 
 /// Определяет открытый раздел галереи.
@@ -34,6 +48,8 @@ enum GalleryTab {
     Indicators, // Выбор, переключатели, статусы присутствия и бейджи.
     Fields,     // Поля формы и поиск.
     Rows,       // Аватары, карточки и строки действий.
+    Selectors,  // Выбор из списка и ввод с подсказками.
+    Messages,   // Сообщения и редактор.
 }
 
 /// Хранит настройки галереи и состояние примеров.
@@ -50,6 +66,11 @@ struct Gallery {
     avatar_photo: AvatarPhoto,         // Искусственное изображение для проверки обрезки аватара.
     member_selected: bool,             // Отмечен ли участник в примере выбора.
     last_panel_action: Option<&'static str>, // Подпись последнего действия панели.
+    selectors: [SelectorExample; 2],   // Значения примеров для обоих размеров.
+    selector_options: Vec<ListboxOption>, // Подсказки для выбора часового пояса.
+    listbox_value: String,             // Выбранный вариант в отдельном примере списка.
+    composer: Content,                 // Черновик в примере редактора сообщения.
+    sent_preview: Option<String>,      // Последнее сообщение, отправленное из примера.
 }
 
 impl Default for Gallery {
@@ -71,6 +92,27 @@ impl Default for Gallery {
             avatar_photo: example_avatar_photo(),
             member_selected: false,
             last_panel_action: None,
+            selectors: std::array::from_fn(|_| SelectorExample {
+                selected: Some("Europe/Moscow".to_owned()),
+                value: String::new(),
+            }),
+            selector_options: [
+                ("Europe/Moscow", "Москва", false),
+                ("Asia/Yekaterinburg", "Екатеринбург", true),
+                ("Europe/Berlin", "Берлин", false),
+                ("Asia/Tokyo", "Токио", false),
+            ]
+            .into_iter()
+            .map(|(value, label, disabled)| ListboxOption {
+                value: value.to_owned(),
+                label: label.to_owned(),
+                description: Some(value.to_owned()),
+                disabled,
+            })
+            .collect(),
+            listbox_value: "Europe/Moscow".to_owned(),
+            composer: Content::new(),
+            sent_preview: None,
         }
     }
 }
@@ -86,13 +128,18 @@ enum Message {
     MoveFocus {
         backwards: bool, // Переход к предыдущему элементу по Shift+Tab.
     },
-    TabChanged(GalleryTab),           // Вкладка, которую нужно открыть.
-    IconToneChanged(IconTone),        // Новый способ окраски иконок.
-    IconSizeChanged(u32),             // Новый размер иконок в логических пикселях.
-    SelectionChanged(bool),           // Чекбокс передал новую отметку.
-    SwitchChanged(bool),              // Переключатель передал новое положение.
-    MemberSelectionChanged(bool),     // Новая отметка в строке выбора участника.
-    PanelActionPressed(&'static str), // Подпись нажатой строки действия.
+    TabChanged(GalleryTab),                // Вкладка, которую нужно открыть.
+    IconToneChanged(IconTone),             // Новый способ окраски иконок.
+    IconSizeChanged(u32),                  // Новый размер иконок в логических пикселях.
+    SelectionChanged(bool),                // Чекбокс передал новую отметку.
+    SwitchChanged(bool),                   // Переключатель передал новое положение.
+    MemberSelectionChanged(bool),          // Новая отметка в строке выбора участника.
+    PanelActionPressed(&'static str),      // Подпись нажатой строки действия.
+    SelectorChanged(usize, String),        // Индекс и значение выбранной опции.
+    SuggestionInputChanged(usize, String), // Индекс и свободный текст поля.
+    ListboxValueChanged(String),           // Значение из отдельного примера списка.
+    ComposerEdited(text_editor::Action),   // Действие редактирования в поле сообщения.
+    ComposerSent,                          // Отправка демонстрационного черновика.
 }
 
 impl Gallery {
@@ -110,6 +157,14 @@ impl Gallery {
             Message::SwitchChanged(on) => self.switch_on = on,
             Message::MemberSelectionChanged(selected) => self.member_selected = selected,
             Message::PanelActionPressed(action) => self.last_panel_action = Some(action),
+            Message::SelectorChanged(index, value) => self.selectors[index].selected = Some(value),
+            Message::SuggestionInputChanged(index, value) => self.selectors[index].value = value,
+            Message::ListboxValueChanged(value) => self.listbox_value = value,
+            Message::ComposerEdited(action) => self.composer.perform(action),
+            Message::ComposerSent => {
+                self.sent_preview = Some(self.composer.text());
+                self.composer = Content::new();
+            }
             Message::TabChanged(tab) => {
                 self.tab = tab;
                 return operation::snap_to("gallery-content", scrollable::RelativeOffset::START);
@@ -159,6 +214,8 @@ impl Gallery {
             ("Выбор и статусы", GalleryTab::Indicators),
             ("Поля", GalleryTab::Fields),
             ("Аватары и строки", GalleryTab::Rows),
+            ("Селекторы", GalleryTab::Selectors),
+            ("Сообщения", GalleryTab::Messages),
         ]
         .into_iter()
         .fold(row![].spacing(12), |row, (label, tab)| {
@@ -174,6 +231,8 @@ impl Gallery {
             GalleryTab::Indicators => self.indicators(),
             GalleryTab::Fields => self.fields(),
             GalleryTab::Rows => self.rows(),
+            GalleryTab::Selectors => self.selectors(),
+            GalleryTab::Messages => self.messages(),
             GalleryTab::Icons => self.icons(),
         };
         let content = scrollable(container(section).padding([16, 28]).center_x(Fill))
@@ -564,6 +623,171 @@ impl Gallery {
         .width(Fill)
         .max_width(760)
         .into()
+    }
+
+    /// Показывает оба размера селекторов и отдельно раскрытый список опций.
+    fn selectors(&self) -> Element<'_, Message> {
+        let fields = row(SELECTOR_EXAMPLES
+            .iter()
+            .enumerate()
+            .map(|(index, &(size, input_id))| self.selector_example(index, size, input_id)))
+        .spacing(24)
+        .wrap();
+        let cases = column![
+            text("Состояния").size(20),
+            form_field(
+                "Пустой список",
+                select(
+                    &[],
+                    None,
+                    "Нет вариантов",
+                    "Список пуст",
+                    FieldSize::Regular,
+                    Some(|value: &str| Message::ListboxValueChanged(value.to_owned()))
+                ),
+                None,
+                None,
+            ),
+            form_field(
+                "Недоступное поле",
+                input_selector(
+                    "timezone-input-disabled",
+                    InputSelectorOptions {
+                        placeholder: "",
+                        value: "Europe/Moscow",
+                        suggestions: &self.selector_options,
+                        empty: "Нет совпадений",
+                        size: FieldSize::Compact,
+                        searchable: true,
+                        invalid: false,
+                        on_submit: None,
+                    },
+                    None::<fn(String) -> Message>,
+                ),
+                None,
+                None,
+            ),
+        ]
+        .width(Fill)
+        .max_width(340)
+        .spacing(12);
+        let list = column![
+            text("Список вариантов").size(20),
+            listbox(
+                &self.selector_options,
+                Some(&self.listbox_value),
+                Some("Europe/Berlin"),
+                "Список пуст",
+                |value| Message::ListboxValueChanged(value.to_owned()),
+            ),
+        ]
+        .width(Fill)
+        .max_width(340)
+        .spacing(12);
+        column![fields, row![list, cases].spacing(24).wrap()]
+            .width(Fill)
+            .max_width(760)
+            .spacing(22)
+            .into()
+    }
+
+    /// Собирает закрытые поля одного размера с разными сценариями ввода.
+    fn selector_example(
+        &self,
+        index: usize,
+        size: FieldSize,
+        input_id: &'static str,
+    ) -> Element<'_, Message> {
+        let example = &self.selectors[index];
+        let title = match size {
+            FieldSize::Compact => "32 px",
+            FieldSize::Regular => "40 px",
+        };
+        column![
+            text(title).size(20),
+            form_field(
+                "Часовой пояс",
+                select(
+                    &self.selector_options,
+                    example.selected.as_deref(),
+                    "Выберите город",
+                    "Список пуст",
+                    size,
+                    Some(move |value: &str| Message::SelectorChanged(index, value.to_owned())),
+                ),
+                None,
+                None,
+            ),
+            form_field(
+                "Ввод с подсказками",
+                input_selector(
+                    input_id,
+                    InputSelectorOptions {
+                        placeholder: "Введите город или часовой пояс",
+                        value: &example.value,
+                        suggestions: &self.selector_options,
+                        empty: "Нет совпадений",
+                        size,
+                        searchable: true,
+                        invalid: false,
+                        on_submit: None,
+                    },
+                    Some(move |value| Message::SuggestionInputChanged(index, value)),
+                ),
+                None,
+                None,
+            ),
+        ]
+        .width(Fill)
+        .max_width(340)
+        .spacing(12)
+        .into()
+    }
+
+    /// Показывает короткое и длинное сообщение, статусы доставки и отправку черновика.
+    fn messages(&self) -> Element<'_, Message> {
+        use MessageDelivery::{Failed, Read, Sending, Sent};
+        use MessageDirection::{Incoming, Outgoing};
+
+        let mut bubbles = column![
+            message_bubble(
+                "Посмотри макет, когда будет время.",
+                Some("Саша"),
+                "12:05",
+                Incoming,
+            ),
+            container(message_bubble(
+                "Посмотрю сегодня. Сначала проверю, как список читается в узком окне, затем сравню светлую и тёмную темы.",
+                None,
+                "12:07",
+                Outgoing(Some(Read)),
+            ))
+            .align_right(Fill),
+            container(message_bubble("Ещё есть пара вопросов.", None, "12:08", Outgoing(Some(Failed))))
+                .align_right(Fill),
+            container(message_bubble("Сейчас пришлю примеры.", None, "12:09", Outgoing(Some(Sending))))
+                .align_right(Fill),
+        ]
+        .spacing(10)
+        .width(Fill);
+
+        if let Some(body) = self.sent_preview.as_deref() {
+            bubbles = bubbles.push(
+                container(message_bubble(body, None, "Сейчас", Outgoing(Some(Sent))))
+                    .align_right(Fill),
+            );
+        }
+        let composer = message_composer(
+            &self.composer,
+            MessageComposerOptions::default(),
+            Some(Message::ComposerEdited),
+            Some(Message::ComposerSent),
+        );
+        column![text("Пузыри и редактор").size(20), bubbles, composer]
+            .spacing(16)
+            .width(Fill)
+            .max_width(600)
+            .into()
     }
 
     /// Показывает каталог SVG с поиском и выбором размера, формы и цвета.
