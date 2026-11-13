@@ -1,0 +1,16 @@
+[package]
+name = "workspace-desktop"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+iced = { version = "0.14.0", default-features = false, features = ["advanced", "canvas", "crisp", "thread-pool", "tiny-skia", "wayland", "x11"], optional = true }
+
+[features]
+default = ["ui-kit"]
+ui-kit = ["dep:iced"]
+
+[[example]]
+name = "ui_gallery"
+required-features = ["ui-kit"]
