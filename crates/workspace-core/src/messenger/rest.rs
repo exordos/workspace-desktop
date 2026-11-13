@@ -3,7 +3,9 @@
 
 use std::time::Duration;
 
-use reqwest::{Client, RequestBuilder, StatusCode, Url, header::ACCEPT, redirect::Policy};
+use reqwest::{
+    Certificate, Client, RequestBuilder, StatusCode, Url, header::ACCEPT, redirect::Policy,
+};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 use uuid::Uuid;
@@ -11,7 +13,7 @@ use uuid::Uuid;
 use crate::{
     context::OwnerContext,
     runtime::SourceError,
-    storage::{Cursor, Message},
+    storage::{Cursor, HistoryChange, Message, MessagePlacement},
     sync::Event,
 };
 
@@ -29,14 +31,20 @@ pub(super) struct RestClient(Client); // Настроенный HTTP-клиен�
 
 impl RestClient {
     /// Создаёт HTTPS-клиент с тайм-аутами и запретом перенаправлений.
-    pub(super) fn new() -> Result<Self, SourceError> {
-        let client = Client::builder()
+    pub(super) fn new(private_ca: Option<&[u8]>) -> Result<Self, SourceError> {
+        let mut builder = Client::builder()
             .https_only(true)
             .redirect(Policy::none())
             .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(20))
-            .build()
-            .map_err(|_| SourceError::Temporary)?;
+            .timeout(Duration::from_secs(20));
+        if let Some(private_ca) = private_ca {
+            let certificate =
+                Certificate::from_der(private_ca).map_err(|_| SourceError::InvalidResponse)?;
+            builder = builder
+                .tls_built_in_root_certs(false)
+                .add_root_certificate(certificate);
+        }
+        let client = builder.build().map_err(|_| SourceError::Temporary)?;
         Ok(Self(client))
     }
 
@@ -281,6 +289,16 @@ impl IncomingMessage {
     }
 }
 
+impl WirePayload {
+    /// Возвращает адрес, если снимок содержит стрим и тему.
+    fn placement(&self) -> Option<MessagePlacement> {
+        Some(MessagePlacement {
+            stream_id: parse_uuid(self.stream_uuid.as_deref()?)?.to_string(),
+            topic_id: parse_uuid(self.topic_uuid.as_deref()?)?.to_string(),
+        })
+    }
+}
+
 /// Счётчик и идентификаторы папки в ответе REST.
 #[derive(Deserialize)]
 struct WireFolder {
@@ -381,7 +399,7 @@ fn parse_uuid(value: &str) -> Option<Uuid> {
     Uuid::parse_str(value).ok()
 }
 
-/// Проверяет владельца и формат события. Возвращает новое сообщение или только позицию.
+/// Проверяет контекст и преобразует событие журнала в изменение для Sync.
 pub(super) fn wire_event(
     value: Value,
     owner: &OwnerContext,
@@ -402,12 +420,15 @@ pub(super) fn wire_event(
         || !nonempty(&wire.payload.kind)
         || wire.project_id != owner.project_id
         || wire.user_uuid != owner.user_id
-        || wire
-            .epoch_generation
-            .as_deref()
-            .is_some_and(|value| value != epoch)
     {
         return Err(SourceError::InvalidResponse);
+    }
+    if wire
+        .epoch_generation
+        .as_deref()
+        .is_some_and(|value| value != epoch)
+    {
+        return Err(SourceError::CursorPruned);
     }
 
     let message_created = wire.object_type == "message" && wire.action == "created";
@@ -436,11 +457,56 @@ pub(super) fn wire_event(
         let count = folder.into_count(owner)?;
         return Ok((Event::UnreadChanged { cursor, count }, None));
     }
-    if !message_created {
+    let message_updated = wire.object_type == "message" && wire.action == "updated";
+    let history = match (wire.object_type.as_str(), wire.action.as_str()) {
+        ("message" | "topic" | "stream", "deleted") => {
+            let payload = &wire.payload;
+            if payload.kind.strip_suffix(".deleted") != Some(wire.object_type.as_str())
+                || !matches_owner(
+                    owner,
+                    payload.project_id.as_deref(),
+                    payload.user_uuid.as_deref(),
+                )
+            {
+                return Err(SourceError::InvalidResponse);
+            }
+            // Отзыв стрима приходит только удалённому участнику. Событие stream_binding.deleted получают остальные.
+            let id = parse_uuid(
+                payload
+                    .uuid
+                    .as_deref()
+                    .ok_or(SourceError::InvalidResponse)?,
+            )
+            .ok_or(SourceError::InvalidResponse)?
+            .to_string();
+            Some(match wire.object_type.as_str() {
+                "stream" => HistoryChange::RemoveStream(id),
+                "topic" => HistoryChange::RemoveTopic(MessagePlacement {
+                    stream_id: payload
+                        .stream_uuid
+                        .as_deref()
+                        .and_then(parse_uuid)
+                        .ok_or(SourceError::InvalidResponse)?
+                        .to_string(),
+                    topic_id: id,
+                }),
+                _ => HistoryChange::RemoveMessage(id),
+            })
+        }
+        _ => None,
+    };
+    if let Some(change) = history {
+        return Ok((Event::HistoryChanged { cursor, change }, None));
+    }
+    if !message_created && !message_updated {
         return Ok((Event::Checkpoint(cursor), None));
+    }
+    if message_updated && wire.payload.kind != "message.updated" {
+        return Err(SourceError::InvalidResponse);
     }
 
     let payload = wire.payload;
+    let placement = payload.placement();
     let incoming = IncomingMessage::from_wire(&payload, owner);
     let id = payload
         .uuid
@@ -460,15 +526,35 @@ pub(super) fn wire_event(
         return Err(SourceError::InvalidResponse);
     }
     if body.kind != "markdown" {
+        if message_updated {
+            return Ok((
+                Event::HistoryChanged {
+                    cursor,
+                    change: HistoryChange::RemoveMessage(id),
+                },
+                None,
+            ));
+        }
         return Ok((Event::Checkpoint(cursor), None));
     }
     let Some(Value::String(text)) = body.content else {
         return Err(SourceError::InvalidResponse);
     };
+    let message = Message { id, text };
+    if message_updated {
+        return Ok((
+            Event::HistoryChanged {
+                cursor,
+                change: HistoryChange::Edit { message, placement },
+            },
+            None,
+        ));
+    }
     Ok((
         Event::MessageCreated {
             cursor,
-            message: Message { id, text },
+            message,
+            placement,
         },
         incoming,
     ))
@@ -536,7 +622,7 @@ mod tests {
     /// Проверяет, что запрос страницы передаёт токен и строгое ограничение по позиции.
     #[test]
     fn pages_request_strict_cursor_and_bearer_token() {
-        let client = RestClient::new().unwrap();
+        let client = RestClient::new(None).unwrap();
         let request = client
             .page_request(&owner(), "test-token", &cursor(42))
             .unwrap()
@@ -564,12 +650,12 @@ mod tests {
     #[test]
     fn decodes_flat_events_and_allows_gaps_in_visible_versions() {
         let owner = owner();
-        let mut unsupported = message(100);
-        unsupported["action"] = json!("updated");
-        unsupported["payload"]["kind"] = json!("message.updated");
+        let mut update = message(100);
+        update["action"] = json!("updated");
+        update["payload"]["kind"] = json!("message.updated");
 
         assert_eq!(
-            decode_page(vec![message(20), unsupported], &owner, &cursor(3)).unwrap(),
+            decode_page(vec![message(20), update], &owner, &cursor(3)).unwrap(),
             [
                 Event::MessageCreated {
                     cursor: cursor(20),
@@ -577,8 +663,18 @@ mod tests {
                         id: "message-uuid".to_owned(),
                         text: "hello".to_owned(),
                     },
+                    placement: None,
                 },
-                Event::Checkpoint(cursor(100))
+                Event::HistoryChanged {
+                    cursor: cursor(100),
+                    change: HistoryChange::Edit {
+                        message: Message {
+                            id: "message-uuid".to_owned(),
+                            text: "hello".to_owned()
+                        },
+                        placement: None,
+                    },
+                }
             ]
         );
     }

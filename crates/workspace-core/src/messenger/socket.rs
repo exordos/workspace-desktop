@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async_with_config,
+    Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
     tungstenite::{
         Error as WebSocketError, Message,
         client::IntoClientRequest,
@@ -47,7 +47,10 @@ pub(super) type SocketStream = Pin<Box<dyn Stream<Item = Result<SocketFrame, Sou
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Открывает WebSocket с заданной позиции и проверяет согласованный протокол.
-pub(super) async fn connect(session: &SourceSession) -> Result<SocketStream, SourceError> {
+pub(super) async fn connect(
+    session: &SourceSession,
+    connector: Option<Connector>,
+) -> Result<SocketStream, SourceError> {
     let cursor = session
         .cursor
         .as_ref()
@@ -59,7 +62,7 @@ pub(super) async fn connect(session: &SourceSession) -> Result<SocketStream, Sou
     // Клиент открывает соединение по заданному адресу и не следует перенаправлениям.
     let (socket, response) = timeout(
         CONNECT_TIMEOUT,
-        connect_async_with_config(request, Some(config), false),
+        connect_async_tls_with_config(request, Some(config), false, connector),
     )
     .await
     .map_err(|_| SourceError::Temporary)?

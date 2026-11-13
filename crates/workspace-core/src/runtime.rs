@@ -234,7 +234,23 @@ impl Worker {
                     let _ = cancelled.await;
                     break;
                 }
-                ConnectionEnd::Retry => {
+                end @ (ConnectionEnd::Retry | ConnectionEnd::Recover) => {
+                    if matches!(end, ConnectionEnd::Recover) {
+                        let sync = self.sync.clone();
+                        let key = self.key.clone();
+                        let generation = self.session.generation;
+                        let reset = spawn_blocking(move || {
+                            sync.reset_source(&key.context, generation, &key.source)
+                        })
+                        .await?;
+                        match reset {
+                            Ok(()) => {}
+                            Err(SyncError::Auth(_)) => break,
+                            Err(SyncError::Storage(error)) => {
+                                log::warn!("{} reset failed: {error}", self.key.source)
+                            }
+                        }
+                    }
                     if until_cancelled(&mut cancelled, sleep(delay))
                         .await
                         .is_none()
@@ -318,9 +334,10 @@ impl Worker {
             match applied {
                 Ok(_) => *delay = INITIAL_RETRY_DELAY,
                 Err(SyncError::Auth(_)) => return Ok(ConnectionEnd::Stopped),
-                Err(SyncError::Storage(
-                    error @ (StorageError::EpochChanged | StorageError::CursorVersionOutOfRange),
-                )) => {
+                Err(SyncError::Storage(StorageError::EpochChanged)) => {
+                    return Ok(ConnectionEnd::Recover);
+                }
+                Err(SyncError::Storage(error @ StorageError::CursorVersionOutOfRange)) => {
                     log::warn!("{} paused: {error}", self.key.source);
                     return Ok(ConnectionEnd::CursorRejected);
                 }
@@ -341,7 +358,8 @@ impl Worker {
                 ConnectionEnd::Retry
             }
             SourceError::Temporary => ConnectionEnd::Retry,
-            SourceError::CursorPruned | SourceError::InvalidResponse | SourceError::Forbidden => {
+            SourceError::CursorPruned => ConnectionEnd::Recover,
+            SourceError::InvalidResponse | SourceError::Forbidden => {
                 log::warn!("{} paused: {error}", self.key.source);
                 ConnectionEnd::CursorRejected
             }
@@ -353,6 +371,7 @@ impl Worker {
 enum ConnectionEnd {
     Stopped,        // Завершить задачу.
     Retry,          // Подождать и подключиться снова.
+    Recover,        // Сбросить непригодную позицию перед повтором.
     CursorRejected, // Приостановить чтение до отмены задачи. Простое переподключение не поможет.
 }
 

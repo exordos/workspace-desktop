@@ -7,7 +7,9 @@ mod socket;
 use std::{sync::Arc, time::Duration, vec::IntoIter};
 
 use futures::{StreamExt, future::BoxFuture, stream};
+use rustls::{ClientConfig, RootCertStore, crypto::ring, pki_types::CertificateDer};
 use tokio::time::timeout;
+use tokio_tungstenite::Connector;
 
 use crate::{
     runtime::{EventSource, EventStream, SourceError, SourceSession},
@@ -23,14 +25,33 @@ const NOTIFICATION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 /// Источник событий мессенджера. При первом подключении берёт текущую позицию журнала.
 /// При следующих подключениях читает события после последней сохранённой позиции.
 pub struct MessengerSource {
-    rest: Arc<RestClient>, // Общий HTTP-клиент для чтения страниц журнала.
+    rest: Arc<RestClient>,        // Общий HTTP-клиент для чтения страниц журнала.
+    connector: Option<Connector>, // Настройки TLS для сервера с частным центром сертификации.
 }
 
 impl MessengerSource {
     /// Создаёт источник и подготавливает HTTP-клиент.
     pub fn new() -> Result<Self, SourceError> {
         Ok(Self {
-            rest: Arc::new(RestClient::new()?),
+            rest: Arc::new(RestClient::new(None)?),
+            connector: None,
+        })
+    }
+
+    /// Доверяет указанному сертификату центра сертификации вместо системных корней для HTTPS и WSS.
+    pub fn with_private_ca(certificate_der: &[u8]) -> Result<Self, SourceError> {
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(certificate_der))
+            .map_err(|_| SourceError::InvalidResponse)?;
+        let tls = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|_| SourceError::InvalidResponse)?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Ok(Self {
+            rest: Arc::new(RestClient::new(Some(certificate_der))?),
+            connector: Some(Connector::Rustls(Arc::new(tls))),
         })
     }
 }
@@ -50,6 +71,7 @@ impl EventSource for MessengerSource {
                 pending: Default::default(),
                 socket: None,
                 live: false,
+                connector: self.connector.clone(),
             };
             let events = stream::try_unfold(connection, |mut connection| async move {
                 Ok(connection.next().await?.map(|event| (event, connection)))
@@ -66,6 +88,7 @@ struct Connection {
     pending: IntoIter<Event>, // Остаток загруженной страницы, который ещё не отдали потребителю.
     socket: Option<socket::SocketStream>, // Открытый поток WebSocket. `None`, пока идёт чтение через HTTP.
     live: bool,                           // Сервер подтвердил завершение догрузки через WebSocket.
+    connector: Option<Connector>, // Частный корневой сертификат либо обычное системное доверие.
 }
 
 impl Connection {
@@ -100,7 +123,7 @@ impl Connection {
                 self.session.cursor = Some(event.cursor().clone());
                 return Ok(Some(event));
             }
-            self.socket = Some(socket::connect(&self.session).await?);
+            self.socket = Some(socket::connect(&self.session, self.connector.clone()).await?);
         }
 
         let socket = self.socket.as_mut().expect("socket initialized");
@@ -112,8 +135,14 @@ impl Connection {
                         self.session.cursor = Some(event.cursor().clone());
                         // Догрузка через REST и кадры до ready не создают баннеры.
                         if self.live
-                            && let (Event::MessageCreated { cursor, message }, Some(incoming)) =
-                                (&event, incoming)
+                            && let (
+                                Event::MessageCreated {
+                                    cursor,
+                                    message,
+                                    placement,
+                                },
+                                Some(incoming),
+                            ) = (&event, incoming)
                         {
                             match timeout(
                                 NOTIFICATION_LOOKUP_TIMEOUT,
@@ -130,6 +159,7 @@ impl Connection {
                                         cursor: cursor.clone(),
                                         message: message.clone(),
                                         conversation_id: incoming.stream.to_string(),
+                                        placement: placement.clone(),
                                     }));
                                 }
                                 Ok(Ok(false)) => {}

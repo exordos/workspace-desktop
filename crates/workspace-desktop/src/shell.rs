@@ -167,6 +167,7 @@ impl Shell {
             Message::Snapshot(accounts) => self.accounts.replace(accounts),
             Message::Synced(update) => match update.change {
                 SyncChange::Unread(count) => self.accounts.set_unread(&update, count),
+                SyncChange::MessengerReset => self.accounts.replace(self.sources.0.snapshot()),
                 SyncChange::IncomingDirectMessage {
                     ref conversation_id,
                     ref message_id,
@@ -547,6 +548,9 @@ fn session_status(status: SessionStatus) -> &'static str {
         SessionStatus::SigningOut => "Выход из аккаунта",
     }
 }
+
+#[cfg(test)]
+mod background_message;
 
 #[cfg(test)]
 mod tests {

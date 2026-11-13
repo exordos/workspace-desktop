@@ -10,7 +10,9 @@ use crate::{
     auth::{Auth, AuthError},
     context::{OwnerContext, SessionGeneration},
     notification_target::{NotificationTarget, NotificationTargetError},
-    storage::{Cursor, Message, Storage, StorageError},
+    storage::{
+        Cursor, EventWrite, HistoryChange, Message, MessagePlacement, Storage, StorageError,
+    },
 };
 
 pub use crate::storage::ApplyOutcome;
@@ -26,7 +28,8 @@ pub struct SyncUpdate {
 /// Изменения после записи в локальную базу.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyncChange {
-    Unread(u32), // Готовое число непрочитанных в папке «Все чаты».
+    Unread(u32),    // Готовое число непрочитанных в папке «Все чаты».
+    MessengerReset, // Кэш очищен. Счётчик неизвестен до снимка с сервера.
     IncomingDirectMessage {
         conversation_id: String, // Идентификатор личного разговора на сервере.
         message_id: String,      // Идентификатор нового сообщения.
@@ -37,13 +40,19 @@ pub enum SyncChange {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
     MessageCreated {
-        cursor: Cursor,   // Позиция, которую сохраняем вместе с сообщением.
-        message: Message, // Новое сообщение для локальной базы.
+        cursor: Cursor,                      // Позиция, которую сохраняем вместе с сообщением.
+        message: Message,                    // Новое сообщение для локальной базы.
+        placement: Option<MessagePlacement>, // Стрим и тема из снимка.
     },
     IncomingDirectMessage {
         cursor: Cursor,          // Позиция нового события после готовности WebSocket.
         message: Message,        // Входящее непрочитанное сообщение для локальной базы.
         conversation_id: String, // Проверенный идентификатор личного разговора.
+        placement: Option<MessagePlacement>, // Стрим и тема из снимка.
+    },
+    HistoryChanged {
+        cursor: Cursor,        // Позиция изменения в журнале.
+        change: HistoryChange, // Правка, удаление или отзыв доступа.
     },
     UnreadChanged {
         cursor: Cursor, // Позиция события обновления папки в журнале.
@@ -62,6 +71,7 @@ impl Event {
         match self {
             Self::MessageCreated { cursor, .. }
             | Self::IncomingDirectMessage { cursor, .. }
+            | Self::HistoryChanged { cursor, .. }
             | Self::UnreadChanged { cursor, .. }
             | Self::UnreadBaseline { cursor, .. }
             | Self::Checkpoint(cursor) => cursor,
@@ -74,7 +84,7 @@ impl Event {
             Self::MessageCreated { message, .. } | Self::IncomingDirectMessage { message, .. } => {
                 Some(message)
             }
-            Self::UnreadChanged { .. } | Self::UnreadBaseline { .. } | Self::Checkpoint(_) => None,
+            _ => None,
         }
     }
 }
@@ -118,6 +128,22 @@ impl Sync {
     /// Возвращает сохранённый счётчик. `None` означает, что сервер его ещё не прислал.
     pub fn unread(&self, owner: &OwnerContext) -> Result<Option<u32>, SyncError> {
         Ok(self.storage.unread(owner)?)
+    }
+
+    /// Сбрасывает данные источника, пока поколение сессии имеет право на запись.
+    pub(crate) fn reset_source(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        source: &str,
+    ) -> Result<(), SyncError> {
+        self.auth.with_active_generation(owner, generation, || {
+            self.storage.reset_source(owner, source)?;
+            if source == crate::messenger::SOURCE_ID {
+                self.publish(owner, generation, SyncChange::MessengerReset);
+            }
+            Ok(())
+        })?
     }
 
     /// Подписывает оболочку на изменения. После пропуска событий счётчик можно перечитать.
@@ -170,13 +196,26 @@ impl Sync {
                 } => Some(conversation_id.as_str()),
                 _ => None,
             };
+            let placement = match &event {
+                Event::MessageCreated { placement, .. }
+                | Event::IncomingDirectMessage { placement, .. } => placement.as_ref(),
+                _ => None,
+            };
+            let history = match &event {
+                Event::HistoryChanged { change, .. } => Some(change),
+                _ => None,
+            };
             let saved = self.storage.apply(
                 owner,
                 source,
                 event.cursor(),
-                event.message(),
-                unread,
-                conversation,
+                EventWrite {
+                    message: event.message(),
+                    unread,
+                    notification_conversation: conversation,
+                    placement,
+                    history,
+                },
             )?;
             if let Some(count) = unread.filter(|_| saved.unread_changed) {
                 self.publish(owner, generation, SyncChange::Unread(count));

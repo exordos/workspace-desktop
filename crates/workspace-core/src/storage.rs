@@ -23,6 +23,35 @@ pub struct Message {
     pub text: String, // Текст сообщения.
 }
 
+/// Адрес сообщения в журнале. Старые записи могут не содержать этот адрес.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessagePlacement {
+    pub stream_id: String, // Стрим, которому принадлежит сообщение.
+    pub topic_id: String,  // Тема внутри стрима.
+}
+
+/// Изменение истории, которое сохраняем вместе с позицией журнала.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HistoryChange {
+    Edit {
+        message: Message,                    // Новый текст существующего сообщения.
+        placement: Option<MessagePlacement>, // Адрес из снимка, если сервер его передал.
+    },
+    RemoveMessage(String), // UUID удалённого или больше не поддерживаемого сообщения.
+    RemoveStream(String),  // UUID стрима, доступ к которому потерян.
+    RemoveTopic(MessagePlacement), // Стрим и UUID удалённой темы.
+}
+
+/// Данные одной записи журнала. Пустые поля не меняют соответствующие таблицы.
+#[derive(Default)]
+pub(crate) struct EventWrite<'a> {
+    pub message: Option<&'a Message>,               // Новое сообщение.
+    pub placement: Option<&'a MessagePlacement>,    // Стрим и тема нового сообщения.
+    pub unread: Option<u32>,                        // Подтверждённый счётчик.
+    pub notification_conversation: Option<&'a str>, // Разговор для цели баннера.
+    pub history: Option<&'a HistoryChange>,         // Правка или удаление.
+}
+
 /// Число непрочитанных и позиция журнала, до которой оно уже учитывает изменения.
 struct StoredUnread {
     count: u32,               // Готовое число непрочитанных сообщений.
@@ -74,8 +103,9 @@ impl Storage {
     }
 
     /// Подготавливает таблицы сообщений, счётчиков и позиций для переданного соединения.
-    fn initialize(connection: Connection) -> Result<Self, StorageError> {
-        connection.execute_batch(
+    fn initialize(mut connection: Connection) -> Result<Self, StorageError> {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS sync_cursors (
                 account_id TEXT NOT NULL,
                 server TEXT NOT NULL,
@@ -95,6 +125,8 @@ impl Storage {
                 user_id TEXT NOT NULL,
                 message_id TEXT NOT NULL,
                 text TEXT NOT NULL,
+                stream_id TEXT,
+                topic_id TEXT,
                 PRIMARY KEY (account_id, server, organization_id, project_id, user_id, message_id)
             );
             CREATE TABLE IF NOT EXISTS messenger_notification_targets (
@@ -119,6 +151,20 @@ impl Storage {
                 PRIMARY KEY (account_id, server, organization_id, project_id, user_id)
             );",
         )?;
+        // Старый кэш хранит только текст. У таких записей адрес остаётся неизвестным.
+        let has_placement: bool = transaction.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('sync_messages') WHERE name = 'stream_id')",
+            [], |row| row.get(0),
+        )?;
+        if !has_placement {
+            transaction.execute_batch(
+                "ALTER TABLE sync_messages ADD COLUMN stream_id TEXT;
+                ALTER TABLE sync_messages ADD COLUMN topic_id TEXT;",
+            )?;
+        }
+        transaction.execute_batch("CREATE INDEX IF NOT EXISTS sync_messages_by_placement
+            ON sync_messages (account_id, server, organization_id, project_id, user_id, stream_id, topic_id)")?;
+        transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -198,6 +244,52 @@ impl Storage {
         Ok(read_unread(&connection, owner)?.map(|saved| saved.count))
     }
 
+    /// Удаляет непригодную позицию и зависимые данные владельца одной транзакцией.
+    pub(crate) fn reset_source(
+        &self,
+        owner: &OwnerContext,
+        source: &str,
+    ) -> Result<(), StorageError> {
+        let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner_params = params![
+            owner.account_id.0,
+            owner.server,
+            owner.organization_id,
+            owner.project_id,
+            owner.user_id
+        ];
+        transaction.execute(
+            "DELETE FROM sync_cursors WHERE account_id = ?1 AND server = ?2
+             AND organization_id = ?3 AND project_id = ?4 AND user_id = ?5 AND source = ?6",
+            params![
+                owner.account_id.0,
+                owner.server,
+                owner.organization_id,
+                owner.project_id,
+                owner.user_id,
+                source
+            ],
+        )?;
+        if source == crate::messenger::SOURCE_ID {
+            for table in [
+                "sync_messages",
+                "messenger_notification_targets",
+                "messenger_unread",
+            ] {
+                transaction.execute(
+                    &format!(
+                        "DELETE FROM {table} WHERE account_id = ?1
+                    AND server = ?2 AND organization_id = ?3 AND project_id = ?4 AND user_id = ?5"
+                    ),
+                    owner_params,
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Записывает снимок REST, сохраняя текущую позицию чтения журнала.
     pub(crate) fn apply_unread_baseline(
         &self,
@@ -228,9 +320,7 @@ impl Storage {
         owner: &OwnerContext,
         source: &str,
         cursor: &Cursor,
-        message: Option<&Message>,
-        unread: Option<u32>,
-        notification_conversation: Option<&str>,
+        change: EventWrite<'_>,
     ) -> Result<AppliedEvent, StorageError> {
         let epoch_version = i64::try_from(cursor.epoch_version)
             .map_err(|_| StorageError::CursorVersionOutOfRange)?;
@@ -250,11 +340,15 @@ impl Storage {
             }
         }
 
-        let message_inserted = if let Some(message) = message {
+        if let Some(history) = change.history {
+            apply_history(&transaction, owner, history)?;
+        }
+
+        let message_inserted = if let Some(message) = change.message {
             transaction.execute(
                 "INSERT INTO sync_messages
-                 (account_id, server, organization_id, project_id, user_id, message_id, text)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 (account_id, server, organization_id, project_id, user_id, message_id, text, stream_id, topic_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT (account_id, server, organization_id, project_id, user_id, message_id)
              DO NOTHING",
                 params![
@@ -265,6 +359,8 @@ impl Storage {
                     owner.user_id,
                     message.id,
                     message.text,
+                    change.placement.map(|address| address.stream_id.as_str()).or(change.notification_conversation),
+                    change.placement.map(|address| &address.topic_id),
                 ],
             )? != 0
         } else {
@@ -272,7 +368,8 @@ impl Storage {
         };
         // Цель уведомления доступна вместе с новым сообщением и его курсором.
         if message_inserted
-            && let (Some(message), Some(conversation_id)) = (message, notification_conversation)
+            && let (Some(message), Some(conversation_id)) =
+                (change.message, change.notification_conversation)
         {
             transaction.execute(
                 "INSERT INTO messenger_notification_targets
@@ -289,7 +386,7 @@ impl Storage {
                 ],
             )?;
         }
-        let unread_changed = match unread {
+        let unread_changed = match change.unread {
             Some(count) => write_unread(
                 &transaction,
                 owner,
@@ -325,6 +422,69 @@ impl Storage {
             unread_changed,
         })
     }
+}
+
+/// Обновляет текст или удаляет затронутые строки и связанные цели уведомлений.
+fn apply_history(
+    connection: &Connection,
+    owner: &OwnerContext,
+    history: &HistoryChange,
+) -> Result<(), StorageError> {
+    match history {
+        HistoryChange::Edit { message, placement } => {
+            connection.execute(
+                "UPDATE sync_messages SET text = ?7, stream_id = COALESCE(?8, stream_id), topic_id = COALESCE(?9, topic_id)
+                 WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3 AND project_id = ?4
+                   AND user_id = ?5 AND message_id = ?6",
+                params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id,
+                    message.id, message.text, placement.as_ref().map(|address| &address.stream_id),
+                    placement.as_ref().map(|address| &address.topic_id)],
+            )?;
+            if let Some(address) = placement {
+                connection.execute(
+                    "DELETE FROM messenger_notification_targets WHERE account_id = ?1 AND server = ?2
+                     AND organization_id = ?3 AND project_id = ?4 AND user_id = ?5
+                     AND message_id = ?6 AND conversation_id <> ?7",
+                    params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id,
+                        owner.user_id, message.id, address.stream_id],
+                )?;
+            }
+            return Ok(());
+        }
+        HistoryChange::RemoveMessage(id) => {
+            connection.execute(
+                "DELETE FROM sync_messages WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
+                 AND project_id = ?4 AND user_id = ?5 AND message_id = ?6",
+                params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id, id],
+            )?;
+        }
+        HistoryChange::RemoveStream(_) | HistoryChange::RemoveTopic(_) => {
+            let (stream, topic) = match history {
+                HistoryChange::RemoveStream(id) => (id, None),
+                HistoryChange::RemoveTopic(address) => {
+                    (&address.stream_id, Some(&address.topic_id))
+                }
+                _ => unreachable!(),
+            };
+            // Записи без адреса могли принадлежать отозванному стриму или теме.
+            connection.execute(
+                "DELETE FROM sync_messages WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
+                 AND project_id = ?4 AND user_id = ?5
+                 AND (stream_id IS NULL OR (stream_id = ?6 AND (?7 IS NULL OR topic_id IS NULL OR topic_id = ?7)))",
+                params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id, stream, topic],
+            )?;
+        }
+    }
+    connection.execute(
+        "DELETE FROM messenger_notification_targets AS target WHERE account_id = ?1 AND server = ?2
+         AND organization_id = ?3 AND project_id = ?4 AND user_id = ?5 AND NOT EXISTS (
+             SELECT 1 FROM sync_messages AS message WHERE message.account_id = ?1 AND message.server = ?2
+               AND message.organization_id = ?3 AND message.project_id = ?4 AND message.user_id = ?5
+               AND message.message_id = target.message_id
+         )",
+        params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id],
+    )?;
+    Ok(())
 }
 
 /// Читает число и позицию счётчика в рамках аккаунта и проекта.
@@ -441,7 +601,15 @@ mod tests {
         message: Message,
     ) -> Result<ApplyOutcome, StorageError> {
         storage
-            .apply(owner, source, &cursor, Some(&message), None, None)
+            .apply(
+                owner,
+                source,
+                &cursor,
+                EventWrite {
+                    message: Some(&message),
+                    ..Default::default()
+                },
+            )
             .map(|saved| saved.outcome)
     }
 

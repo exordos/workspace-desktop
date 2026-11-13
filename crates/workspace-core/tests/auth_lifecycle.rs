@@ -548,6 +548,7 @@ fn incoming_with_id(version: u64, id: &str, text: &str) -> Event {
             id: id.into(),
             text: text.into(),
         },
+        placement: None,
     }
 }
 
@@ -646,6 +647,7 @@ fn messenger_updates_are_committed_deduplicated_and_scoped_to_the_session() {
             text: "hello".into(),
         },
         conversation_id: "conversation".into(),
+        placement: None,
     };
     sync.apply(&second, second_generation, "messenger", live(6))
         .unwrap();
@@ -748,6 +750,7 @@ fn notification_target_requires_matching_session_conversation_and_message() {
         Event::MessageCreated {
             cursor: cursor.clone(),
             message: message.clone(),
+            placement: None,
         },
     )
     .unwrap();
@@ -759,6 +762,7 @@ fn notification_target_requires_matching_session_conversation_and_message() {
             cursor,
             message,
             conversation_id: "direct-conversation".into(),
+            placement: None,
         },
     )
     .unwrap();
