@@ -1,10 +1,12 @@
 //! Shared Iced widgets. Callers own application state and handle widget messages.
 
 mod button;
+mod icon;
 mod text_input;
 mod theme;
 
 pub use button::{ButtonAppearance, ButtonOptions, ButtonSize, ButtonVariant, button, button_with};
+pub use icon::{IconName, IconTone, icon};
 pub use text_input::text_input;
 pub use theme::{ThemeMode, workspace_theme};
 

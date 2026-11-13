@@ -27,7 +27,7 @@ pub(super) fn button_colors(theme: &Theme) -> ButtonColors {
             card_active: Color::from_rgb8(0x30, 0x46, 0x5d),
             border_subtle: Color::from_rgb8(0x39, 0x4a, 0x61),
             accent_soft: Color::from_rgb8(0x2f, 0x3f, 0x66),
-            text_muted: Color::from_rgb8(0x74, 0x83, 0x96),
+            text_muted: text_muted(theme),
         }
     } else {
         ButtonColors {
@@ -37,8 +37,16 @@ pub(super) fn button_colors(theme: &Theme) -> ButtonColors {
             card_active: Color::from_rgb8(0xd5, 0xe5, 0xf6),
             border_subtle: Color::from_rgb8(0xd3, 0xdf, 0xec),
             accent_soft: Color::from_rgb8(0xdc, 0xe8, 0xfb),
-            text_muted: Color::from_rgb8(0x8d, 0x9b, 0xae),
+            text_muted: text_muted(theme),
         }
+    }
+}
+
+pub(super) fn text_muted(theme: &Theme) -> Color {
+    if theme.extended_palette().is_dark {
+        Color::from_rgb8(0x74, 0x83, 0x96)
+    } else {
+        Color::from_rgb8(0x8d, 0x9b, 0xae)
     }
 }
 

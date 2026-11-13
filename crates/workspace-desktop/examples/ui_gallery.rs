@@ -1,20 +1,40 @@
 use iced::keyboard::{self, Key, key::Named};
-use iced::widget::{canvas, column, container, operation, row, scrollable, text, toggler};
-use iced::{
-    Color, Element, Event, Fill, Rectangle, Renderer, Subscription, Task, Theme, Vector, event,
-    mouse,
-};
+use iced::widget::{column, container, operation, row, scrollable, text, toggler};
+use iced::{Element, Event, Fill, Subscription, Task, Theme, event};
 use workspace_desktop::ui_kit::{
-    ButtonAppearance, ButtonOptions, ButtonSize, ButtonVariant, ThemeMode, button, button_with,
-    text_input, workspace_theme,
+    ButtonAppearance, ButtonOptions, ButtonSize, ButtonVariant, IconName, IconTone, ThemeMode,
+    button, button_with, icon, text_input, workspace_theme,
 };
 
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum GalleryTab {
+    #[default]
+    Controls,
+    Icons,
+}
+
 struct Gallery {
     dark: bool,
     input: String,
     last_button: Option<&'static str>,
     button_presses: usize,
+    tab: GalleryTab,
+    icon_tone: IconTone,
+    icon_size: u32,
+}
+
+impl Default for Gallery {
+    fn default() -> Self {
+        Self {
+            dark: false,
+            input: String::new(),
+            last_button: None,
+            button_presses: 0,
+            tab: GalleryTab::default(),
+            icon_tone: IconTone::default(),
+            icon_size: 24,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +43,9 @@ enum Message {
     InputChanged(String),
     ButtonPressed(&'static str),
     MoveFocus { backwards: bool },
+    TabChanged(GalleryTab),
+    IconToneChanged(IconTone),
+    IconSizeChanged(u32),
 }
 
 impl Gallery {
@@ -30,6 +53,12 @@ impl Gallery {
         match message {
             Message::ThemeChanged(dark) => self.dark = dark,
             Message::InputChanged(value) => self.input = value,
+            Message::TabChanged(tab) => {
+                self.tab = tab;
+                return operation::snap_to("gallery-content", scrollable::RelativeOffset::START);
+            }
+            Message::IconToneChanged(tone) => self.icon_tone = tone,
+            Message::IconSizeChanged(size) => self.icon_size = size,
             Message::ButtonPressed(label) => {
                 self.last_button = Some(label);
                 self.button_presses += 1;
@@ -64,6 +93,44 @@ impl Gallery {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        let tabs = [
+            ("Компоненты", GalleryTab::Controls),
+            ("Иконки", GalleryTab::Icons),
+        ]
+        .into_iter()
+        .fold(row![].spacing(12), |row, (label, tab)| {
+            row.push(option_button(
+                label,
+                self.tab == tab,
+                Message::TabChanged(tab),
+            ))
+        });
+        let content = match self.tab {
+            GalleryTab::Controls => self.controls(),
+            GalleryTab::Icons => self.icons(),
+        };
+        column![
+            container(
+                column![
+                    text("Workspace UI Kit").size(28),
+                    toggler(self.dark)
+                        .label("Тёмная тема")
+                        .on_toggle(Message::ThemeChanged),
+                    tabs,
+                ]
+                .spacing(16)
+                .max_width(760)
+            )
+            .padding([20, 28])
+            .center_x(Fill),
+            scrollable(container(content).padding([16, 28]).center_x(Fill))
+                .id("gallery-content")
+                .height(Fill),
+        ]
+        .into()
+    }
+
+    fn controls(&self) -> Element<'_, Message> {
         use ButtonAppearance::{Filled, Ghost, Outline};
         use ButtonSize::{Large, Medium, Small};
         use ButtonVariant::{Danger, Neutral, Primary};
@@ -124,14 +191,7 @@ impl Gallery {
                     },
                     Some(Message::ButtonPressed("Загрузка"))
                 ),
-                button_with(
-                    "Добавить",
-                    ButtonOptions {
-                        leading_icon: Some(canvas(PlusIcon).width(12).height(12).into()),
-                        ..ButtonOptions::default()
-                    },
-                    Some(Message::ButtonPressed("Добавить"))
-                ),
+                add_button(),
             ]
             .spacing(12)
             .wrap(),
@@ -164,50 +224,110 @@ impl Gallery {
         .spacing(12)
         .max_width(360);
 
-        let content = column![
-            text("Workspace UI Kit").size(28),
-            toggler(self.dark)
-                .label("Тёмная тема")
-                .on_toggle(Message::ThemeChanged),
-            buttons,
-            inputs,
-        ]
-        .spacing(28)
-        .max_width(760);
+        column![buttons, inputs]
+            .spacing(28)
+            .width(Fill)
+            .max_width(760)
+            .into()
+    }
 
-        scrollable(container(content).padding(28).center_x(Fill)).into()
+    fn icons(&self) -> Element<'_, Message> {
+        let tones = [
+            ("Основной", IconTone::Inherit),
+            ("Приглушённый", IconTone::Muted),
+            ("Акцентный", IconTone::Accent),
+            ("Опасное действие", IconTone::Danger),
+        ]
+        .into_iter()
+        .fold(row![].spacing(8), |row, (label, tone)| {
+            row.push(option_button(
+                label,
+                self.icon_tone == tone,
+                Message::IconToneChanged(tone),
+            ))
+        });
+        let sizes = [("16", 16), ("20", 20), ("24", 24), ("32", 32), ("48", 48)]
+            .into_iter()
+            .fold(row![].spacing(8), |row, (label, size)| {
+                row.push(option_button(
+                    label,
+                    self.icon_size == size,
+                    Message::IconSizeChanged(size),
+                ))
+            });
+        let previews = [
+            ("Plus", IconName::Plus),
+            ("Search", IconName::Search),
+            ("Close", IconName::Close),
+            ("Attach", IconName::Attach),
+        ]
+        .into_iter()
+        .fold(row![].spacing(12), |row, (label, name)| {
+            row.push(
+                container(
+                    column![
+                        container(icon(name, self.icon_size, self.icon_tone))
+                            .center_x(Fill)
+                            .center_y(64),
+                        text(label).size(13),
+                    ]
+                    .align_x(iced::Center),
+                )
+                .width(120)
+                .padding([8, 12])
+                .style(container::rounded_box),
+            )
+        });
+
+        column![
+            column![text("Цвет"), tones.wrap()].spacing(8),
+            column![text("Размер, px"), sizes.wrap()].spacing(8),
+            previews.wrap(),
+            column![
+                text("В кнопке · 16 px · цвет подписи").size(14),
+                add_button()
+            ]
+            .spacing(8),
+            text(format!("Нажатий на кнопки: {}", self.button_presses)).size(14),
+        ]
+        .width(Fill)
+        .max_width(760)
+        .spacing(20)
+        .into()
     }
 }
 
-struct PlusIcon;
+fn option_button(
+    label: &'static str,
+    selected: bool,
+    message: Message,
+) -> Element<'static, Message> {
+    let (variant, appearance) = if selected {
+        (ButtonVariant::Primary, ButtonAppearance::Filled)
+    } else {
+        (ButtonVariant::Neutral, ButtonAppearance::Outline)
+    };
+    button_with(
+        label,
+        ButtonOptions {
+            variant,
+            appearance,
+            size: ButtonSize::Small,
+            ..ButtonOptions::default()
+        },
+        Some(message),
+    )
+}
 
-impl canvas::Program<Message> for PlusIcon {
-    type State = ();
-
-    fn draw(
-        &self,
-        _state: &(),
-        renderer: &Renderer,
-        _theme: &Theme,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Vec<canvas::Geometry> {
-        let mut frame = canvas::Frame::new(renderer, bounds.size());
-        let center = frame.center();
-        let path = canvas::Path::new(|path| {
-            path.move_to(center - Vector::new(4.0, 0.0));
-            path.line_to(center + Vector::new(4.0, 0.0));
-            path.move_to(center - Vector::new(0.0, 4.0));
-            path.line_to(center + Vector::new(0.0, 4.0));
-        });
-        frame.stroke(
-            &path,
-            canvas::Stroke::default()
-                .with_width(1.5)
-                .with_color(Color::from_rgb8(0x10, 0x1a, 0x28)),
-        );
-        vec![frame.into_geometry()]
-    }
+fn add_button() -> Element<'static, Message> {
+    button_with(
+        "Добавить",
+        ButtonOptions {
+            leading_icon: Some(icon(IconName::Plus, 16, IconTone::Inherit)),
+            ..ButtonOptions::default()
+        },
+        Some(Message::ButtonPressed("Добавить")),
+    )
 }
 
 fn main() -> iced::Result {
