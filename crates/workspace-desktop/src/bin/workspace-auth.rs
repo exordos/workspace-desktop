@@ -1,0 +1,201 @@
+use std::error::Error;
+use std::process::ExitCode;
+
+const USAGE: &str = "Usage: workspace-auth <command>\n\
+  login <https://workspace-server>   Sign in and select a project\n\
+  status                            Restore and list saved accounts\n\
+  verify <account-id>               Verify access to Workspace Messenger\n\
+  logout <account-id>               Sign out locally and delete the saved secret";
+
+fn main() -> ExitCode {
+    let arguments: Vec<_> = std::env::args().skip(1).collect();
+    match run(&arguments) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    match arguments {
+        [] => println!("{USAGE}"),
+        [help] if help == "--help" || help == "-h" || help == "help" => println!("{USAGE}"),
+        _ => platform::run(arguments)?,
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+mod platform {
+    pub(super) fn run(_: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+        Err("workspace-auth requires macOS Keychain".into())
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod platform {
+    use std::error::Error;
+    use std::io::{self, IsTerminal, Write};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use futures::executor::block_on;
+    use workspace_core::auth::{Auth, AuthError, IamError, Service, SessionStatus};
+    use workspace_core::context::AccountId;
+    use workspace_core::iam_http::WorkspaceIamHttp;
+    use workspace_desktop::platform::{JsonAccountStore, MacKeychain};
+
+    enum Command<'a> {
+        Login(&'a str),
+        Status,
+        Verify(AccountId),
+        Logout(AccountId),
+    }
+
+    pub(super) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+        let command = match arguments {
+            [name, server] if name == "login" => Command::Login(server),
+            [name] if name == "status" => Command::Status,
+            [name, id] if name == "verify" => Command::Verify(AccountId(id.clone())),
+            [name, id] if name == "logout" => Command::Logout(AccountId(id.clone())),
+            _ => return Err(super::USAGE.into()),
+        };
+        let iam = Arc::new(WorkspaceIamHttp::new());
+        let accounts = Arc::new(JsonAccountStore::open(&state_directory()?)?);
+        let auth = Auth::new(iam.clone(), accounts, Arc::new(MacKeychain));
+
+        match command {
+            Command::Login(server) => login(&auth, server)?,
+            Command::Status => {
+                block_on(auth.restore())?;
+                let sessions = auth.snapshot();
+                if sessions.is_empty() {
+                    println!("No saved Workspace accounts.");
+                }
+                for session in sessions {
+                    let context = session.context;
+                    println!(
+                        "{}  {}  project={}  {}",
+                        context.account_id.0.escape_debug(),
+                        context.server.escape_debug(),
+                        context.project_id.escape_debug(),
+                        status_label(session.status),
+                    );
+                }
+            }
+            Command::Verify(id) => {
+                block_on(auth.restore())?;
+                let session = auth
+                    .snapshot()
+                    .into_iter()
+                    .find(|session| session.context.account_id == id)
+                    .ok_or("Workspace account not found")?;
+                if session.status != SessionStatus::Active {
+                    return Err(
+                        format!("Workspace session is {}", status_label(session.status)).into(),
+                    );
+                }
+                let context = session.context;
+                let token = block_on(auth.access_token(&context, Service::Messenger))?;
+                iam.verify_messenger(&context, &token)?;
+                println!("Workspace Messenger accepted the project's credentials.");
+            }
+            Command::Logout(id) => {
+                auth.logout(&id)?;
+                println!("Workspace account signed out locally.");
+            }
+        }
+        Ok(())
+    }
+
+    fn state_directory() -> Result<PathBuf, Box<dyn Error>> {
+        if let Some(directory) = std::env::var_os("WORKSPACE_AUTH_STATE_DIR") {
+            if directory.is_empty() {
+                return Err("WORKSPACE_AUTH_STATE_DIR must name a directory".into());
+            }
+            return Ok(PathBuf::from(directory));
+        }
+        let home = std::env::var_os("HOME").ok_or("Home directory unavailable")?;
+        Ok(PathBuf::from(home).join("Library/Application Support/Workspace Desktop/auth"))
+    }
+
+    fn login(auth: &Auth, server: &str) -> Result<(), Box<dyn Error>> {
+        if !io::stdin().is_terminal() {
+            return Err("Workspace login requires an interactive terminal".into());
+        }
+        let login = prompt("Login: ")?;
+        let password = rpassword::prompt_password("Password: ")?;
+        let attempt = match auth.begin_login(server, &login, &password, None) {
+            Err(AuthError::Iam(IamError::OtpRequired)) => {
+                let otp = rpassword::prompt_password("One-time password: ")?;
+                auth.begin_login(server, &login, &password, Some(&otp))?
+            }
+            result => result?,
+        };
+        drop(password);
+
+        if attempt.projects.is_empty() {
+            auth.cancel_login(attempt.id);
+            return Err("IAM returned no available projects".into());
+        }
+
+        for (index, project) in attempt.projects.iter().enumerate() {
+            println!(
+                "{}. {} ({})",
+                index + 1,
+                project.name.escape_debug(),
+                project.id.escape_debug(),
+            );
+        }
+        let selected = prompt("Project number (empty to cancel): ").and_then(|number| {
+            if number.is_empty() {
+                return Ok(None);
+            }
+            let index = number
+                .parse::<usize>()
+                .ok()
+                .and_then(|number| number.checked_sub(1));
+            index
+                .and_then(|index| attempt.projects.get(index))
+                .map(Some)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "Invalid project number")
+                })
+        });
+        let context = match selected {
+            Ok(Some(project)) => auth.complete_login(attempt.id, &project.id),
+            selection => {
+                auth.cancel_login(attempt.id);
+                selection?;
+                println!("Workspace login cancelled.");
+                return Ok(());
+            }
+        }?;
+        println!(
+            "Signed in to project {} as account {}.",
+            context.project_id.escape_debug(),
+            context.account_id.0.escape_debug(),
+        );
+        Ok(())
+    }
+
+    fn prompt(message: &str) -> io::Result<String> {
+        eprint!("{message}");
+        io::stderr().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        Ok(input.trim().to_owned())
+    }
+
+    fn status_label(status: SessionStatus) -> &'static str {
+        match status {
+            SessionStatus::Restoring => "restoring",
+            SessionStatus::Active => "active",
+            SessionStatus::TemporarilyUnavailable => "temporarily unavailable",
+            SessionStatus::ReauthenticationRequired => "sign in required",
+            SessionStatus::SigningOut => "sign-out pending",
+        }
+    }
+}
