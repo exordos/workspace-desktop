@@ -140,6 +140,25 @@ impl Auth {
         self.inner.publication.lock().unwrap().snapshot()
     }
 
+    /// Runs a synchronous commit under the same account lock as session revocation.
+    /// The callback must not call back into authentication or perform network I/O.
+    pub(crate) fn with_active_generation<T>(
+        &self,
+        context: &OwnerContext,
+        generation: SessionGeneration,
+        commit: impl FnOnce() -> T,
+    ) -> Result<T, AuthError> {
+        let slot = self.account_slot(&context.account_id)?;
+        let state = slot.lock().unwrap();
+        if state.generation != generation
+            || state.status != SessionStatus::Active
+            || state.record.as_ref().map(|record| &record.context) != Some(context)
+        {
+            return Err(AuthError::SessionUnavailable);
+        }
+        Ok(commit())
+    }
+
     pub fn subscribe(&self) -> impl Stream<Item = Vec<SessionSnapshot>> + use<> {
         let (mut sender, receiver) = async_mpsc::channel(1);
         let mut publication = self.inner.publication.lock().unwrap();
@@ -369,6 +388,16 @@ impl Auth {
             .entry(account_id.clone())
             .or_insert_with(|| Arc::new(Mutex::new(AccountState::new(None))))
             .clone()
+    }
+
+    fn account_slot(&self, account_id: &AccountId) -> Result<Arc<Mutex<AccountState>>, AuthError> {
+        self.inner
+            .slots
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .cloned()
+            .ok_or(AuthError::SessionUnavailable)
     }
 
     fn load_accounts(&self) -> Result<(), AuthError> {

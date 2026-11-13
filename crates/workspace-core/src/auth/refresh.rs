@@ -91,18 +91,22 @@ impl Auth {
     pub async fn access_token(
         &self,
         context: &OwnerContext,
-        _service: Service,
+        service: Service,
     ) -> Result<String, AuthError> {
         self.load_accounts()?;
-        let slot = self
-            .inner
-            .slots
-            .lock()
-            .unwrap()
-            .get(&context.account_id)
-            .cloned()
-            .ok_or(AuthError::SessionUnavailable)?;
+        let slot = self.account_slot(&context.account_id)?;
         let generation = slot.lock().unwrap().generation;
+        self.access_token_for_generation(context, service, generation)
+            .await
+    }
+
+    pub(crate) async fn access_token_for_generation(
+        &self,
+        context: &OwnerContext,
+        _service: Service,
+        generation: SessionGeneration,
+    ) -> Result<String, AuthError> {
+        let slot = self.account_slot(&context.account_id)?;
         loop {
             let (flight, valid_token) = {
                 let mut state = slot.lock().unwrap();

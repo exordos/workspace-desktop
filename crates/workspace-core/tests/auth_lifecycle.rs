@@ -7,12 +7,17 @@ use std::task::Context;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use futures::future::BoxFuture;
 use futures::{StreamExt, executor::block_on, task::noop_waker_ref};
+use tokio::sync::{mpsc as async_mpsc, oneshot};
 use workspace_core::auth::{
     AccountRecord, AccountStore, Auth, AuthError, Clock, IamClient, IamError, IamProject, IamToken,
     SecretStore, Service, SessionStatus, StoreError,
 };
 use workspace_core::context::{AccountId, OwnerContext};
+use workspace_core::runtime::{EventSource, EventStream, Runtime, SourceError, SourceSession};
+use workspace_core::storage::{Cursor, Message, Storage};
+use workspace_core::sync::{Event, Sync as EventSync};
 
 const SERVER: &str = "https://workspace.test";
 
@@ -460,4 +465,244 @@ fn slow_subscriber_receives_latest_snapshot_without_secrets() {
     let latest = block_on(changes.next()).unwrap();
     assert_eq!(latest.len(), 1);
     assert_eq!(latest[0].context, b);
+}
+
+type TestConnection = (
+    SourceSession,
+    async_mpsc::Sender<Result<Event, SourceError>>,
+);
+
+struct TestSource(async_mpsc::UnboundedSender<TestConnection>);
+
+impl EventSource for TestSource {
+    fn id(&self) -> &str {
+        "messenger"
+    }
+
+    fn connect(&self, session: SourceSession) -> BoxFuture<'_, Result<EventStream, SourceError>> {
+        Box::pin(async move {
+            let (send, receive) = async_mpsc::channel(4);
+            self.0.send((session, send)).map_err(|_| SourceError)?;
+            let stream = futures::stream::unfold(receive, |mut receive| async move {
+                receive.recv().await.map(|event| (event, receive))
+            });
+            Ok(Box::pin(stream) as EventStream)
+        })
+    }
+}
+
+fn incoming(version: u64, text: &str) -> Event {
+    Event {
+        cursor: Cursor {
+            epoch_generation: "test-epoch".into(),
+            epoch_version: version,
+        },
+        message: Message {
+            id: "shared-message-id".into(),
+            text: text.into(),
+        },
+    }
+}
+
+async fn wait_for(test: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !test() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("condition did not become true");
+}
+
+#[tokio::test]
+async fn runtime_tracks_two_accounts_and_resumes_from_the_committed_cursor() {
+    let fixture = Fixture::new(|user, _| Ok(project_token(user, "refreshed", None)));
+    let directory = tempfile::tempdir().unwrap();
+    let db_path = directory.path().join("sync.sqlite3");
+    let storage = Arc::new(Storage::open(&db_path).unwrap());
+    let sync = Arc::new(EventSync::new(fixture.auth.clone(), storage.clone()));
+    let (connections, mut receive) = async_mpsc::unbounded_channel();
+    let runtime = Runtime::new(sync.clone(), vec![Arc::new(TestSource(connections))]).unwrap();
+    let (shutdown, stopped) = oneshot::channel();
+    let worker = tokio::spawn(runtime.run(async {
+        let _ = stopped.await;
+    }));
+
+    let a = fixture.login("a");
+    let b = fixture.login("b");
+    let mut connected = HashMap::new();
+    for _ in 0..2 {
+        let (session, send) = tokio::time::timeout(Duration::from_secs(5), receive.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.access_token, "sign-in");
+        assert!(session.cursor.is_none());
+        assert!(
+            connected
+                .insert(session.context.account_id, (session.generation, send))
+                .is_none()
+        );
+    }
+    let (generation_a, send_a) = connected.remove(&a.account_id).unwrap();
+    let (generation_b, send_b) = connected.remove(&b.account_id).unwrap();
+    let event_a = incoming(4, "for A");
+    let event_b = incoming(7, "for B");
+    send_a.send(Ok(event_a.clone())).await.unwrap();
+    send_b.send(Ok(event_b.clone())).await.unwrap();
+    wait_for(|| {
+        sync.cursor(&a, "messenger").unwrap().as_ref() == Some(&event_a.cursor)
+            && sync.cursor(&b, "messenger").unwrap().as_ref() == Some(&event_b.cursor)
+    })
+    .await;
+    assert_eq!(
+        storage.message(&a, &event_a.message.id).unwrap(),
+        Some(event_a.message.clone())
+    );
+    assert_eq!(
+        storage.message(&b, &event_b.message.id).unwrap(),
+        Some(event_b.message.clone())
+    );
+
+    let mut next_a = incoming(5, "next A");
+    next_a.message.id = "next-message-id".into();
+    let fault = rusqlite::Connection::open(&db_path).unwrap();
+    fault
+        .execute_batch(
+            "CREATE TRIGGER fail_cursor BEFORE UPDATE ON sync_cursors
+         WHEN NEW.epoch_version = 5
+         BEGIN SELECT RAISE(ABORT, 'test cursor write failure'); END;",
+        )
+        .unwrap();
+    assert!(matches!(
+        sync.apply(&a, generation_a, "messenger", next_a.clone()),
+        Err(workspace_core::sync::SyncError::Storage(_)),
+    ));
+    assert_eq!(storage.message(&a, &next_a.message.id).unwrap(), None);
+    assert_eq!(
+        sync.cursor(&a, "messenger").unwrap().as_ref(),
+        Some(&event_a.cursor)
+    );
+    assert_eq!(
+        sync.cursor(&b, "messenger").unwrap().as_ref(),
+        Some(&event_b.cursor)
+    );
+    fault.execute_batch("DROP TRIGGER fail_cursor").unwrap();
+
+    fixture.clock.advance(110);
+    assert_eq!(
+        fixture
+            .auth
+            .access_token(&a, Service::Messenger)
+            .await
+            .unwrap(),
+        "refreshed"
+    );
+    let (reconnected, send_a_new) = tokio::time::timeout(Duration::from_secs(5), receive.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reconnected.context, a);
+    assert_eq!(reconnected.generation, generation_a);
+    assert_eq!(reconnected.cursor.as_ref(), Some(&event_a.cursor));
+    assert_eq!(reconnected.access_token, "refreshed");
+    assert!(send_a.is_closed());
+    assert!(!send_b.is_closed());
+
+    fixture.auth.logout(&b.account_id).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), send_b.closed())
+        .await
+        .unwrap();
+    assert!(!send_a_new.is_closed());
+
+    assert_eq!(fixture.login("b"), b);
+    let (restored_b, send_b_new) = tokio::time::timeout(Duration::from_secs(5), receive.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored_b.context, b);
+    assert_ne!(restored_b.generation, generation_b);
+    assert_eq!(restored_b.cursor.as_ref(), Some(&event_b.cursor));
+
+    let mut stale_b = incoming(8, "stale B");
+    stale_b.message.id = "stale-message-id".into();
+    assert!(matches!(
+        sync.apply(&b, generation_b, "messenger", stale_b.clone()),
+        Err(workspace_core::sync::SyncError::Auth(
+            AuthError::SessionUnavailable
+        )),
+    ));
+    send_a_new.send(Ok(next_a.clone())).await.unwrap();
+    wait_for(|| sync.cursor(&a, "messenger").unwrap().as_ref() == Some(&next_a.cursor)).await;
+
+    shutdown.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(send_a_new.is_closed());
+    assert!(send_b_new.is_closed());
+    let reopened = Storage::open(&db_path).unwrap();
+    assert_eq!(
+        reopened.message(&a, &next_a.message.id).unwrap(),
+        Some(next_a.message)
+    );
+    assert_eq!(
+        reopened.message(&b, &event_b.message.id).unwrap(),
+        Some(event_b.message)
+    );
+    assert_eq!(
+        reopened.cursor(&a, "messenger").unwrap(),
+        Some(next_a.cursor)
+    );
+    assert_eq!(
+        reopened.cursor(&b, "messenger").unwrap(),
+        Some(event_b.cursor)
+    );
+    assert_eq!(reopened.message(&b, &stale_b.message.id).unwrap(), None);
+}
+
+#[tokio::test]
+async fn runtime_recovers_after_temporary_iam_failure_on_reconnect() {
+    let fixture = Fixture::new(|user, attempt| {
+        if attempt == 1 {
+            Err(IamError::Temporary)
+        } else {
+            Ok(project_token(user, "recovered", None))
+        }
+    });
+    let owner = fixture.login("a");
+    let storage = Arc::new(Storage::in_memory().unwrap());
+    let sync = Arc::new(EventSync::new(fixture.auth.clone(), storage));
+    let (connections, mut receive) = async_mpsc::unbounded_channel();
+    let runtime = Runtime::new(sync, vec![Arc::new(TestSource(connections))]).unwrap();
+    let (shutdown, stopped) = oneshot::channel();
+    let worker = tokio::spawn(runtime.run(async {
+        let _ = stopped.await;
+    }));
+
+    let (initial, stream) = tokio::time::timeout(Duration::from_secs(5), receive.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    fixture.clock.advance(121);
+    drop(stream);
+    wait_for(|| fixture.auth.snapshot()[0].status == SessionStatus::TemporarilyUnavailable).await;
+    fixture.clock.advance(3);
+
+    let (reconnected, _stream) = tokio::time::timeout(Duration::from_secs(5), receive.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reconnected.context, owner);
+    assert_eq!(reconnected.generation, initial.generation);
+    assert!(reconnected.token_version > initial.token_version);
+    assert_eq!(reconnected.access_token, "recovered");
+    shutdown.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }
