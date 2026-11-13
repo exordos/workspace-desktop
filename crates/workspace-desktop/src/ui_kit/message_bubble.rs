@@ -2,10 +2,11 @@
 //! затем расположение автора, текста, времени и отметки доставки.
 
 use iced::advanced::renderer::{self, Renderer as _};
+use iced::advanced::text::Renderer as TextRenderer;
 use iced::advanced::widget::{Operation, Tree};
 use iced::advanced::{Layout, Widget, layout};
 use iced::widget::text::{Style, Wrapping};
-use iced::widget::{pin, row, space, stack, text};
+use iced::widget::{row, space, text};
 use iced::{
     Border, Color, Element, Font, Length, Pixels, Point, Rectangle, Renderer, Size, Theme, font,
     mouse,
@@ -18,7 +19,7 @@ const HORIZONTAL_PADDING: f32 = 12.0;
 const VERTICAL_PADDING: f32 = 8.0;
 const BODY_HEIGHT: f32 = 20.0;
 const META_HEIGHT: f32 = 16.0;
-const INLINE_GAP: f32 = 12.0;
+const INLINE_GAP: f32 = 8.0;
 const STACKED_GAP: f32 = 4.0;
 
 /// Определяет фон пузыря и возможность показать состояние доставки.
@@ -39,6 +40,7 @@ pub enum MessageDelivery {
 }
 
 /// Показывает текст, время и, для исходящего сообщения, отметку доставки.
+/// Время передаётся уже отформатированной короткой подписью.
 /// Размещение пузыря слева или справа задаёт вызывающий экран.
 pub fn message_bubble<'a, Message: 'a>(
     body: &'a str,
@@ -91,25 +93,14 @@ pub fn message_bubble<'a, Message: 'a>(
 
 /// Собирает отметку доставки из иконок Workspace.
 fn delivery_mark<'a, Message: 'a>(delivery: MessageDelivery) -> Element<'a, Message> {
-    match delivery {
-        MessageDelivery::Sending => icon(IconName::Schedule, 14, IconTone::Muted, None),
-        MessageDelivery::Sent => icon(IconName::Check, 14, IconTone::Muted, None),
-        MessageDelivery::Failed => icon(IconName::Warning, 14, IconTone::Danger, None),
-        MessageDelivery::Delivered | MessageDelivery::Read => {
-            let tone = if delivery == MessageDelivery::Read {
-                IconTone::Accent
-            } else {
-                IconTone::Muted
-            };
-            let tick = || icon(IconName::Check, 11, tone, None);
-            stack![
-                space().width(15).height(14),
-                pin(tick()).y(2),
-                pin(tick()).x(4).y(2),
-            ]
-            .into()
-        }
-    }
+    let (name, tone) = match delivery {
+        MessageDelivery::Sending => (IconName::Schedule, IconTone::Muted),
+        MessageDelivery::Sent => (IconName::Check, IconTone::Muted),
+        MessageDelivery::Delivered => (IconName::DoneAll, IconTone::Muted),
+        MessageDelivery::Read => (IconName::DoneAll, IconTone::Accent),
+        MessageDelivery::Failed => (IconName::Error, IconTone::Danger),
+    };
+    icon(name, 16, tone, None)
 }
 
 /// Возвращает фон входящего или исходящего сообщения из палитры Blue Mist.
@@ -154,7 +145,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Bubble<'_, Message> {
         Size::new(Length::Shrink, Length::Shrink)
     }
 
-    /// Помещает время справа от короткого текста или под многострочным сообщением.
+    /// Помещает время справа от последней строки, если хватает места.
     fn layout(
         &mut self,
         tree: &mut Tree,
@@ -182,20 +173,42 @@ impl<Message> Widget<Message, Theme, Renderer> for Bubble<'_, Message> {
             0.0
         };
         let body_bottom = body_y + body.size().height;
-        let inline_width = body.size().width + INLINE_GAP + meta.size().width;
-        let inline = body.size().height <= BODY_HEIGHT && inline_width <= available.max().width;
-        let body_meta_width = if inline {
+        // Берём последнюю строку раскладки Iced. Она учитывает переносы, шрифт и направление текста.
+        let last_line = tree.children[1]
+            .state
+            .downcast_ref::<iced::widget::text::State<<Renderer as TextRenderer>::Paragraph>>()
+            .raw()
+            .buffer()
+            .layout_runs()
+            .last();
+        let last_line_right = last_line.as_ref().map_or(0.0, |line| {
+            line.glyphs
+                .iter()
+                .map(|glyph| glyph.x + glyph.w)
+                .fold(0.0, f32::max)
+        });
+        let has_gap = last_line_right > 0.0 && meta.size().width > 0.0;
+        let gap = if has_gap { INLINE_GAP } else { 0.0 };
+        let inline_width = last_line_right.ceil() + gap + meta.size().width;
+        let line_height = last_line
+            .as_ref()
+            .map_or(BODY_HEIGHT, |line| line.line_height);
+        let inline = inline_width <= available.max().width && meta.size().height <= line_height;
+        let body_meta_width = body.size().width.max(if inline {
             inline_width
         } else {
-            body.size().width.max(meta.size().width)
-        };
+            meta.size().width
+        });
         let width = author
             .size()
             .width
             .max(body_meta_width)
             .max(available.min().width);
         let meta_y = if inline {
-            (body_bottom - meta.size().height).max(body_y)
+            let line_bottom = last_line
+                .as_ref()
+                .map_or(0.0, |line| line.line_top + line.line_height);
+            body_y + (line_bottom - meta.size().height).max(0.0)
         } else {
             body_bottom + STACKED_GAP
         };
@@ -358,10 +371,10 @@ mod tests {
         assert!(status.width > time.width);
     }
 
-    /// Несколько строк и длинное слово укладываются по ширине, время идёт ниже текста.
+    /// Длинное слово переносится, а время помещается справа от короткой последней строки.
     #[test]
-    fn multiline_message_keeps_meta_below_wrapped_body() {
-        let body = "Первая строка\nДлинноеСловоДлинноеСловоДлинноеСловоДлинноеСлово";
+    fn multiline_message_keeps_meta_on_the_last_line_when_it_fits() {
+        let body = "ДлинноеСловоДлинноеСловоДлинноеСловоДлинноеСлово\nДа";
         let rendered = RenderedText::measure(
             message_bubble(body, None, "12:34", MessageDirection::Incoming),
             180.0,
@@ -370,7 +383,23 @@ mod tests {
         let time = rendered.bounds("12:34");
         assert!(body.height > BODY_HEIGHT * 2.0);
         assert!(body.x + body.width <= 180.0 - HORIZONTAL_PADDING + 1.0);
-        assert!(time.y > body.y + body.height);
+        assert!(time.x > body.x + 50.0);
+        assert_eq!(time.y + time.height, body.y + body.height);
         assert_eq!(rendered.0.len(), 2);
+    }
+
+    /// Если последняя строка занимает почти всю ширину, время переносится вниз целиком.
+    #[test]
+    fn full_last_line_pushes_time_below_body() {
+        let body = "Да\nДлинное слово";
+        let rendered = RenderedText::measure(
+            message_bubble(body, None, "12:34", MessageDirection::Incoming),
+            139.0,
+        );
+        let body = rendered.bounds(body);
+        let time = rendered.bounds("12:34");
+        assert_eq!(body.height, BODY_HEIGHT * 2.0);
+        assert!(time.y > body.y + body.height);
+        assert!(time.x + time.width <= 139.0 - HORIZONTAL_PADDING + 1.0);
     }
 }

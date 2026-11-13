@@ -27,6 +27,16 @@ const SELECTOR_EXAMPLES: [(FieldSize, &str); 2] = [
     (FieldSize::Regular, "timezone-input-regular"),
 ];
 
+const LONG_MESSAGE_DRAFT: &str = concat!(
+    "Посмотри, пожалуйста, варианты интерфейса.\n",
+    "Проверь светлую и тёмную темы.\n",
+    "Открой узкое окно и попробуй отправить сообщение.\n",
+    "Убедись, что длинный текст не перекрывает кнопки.\n",
+    "Сравни отступы в коротком и многострочном сообщении.\n",
+    "Когда закончишь, напиши, что стоит поправить.\n",
+    "Спасибо!",
+);
+
 /// Хранит значения полей для одного размера.
 struct FieldExample {
     title: String, // Название темы в примере с проверкой.
@@ -146,6 +156,7 @@ enum Message {
     ListboxValueChanged(String),           // Значение из отдельного примера списка.
     ComposerEdited(text_editor::Action),   // Действие редактирования в поле сообщения.
     ComposerSent,                          // Отправка демонстрационного черновика.
+    ComposerDraftLoaded,                   // Загрузка длинного текста для проверки редактора.
 }
 
 impl Gallery {
@@ -167,6 +178,7 @@ impl Gallery {
             Message::SuggestionInputChanged(index, value) => self.selectors[index].value = value,
             Message::ListboxValueChanged(value) => self.listbox_value = value,
             Message::ComposerEdited(action) => self.composer.perform(action),
+            Message::ComposerDraftLoaded => self.composer = Content::with_text(LONG_MESSAGE_DRAFT),
             Message::ComposerSent => {
                 self.sent_preview = Some(self.composer.text());
                 self.composer = Content::new();
@@ -762,30 +774,44 @@ impl Gallery {
 
     /// Показывает короткое и длинное сообщение, статусы доставки и отправку черновика.
     fn messages(&self) -> Element<'_, Message> {
-        use MessageDelivery::{Failed, Read, Sending, Sent};
+        use MessageDelivery::{Delivered, Failed, Read, Sending, Sent};
         use MessageDirection::{Incoming, Outgoing};
 
-        let mut bubbles = column![
-            message_bubble(
-                "Посмотри макет, когда будет время.",
-                Some("Саша"),
-                "12:05",
-                Incoming,
-            ),
-            container(message_bubble(
-                "Посмотрю сегодня. Сначала проверю, как список читается в узком окне, затем сравню светлую и тёмную темы.",
-                None,
-                "12:07",
-                Outgoing(Some(Read)),
-            ))
-            .align_right(Fill),
-            container(message_bubble("Ещё есть пара вопросов.", None, "12:08", Outgoing(Some(Failed))))
-                .align_right(Fill),
-            container(message_bubble("Сейчас пришлю примеры.", None, "12:09", Outgoing(Some(Sending))))
-                .align_right(Fill),
-        ]
+        let mut bubbles = column![message_bubble(
+            "Посмотри макет, когда будет время.",
+            Some("Саша"),
+            "12:05",
+            Incoming,
+        )]
         .spacing(10)
         .width(Fill);
+
+        for (body, time, delivery, max_width) in [
+            (
+                "Сначала проверю, как список читается в узком окне, затем сравню светлую и тёмную темы.\nНачну сегодня.",
+                "12:07",
+                Read,
+                500,
+            ),
+            (
+                "Если окно узкое, у времени может не хватить места.\nПрикреплю небольшой пример.",
+                "12:08",
+                Delivered,
+                245,
+            ),
+            ("Добавил комментарии.", "12:09", Sent, 500),
+            ("Пришлю ещё один пример.", "12:10", Sending, 500),
+            (
+                "На этой строке произошла ошибка отправки.",
+                "12:11",
+                Failed,
+                500,
+            ),
+        ] {
+            let bubble = container(message_bubble(body, None, time, Outgoing(Some(delivery))))
+                .max_width(max_width);
+            bubbles = bubbles.push(container(bubble).align_right(Fill));
+        }
 
         if let Some(body) = self.sent_preview.as_deref() {
             bubbles = bubbles.push(
@@ -795,15 +821,33 @@ impl Gallery {
         }
         let composer = message_composer(
             &self.composer,
-            MessageComposerOptions::default(),
+            MessageComposerOptions {
+                leading: Some(composer_slot(IconName::Attach)),
+                trailing: Some(composer_slot(IconName::ComposerEmoji)),
+                ..MessageComposerOptions::default()
+            },
             Some(Message::ComposerEdited),
             Some(Message::ComposerSent),
         );
-        column![text("Пузыри и редактор").size(20), bubbles, composer]
-            .spacing(16)
-            .width(Fill)
-            .max_width(600)
-            .into()
+        column![
+            row![
+                text("Сообщения").size(20),
+                button(
+                    "Длинный черновик",
+                    ButtonVariant::Neutral,
+                    Some(Message::ComposerDraftLoaded),
+                ),
+            ]
+            .spacing(12)
+            .align_y(iced::Center)
+            .wrap(),
+            composer,
+            bubbles,
+        ]
+        .spacing(16)
+        .width(Fill)
+        .max_width(600)
+        .into()
     }
 
     /// Показывает каталог SVG с поиском и выбором размера, формы и цвета.
@@ -955,6 +999,13 @@ fn add_button() -> Element<'static, Message> {
         },
         Some(Message::ButtonPressed("Добавить")),
     )
+}
+
+/// Показывает иконку действия редактора в слоте шириной 32 px.
+fn composer_slot(name: IconName) -> Element<'static, Message> {
+    container(icon(name, 24, IconTone::Muted, None))
+        .center(32)
+        .into()
 }
 
 /// Создаёт тестовое изображение для проверки круглой обрезки и масштабирования.
