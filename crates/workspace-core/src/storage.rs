@@ -1,6 +1,14 @@
 //! Хранит сообщения, счётчики и позиции чтения в SQLite.
 //! Сначала описаны данные и таблицы, затем чтение и запись.
 
+mod history;
+
+pub(crate) use history::HistoryPageGuard;
+pub use history::{
+    HistoryDirection, HistoryEdge, HistoryMessage, HistoryMetadata, HistoryPageEdges,
+    HistoryPageOutcome, HistoryPageTarget, HistoryScope, HistoryTime, HistoryWindow,
+};
+
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -46,6 +54,7 @@ pub enum HistoryChange {
 #[derive(Default)]
 pub(crate) struct EventWrite<'a> {
     pub message: Option<&'a Message>,               // Новое сообщение.
+    pub metadata: Option<&'a HistoryMetadata>,      // Автор и серверное время нового сообщения.
     pub placement: Option<&'a MessagePlacement>,    // Стрим и тема нового сообщения.
     pub unread: Option<u32>,                        // Подтверждённый счётчик.
     pub notification_conversation: Option<&'a str>, // Разговор для цели баннера.
@@ -82,6 +91,8 @@ pub enum StorageError {
     CursorVersionOutOfRange, // Номер позиции нельзя представить в допустимом диапазоне SQLite.
     #[error("the storage connection lock is poisoned")]
     Poisoned, // Доступ к соединению потерян после паники под блокировкой.
+    #[error("invalid messenger history page")]
+    InvalidHistoryPage, // Страница не подходит по области, направлению или формату.
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error), // Исходная ошибка SQLite.
 }
@@ -104,6 +115,7 @@ impl Storage {
 
     /// Подготавливает таблицы сообщений, счётчиков и позиций для переданного соединения.
     fn initialize(mut connection: Connection) -> Result<Self, StorageError> {
+        connection.pragma_update(None, "foreign_keys", true)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS sync_cursors (
@@ -164,6 +176,7 @@ impl Storage {
         }
         transaction.execute_batch("CREATE INDEX IF NOT EXISTS sync_messages_by_placement
             ON sync_messages (account_id, server, organization_id, project_id, user_id, stream_id, topic_id)")?;
+        history::initialize(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -272,6 +285,7 @@ impl Storage {
             ],
         )?;
         if source == crate::messenger::SOURCE_ID {
+            history::reset(&transaction, owner)?;
             for table in [
                 "sync_messages",
                 "messenger_notification_targets",
@@ -340,15 +354,19 @@ impl Storage {
             }
         }
 
-        if let Some(history) = change.history {
+        if let Some(history) = change.history
+            && history::before_change(&transaction, owner, history)?
+        {
             apply_history(&transaction, owner, history)?;
         }
 
-        let message_inserted = if let Some(message) = change.message {
-            transaction.execute(
+        let message_inserted = if let Some(message) = change.message
+            && history::can_create(&transaction, owner, &message.id)?
+        {
+            let inserted = transaction.execute(
                 "INSERT INTO sync_messages
-                 (account_id, server, organization_id, project_id, user_id, message_id, text, stream_id, topic_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 (account_id, server, organization_id, project_id, user_id, message_id, text, stream_id, topic_id, author_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT (account_id, server, organization_id, project_id, user_id, message_id)
              DO NOTHING",
                 params![
@@ -361,8 +379,21 @@ impl Storage {
                     message.text,
                     change.placement.map(|address| address.stream_id.as_str()).or(change.notification_conversation),
                     change.placement.map(|address| &address.topic_id),
+                    change.metadata.and_then(|metadata| metadata.author_id).map(|id| id.to_string()),
+                    change.metadata.map(|metadata| metadata.created_at.as_str()),
+                    change.metadata.and_then(|metadata| metadata.updated_at.as_ref()).map(HistoryTime::as_str),
                 ],
-            )? != 0
+            )? != 0;
+            if inserted {
+                history::record_creation(
+                    &transaction,
+                    owner,
+                    message,
+                    change.placement,
+                    change.metadata,
+                )?;
+            }
+            inserted
         } else {
             false
         };

@@ -36,8 +36,8 @@ const MAX_EVENT_BYTES: usize = 4 * 1024 * 1024;
 
 /// Кадр, который WebSocket передаёт источнику мессенджера.
 pub(super) enum SocketFrame {
-    Event(Event, Option<IncomingMessage>), // Событие и данные для возможного уведомления.
-    Ready(Cursor),                         // Позиция сервера после завершения догрузки.
+    Event(Box<Event>, Option<IncomingMessage>), // Событие и данные для возможного уведомления.
+    Ready(Cursor),                              // Позиция сервера после завершения догрузки.
 }
 
 /// Поток кадров WebSocket. После ошибки чтение завершается.
@@ -209,7 +209,7 @@ fn parse_text(text: &str, context: &OwnerContext, epoch: &str) -> Result<SocketF
         return Ok(SocketFrame::Ready(cursor));
     }
     let (event, incoming) = wire_event(value, context, epoch)?;
-    Ok(SocketFrame::Event(event, incoming))
+    Ok(SocketFrame::Event(Box::new(event), incoming))
 }
 
 /// Данные служебного кадра, которым сервер подтверждает готовность потока.

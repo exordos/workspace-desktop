@@ -140,9 +140,10 @@ impl Connection {
                                     cursor,
                                     message,
                                     placement,
+                                    metadata,
                                 },
                                 Some(incoming),
-                            ) = (&event, incoming)
+                            ) = (event.as_ref(), incoming)
                         {
                             match timeout(
                                 NOTIFICATION_LOOKUP_TIMEOUT,
@@ -160,6 +161,7 @@ impl Connection {
                                         message: message.clone(),
                                         conversation_id: incoming.stream.to_string(),
                                         placement: placement.clone(),
+                                        metadata: metadata.clone(),
                                     }));
                                 }
                                 Ok(Ok(false)) => {}
@@ -171,7 +173,7 @@ impl Connection {
                                 }
                             }
                         }
-                        return Ok(Some(event));
+                        return Ok(Some(*event));
                     }
                 }
                 SocketFrame::Ready(cursor) => {

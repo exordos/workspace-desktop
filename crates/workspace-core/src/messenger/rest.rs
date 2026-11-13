@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::{
     context::OwnerContext,
     runtime::SourceError,
-    storage::{Cursor, HistoryChange, Message, MessagePlacement},
+    storage::{Cursor, HistoryChange, HistoryMetadata, HistoryTime, Message, MessagePlacement},
     sync::Event,
 };
 
@@ -252,6 +252,8 @@ struct WirePayload {
     author_uuid: Option<String>, // Идентификатор автора сообщения.
     stream_uuid: Option<String>, // Идентификатор разговора.
     topic_uuid: Option<String>, // Идентификатор темы внутри разговора.
+    created_at: Option<String>, // Серверное время создания сообщения.
+    updated_at: Option<String>, // Серверное время последней правки.
 }
 
 /// Тело сообщения в ответе сервера.
@@ -290,6 +292,15 @@ impl IncomingMessage {
 }
 
 impl WirePayload {
+    /// Извлекает поля для упорядоченной истории. Старые снимки могут не содержать даты.
+    fn history_metadata(&self) -> Option<HistoryMetadata> {
+        Some(HistoryMetadata {
+            author_id: self.author_uuid.as_deref().and_then(parse_uuid),
+            created_at: HistoryTime::parse(self.created_at.as_deref()?)?,
+            updated_at: self.updated_at.as_deref().and_then(HistoryTime::parse),
+        })
+    }
+
     /// Возвращает адрес, если снимок содержит стрим и тему.
     fn placement(&self) -> Option<MessagePlacement> {
         Some(MessagePlacement {
@@ -507,11 +518,13 @@ pub(super) fn wire_event(
 
     let payload = wire.payload;
     let placement = payload.placement();
+    let metadata = payload.history_metadata();
     let incoming = IncomingMessage::from_wire(&payload, owner);
     let id = payload
         .uuid
         .filter(|id| nonempty(id))
         .ok_or(SourceError::InvalidResponse)?;
+    let id = parse_uuid(&id).map_or(id, |uuid| uuid.to_string());
     if !matches_owner(
         owner,
         payload.project_id.as_deref(),
@@ -555,6 +568,7 @@ pub(super) fn wire_event(
             cursor,
             message,
             placement,
+            metadata,
         },
         incoming,
     ))
@@ -664,6 +678,7 @@ mod tests {
                         text: "hello".to_owned(),
                     },
                     placement: None,
+                    metadata: None,
                 },
                 Event::HistoryChanged {
                     cursor: cursor(100),

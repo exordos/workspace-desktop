@@ -216,6 +216,7 @@ async fn local_wss_recovers_pruned_cursor_and_changed_epoch() {
                     text: "данные A".into(),
                 },
                 placement: None,
+                metadata: None,
             },
         )
         .unwrap();

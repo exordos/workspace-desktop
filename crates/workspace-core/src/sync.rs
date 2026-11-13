@@ -11,7 +11,9 @@ use crate::{
     context::{OwnerContext, SessionGeneration},
     notification_target::{NotificationTarget, NotificationTargetError},
     storage::{
-        Cursor, EventWrite, HistoryChange, Message, MessagePlacement, Storage, StorageError,
+        Cursor, EventWrite, HistoryChange, HistoryMessage, HistoryMetadata, HistoryPageEdges,
+        HistoryPageGuard, HistoryPageOutcome, HistoryPageTarget, HistoryScope, HistoryWindow,
+        Message, MessagePlacement, Storage, StorageError,
     },
 };
 
@@ -43,12 +45,14 @@ pub enum Event {
         cursor: Cursor,                      // Позиция, которую сохраняем вместе с сообщением.
         message: Message,                    // Новое сообщение для локальной базы.
         placement: Option<MessagePlacement>, // Стрим и тема из снимка.
+        metadata: Option<HistoryMetadata>,   // Автор и время, если снимок пригоден для истории.
     },
     IncomingDirectMessage {
         cursor: Cursor,          // Позиция нового события после готовности WebSocket.
         message: Message,        // Входящее непрочитанное сообщение для локальной базы.
         conversation_id: String, // Проверенный идентификатор личного разговора.
         placement: Option<MessagePlacement>, // Стрим и тема из снимка.
+        metadata: Option<HistoryMetadata>, // Автор и время, если снимок пригоден для истории.
     },
     HistoryChanged {
         cursor: Cursor,        // Позиция изменения в журнале.
@@ -86,6 +90,21 @@ impl Event {
             }
             _ => None,
         }
+    }
+}
+
+/// Разрешение записать страницу, запрошенную в действующей сессии.
+#[derive(Debug)]
+pub struct HistoryRequest {
+    owner: OwnerContext,           // Владелец, для которого запросили страницу.
+    generation: SessionGeneration, // Поколение сессии на момент запроса.
+    guard: HistoryPageGuard,       // Версия кэша и края окна перед запросом.
+}
+
+impl HistoryRequest {
+    /// Возвращает маркер, если страница продолжает существующее окно.
+    pub fn marker(&self) -> Option<&str> {
+        self.guard.marker()
     }
 }
 
@@ -146,6 +165,56 @@ impl Sync {
         })?
     }
 
+    /// Фиксирует условия записи до сетевого запроса. Доступ к стриму или теме проверяет вызывающий модуль.
+    pub fn prepare_history_page(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        scope: HistoryScope,
+        target: HistoryPageTarget,
+    ) -> Result<Option<HistoryRequest>, SyncError> {
+        self.auth.with_active_generation(owner, generation, || {
+            Ok(self
+                .storage
+                .prepare_history_page(owner, scope, target)?
+                .map(|guard| HistoryRequest {
+                    owner: owner.clone(),
+                    generation,
+                    guard,
+                }))
+        })?
+    }
+
+    /// Применяет страницу той же сессии, которая начала запрос, не двигая курсор событий.
+    pub fn save_history_page(
+        &self,
+        request: HistoryRequest,
+        messages: &[HistoryMessage],
+        edges: HistoryPageEdges,
+    ) -> Result<HistoryPageOutcome, SyncError> {
+        self.auth
+            .with_active_generation(&request.owner, request.generation, || {
+                Ok(self.storage.save_history_page(
+                    &request.owner,
+                    request.guard,
+                    messages,
+                    edges,
+                )?)
+            })?
+    }
+
+    /// Читает окна активной сессии. Вызывающий модуль заранее подтверждает доступ к области.
+    pub fn history_windows(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        scope: HistoryScope,
+    ) -> Result<Vec<HistoryWindow>, SyncError> {
+        self.auth.with_active_generation(owner, generation, || {
+            Ok(self.storage.history_windows(owner, scope)?)
+        })?
+    }
+
     /// Подписывает оболочку на изменения. После пропуска событий счётчик можно перечитать.
     pub fn subscribe(&self) -> broadcast::Receiver<SyncUpdate> {
         self.updates.subscribe()
@@ -201,6 +270,11 @@ impl Sync {
                 | Event::IncomingDirectMessage { placement, .. } => placement.as_ref(),
                 _ => None,
             };
+            let metadata = match &event {
+                Event::MessageCreated { metadata, .. }
+                | Event::IncomingDirectMessage { metadata, .. } => metadata.as_ref(),
+                _ => None,
+            };
             let history = match &event {
                 Event::HistoryChanged { change, .. } => Some(change),
                 _ => None,
@@ -214,6 +288,7 @@ impl Sync {
                     unread,
                     notification_conversation: conversation,
                     placement,
+                    metadata,
                     history,
                 },
             )?;
