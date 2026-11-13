@@ -4,6 +4,10 @@
 - `crates/workspace-desktop` подключает системные адаптеры и содержит UI-компоненты Iced.
 - [Архитектура](docs/plans/workspace-desktop-architecture.md) и [контракт авторизации](docs/plans/modules/auth.md) описывают границы модулей.
 
+## Разработка фич
+
+При проектировании или реализации фичи, которая затрагивает и `workspace-core`, и `workspace-desktop`, используй [Workspace Desktop Feature](skills/workspace-desktop-feature/SKILL.md).
+
 ## Запуск приложения
 
 Окно и команда `workspace-auth sync` запускают фоновую работу через `workspace_core::bootstrap::run`. Порядок начальной загрузки описывай в [Bootstrap](docs/plans/workspace-desktop-architecture.md#bootstrap), а запросы, обработку и хранение данных оставляй в модуле, который ими владеет.
@@ -21,6 +25,10 @@
 
 - Для проектирования, реализации или ревью компонентов и экранов используй [Workspace Desktop UI](skills/workspace-desktop-ui/SKILL.md).
 - Когда для задачи нужен актуальный макет, используй [Workspace Desktop Figma Bridge](skills/workspace-desktop-figma-bridge/SKILL.md), даже если Figma не упомянута.
+
+## Автотесты
+
+При изменении поведения, исправлении бага или работе с автотестами используй [Workspace Desktop Testing](skills/workspace-desktop-testing/SKILL.md).
 
 ## Проверки из корня workspace
 
