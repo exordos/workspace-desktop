@@ -1,3 +1,5 @@
+//! Связывает имена иконок с файлами SVG и рисует их средствами Iced.
+
 use std::sync::LazyLock;
 
 use iced::advanced::svg::{Handle, Renderer as _, Svg};
@@ -7,15 +9,17 @@ use iced::{Element, Length, Rectangle, Renderer, Size, Theme, mouse};
 
 use super::theme::text_muted;
 
+/// Имя иконки, по которому виджет выбирает встроенный SVG.
 #[derive(Debug, Clone, Copy)]
 pub enum IconName {
-    Plus,
-    Search,
-    Close,
-    Attach,
+    Plus,   // Знак добавления.
+    Search, // Лупа для поиска.
+    Close,  // Крестик для закрытия.
+    Attach, // Скрепка для вложения.
 }
 
 impl IconName {
+    /// Загружает встроенный SVG при первом обращении и возвращает ссылку на него.
     fn handle(self) -> &'static Handle {
         // Keep the original Workspace UI SVGs and their viewBox.
         static PLUS: LazyLock<Handle> = LazyLock::new(|| {
@@ -40,31 +44,35 @@ impl IconName {
     }
 }
 
+/// Способ выбрать цвет иконки из темы.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum IconTone {
     #[default]
-    Inherit,
-    Muted,
-    Accent,
-    Danger,
+    Inherit, // Цвет окружающего текста.
+    Muted,  // Приглушённый цвет темы.
+    Accent, // Основной акцент темы.
+    Danger, // Цвет опасного действия.
 }
 
-/// Render a decorative icon. Inherit uses the surrounding widget's text color.
+/// Создаёт декоративную иконку заданного размера и цвета.
 pub fn icon<Message>(name: IconName, size: u32, tone: IconTone) -> Element<'static, Message> {
     Element::new(Icon { name, size, tone })
 }
 
+/// Виджет Iced, который рисует одну иконку без собственного состояния.
 struct Icon {
-    name: IconName,
-    size: u32,
-    tone: IconTone,
+    name: IconName, // Имя, по которому выбирается файл SVG.
+    size: u32,      // Сторона квадрата иконки в логических пикселях.
+    tone: IconTone, // Способ подобрать цвет иконки.
 }
 
 impl<Message> Widget<Message, Theme, Renderer> for Icon {
+    /// Запрашивает квадрат заданного размера.
     fn size(&self) -> Size<Length> {
         Size::new(self.size.into(), self.size.into())
     }
 
+    /// Рассчитывает место под квадрат с учётом ограничений родительского виджета.
     fn layout(
         &mut self,
         _tree: &mut Tree,
@@ -74,6 +82,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Icon {
         layout::atomic(limits, self.size, self.size)
     }
 
+    /// Рисует SVG в доступном квадрате и применяет выбранный цвет.
     fn draw(
         &self,
         _tree: &Tree,

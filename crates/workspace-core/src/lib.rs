@@ -1,3 +1,6 @@
+//! Объявляет модули ядра Workspace Desktop.
+//! Здесь подключены контекст, авторизация, клиент IAM, получение событий и локальное хранение.
+
 pub mod auth;
 pub mod context;
 pub mod iam_http;

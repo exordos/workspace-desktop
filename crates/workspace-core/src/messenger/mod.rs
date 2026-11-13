@@ -1,3 +1,6 @@
+//! Подключает журнал мессенджера к фоновой синхронизации.
+//! Сначала источник догоняет журнал по HTTP, затем читает новые события через WebSocket.
+
 mod rest;
 mod socket;
 
@@ -15,13 +18,14 @@ use socket::SocketFrame;
 
 pub const SOURCE_ID: &str = "messenger";
 
-/// The first connection establishes a baseline for new incoming messages.
-/// Every subsequent connection backfills from the last committed cursor.
+/// Источник событий мессенджера. При первом подключении берёт текущую позицию журнала.
+/// При следующих подключениях читает события после последней сохранённой позиции.
 pub struct MessengerSource {
-    rest: Arc<RestClient>,
+    rest: Arc<RestClient>, // Общий HTTP-клиент для чтения страниц журнала.
 }
 
 impl MessengerSource {
+    /// Создаёт источник и подготавливает HTTP-клиент.
     pub fn new() -> Result<Self, SourceError> {
         Ok(Self {
             rest: Arc::new(RestClient::new()?),
@@ -30,10 +34,12 @@ impl MessengerSource {
 }
 
 impl EventSource for MessengerSource {
+    /// Возвращает постоянное имя источника мессенджера.
     fn id(&self) -> &str {
         SOURCE_ID
     }
 
+    /// Готовит поток для сессии. Сетевые запросы начнутся при чтении первого элемента.
     fn connect(&self, session: SourceSession) -> BoxFuture<'_, Result<EventStream, SourceError>> {
         Box::pin(async move {
             let connection = Connection {
@@ -50,14 +56,16 @@ impl EventSource for MessengerSource {
     }
 }
 
+/// Состояние чтения журнала в одном подключении.
 struct Connection {
-    rest: Arc<RestClient>,
-    session: SourceSession,
-    pending: IntoIter<Event>,
-    socket: Option<socket::SocketStream>,
+    rest: Arc<RestClient>, // HTTP-клиент для начальной позиции и пропущенных событий.
+    session: SourceSession, // Параметры сессии и последняя позиция, выданная этим потоком.
+    pending: IntoIter<Event>, // Остаток загруженной страницы, который ещё не отдали потребителю.
+    socket: Option<socket::SocketStream>, // Открытый поток WebSocket. `None`, пока идёт чтение через HTTP.
 }
 
 impl Connection {
+    /// Выдаёт начальную позицию, следующее событие из REST или новое событие из WebSocket.
     async fn next(&mut self) -> Result<Option<Event>, SourceError> {
         if self.session.cursor.is_none() {
             let cursor = self

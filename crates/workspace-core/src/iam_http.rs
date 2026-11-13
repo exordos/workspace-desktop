@@ -1,3 +1,6 @@
+//! Отправляет HTTPS-запросы к IAM Workspace и проверяет доступ к мессенджеру.
+//! Ниже описаны запросы, разбор ответов и тесты форматов сервера.
+
 use std::{
     collections::HashSet,
     sync::OnceLock,
@@ -28,16 +31,19 @@ const INTROSPECTION_PATH: &str = "/api/core/v1/iam/clients/default/actions/intro
 const STREAMS_PATH: &str = "/api/workspace/v1/messenger/streams/";
 const BASE_SCOPE: &str = "openid email profile";
 
+/// Клиент Workspace IAM для входа, выбора проекта и продления сессии.
 #[derive(Default)]
 pub struct WorkspaceIamHttp {
-    client: OnceLock<Client>,
+    client: OnceLock<Client>, // Общий HTTP-клиент, который создаётся при первом запросе.
 }
 
 impl WorkspaceIamHttp {
+    /// Создаёт адаптер IAM. HTTP-клиент появится при первом обращении.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Создаёт или возвращает общий HTTPS-клиент с тайм-аутами и запретом перенаправлений.
     fn client(&self) -> Result<&Client, IamError> {
         if let Some(client) = self.client.get() {
             return Ok(client);
@@ -52,6 +58,7 @@ impl WorkspaceIamHttp {
         Ok(self.client.get_or_init(|| client))
     }
 
+    /// Проверяет, может ли токен читать список каналов выбранного проекта.
     pub fn verify_messenger(
         &self,
         context: &OwnerContext,
@@ -65,6 +72,7 @@ impl WorkspaceIamHttp {
         Ok(())
     }
 
+    /// Собирает запрос одного канала с токеном и идентификатором проекта.
     fn messenger_request(
         &self,
         context: &OwnerContext,
@@ -82,6 +90,7 @@ impl WorkspaceIamHttp {
             .bearer_auth(access_token))
     }
 
+    /// Собирает запрос первого токена по логину и паролю, при необходимости добавляя одноразовый код.
     fn login_request(
         &self,
         server: &str,
@@ -109,6 +118,7 @@ impl WorkspaceIamHttp {
         Ok(request)
     }
 
+    /// Собирает запрос обновления токена. Если указан проект, добавляет его в область доступа.
     fn refresh_request(
         &self,
         server: &str,
@@ -129,6 +139,7 @@ impl WorkspaceIamHttp {
             .json(&body))
     }
 
+    /// Выполняет обмен токенов, определяет владельца и вычисляет оставшийся срок действия.
     fn grant(
         &self,
         server: &str,
@@ -171,6 +182,7 @@ impl WorkspaceIamHttp {
         })
     }
 
+    /// Запрашивает у IAM подтверждённые данные о владельце и области действия токена.
     fn introspect(&self, server: &str, access_token: &str) -> Result<Introspection, IamError> {
         let request = self
             .client()?
@@ -186,10 +198,12 @@ impl WorkspaceIamHttp {
 }
 
 impl IamClient for WorkspaceIamHttp {
+    /// Возвращает адрес сервера в едином виде, пригодном для запросов и сравнения.
     fn normalize_server(&self, server: &str) -> Result<String, IamError> {
         Ok(server_origin(server)?.origin().ascii_serialization())
     }
 
+    /// Получает первый токен с помощью логина, пароля и, если нужен, одноразового кода.
     fn login(
         &self,
         server: &str,
@@ -201,6 +215,7 @@ impl IamClient for WorkspaceIamHttp {
         self.grant(server, request, Grant::Login)
     }
 
+    /// Читает доступные проекты. Ответ без содержимого означает пустой список.
     fn projects(&self, server: &str, access_token: &str) -> Result<Vec<IamProject>, IamError> {
         let response = send(
             self.client()?
@@ -217,6 +232,7 @@ impl IamClient for WorkspaceIamHttp {
         parse_projects(response_json(response)?)
     }
 
+    /// Получает токен, привязанный к выбранному проекту.
     fn select_project(
         &self,
         server: &str,
@@ -227,12 +243,14 @@ impl IamClient for WorkspaceIamHttp {
         self.grant(server, request, Grant::Refresh)
     }
 
+    /// Продлевает токен без запроса новой области доступа.
     fn refresh(&self, server: &str, refresh_token: &str) -> Result<IamToken, IamError> {
         let request = self.refresh_request(server, refresh_token, None)?;
         self.grant(server, request, Grant::Refresh)
     }
 }
 
+/// Проверяет адрес и оставляет схему HTTPS, имя сервера и порт.
 fn server_origin(server: &str) -> Result<Url, IamError> {
     let server = server.trim();
     if server.is_empty() || server.contains(|ch: char| ch.is_whitespace() || ch == '\\') {
@@ -262,12 +280,14 @@ fn server_origin(server: &str) -> Result<Url, IamError> {
     Url::parse(&url.origin().ascii_serialization()).map_err(|_| IamError::InvalidServer)
 }
 
+/// Подставляет путь API в проверенный адрес сервера.
 fn endpoint(server: &str, path: &str) -> Result<Url, IamError> {
     let mut url = server_origin(server)?;
     url.set_path(path);
     Ok(url)
 }
 
+/// Отправляет запрос и переводит ошибку транспорта или сборки запроса в ошибку IAM.
 fn send(request: RequestBuilder) -> Result<Response, IamError> {
     request.send().map_err(|error| {
         if error.is_builder() {
@@ -278,6 +298,7 @@ fn send(request: RequestBuilder) -> Result<Response, IamError> {
     })
 }
 
+/// Читает JSON и различает сбой чтения и неверный формат ответа.
 fn response_json<T: serde::de::DeserializeOwned>(response: Response) -> Result<T, IamError> {
     response.json().map_err(|error| {
         if error.is_timeout() || error.is_body() {
@@ -288,6 +309,7 @@ fn response_json<T: serde::de::DeserializeOwned>(response: Response) -> Result<T
     })
 }
 
+/// Определяет общую ошибку запроса по HTTP-статусу.
 fn request_error(status: StatusCode) -> IamError {
     if status.is_server_error() || [408, 429].contains(&status.as_u16()) {
         IamError::Temporary
@@ -296,12 +318,14 @@ fn request_error(status: StatusCode) -> IamError {
     }
 }
 
+/// Вид запроса токена, от которого зависит трактовка ошибок IAM.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Grant {
-    Login,
-    Refresh,
+    Login,   // Первый токен по данным пользователя.
+    Refresh, // Получение токена по токену обновления, в том числе при выборе проекта.
 }
 
+/// Определяет по статусу и деталям ответа, нужен ли одноразовый код, повтор или новый вход.
 fn grant_error(status: StatusCode, detail: Option<&Value>, kind: Grant) -> IamError {
     const FIELDS: &[&str] = &[
         "error",
@@ -371,34 +395,39 @@ fn grant_error(status: StatusCode, detail: Option<&Value>, kind: Grant) -> IamEr
     }
 }
 
+/// Поля JSON-ответа IAM на запрос токена.
 #[derive(Deserialize)]
 struct TokenBody {
-    access_token: String,
-    refresh_token: Option<String>,
-    expires_in: Option<u64>,
+    access_token: String,          // Токен доступа, который сервер только что выдал.
+    refresh_token: Option<String>, // Новый токен обновления, если сервер его прислал.
+    expires_in: Option<u64>, // Срок действия в секундах от получения ответа, если сервер его указал.
 }
 
+/// Сведения о владельце и сроке действия из полезной нагрузки токена.
 #[derive(Deserialize, Default)]
 struct TokenIdentity {
     #[serde(alias = "userUuid")]
-    user_uuid: Option<String>,
-    sub: Option<String>,
+    user_uuid: Option<String>, // Основной идентификатор пользователя, если есть.
+    sub: Option<String>, // Запасной идентификатор пользователя из поля subject.
     #[serde(alias = "projectId")]
-    project_id: Option<String>,
+    project_id: Option<String>, // Идентификатор проекта, если токен к нему привязан.
     #[serde(alias = "organizationId")]
-    organization_id: Option<String>,
-    exp: Option<u64>,
+    organization_id: Option<String>, // Идентификатор организации, если он указан в токене.
+    exp: Option<u64>,    // Момент истечения в секундах с начала Unix-эпохи, если он указан.
 }
 
 impl TokenIdentity {
+    /// Сообщает, есть ли хотя бы один идентификатор пользователя.
     fn has_user(&self) -> bool {
         self.user_uuid.is_some() || self.sub.is_some()
     }
 
+    /// Возвращает основной идентификатор пользователя или запасной subject.
     fn user_id(&self) -> Option<String> {
         self.user_uuid.clone().or_else(|| self.sub.clone())
     }
 
+    /// Дополняет данные токена сведениями от IAM. При расхождении возвращает ошибку.
     fn merge_introspection(&mut self, introspection: Introspection) -> Result<(), IamError> {
         let supplied_user = nonempty(Some(introspection.user_info.uuid));
         let supplied_project = nonempty(introspection.project_id);
@@ -419,25 +448,29 @@ impl TokenIdentity {
     }
 }
 
+/// Проверяет, что оба значения заданы и отличаются.
 fn mismatch(left: &Option<String>, right: &Option<String>) -> bool {
     matches!((left, right), (Some(left), Some(right)) if left != right)
 }
 
+/// Ответ IAM с подтверждёнными данными о владельце токена.
 #[derive(Deserialize)]
 struct Introspection {
-    user_info: UserInfo,
-    project_id: Option<String>,
-    organization_id: Option<String>,
+    user_info: UserInfo,        // Данные пользователя, которому принадлежит токен.
+    project_id: Option<String>, // Проект из ответа IAM, если он указан.
+    organization_id: Option<String>, // Организация из ответа IAM, если она указана.
 }
 
+/// Часть ответа IAM с данными пользователя.
 #[derive(Deserialize)]
 struct UserInfo {
-    uuid: String,
+    uuid: String, // Идентификатор владельца токена.
 }
 
+/// Извлекает сведения из полезной нагрузки JWT. Если её нельзя прочитать, возвращает пустые данные.
 fn token_identity(encoded: &str) -> TokenIdentity {
-    // Claims from the TLS-protected IAM response identify the local context.
-    // The server checks the bearer token when authorizing every API request.
+    // Из ответа IAM по HTTPS берём данные для локального контекста.
+    // Право на каждый запрос по этому токену проверяет сервер.
     let Some(payload) = encoded.split('.').nth(1) else {
         return TokenIdentity::default();
     };
@@ -457,6 +490,7 @@ fn token_identity(encoded: &str) -> TokenIdentity {
     identity
 }
 
+/// Вычисляет оставшийся срок действия по JWT или ответу IAM. Истёкший токен отклоняет.
 fn token_lifetime(
     body: &TokenBody,
     identity: &TokenIdentity,
@@ -475,29 +509,36 @@ fn token_lifetime(
         .ok_or(IamError::InvalidResponse)
 }
 
+/// Оставляет строку, только если она проходит проверку на заполненность.
 fn nonempty(value: Option<String>) -> Option<String> {
     value.filter(|text| is_nonempty(text))
 }
 
+/// Проверяет, что строка непустая и без пробелов по краям.
 fn is_nonempty(value: &str) -> bool {
     !value.is_empty() && value.trim() == value
 }
 
+/// Проект в том виде, в котором он приходит от IAM.
 #[derive(Deserialize)]
 struct ProjectBody {
-    uuid: String,
-    name: String,
-    organization: Option<Organization>,
+    uuid: String,                       // Идентификатор проекта в ответе сервера.
+    name: String,                       // Название проекта для пользователя.
+    organization: Option<Organization>, // Организация проекта, если сервер передал её.
 }
 
+/// Два формата организации, которые может прислать IAM.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum Organization {
-    Id(String),
-    Object { uuid: Option<String> },
+    Id(String), // Идентификатор организации, присланный строкой.
+    Object {
+        uuid: Option<String>, // Идентификатор организации, если он указан в объекте.
+    },
 }
 
 impl Organization {
+    /// Достаёт идентификатор организации из строки или объекта.
     fn id(self) -> Option<String> {
         match self {
             Self::Id(id) => Some(id),
@@ -506,6 +547,7 @@ impl Organization {
     }
 }
 
+/// Находит массив в ответе сервера, в том числе внутри известного поля-обёртки.
 fn collection(value: Value) -> Result<Vec<Value>, IamError> {
     match value {
         Value::Array(values) => Ok(values),
@@ -521,6 +563,7 @@ fn collection(value: Value) -> Result<Vec<Value>, IamError> {
     }
 }
 
+/// Читает проекты из ответа, пропуская неполные и повторяющиеся записи.
 fn parse_projects(value: Value) -> Result<Vec<IamProject>, IamError> {
     let mut projects = Vec::<IamProject>::new();
     let mut ids = HashSet::new();
@@ -550,10 +593,12 @@ mod tests {
     use super::*;
     use crate::context::AccountId;
 
+    /// Читает JSON из подготовленного запроса для проверок теста.
     fn request_body(request: &Request) -> Value {
         serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap()
     }
 
+    /// Проверяет формат запросов входа, выбора проекта и обновления токена.
     #[test]
     fn login_and_project_exchange_follow_the_workspace_contract() {
         let iam = WorkspaceIamHttp::new();
@@ -615,6 +660,7 @@ mod tests {
         );
     }
 
+    /// Проверяет, что запрос к мессенджеру передаёт проект и помечает токен как секретный.
     #[test]
     fn messenger_probe_uses_context_project_and_sensitive_bearer_header() {
         let iam = WorkspaceIamHttp::new();
@@ -643,6 +689,7 @@ mod tests {
         assert!(request.headers()[AUTHORIZATION].is_sensitive());
     }
 
+    /// Проверяет нормализацию адреса и отказ от недопустимых адресов.
     #[test]
     fn only_valid_https_origins_are_used() {
         let origin =
@@ -672,6 +719,7 @@ mod tests {
         }
     }
 
+    /// Проверяет, как статус и тело ответа влияют на ошибки входа и обновления.
     #[test]
     fn authentication_and_refresh_errors_are_classified_from_status_and_response() {
         assert_eq!(
@@ -722,6 +770,7 @@ mod tests {
         );
     }
 
+    /// Проверяет, как данные JWT и ответ IAM определяют владельца и срок действия.
     #[test]
     fn issuer_claims_and_introspection_resolve_identity_and_expiry() {
         let claims = json!({"sub":"user", "organizationId":"org", "exp": 500});
@@ -772,6 +821,7 @@ mod tests {
         );
     }
 
+    /// Проверяет старый формат списка проектов и сохранение организации.
     #[test]
     fn supports_wrapped_projects_from_older_gateways_and_keeps_organization() {
         let projects = parse_projects(json!({
@@ -800,6 +850,7 @@ mod tests {
         );
     }
 
+    /// Проверяет, что идентификатор организации можно прислать обычной строкой.
     #[test]
     fn accepts_projects_with_an_organization_id_as_a_string() {
         let projects = parse_projects(json!([

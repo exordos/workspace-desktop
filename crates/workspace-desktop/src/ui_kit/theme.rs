@@ -1,23 +1,29 @@
+//! Задаёт светлую и тёмную палитры Workspace.
+//! Здесь собраны базовая тема Iced и дополнительные цвета для кнопок и иконок.
+
 use iced::theme::Palette;
 use iced::{Color, Theme};
 
+/// Режим оформления интерфейса Workspace.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum ThemeMode {
     #[default]
-    Light,
-    Dark,
+    Light, // Светлая палитра, выбранная по умолчанию.
+    Dark, // Тёмная палитра.
 }
 
+/// Дополнительные цвета для оформления кнопок.
 pub(super) struct ButtonColors {
-    pub on_accent: Color,
-    pub elevated: Color,
-    pub card: Color,
-    pub card_active: Color,
-    pub border_subtle: Color,
-    pub accent_soft: Color,
-    pub text_muted: Color,
+    pub on_accent: Color,     // Цвет текста на акцентном фоне.
+    pub elevated: Color,      // Цвет приподнятой поверхности.
+    pub card: Color,          // Фон нейтральной поверхности.
+    pub card_active: Color,   // Фон нейтральной поверхности в активном состоянии.
+    pub border_subtle: Color, // Цвет ненавязчивой границы.
+    pub accent_soft: Color,   // Светлее или темнее основного акцента, для мягкой подсветки.
+    pub text_muted: Color,    // Цвет приглушённого текста.
 }
 
+/// Подбирает дополнительные цвета кнопок для текущей темы.
 pub(super) fn button_colors(theme: &Theme) -> ButtonColors {
     if theme.extended_palette().is_dark {
         ButtonColors {
@@ -42,6 +48,7 @@ pub(super) fn button_colors(theme: &Theme) -> ButtonColors {
     }
 }
 
+/// Возвращает цвет приглушённого текста для текущей темы.
 pub(super) fn text_muted(theme: &Theme) -> Color {
     if theme.extended_palette().is_dark {
         Color::from_rgb8(0x74, 0x83, 0x96)
@@ -50,8 +57,9 @@ pub(super) fn text_muted(theme: &Theme) -> Color {
     }
 }
 
+/// Создаёт тему Iced с палитрой Blue Mist для заданного режима.
 pub fn workspace_theme(mode: ThemeMode) -> Theme {
-    // Workspace UI's Blue Mist palette, mapped to Iced's semantic colors.
+    // Назначаем цветам Blue Mist роли в теме Iced: фон, текст, акцент и опасное действие.
     let palette = match mode {
         ThemeMode::Light => Palette {
             background: Color::from_rgb8(0xe8, 0xf0, 0xf5),

@@ -1,3 +1,6 @@
+//! Читает начальную позицию и страницы журнала мессенджера по HTTPS.
+//! Здесь же разбирается общий формат событий, который используют HTTP и WebSocket.
+
 use std::time::Duration;
 
 use reqwest::{Client, RequestBuilder, StatusCode, Url, header::ACCEPT, redirect::Policy};
@@ -15,9 +18,11 @@ const EPOCH_PATH: &str = "/api/workspace/v1/epoch/";
 const EVENTS_PATH: &str = "/api/workspace/v1/events/";
 const PAGE_LIMIT: usize = 100;
 
-pub(super) struct RestClient(Client);
+/// HTTP-клиент для чтения журнала мессенджера.
+pub(super) struct RestClient(Client); // Настроенный HTTP-клиент для запросов к журналу.
 
 impl RestClient {
+    /// Создаёт HTTPS-клиент с тайм-аутами и запретом перенаправлений.
     pub(super) fn new() -> Result<Self, SourceError> {
         let client = Client::builder()
             .https_only(true)
@@ -29,6 +34,7 @@ impl RestClient {
         Ok(Self(client))
     }
 
+    /// Получает текущую позицию журнала, с которой начинается первый запуск.
     pub(super) async fn current_cursor(
         &self,
         owner: &OwnerContext,
@@ -38,6 +44,7 @@ impl RestClient {
         epoch.into_cursor()
     }
 
+    /// Загружает и проверяет одну страницу событий строго после заданной позиции.
     pub(super) async fn page(
         &self,
         owner: &OwnerContext,
@@ -49,6 +56,7 @@ impl RestClient {
         decode_page(wire, owner, after)
     }
 
+    /// Добавляет к запросу метку журнала, нижнюю границу позиции и размер страницы.
     fn page_request(
         &self,
         owner: &OwnerContext,
@@ -63,6 +71,7 @@ impl RestClient {
         ]))
     }
 
+    /// Собирает GET-запрос к серверу владельца и добавляет токен доступа.
     fn request(
         &self,
         owner: &OwnerContext,
@@ -79,6 +88,7 @@ impl RestClient {
     }
 }
 
+/// Проверяет, что адрес владельца содержит базовый HTTPS-адрес сервера.
 pub(super) fn workspace_origin(owner: &OwnerContext) -> Result<Url, SourceError> {
     let url = Url::parse(&owner.server).map_err(|_| SourceError::InvalidResponse)?;
     if url.scheme() != "https"
@@ -94,12 +104,14 @@ pub(super) fn workspace_origin(owner: &OwnerContext) -> Result<Url, SourceError>
     Ok(url)
 }
 
+/// Выполняет запрос, проверяет HTTP-статус и разбирает JSON.
 async fn get_json<T: DeserializeOwned>(request: RequestBuilder) -> Result<T, SourceError> {
     let response = request.send().await.map_err(request_error)?;
     check_status(response.status())?;
     response.json().await.map_err(request_error)
 }
 
+/// Переводит статус HTTP в ошибку источника, которую понимает синхронизация.
 fn check_status(status: StatusCode) -> Result<(), SourceError> {
     match status {
         StatusCode::OK => Ok(()),
@@ -112,6 +124,7 @@ fn check_status(status: StatusCode) -> Result<(), SourceError> {
     }
 }
 
+/// Различает неверный запрос или ответ и временный сбой транспорта.
 fn request_error(error: reqwest::Error) -> SourceError {
     if error.is_decode() || error.is_builder() {
         SourceError::InvalidResponse
@@ -120,13 +133,15 @@ fn request_error(error: reqwest::Error) -> SourceError {
     }
 }
 
+/// Ответ сервера с текущей позицией в журнале.
 #[derive(Deserialize)]
 struct Epoch {
-    epoch_generation: String,
-    epoch_version: u64,
+    epoch_generation: String, // Метка текущего журнала.
+    epoch_version: u64,       // Последний номер события в журнале.
 }
 
 impl Epoch {
+    /// Преобразует ответ сервера в позицию и проверяет допустимый диапазон.
     fn into_cursor(self) -> Result<Cursor, SourceError> {
         let cursor = Cursor {
             epoch_generation: self.epoch_generation,
@@ -137,6 +152,7 @@ impl Epoch {
     }
 }
 
+/// Разбирает страницу и проверяет рост позиций. Пропуски между видимыми событиями допустимы.
 fn decode_page(
     wire: Vec<Value>,
     owner: &OwnerContext,
@@ -156,34 +172,38 @@ fn decode_page(
         .collect()
 }
 
+/// Внешние поля события в JSON, полученном от сервера.
 #[derive(Deserialize)]
 struct WireEnvelope {
-    schema_version: u64,
-    uuid: String,
-    epoch_generation: Option<String>,
-    epoch_version: u64,
-    project_id: String,
-    user_uuid: String,
-    object_type: String,
-    action: String,
-    payload: WirePayload,
+    schema_version: u64, // Версия формата события. Поддерживается версия 1.
+    uuid: String,        // Идентификатор события в журнале.
+    epoch_generation: Option<String>, // Метка журнала, если сервер прислал её в самом событии.
+    epoch_version: u64,  // Номер события внутри журнала.
+    project_id: String,  // Идентификатор проекта, которому принадлежит событие.
+    user_uuid: String,   // Идентификатор пользователя, для которого выдано событие.
+    object_type: String, // Тип объекта, например сообщение.
+    action: String,      // Что произошло с объектом, например создание.
+    payload: WirePayload, // Данные события и признак его вида.
 }
 
+/// Вложенные данные события из JSON.
 #[derive(Deserialize)]
 struct WirePayload {
-    kind: String,
-    uuid: Option<String>,
-    project_id: Option<String>,
-    user_uuid: Option<String>,
-    payload: Option<Value>,
+    kind: String,               // Название события, например `message.created`.
+    uuid: Option<String>,       // Идентификатор объекта. Для нового сообщения обязателен.
+    project_id: Option<String>, // Идентификатор проекта, если сервер повторил его во вложенных данных.
+    user_uuid: Option<String>, // Идентификатор пользователя, если сервер повторил его во вложенных данных.
+    payload: Option<Value>, // Тело объекта. Для нового сообщения здесь лежат формат и содержимое.
 }
 
+/// Тело сообщения в ответе сервера.
 #[derive(Deserialize)]
 struct WireMessageBody {
-    kind: String,
-    content: Option<Value>,
+    kind: String,           // Формат содержимого. Текст сохраняется для формата `markdown`.
+    content: Option<Value>, // Содержимое сообщения. Для Markdown это обязательная строка.
 }
 
+/// Проверяет владельца и формат события. Возвращает новое сообщение или только позицию.
 pub(super) fn wire_event(
     value: Value,
     owner: &OwnerContext,
@@ -250,6 +270,7 @@ pub(super) fn wire_event(
     })
 }
 
+/// Проверяет метку журнала и то, что номер позиции помещается в SQLite.
 pub(super) fn validate_cursor(cursor: &Cursor) -> Result<(), SourceError> {
     if !nonempty(&cursor.epoch_generation) || i64::try_from(cursor.epoch_version).is_err() {
         return Err(SourceError::InvalidResponse);
@@ -257,6 +278,7 @@ pub(super) fn validate_cursor(cursor: &Cursor) -> Result<(), SourceError> {
     Ok(())
 }
 
+/// Проверяет, что строка непустая и без пробелов по краям.
 fn nonempty(value: &str) -> bool {
     !value.is_empty() && value == value.trim()
 }
@@ -268,6 +290,7 @@ mod tests {
     use super::*;
     use crate::context::AccountId;
 
+    /// Создаёт владельца данных для тестов журнала.
     fn owner() -> OwnerContext {
         OwnerContext {
             account_id: AccountId("local-account".into()),
@@ -278,6 +301,7 @@ mod tests {
         }
     }
 
+    /// Создаёт позицию тестового журнала с заданным номером.
     fn cursor(version: u64) -> Cursor {
         Cursor {
             epoch_generation: "epoch".to_owned(),
@@ -285,6 +309,7 @@ mod tests {
         }
     }
 
+    /// Создаёт JSON события о новом сообщении для теста.
     fn message(version: u64) -> Value {
         json!({
             "schema_version": 1,
@@ -304,6 +329,7 @@ mod tests {
         })
     }
 
+    /// Проверяет, что запрос страницы передаёт токен и строгое ограничение по позиции.
     #[test]
     fn pages_request_strict_cursor_and_bearer_token() {
         let client = RestClient::new().unwrap();
@@ -330,6 +356,7 @@ mod tests {
         );
     }
 
+    /// Проверяет чтение событий и допустимость пропусков в их номерах.
     #[test]
     fn decodes_flat_events_and_allows_gaps_in_visible_versions() {
         let owner = owner();
@@ -352,6 +379,7 @@ mod tests {
         );
     }
 
+    /// Проверяет, что неверное сообщение или чужие данные не продвигают позицию.
     #[test]
     fn refuses_malformed_created_messages_or_wrong_scope_before_advancing() {
         let owner = owner();

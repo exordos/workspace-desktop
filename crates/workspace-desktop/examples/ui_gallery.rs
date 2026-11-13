@@ -1,3 +1,6 @@
+//! Открывает демонстрационное окно для ручной проверки UI-кита.
+//! Здесь хранятся настройки примеров и собираются вкладки с элементами управления и иконками.
+
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{column, container, operation, row, scrollable, text, toggler};
 use iced::{Element, Event, Fill, Subscription, Task, Theme, event};
@@ -6,24 +9,27 @@ use workspace_desktop::ui_kit::{
     button, button_with, icon, text_input, workspace_theme,
 };
 
+/// Определяет открытый раздел галереи.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum GalleryTab {
     #[default]
-    Controls,
-    Icons,
+    Controls, // Кнопки и текстовое поле.
+    Icons, // Примеры иконок.
 }
 
+/// Хранит настройки галереи и состояние примеров.
 struct Gallery {
-    dark: bool,
-    input: String,
-    last_button: Option<&'static str>,
-    button_presses: usize,
-    tab: GalleryTab,
-    icon_tone: IconTone,
-    icon_size: u32,
+    dark: bool,                        // Признак включённой тёмной темы.
+    input: String,                     // Текст демонстрационного поля ввода.
+    last_button: Option<&'static str>, // Подпись последней нажатой кнопки. `None` до первого нажатия.
+    button_presses: usize,             // Количество нажатий демонстрационных кнопок.
+    tab: GalleryTab,                   // Открытый раздел галереи.
+    icon_tone: IconTone,               // Выбранный способ окраски иконок.
+    icon_size: u32,                    // Сторона иконок в логических пикселях.
 }
 
 impl Default for Gallery {
+    /// Задаёт начальные настройки вкладок и демонстрационных элементов.
     fn default() -> Self {
         Self {
             dark: false,
@@ -37,18 +43,22 @@ impl Default for Gallery {
     }
 }
 
+/// Передаёт действия пользователя из виджетов в галерею.
 #[derive(Debug, Clone)]
 enum Message {
-    ThemeChanged(bool),
-    InputChanged(String),
-    ButtonPressed(&'static str),
-    MoveFocus { backwards: bool },
-    TabChanged(GalleryTab),
-    IconToneChanged(IconTone),
-    IconSizeChanged(u32),
+    ThemeChanged(bool),          // Новое состояние тёмной темы.
+    InputChanged(String),        // Новый текст демонстрационного поля.
+    ButtonPressed(&'static str), // Подпись нажатой кнопки.
+    MoveFocus {
+        backwards: bool, // Переход к предыдущему элементу по Shift+Tab.
+    },
+    TabChanged(GalleryTab),    // Вкладка, которую нужно открыть.
+    IconToneChanged(IconTone), // Новый способ окраски иконок.
+    IconSizeChanged(u32),      // Новый размер иконок в логических пикселях.
 }
 
 impl Gallery {
+    /// Обновляет состояние примеров и при необходимости двигает фокус или прокрутку.
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::ThemeChanged(dark) => self.dark = dark,
@@ -69,6 +79,7 @@ impl Gallery {
         Task::none()
     }
 
+    /// Преобразует Tab и Shift+Tab в запросы перехода фокуса.
     fn subscription(&self) -> Subscription<Message> {
         event::listen().filter_map(|event| match event {
             Event::Keyboard(keyboard::Event::KeyPressed {
@@ -84,6 +95,7 @@ impl Gallery {
         })
     }
 
+    /// Выбирает светлую или тёмную тему для окна галереи.
     fn theme(&self) -> Theme {
         workspace_theme(if self.dark {
             ThemeMode::Dark
@@ -92,6 +104,7 @@ impl Gallery {
         })
     }
 
+    /// Собирает шапку, вкладки и прокручиваемую область выбранного раздела.
     fn view(&self) -> Element<'_, Message> {
         let tabs = [
             ("Компоненты", GalleryTab::Controls),
@@ -130,6 +143,7 @@ impl Gallery {
         .into()
     }
 
+    /// Показывает варианты кнопок и текстового поля для ручной проверки.
     fn controls(&self) -> Element<'_, Message> {
         use ButtonAppearance::{Filled, Ghost, Outline};
         use ButtonSize::{Large, Medium, Small};
@@ -231,6 +245,7 @@ impl Gallery {
             .into()
     }
 
+    /// Показывает примеры иконок с выбором размера и цвета.
     fn icons(&self) -> Element<'_, Message> {
         let tones = [
             ("Основной", IconTone::Inherit),
@@ -297,6 +312,7 @@ impl Gallery {
     }
 }
 
+/// Создаёт кнопку выбора настройки и выделяет текущий вариант.
 fn option_button(
     label: &'static str,
     selected: bool,
@@ -319,6 +335,7 @@ fn option_button(
     )
 }
 
+/// Показывает пример кнопки добавления с иконкой.
 fn add_button() -> Element<'static, Message> {
     button_with(
         "Добавить",
@@ -330,6 +347,7 @@ fn add_button() -> Element<'static, Message> {
     )
 }
 
+/// Запускает окно Iced с темой, обработкой действий и подпиской на клавиатуру.
 fn main() -> iced::Result {
     iced::application(Gallery::default, Gallery::update, Gallery::view)
         .title("Workspace UI Kit")

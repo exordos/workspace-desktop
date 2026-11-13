@@ -1,4 +1,5 @@
-//! Shared Iced widgets. Callers own application state and handle widget messages.
+//! Общие виджеты Iced, их тема и размеры.
+//! Вызывающий код передаёт состояние и обрабатывает события виджетов.
 
 mod button;
 mod icon;

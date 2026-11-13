@@ -1,3 +1,6 @@
+//! Управляет входом, восстановлением сессий и выходом из аккаунта.
+//! Контракты вынесены в contracts, продление токенов — в refresh. Здесь хранятся состояния и публикуются их изменения.
+
 mod contracts;
 mod refresh;
 
@@ -19,64 +22,74 @@ use refresh::{RefreshFlight, TimedToken};
 
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Источник времени, который в тестах можно заменить управляемыми часами.
 pub trait Clock: Send + Sync + 'static {
+    /// Возвращает текущий момент для проверки сроков действия.
     fn now(&self) -> Instant;
 }
 
+/// Часы приложения, которые используют монотонное время системы.
 struct SystemClock;
 
 impl Clock for SystemClock {
+    /// Читает системное время для измерения интервалов.
     fn now(&self) -> Instant {
         Instant::now()
     }
 }
 
+/// Точка входа для работы с авторизацией. Копии используют общее состояние.
 #[derive(Clone)]
 pub struct Auth {
-    inner: Arc<Inner>,
+    inner: Arc<Inner>, // Общие зависимости и состояния сессий.
 }
 
+/// Данные, которые используют все копии Auth.
 struct Inner {
-    iam: Arc<dyn IamClient>,
-    accounts: Arc<dyn AccountStore>,
-    secrets: Arc<dyn SecretStore>,
-    clock: Arc<dyn Clock>,
-    sequence: AtomicU64,
-    loaded: Mutex<bool>,
-    slots: Mutex<HashMap<AccountId, Arc<Mutex<AccountState>>>>,
-    attempts: Mutex<HashMap<LoginAttemptId, PendingLogin>>,
-    publication: Mutex<Publication>,
+    iam: Arc<dyn IamClient>,         // Клиент запросов к серверу авторизации.
+    accounts: Arc<dyn AccountStore>, // Хранилище записей аккаунтов.
+    secrets: Arc<dyn SecretStore>,   // Защищённое хранилище токенов обновления.
+    clock: Arc<dyn Clock>,           // Часы для сроков входа и действия токенов.
+    sequence: AtomicU64,             // Общий счётчик попыток входа и поколений сессий.
+    loaded: Mutex<bool>,             // Признак успешной загрузки сохранённых аккаунтов.
+    slots: Mutex<HashMap<AccountId, Arc<Mutex<AccountState>>>>, // Состояния по аккаунтам. У каждого аккаунта своя блокировка.
+    attempts: Mutex<HashMap<LoginAttemptId, PendingLogin>>, // Попытки, которые ещё ждут выбора проекта.
+    publication: Mutex<Publication>, // Последние снимки сессий и подписчики на изменения.
 }
 
+/// Данные для завершения входа после выбора проекта.
 struct PendingLogin {
-    server: String,
-    user_id: String,
-    refresh_token: String,
-    projects: Vec<IamProject>,
-    expires_at: Instant,
-    selecting: bool,
-    _expiration: mpsc::Sender<()>,
+    server: String,                // Проверенный адрес сервера.
+    user_id: String,               // Идентификатор пользователя из ответа IAM.
+    refresh_token: String,         // Токен обновления для обмена на токен выбранного проекта.
+    projects: Vec<IamProject>,     // Проекты, доступные этой попытке входа.
+    expires_at: Instant,           // Момент, после которого выбор проекта отклоняется.
+    selecting: bool,               // Признак, что запрос выбора проекта уже выполняется.
+    _expiration: mpsc::Sender<()>, // Канал закрывается при удалении попытки и останавливает ожидание таймера.
 }
 
+/// Состояния сессий, которые видны остальному приложению.
 #[derive(Default)]
 struct Publication {
-    sessions: HashMap<AccountId, SessionSnapshot>,
-    subscribers: Vec<async_mpsc::Sender<()>>,
+    sessions: HashMap<AccountId, SessionSnapshot>, // Последний снимок по каждому сохранённому аккаунту.
+    subscribers: Vec<async_mpsc::Sender<()>>, // Каналы, которые будят подписчиков при изменении снимков.
 }
 
+/// Текущее внутреннее состояние одного аккаунта.
 struct AccountState {
-    record: Option<AccountRecord>,
-    generation: SessionGeneration,
-    status: SessionStatus,
-    access: Option<TimedToken>,
-    refresh_token: Option<String>,
-    pending_token: Option<TimedToken>,
-    token_version: u64,
-    refresh: Option<RefreshFlight>,
-    retry_at: Option<Instant>,
+    record: Option<AccountRecord>, // Сохранённые данные аккаунта. `None` означает, что записи нет.
+    generation: SessionGeneration, // Номер входа, который защищает от результатов старых запросов.
+    status: SessionStatus,         // Текущее состояние сессии.
+    access: Option<TimedToken>,    // Токен доступа с датами обновления и истечения, если он есть.
+    refresh_token: Option<String>, // Токен обновления в памяти, если его уже загрузили или получили.
+    pending_token: Option<TimedToken>, // Ответ IAM, который ждёт успешного сохранения нового секрета.
+    token_version: u64,                // Номер установленного токена доступа внутри текущей сессии.
+    refresh: Option<RefreshFlight>,    // Текущая общая операция обновления, если она запущена.
+    retry_at: Option<Instant>, // Ближайший момент повтора после временного сбоя, если он задан.
 }
 
 impl AccountState {
+    /// Создаёт состояние для восстановления записи или для пустого аккаунта.
     fn new(record: Option<AccountRecord>) -> Self {
         let status = if record.as_ref().is_some_and(|record| !record.signed_out) {
             SessionStatus::Restoring
@@ -96,6 +109,7 @@ impl AccountState {
         }
     }
 
+    /// Меняет статус и сбрасывает токены и ожидающие обновления в памяти.
     fn end(&mut self, status: SessionStatus) {
         self.status = status;
         self.access = None;
@@ -107,6 +121,7 @@ impl AccountState {
 }
 
 impl Auth {
+    /// Создаёт авторизацию с системными часами и переданными хранилищами.
     pub fn new(
         iam: Arc<dyn IamClient>,
         accounts: Arc<dyn AccountStore>,
@@ -115,6 +130,7 @@ impl Auth {
         Self::with_clock(iam, accounts, secrets, Arc::new(SystemClock))
     }
 
+    /// Создаёт авторизацию с заданными часами. В тестах ими можно управлять.
     pub fn with_clock(
         iam: Arc<dyn IamClient>,
         accounts: Arc<dyn AccountStore>,
@@ -136,12 +152,13 @@ impl Auth {
         }
     }
 
+    /// Возвращает текущие состояния аккаунтов без токенов.
     pub fn snapshot(&self) -> Vec<SessionSnapshot> {
         self.inner.publication.lock().unwrap().snapshot()
     }
 
-    /// Runs a synchronous commit under the same account lock as session revocation.
-    /// The callback must not call back into authentication or perform network I/O.
+    /// Выполняет запись под той же блокировкой, что и отзыв сессии.
+    /// Переданная функция не должна обращаться к авторизации или выполнять сетевые запросы.
     pub(crate) fn with_active_generation<T>(
         &self,
         context: &OwnerContext,
@@ -159,6 +176,7 @@ impl Auth {
         Ok(commit())
     }
 
+    /// Сразу отдаёт текущий список сессий, а после изменений — его свежую версию.
     pub fn subscribe(&self) -> impl Stream<Item = Vec<SessionSnapshot>> + use<> {
         let (mut sender, receiver) = async_mpsc::channel(1);
         let mut publication = self.inner.publication.lock().unwrap();
@@ -173,6 +191,7 @@ impl Auth {
         })
     }
 
+    /// Проверяет данные для входа и возвращает попытку со списком проектов.
     pub fn begin_login(
         &self,
         server: &str,
@@ -224,10 +243,13 @@ impl Auth {
         Ok(LoginAttempt { id, projects })
     }
 
+    /// Отменяет выбор проекта и освобождает временные данные попытки.
     pub fn cancel_login(&self, attempt: LoginAttemptId) {
         self.inner.attempts.lock().unwrap().remove(&attempt);
     }
 
+    /// Проверяет выбранный проект, получает токен и сохраняет новую сессию.
+    /// При временном сбое IAM ту же попытку можно повторить до истечения срока.
     pub fn complete_login(
         &self,
         attempt: LoginAttemptId,
@@ -261,6 +283,7 @@ impl Auth {
                 project,
             )
         };
+        // Запрос выполняется без блокировки. После него ещё раз проверяем, жива ли попытка.
         let requested_at = self.inner.clock.now();
         let selection = self
             .inner
@@ -301,6 +324,7 @@ impl Auth {
         let token = TimedToken::new(token, &context, requested_at)?;
         let slot = self.slot_or_insert(&account_id);
         let mut state = slot.lock().unwrap();
+        // Запоздавший ответ не должен заменить состояние, которое уже изменилось.
         if state.generation.0 > attempt.0 {
             return Err(AuthError::AttemptUnavailable);
         }
@@ -308,6 +332,7 @@ impl Auth {
         Ok(context)
     }
 
+    /// Загружает сохранённые аккаунты и ждёт обновления сессий или очистки после выхода.
     pub async fn restore(&self) -> Result<(), AuthError> {
         self.load_accounts()?;
         let slots: Vec<_> = self.inner.slots.lock().unwrap().values().cloned().collect();
@@ -354,6 +379,7 @@ impl Auth {
         Ok(())
     }
 
+    /// Останавливает сессию аккаунта и удаляет сохранённые данные. При сбое очистку можно повторить.
     pub fn logout(&self, account_id: &AccountId) -> Result<(), AuthError> {
         self.load_accounts()?;
         let slot = self.slot_or_insert(account_id);
@@ -366,20 +392,24 @@ impl Auth {
         Ok(())
     }
 
+    /// Вычисляет одинаковый идентификатор для одной пары сервер и пользователь.
     fn account_id(server: &str, user_id: &str) -> AccountId {
         let identity = format!("{server}\0{user_id}");
         AccountId(Uuid::new_v5(&Uuid::NAMESPACE_URL, identity.as_bytes()).to_string())
     }
 
+    /// Проверяет, что ключ секрета принадлежит аккаунту и оканчивается корректным UUID.
     fn check_secret_key(account_id: &AccountId, key: &str) -> bool {
         key.split_once(':')
             .is_some_and(|(owner, nonce)| owner == account_id.0 && Uuid::parse_str(nonce).is_ok())
     }
 
+    /// Выдаёт следующий номер для попытки входа или поколения сессии.
     fn next_sequence(&self) -> u64 {
         self.inner.sequence.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    /// Находит состояние аккаунта или создаёт пустое.
     fn slot_or_insert(&self, account_id: &AccountId) -> Arc<Mutex<AccountState>> {
         self.inner
             .slots
@@ -390,6 +420,7 @@ impl Auth {
             .clone()
     }
 
+    /// Находит существующее состояние или сообщает, что сессия недоступна.
     fn account_slot(&self, account_id: &AccountId) -> Result<Arc<Mutex<AccountState>>, AuthError> {
         self.inner
             .slots
@@ -400,6 +431,7 @@ impl Auth {
             .ok_or(AuthError::SessionUnavailable)
     }
 
+    /// Один раз читает и проверяет записи аккаунтов, затем публикует их состояния.
     fn load_accounts(&self) -> Result<(), AuthError> {
         let mut loaded = self.inner.loaded.lock().unwrap();
         if !*loaded {
@@ -428,6 +460,7 @@ impl Auth {
         Ok(())
     }
 
+    /// Сохраняет новый секрет и запись аккаунта, затем включает сессию и удаляет старые секреты.
     fn commit_login(
         &self,
         state: &mut AccountState,
@@ -447,6 +480,7 @@ impl Auth {
                 .clone_from(&previous.retired_secret_keys);
             record.retired_secret_keys.push(previous.secret_key.clone());
         }
+        // Храним новый секрет под отдельным ключом, чтобы сохранить старый вход при сбое записи.
         let refresh_token = token.replacement_refresh().cloned().unwrap_or(base_refresh);
         self.inner
             .secrets
@@ -475,10 +509,12 @@ impl Auth {
         Ok(())
     }
 
+    /// Помечает запись как вышедшую, удаляет секреты и только потом саму запись.
     fn finish_logout(&self, state: &mut AccountState) -> Result<(), AuthError> {
         let Some(record) = &mut state.record else {
             return Ok(());
         };
+        // Сохраняем отметку о выходе до очистки, чтобы после перезапуска не восстановить сессию.
         if !record.signed_out {
             let mut signed_out = record.clone();
             signed_out.signed_out = true;
@@ -506,6 +542,7 @@ impl Auth {
         Ok(())
     }
 
+    /// Обновляет снимок аккаунта и уведомляет подписчиков об изменении.
     fn publish(&self, account_id: &AccountId, state: &AccountState) {
         let mut publication = self.inner.publication.lock().unwrap();
         if let Some(record) = &state.record {
@@ -529,6 +566,7 @@ impl Auth {
 }
 
 impl Publication {
+    /// Собирает копии снимков в стабильном порядке по идентификаторам аккаунтов.
     fn snapshot(&self) -> Vec<SessionSnapshot> {
         let mut snapshot: Vec<_> = self.sessions.values().cloned().collect();
         snapshot.sort_by(|left, right| left.context.account_id.cmp(&right.context.account_id));

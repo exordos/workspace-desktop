@@ -1,3 +1,6 @@
+//! Хранит токены обновления в связке ключей macOS.
+//! В конце есть тест чтения, замены и удаления секрета в настоящей связке ключей.
+
 use security_framework::passwords::{
     delete_generic_password, get_generic_password, set_generic_password,
 };
@@ -6,9 +9,11 @@ use workspace_core::auth::{SecretStore, StoreError};
 const SERVICE: &str = "com.workspace.desktop.auth";
 const ITEM_NOT_FOUND: i32 = -25300;
 
+/// Адаптер защищённого хранилища macOS для авторизации.
 pub struct MacKeychain;
 
 impl SecretStore for MacKeychain {
+    /// Читает токен по ключу. Возвращает `None`, если записи нет.
     fn load(&self, key: &str) -> Result<Option<String>, StoreError> {
         match get_generic_password(SERVICE, key) {
             Ok(value) => String::from_utf8(value).map(Some).map_err(|_| StoreError),
@@ -17,10 +22,12 @@ impl SecretStore for MacKeychain {
         }
     }
 
+    /// Записывает новый токен или заменяет старый по тому же ключу.
     fn save(&self, key: &str, value: &str) -> Result<(), StoreError> {
         set_generic_password(SERVICE, key, value.as_bytes()).map_err(|_| StoreError)
     }
 
+    /// Удаляет секрет. Отсутствие записи считается успешной очисткой.
     fn remove(&self, key: &str) -> Result<(), StoreError> {
         match delete_generic_password(SERVICE, key) {
             Ok(()) => Ok(()),
@@ -34,11 +41,14 @@ impl SecretStore for MacKeychain {
 mod tests {
     use super::*;
 
+    /// Проверяет запись, чтение, замену и удаление тестового секрета в связке ключей.
     #[test]
     #[ignore = "requires an unlocked macOS login Keychain"]
     fn keychain_round_trip() {
-        struct Cleanup(String);
+        /// Удаляет тестовый секрет, когда тест выходит из области видимости.
+        struct Cleanup(String); // Ключ тестовой записи в связке ключей.
         impl Drop for Cleanup {
+            /// Пытается удалить тестовый секрет даже после сбоя проверки.
             fn drop(&mut self) {
                 let _ = MacKeychain.remove(&self.0);
             }

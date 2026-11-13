@@ -1,3 +1,6 @@
+//! Создаёт кнопки Workspace на основе Iced.
+//! Сначала идут параметры, сборка и цвета кнопок, затем обработка клавиатуры и анимация загрузки.
+
 use std::{cell::Cell, f32::consts::TAU, rc::Rc};
 
 use iced::advanced::renderer::{self, Renderer as _};
@@ -17,42 +20,45 @@ use super::theme::button_colors;
 
 const LEADING_ICON_SIZE: u32 = 16;
 
+/// Назначение кнопки, от которого зависят её цвета.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum ButtonVariant {
     #[default]
-    Primary,
-    Neutral,
-    Danger,
+    Primary, // Основное действие.
+    Neutral, // Обычное действие без акцента.
+    Danger,  // Действие с серьёзными последствиями, например удаление.
 }
 
+/// Способ оформления фона и границы кнопки.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum ButtonAppearance {
     #[default]
-    Filled,
-    Outline,
-    Ghost,
+    Filled, // Кнопка с заливкой.
+    Outline, // Кнопка с контуром.
+    Ghost,   // Кнопка с прозрачным фоном в обычном состоянии.
 }
 
+/// Размер кнопки, который определяет отступы и размер текста.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum ButtonSize {
-    Small,
+    Small, // Компактный размер.
     #[default]
-    Medium,
-    Large,
+    Medium, // Стандартный размер.
+    Large, // Увеличенный размер.
 }
 
+/// Настройки кнопки для случаев, когда стандартных параметров мало.
 pub struct ButtonOptions<'a, Message> {
-    pub variant: ButtonVariant,
-    pub appearance: ButtonAppearance,
-    pub size: ButtonSize,
-    pub loading: bool,
-    pub full_width: bool,
-    /// A decorative Iced element from any icon source. It is centered in a 16 × 16 slot.
-    /// The spinner occupies the same slot while loading.
-    pub leading_icon: Option<Element<'a, Message>>,
+    pub variant: ButtonVariant, // Назначение, по которому выбираются цвета.
+    pub appearance: ButtonAppearance, // Оформление заливки и границы.
+    pub size: ButtonSize,       // Размер текста и отступов.
+    pub loading: bool,          // Признак загрузки. Показывает индикатор и отключает нажатие.
+    pub full_width: bool,       // Признак, что кнопка должна занять доступную ширину.
+    pub leading_icon: Option<Element<'a, Message>>, // Иконка в области 16 × 16. При загрузке её место занимает индикатор.
 }
 
 impl<Message> Default for ButtonOptions<'_, Message> {
+    /// Возвращает стандартные параметры кнопки без иконки и загрузки.
     fn default() -> Self {
         Self {
             variant: ButtonVariant::default(),
@@ -65,6 +71,7 @@ impl<Message> Default for ButtonOptions<'_, Message> {
     }
 }
 
+/// Создаёт кнопку с выбранным назначением и стандартным оформлением.
 pub fn button<'a, Message: Clone + 'a>(
     label: &'a str,
     variant: ButtonVariant,
@@ -80,6 +87,7 @@ pub fn button<'a, Message: Clone + 'a>(
     )
 }
 
+/// Создаёт кнопку с заданными параметрами. `None` вместо сообщения отключает нажатие.
 pub fn button_with<'a, Message: Clone + 'a>(
     label: &'a str,
     options: ButtonOptions<'a, Message>,
@@ -164,6 +172,7 @@ pub fn button_with<'a, Message: Clone + 'a>(
     })
 }
 
+/// Подбирает фон, текст и границу для темы, оформления и состояния кнопки.
 fn button_style(
     theme: &Theme,
     variant: ButtonVariant,
@@ -271,29 +280,33 @@ fn button_style(
     }
 }
 
-// Iced's Button handles pointer events. This wrapper adds focus and keyboard activation.
+/// Обёртка над кнопкой Iced, которая добавляет фокус и нажатие с клавиатуры.
 struct KeyboardButton<'a, Message> {
-    inner: Button<'a, Message>,
-    on_press: Option<Message>,
-    keyboard_pressed: Rc<Cell<bool>>,
+    inner: Button<'a, Message>, // Кнопка Iced, которая рисует содержимое и обрабатывает указатель.
+    on_press: Option<Message>,  // Сообщение при нажатии. `None` означает, что кнопка отключена.
+    keyboard_pressed: Rc<Cell<bool>>, // Общий признак нажатия клавишей, который читает стиль кнопки.
 }
 
+/// Состояние клавиатуры, которое Iced хранит между обновлениями виджета.
 #[derive(Default)]
 struct FocusState {
-    enabled: bool,
-    focused: bool,
-    space_held: bool,
+    enabled: bool,    // Признак, что кнопку можно нажать.
+    focused: bool,    // Признак, что кнопка сейчас принимает ввод с клавиатуры.
+    space_held: bool, // Признак, что пробел удерживается до отпускания или потери фокуса.
 }
 
 impl Focusable for FocusState {
+    /// Сообщает Iced, находится ли кнопка в фокусе.
     fn is_focused(&self) -> bool {
         self.focused
     }
 
+    /// Переводит клавиатурный фокус на кнопку.
     fn focus(&mut self) {
         self.focused = true;
     }
 
+    /// Снимает фокус и сбрасывает удержание пробела.
     fn unfocus(&mut self) {
         self.focused = false;
         self.space_held = false;
@@ -301,10 +314,12 @@ impl Focusable for FocusState {
 }
 
 impl<'a, Message: Clone + 'a> Widget<Message, Theme, Renderer> for KeyboardButton<'a, Message> {
+    /// Указывает Iced, какой тип состояния хранить для этой обёртки.
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<FocusState>()
     }
 
+    /// Создаёт начальное состояние клавиатуры по доступности кнопки.
     fn state(&self) -> tree::State {
         tree::State::new(FocusState {
             enabled: self.on_press.is_some(),
@@ -312,12 +327,14 @@ impl<'a, Message: Clone + 'a> Widget<Message, Theme, Renderer> for KeyboardButto
         })
     }
 
+    /// Создаёт отдельную ветку состояния для вложенной кнопки.
     fn children(&self) -> Vec<Tree> {
         vec![Tree::new(
             &self.inner as &dyn Widget<Message, Theme, Renderer>,
         )]
     }
 
+    /// Обновляет дерево Iced и сбрасывает фокус, когда меняется доступность кнопки.
     fn diff(&self, tree: &mut Tree) {
         let state = tree.state.downcast_mut::<FocusState>();
         let enabled = self.on_press.is_some();
@@ -330,10 +347,12 @@ impl<'a, Message: Clone + 'a> Widget<Message, Theme, Renderer> for KeyboardButto
         }
     }
 
+    /// Возвращает размеры вложенной кнопки.
     fn size(&self) -> Size<Length> {
         self.inner.size()
     }
 
+    /// Просит вложенную кнопку рассчитать расположение содержимого.
     fn layout(
         &mut self,
         tree: &mut Tree,
@@ -343,6 +362,7 @@ impl<'a, Message: Clone + 'a> Widget<Message, Theme, Renderer> for KeyboardButto
         self.inner.layout(&mut tree.children[0], renderer, limits)
     }
 
+    /// Регистрирует доступную кнопку для перехода фокуса и передаёт операцию внутрь.
     fn operate(
         &mut self,
         tree: &mut Tree,
@@ -361,6 +381,7 @@ impl<'a, Message: Clone + 'a> Widget<Message, Theme, Renderer> for KeyboardButto
             .operate(&mut tree.children[0], layout, renderer, operation);
     }
 
+    /// Обрабатывает Enter и пробел, а остальные события передаёт вложенной кнопке.
     fn update(
         &mut self,
         tree: &mut Tree,
@@ -432,6 +453,7 @@ impl<'a, Message: Clone + 'a> Widget<Message, Theme, Renderer> for KeyboardButto
         );
     }
 
+    /// Рисует кнопку и рамку клавиатурного фокуса.
     fn draw(
         &self,
         tree: &Tree,
@@ -469,6 +491,7 @@ impl<'a, Message: Clone + 'a> Widget<Message, Theme, Renderer> for KeyboardButto
         }
     }
 
+    /// Спрашивает у вложенной кнопки, какой указатель мыши показать.
     fn mouse_interaction(
         &self,
         tree: &Tree,
@@ -481,6 +504,7 @@ impl<'a, Message: Clone + 'a> Widget<Message, Theme, Renderer> for KeyboardButto
             .mouse_interaction(&tree.children[0], layout, cursor, viewport, renderer)
     }
 
+    /// Передаёт вложенной кнопке запрос на отрисовку поверх других виджетов.
     fn overlay<'b>(
         &'b mut self,
         tree: &'b mut Tree,
@@ -499,20 +523,24 @@ impl<'a, Message: Clone + 'a> Widget<Message, Theme, Renderer> for KeyboardButto
     }
 }
 
+/// Индикатор, который крутится на месте иконки во время загрузки.
 struct Spinner {
-    variant: ButtonVariant,
-    appearance: ButtonAppearance,
+    variant: ButtonVariant,       // Назначение кнопки для выбора цвета индикатора.
+    appearance: ButtonAppearance, // Оформление кнопки для выбора цвета индикатора.
 }
 
+/// Параметры текущего кадра анимации.
 #[derive(Default)]
 struct SpinnerState {
-    start: Option<Instant>,
-    angle: f32,
+    start: Option<Instant>, // Момент первого кадра. `None` до первого запроса перерисовки.
+    angle: f32,             // Текущий угол поворота в радианах.
 }
 
 impl<Message> canvas::Program<Message> for Spinner {
+    /// Состояние анимации, которое Iced хранит для индикатора.
     type State = SpinnerState;
 
+    /// Вычисляет угол по времени и просит Iced нарисовать следующий кадр.
     fn update(
         &self,
         state: &mut Self::State,
@@ -530,6 +558,7 @@ impl<Message> canvas::Program<Message> for Spinner {
         ))
     }
 
+    /// Рисует дугу индикатора цветом текста отключённой кнопки.
     fn draw(
         &self,
         state: &Self::State,

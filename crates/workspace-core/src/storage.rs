@@ -1,3 +1,6 @@
+//! Хранит сообщения и позиции чтения в SQLite.
+//! Сначала описаны данные и таблицы, затем чтение и запись. В конце проверяются повтор событий и откат записи.
+
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -6,50 +9,57 @@ use thiserror::Error;
 
 use crate::context::OwnerContext;
 
+/// Позиция в журнале событий, с которой можно продолжить чтение.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Cursor {
-    /// The source issues an opaque epoch identifier. Only versions within one epoch are ordered.
-    pub epoch_generation: String,
-    pub epoch_version: u64,
+    pub epoch_generation: String, // Метка журнала от источника. Позиции сравнимы только при одинаковой метке.
+    pub epoch_version: u64,       // Номер события внутри этого журнала.
 }
 
+/// Сообщение мессенджера в локальной базе.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Message {
-    pub id: String,
-    pub text: String,
+    pub id: String,   // Серверный идентификатор сообщения.
+    pub text: String, // Текст сообщения.
 }
 
+/// Результат обработки события в локальной базе.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApplyOutcome {
-    Applied,
-    Duplicate,
+    Applied,   // Позиция обновилась. Сообщение сохранено, если оно было в событии.
+    Duplicate, // Эта позиция уже обработана или находится позади сохранённой.
 }
 
+/// Причины, по которым локальная база не смогла прочитать или записать данные.
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("the source epoch changed and requires recovery")]
-    EpochChanged,
+    EpochChanged, // Метка журнала изменилась. Старую и новую позиции сравнить нельзя.
     #[error("the source cursor version exceeds the supported range")]
-    CursorVersionOutOfRange,
+    CursorVersionOutOfRange, // Номер позиции нельзя представить в допустимом диапазоне SQLite.
     #[error("the storage connection lock is poisoned")]
-    Poisoned,
+    Poisoned, // Доступ к соединению потерян после паники под блокировкой.
     #[error(transparent)]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(#[from] rusqlite::Error), // Исходная ошибка SQLite.
 }
 
+/// Локальное хранилище сообщений и позиций чтения.
 pub struct Storage {
-    connection: Mutex<Connection>,
+    connection: Mutex<Connection>, // Соединение с SQLite. Блокировка выдаёт его по одному запросу за раз.
 }
 
 impl Storage {
+    /// Открывает базу по пути и создаёт таблицы при необходимости.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         Self::initialize(Connection::open(path)?)
     }
 
+    /// Создаёт базу в памяти для работы без файла.
     pub fn in_memory() -> Result<Self, StorageError> {
         Self::initialize(Connection::open_in_memory()?)
     }
 
+    /// Подготавливает таблицы сообщений и позиций для переданного соединения.
     fn initialize(connection: Connection) -> Result<Self, StorageError> {
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS sync_cursors (
@@ -79,6 +89,7 @@ impl Storage {
         })
     }
 
+    /// Читает позицию указанного источника для аккаунта и проекта. `None`, если её ещё нет.
     pub fn cursor(
         &self,
         owner: &OwnerContext,
@@ -88,6 +99,7 @@ impl Storage {
         read_cursor(&connection, owner, source)
     }
 
+    /// Ищет сообщение по идентификатору в пределах аккаунта и проекта.
     pub fn message(
         &self,
         owner: &OwnerContext,
@@ -117,6 +129,8 @@ impl Storage {
             .optional()?)
     }
 
+    /// Записывает сообщение и позицию одной транзакцией.
+    /// Пропускает повторную позицию и возвращает ошибку при смене метки журнала.
     pub(crate) fn apply(
         &self,
         owner: &OwnerContext,
@@ -179,6 +193,7 @@ impl Storage {
     }
 }
 
+/// Читает позицию через переданное соединение, в том числе внутри транзакции.
 fn read_cursor(
     connection: &Connection,
     owner: &OwnerContext,
@@ -216,6 +231,7 @@ mod tests {
     use super::*;
     use crate::context::AccountId;
 
+    /// Записывает тестовое событие с сообщением.
     fn apply_message(
         storage: &Storage,
         owner: &OwnerContext,
@@ -228,6 +244,7 @@ mod tests {
 
     const SOURCE: &str = "messenger";
 
+    /// Возвращает владельца данных для тестов хранилища.
     fn owner() -> OwnerContext {
         OwnerContext {
             account_id: AccountId("account".into()),
@@ -238,6 +255,7 @@ mod tests {
         }
     }
 
+    /// Собирает тестовую позицию из метки и номера события.
     fn cursor(epoch_generation: &str, epoch_version: u64) -> Cursor {
         Cursor {
             epoch_generation: epoch_generation.into(),
@@ -245,6 +263,7 @@ mod tests {
         }
     }
 
+    /// Создаёт тестовое сообщение с заданным текстом и идентификатором.
     fn message(id: &str, text: &str) -> Message {
         Message {
             id: id.into(),
@@ -252,6 +271,7 @@ mod tests {
         }
     }
 
+    /// Проверяет, что повтор или смена журнала не повреждают сообщения и позицию.
     #[test]
     fn preserves_cursor_and_messages_on_duplicate_or_epoch_change() {
         let storage = Storage::in_memory().unwrap();
@@ -289,6 +309,7 @@ mod tests {
         assert_eq!(storage.message(&owner, "third").unwrap(), None);
     }
 
+    /// Проверяет, что сбой записи позиции отменяет запись сообщения и позволяет повторить событие.
     #[test]
     fn failed_cursor_write_rolls_back_message_and_allows_replay() {
         let storage = Storage::in_memory().unwrap();
@@ -332,6 +353,7 @@ mod tests {
         assert_eq!(storage.message(&owner, "two").unwrap(), Some(pending));
     }
 
+    /// Проверяет границу 64-битного целого SQLite для номера позиции.
     #[test]
     fn accepts_bigint_max_and_rejects_out_of_range_cursor() {
         let storage = Storage::in_memory().unwrap();

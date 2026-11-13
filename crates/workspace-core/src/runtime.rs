@@ -1,3 +1,6 @@
+//! Поддерживает фоновые подключения к источникам событий.
+//! По состоянию сессий запускает и останавливает задачи, возобновляет чтение и передаёт события в Sync.
+
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use futures::{Stream, StreamExt, future::BoxFuture};
@@ -18,68 +21,79 @@ use crate::{
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 
+/// Поток, который выдаёт по одному событию или ошибке источника.
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<Event, SourceError>> + Send>>;
 
+/// Причины, по которым источник событий не смог продолжить чтение.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum SourceError {
     #[error("event source is unavailable")]
-    Temporary,
+    Temporary, // Временный сбой. Соединение можно открыть заново.
     #[error("event source rejected the session token")]
-    Unauthorized,
+    Unauthorized, // Сервер отклонил токен доступа.
     #[error("event source denied access to this project")]
-    Forbidden,
+    Forbidden, // У пользователя нет права читать события.
     #[error("event source returned an invalid response")]
-    InvalidResponse,
+    InvalidResponse, // Ответ источника не соответствует ожидаемому формату.
     #[error("saved source cursor expired and requires recovery")]
-    CursorPruned,
+    CursorPruned, // Источник больше не хранит события с указанной позиции.
 }
 
+/// Данные, которые источник получает при открытии соединения.
 pub struct SourceSession {
-    pub context: OwnerContext,
-    pub generation: SessionGeneration,
-    pub token_version: u64,
-    pub cursor: Option<Cursor>,
-    pub access_token: String,
+    pub context: OwnerContext, // Аккаунт и проект, для которых нужно читать события.
+    pub generation: SessionGeneration, // Поколение сессии, к которому относится подключение.
+    pub token_version: u64,    // Версия переданного токена доступа.
+    pub cursor: Option<Cursor>, // Последняя сохранённая позиция. `None` означает первое подключение.
+    pub access_token: String,   // Токен для подключения к источнику.
 }
 
+/// Интерфейс источника, который умеет открывать поток событий для сессии.
 pub trait EventSource: Send + std::marker::Sync {
+    /// Возвращает постоянное имя источника для задач и сохранённых позиций.
     fn id(&self) -> &str;
 
+    /// Возвращает сервис, для которого нужен токен доступа.
     fn service(&self) -> Service {
         Service::Messenger
     }
 
-    /// The runtime reconnects after errors or end of stream. Dropping this
-    /// future or its returned stream must release the source's connection.
+    /// Открывает поток. После ошибки или конца потока Runtime может открыть его снова.
+    /// Отмена запроса или уничтожение потока должны освобождать соединение.
     fn connect(&self, session: SourceSession) -> BoxFuture<'_, Result<EventStream, SourceError>>;
 }
 
+/// Ошибка настройки или работы фоновой синхронизации.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     #[error("duplicate event source: {0}")]
-    DuplicateSource(String),
+    DuplicateSource(String), // Имя, которое использовали два источника.
     #[error("background worker failed: {0}")]
-    Worker(#[from] JoinError),
+    Worker(#[from] JoinError), // Причина аварийного завершения фоновой задачи Tokio.
 }
 
+/// Согласует фоновые задачи получения событий с состояниями сессий.
 pub struct Runtime {
-    sync: Arc<Sync>,
-    sources: HashMap<String, Arc<dyn EventSource>>,
+    sync: Arc<Sync>, // Синхронизация, которая читает позицию и сохраняет события.
+    sources: HashMap<String, Arc<dyn EventSource>>, // Источники событий по их уникальным именам.
 }
 
+/// Ключ отдельной задачи чтения событий.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct TaskKey {
-    context: OwnerContext,
-    source: String,
+    context: OwnerContext, // Аккаунт и проект, для которых читаются события.
+    source: String,        // Имя источника событий.
 }
 
+/// Сведения о запущенной задаче для проверки и отмены.
 struct Task {
-    generation: SessionGeneration,
-    token_version: u64,
-    cancel: Option<oneshot::Sender<()>>,
+    generation: SessionGeneration, // Поколение сессии, с которым запустили задачу.
+    token_version: u64,            // Версия токена, с которой запустили задачу.
+    cancel: Option<oneshot::Sender<()>>, // Канал остановки. `None` означает, что сигнал уже отправлен.
 }
 
 impl Task {
+    /// Отправляет сигнал остановки один раз.
     fn cancel(&mut self) {
         if let Some(cancel) = self.cancel.take() {
             let _ = cancel.send(());
@@ -87,9 +101,11 @@ impl Task {
     }
 }
 
+/// Ключ завершившейся задачи и результат её работы.
 type WorkerResult = (TaskKey, Result<(), JoinError>);
 
 impl Runtime {
+    /// Создаёт Runtime и проверяет, что имена источников уникальны.
     pub fn new(sync: Arc<Sync>, sources: Vec<Arc<dyn EventSource>>) -> Result<Self, RuntimeError> {
         let mut by_id = HashMap::new();
         for source in sources {
@@ -104,8 +120,9 @@ impl Runtime {
         })
     }
 
-    /// Signal shutdown and await this future to join all workers and pending
-    /// writes. Dropping the future aborts workers without awaiting writes.
+    /// Следит за сессиями и управляет задачами до сигнала остановки.
+    /// Чтобы дождаться задач и начатых записей, передай сигнал и дождись результата этой функции.
+    /// Если отменить ожидание функции, задачи прервутся, а начатые записи могут ещё выполняться.
     pub async fn run(self, shutdown: impl Future<Output = ()>) -> Result<(), RuntimeError> {
         let snapshots = self.sync.auth().subscribe();
         tokio::pin!(snapshots, shutdown);
@@ -146,6 +163,7 @@ impl Runtime {
         result
     }
 
+    /// Останавливает устаревшие задачи и запускает недостающие для текущих сессий.
     fn reconcile(
         &self,
         snapshots: Vec<SessionSnapshot>,
@@ -196,22 +214,23 @@ impl Runtime {
     }
 }
 
+/// Фоновая работа с одним источником событий для одной сессии.
 struct Worker {
-    sync: Arc<Sync>,
-    source: Arc<dyn EventSource>,
-    key: TaskKey,
-    session: SessionSnapshot,
+    sync: Arc<Sync>,              // Доступ к авторизации и локальному сохранению событий.
+    source: Arc<dyn EventSource>, // Источник, у которого задача открывает поток.
+    key: TaskKey,                 // Аккаунт, проект и имя источника этой задачи.
+    session: SessionSnapshot,     // Снимок сессии и версии токена на момент запуска задачи.
 }
 
 impl Worker {
+    /// Читает события, повторяет временные сбои с паузой и реагирует на отмену.
     async fn run(self, mut cancelled: oneshot::Receiver<()>) -> Result<(), JoinError> {
         let mut delay = INITIAL_RETRY_DELAY;
         loop {
             match self.consume(&mut cancelled, &mut delay).await? {
                 ConnectionEnd::Stopped => break,
                 ConnectionEnd::CursorRejected => {
-                    // Wait for replacement or shutdown instead of repeatedly
-                    // reconnecting at a cursor the source cannot advance.
+                    // Повтор с той же позицией не поможет. Ждём замены или остановки задачи.
                     let _ = cancelled.await;
                     break;
                 }
@@ -229,6 +248,7 @@ impl Worker {
         Ok(())
     }
 
+    /// Загружает позицию и токен, открывает поток и сохраняет события до остановки или ошибки.
     async fn consume(
         &self,
         cancelled: &mut oneshot::Receiver<()>,
@@ -254,7 +274,7 @@ impl Worker {
             }
             Some(Err(_)) => return Ok(ConnectionEnd::Retry),
         };
-        // Obtaining a token can advance its version and trigger reconciliation.
+        // Получение токена могло сменить его версию. Тогда подключаться будет уже новая задача.
         let status = auth
             .snapshot()
             .into_iter()
@@ -291,7 +311,7 @@ impl Worker {
             let sync = self.sync.clone();
             let key = self.key.clone();
             let generation = self.session.generation;
-            // Await an already submitted write before releasing the worker's key.
+            // Ждём начатую запись, чтобы следующая задача не прочитала старую позицию.
             let applied =
                 spawn_blocking(move || sync.apply(&key.context, generation, &key.source, event))
                     .await?;
@@ -309,6 +329,7 @@ impl Worker {
         }
     }
 
+    /// Решает, можно ли повторить подключение, и сбрасывает токен при отказе сервера.
     fn source_failure(&self, error: SourceError) -> ConnectionEnd {
         match error {
             SourceError::Unauthorized => {
@@ -328,12 +349,14 @@ impl Worker {
     }
 }
 
+/// Решение о том, что делать после завершения попытки чтения.
 enum ConnectionEnd {
-    Stopped,
-    Retry,
-    CursorRejected,
+    Stopped,        // Завершить задачу.
+    Retry,          // Подождать и подключиться снова.
+    CursorRejected, // Приостановить чтение до отмены задачи. Простое переподключение не поможет.
 }
 
+/// Ждёт операцию или отмену. При отмене возвращает `None`.
 async fn until_cancelled<T>(
     cancelled: &mut oneshot::Receiver<()>,
     operation: impl Future<Output = T>,

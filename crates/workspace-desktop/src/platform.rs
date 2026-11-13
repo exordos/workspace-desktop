@@ -1,3 +1,6 @@
+//! Связывает хранилища авторизации с операционной системой.
+//! Здесь хранится список аккаунтов в JSON. Работа с секретами macOS вынесена в keychain.
+
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -6,13 +9,15 @@ use std::sync::Mutex;
 use workspace_core::auth::{AccountRecord, AccountStore, StoreError};
 use workspace_core::context::AccountId;
 
+/// Хранилище записей аккаунтов в одном JSON-файле.
 pub struct JsonAccountStore {
-    path: PathBuf,
-    _process_lock: File,
-    write_lock: Mutex<()>,
+    path: PathBuf,         // Путь к файлу с записями аккаунтов.
+    _process_lock: File, // Открытый файл, который не даёт второму процессу менять записи одновременно.
+    write_lock: Mutex<()>, // Блокировка записи между потоками одного процесса.
 }
 
 impl JsonAccountStore {
+    /// Создаёт каталог и пытается получить исключительный доступ к хранилищу.
     pub fn open(directory: &Path) -> io::Result<Self> {
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true);
@@ -49,6 +54,7 @@ impl JsonAccountStore {
         })
     }
 
+    /// Читает JSON. Если файла ещё нет, возвращает пустой список.
     fn read(&self) -> Result<Vec<AccountRecord>, StoreError> {
         match File::open(&self.path) {
             Ok(file) => serde_json::from_reader(io::BufReader::new(file)).map_err(|_| StoreError),
@@ -57,6 +63,7 @@ impl JsonAccountStore {
         }
     }
 
+    /// Пишет данные во временный файл и заменяет им основной после успешной записи.
     fn write(&self, records: &[AccountRecord]) -> Result<(), StoreError> {
         let directory = self.path.parent().ok_or(StoreError)?;
         let mut file = tempfile::NamedTempFile::new_in(directory).map_err(|_| StoreError)?;
@@ -64,17 +71,19 @@ impl JsonAccountStore {
         file.flush().map_err(|_| StoreError)?;
         file.as_file().sync_all().map_err(|_| StoreError)?;
         file.persist(&self.path).map_err(|_| StoreError)?;
-        // Rename committed the new record. A directory sync failure cannot undo it.
+        // Переименование уже заменило запись. Сбой синхронизации каталога её не отменит.
         let _ = File::open(directory).and_then(|directory| directory.sync_all());
         Ok(())
     }
 }
 
 impl AccountStore for JsonAccountStore {
+    /// Загружает сохранённые записи аккаунтов.
     fn load(&self) -> Result<Vec<AccountRecord>, StoreError> {
         self.read()
     }
 
+    /// Под блокировкой добавляет или заменяет одну запись аккаунта.
     fn save(&self, record: &AccountRecord) -> Result<(), StoreError> {
         let _guard = self.write_lock.lock().map_err(|_| StoreError)?;
         let mut records = self.read()?;
@@ -89,6 +98,7 @@ impl AccountStore for JsonAccountStore {
         self.write(&records)
     }
 
+    /// Под блокировкой удаляет аккаунт. Если его уже нет, запись файла не нужна.
     fn remove(&self, account_id: &AccountId) -> Result<(), StoreError> {
         let _guard = self.write_lock.lock().map_err(|_| StoreError)?;
         let mut records = self.read()?;
@@ -112,6 +122,7 @@ mod tests {
     use super::*;
     use workspace_core::context::OwnerContext;
 
+    /// Готовит запись аккаунта с заданным идентификатором для тестов.
     fn account(id: &str) -> AccountRecord {
         AccountRecord {
             context: OwnerContext {
@@ -127,6 +138,7 @@ mod tests {
         }
     }
 
+    /// Проверяет сохранение изменений и удаления между открытиями хранилища.
     #[test]
     fn persists_account_updates_and_removal_across_opens() {
         let directory = tempfile::tempdir().unwrap();
@@ -153,6 +165,7 @@ mod tests {
         assert_eq!(store.load().unwrap(), vec![second]);
     }
 
+    /// Проверяет, что второй экземпляр не получит доступ до закрытия первого.
     #[test]
     fn refuses_second_process_lock_until_first_store_closes() {
         let directory = tempfile::tempdir().unwrap();
@@ -165,6 +178,7 @@ mod tests {
         assert!(JsonAccountStore::open(directory.path()).is_ok());
     }
 
+    /// Проверяет, что повреждённый JSON не затирается при неудачном обновлении.
     #[test]
     fn invalid_metadata_is_preserved_if_update_cannot_read_it() {
         let directory = tempfile::tempdir().unwrap();

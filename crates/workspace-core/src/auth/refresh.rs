@@ -116,7 +116,8 @@ impl Auth {
             && state.record.as_ref().map(|record| &record.context) == Some(context)
             && state.access.take().is_some()
         {
-            // The next token version starts a new worker and resets its transport backoff.
+            // Новый токен запустит задачу с начальной паузой переподключения.
+            // Поэтому ограничиваем частоту повторов здесь, пока сервер отклоняет токены.
             let retry_at = self.inner.clock.now() + RETRY_DELAY;
             state.retry_at = Some(
                 state
@@ -253,6 +254,7 @@ impl Auth {
             let mut state = slot.lock().unwrap();
             Self::check_generation(&state, generation)?;
             let record = state.record.clone().ok_or(AuthError::SessionUnavailable)?;
+            // Если запись секрета не удалась, повторяем её с тем же ответом IAM.
             if let Some(token) = state.pending_token.take() {
                 return self.commit_refresh(&mut state, &record, token);
             }

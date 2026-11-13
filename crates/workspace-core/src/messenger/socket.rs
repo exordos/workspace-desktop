@@ -1,3 +1,6 @@
+//! Читает новые события мессенджера через защищённый WebSocket.
+//! Ниже описаны подключение, контроль связи, разбор кадров и обработка ошибок.
+
 use std::{pin::Pin, time::Duration};
 
 use futures::{SinkExt, Stream, StreamExt, stream};
@@ -31,15 +34,19 @@ const FRAME_IDLE_TIMEOUT: Duration = Duration::from_secs(35);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_EVENT_BYTES: usize = 4 * 1024 * 1024;
 
+/// Кадр, который WebSocket передаёт источнику мессенджера.
 pub(super) enum SocketFrame {
-    Event(Event),
-    Ready,
+    Event(Event), // Событие журнала для передачи в синхронизацию.
+    Ready,        // Сервер сообщил, что поток готов.
 }
 
+/// Поток кадров WebSocket. После ошибки чтение завершается.
 pub(super) type SocketStream = Pin<Box<dyn Stream<Item = Result<SocketFrame, SourceError>> + Send>>;
 
+/// Соединение WebSocket поверх TCP с поддержкой TLS.
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// Открывает WebSocket с заданной позиции и проверяет согласованный протокол.
 pub(super) async fn connect(session: &SourceSession) -> Result<SocketStream, SourceError> {
     let cursor = session
         .cursor
@@ -49,7 +56,7 @@ pub(super) async fn connect(session: &SourceSession) -> Result<SocketStream, Sou
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_EVENT_BYTES))
         .max_frame_size(Some(MAX_EVENT_BYTES));
-    // The async connector opens one connection and does not follow redirects.
+    // Клиент открывает соединение по заданному адресу и не следует перенаправлениям.
     let (socket, response) = timeout(
         CONNECT_TIMEOUT,
         connect_async_with_config(request, Some(config), false),
@@ -81,6 +88,7 @@ pub(super) async fn connect(session: &SourceSession) -> Result<SocketStream, Sou
     })))
 }
 
+/// Собирает адрес WSS и передаёт позицию и токен при открытии соединения.
 fn request(
     owner: &OwnerContext,
     cursor: &Cursor,
@@ -95,8 +103,7 @@ fn request(
         .append_pair("last_epoch_version", &cursor.epoch_version.to_string())
         .append_pair("epoch_generation", &cursor.epoch_generation);
 
-    // The bearer value is a WebSocket subprotocol token, which forbids
-    // separators such as whitespace or commas. IAM issues compact JWTs.
+    // Токен передаётся в списке подпротоколов WebSocket. Пробелы и запятые в нём недопустимы.
     if access_token.is_empty()
         || !access_token
             .bytes()
@@ -117,14 +124,16 @@ fn request(
     Ok(request)
 }
 
+/// Данные, которые нужны для проверки кадров и поддержания соединения.
 struct SocketState {
-    socket: Socket,
-    context: OwnerContext,
-    epoch: String,
-    ready: bool,
+    socket: Socket,        // Открытое соединение с сервером.
+    context: OwnerContext, // Владелец и проект, которым должны соответствовать события.
+    epoch: String,         // Метка журнала, с которой открыли соединение.
+    ready: bool,           // Признак, что сервер уже прислал сообщение о готовности.
 }
 
 impl SocketState {
+    /// Читает до следующего события или сигнала готовности, обрабатывая служебные кадры.
     async fn next_frame(&mut self) -> Result<SocketFrame, SourceError> {
         loop {
             match self.read_message().await? {
@@ -139,7 +148,7 @@ impl SocketState {
                     return Ok(frame);
                 }
                 Message::Ping(_) => {
-                    // Tungstenite queues the matching pong automatically.
+                    // Tungstenite сам готовит ответ pong. Здесь отправляем его из буфера.
                     timeout(HEARTBEAT_TIMEOUT, self.socket.flush())
                         .await
                         .map_err(|_| SourceError::Temporary)?
@@ -156,6 +165,7 @@ impl SocketState {
         }
     }
 
+    /// Ждёт кадр. Если сервер долго молчит, проверяет соединение с помощью ping.
     async fn read_message(&mut self) -> Result<Message, SourceError> {
         let next = match timeout(FRAME_IDLE_TIMEOUT, self.socket.next()).await {
             Ok(next) => next,
@@ -176,6 +186,7 @@ impl SocketState {
     }
 }
 
+/// Различает событие, готовность потока и ответ об устаревшей позиции.
 fn parse_text(text: &str, context: &OwnerContext, epoch: &str) -> Result<SocketFrame, SourceError> {
     let value: Value = serde_json::from_str(text).map_err(|_| SourceError::InvalidResponse)?;
     if value.get("error").and_then(Value::as_str) == Some("epoch_pruned") {
@@ -192,13 +203,15 @@ fn parse_text(text: &str, context: &OwnerContext, epoch: &str) -> Result<SocketF
     Ok(SocketFrame::Event(wire_event(value, context, epoch)?))
 }
 
+/// Данные служебного кадра, которым сервер подтверждает готовность потока.
 #[derive(Deserialize)]
 struct ReadyMarker {
-    epoch_generation: String,
+    epoch_generation: String, // Метка журнала, которую сервер подтвердил.
     #[serde(rename = "epoch_version")]
-    _epoch_version: u64,
+    _epoch_version: u64, // Номер позиции из ответа. Проверяется при разборе, но не сохраняется.
 }
 
+/// Переводит код закрытия WebSocket в ошибку источника.
 fn close_error(code: Option<CloseCode>) -> SourceError {
     match code.map(u16::from) {
         Some(4400) => SourceError::InvalidResponse,
@@ -209,6 +222,7 @@ fn close_error(code: Option<CloseCode>) -> SourceError {
     }
 }
 
+/// Классифицирует ошибки открытия и чтения соединения для синхронизации.
 fn websocket_error(error: WebSocketError) -> SourceError {
     match error {
         WebSocketError::Http(response) => match response.status().as_u16() {
@@ -233,6 +247,7 @@ mod tests {
     use super::*;
     use crate::context::AccountId;
 
+    /// Создаёт владельца данных для тестов WebSocket.
     fn owner() -> OwnerContext {
         OwnerContext {
             account_id: AccountId("account".into()),
@@ -243,6 +258,7 @@ mod tests {
         }
     }
 
+    /// Проверяет передачу позиции и секретного токена в запросе открытия WebSocket.
     #[test]
     fn handshake_sends_cursor_and_sensitive_bearer_subprotocol() {
         let owner = owner();
@@ -265,6 +281,7 @@ mod tests {
         ));
     }
 
+    /// Проверяет, что сигналы готовности и устаревшей позиции обрабатываются отдельно от событий.
     #[test]
     fn ready_and_cursor_pruned_control_frames_are_not_events() {
         let owner = owner();

@@ -1,3 +1,6 @@
+//! Запускает команды авторизации и синхронизации без окна.
+//! Сначала обрабатывает справку и ошибки запуска, затем подключает хранилища macOS и выполняет команду.
+
 use std::error::Error;
 use std::process::ExitCode;
 
@@ -8,6 +11,7 @@ const USAGE: &str = "Usage: workspace-auth <command>\n\
   sync                               Sync Messenger until Ctrl-C\n\
   logout <account-id>               Sign out locally and delete the saved secret";
 
+/// Читает аргументы и возвращает код завершения процесса.
 fn main() -> ExitCode {
     let arguments: Vec<_> = std::env::args().skip(1).collect();
     match run(&arguments) {
@@ -19,6 +23,7 @@ fn main() -> ExitCode {
     }
 }
 
+/// Показывает справку или передаёт аргументы реализации для текущей системы.
 fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     match arguments {
         [] => println!("{USAGE}"),
@@ -30,6 +35,7 @@ fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
 #[cfg(not(target_os = "macos"))]
 mod platform {
+    /// Сообщает, что для команд нужна связка ключей macOS.
     pub(super) fn run(_: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         Err("workspace-auth requires macOS Keychain".into())
     }
@@ -52,14 +58,16 @@ mod platform {
     use workspace_core::sync::Sync;
     use workspace_desktop::platform::{JsonAccountStore, MacKeychain};
 
+    /// Команды, которые утилита умеет выполнять.
     enum Command<'a> {
-        Login(&'a str),
-        Status,
-        Verify(AccountId),
-        Sync,
-        Logout(AccountId),
+        Login(&'a str),    // Адрес сервера для входа.
+        Status,            // Восстанавливает сессии и выводит список аккаунтов.
+        Verify(AccountId), // Аккаунт, для которого проверяем доступ к мессенджеру.
+        Sync,              // Запускает фоновую синхронизацию мессенджера.
+        Logout(AccountId), // Аккаунт, из которого нужно выйти.
     }
 
+    /// Разбирает аргументы, подключает хранилища и выполняет команду macOS.
     pub(super) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         let command = match arguments {
             [name, server] if name == "login" => Command::Login(server),
@@ -160,22 +168,27 @@ mod platform {
         Ok(())
     }
 
+    /// Выводит сообщения фоновой синхронизации в терминал.
     struct SyncLog;
 
     impl log::Log for SyncLog {
+        /// Проверяет, нужно ли выводить запись журнала этого уровня.
         fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
             metadata.target().starts_with("workspace_core::")
         }
 
+        /// Печатает подходящую запись журнала в stderr.
         fn log(&self, record: &log::Record<'_>) {
             if self.enabled(record.metadata()) {
                 eprintln!("{}", record.args());
             }
         }
 
+        /// Завершает вывод журнала. Собственного буфера у него нет.
         fn flush(&self) {}
     }
 
+    /// Определяет каталог приложения для аккаунтов и локальной базы.
     fn state_directory() -> Result<PathBuf, Box<dyn Error>> {
         if let Some(directory) = std::env::var_os("WORKSPACE_AUTH_STATE_DIR") {
             if directory.is_empty() {
@@ -187,6 +200,7 @@ mod platform {
         Ok(PathBuf::from(home).join("Library/Application Support/Workspace Desktop/auth"))
     }
 
+    /// Спрашивает данные для входа и даёт выбрать доступный проект.
     fn login(auth: &Auth, server: &str) -> Result<(), Box<dyn Error>> {
         if !io::stdin().is_terminal() {
             return Err("Workspace login requires an interactive terminal".into());
@@ -247,6 +261,7 @@ mod platform {
         Ok(())
     }
 
+    /// Выводит приглашение и читает одну строку из терминала.
     fn prompt(message: &str) -> io::Result<String> {
         eprint!("{message}");
         io::stderr().flush()?;
@@ -255,6 +270,7 @@ mod platform {
         Ok(input.trim().to_owned())
     }
 
+    /// Возвращает короткую подпись состояния сессии для терминала.
     fn status_label(status: SessionStatus) -> &'static str {
         match status {
             SessionStatus::Restoring => "restoring",

@@ -1,3 +1,6 @@
+//! Проверяет жизненный цикл авторизации и фоновой синхронизации без настоящего сервера.
+//! Сначала идут подмены хранилищ, часов и IAM, затем сценарии входа, обновления токенов и чтения событий.
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::pin;
@@ -21,20 +24,23 @@ use workspace_core::sync::{Event, Sync as EventSync};
 
 const SERVER: &str = "https://workspace.test";
 
+/// Хранилища аккаунтов и секретов в памяти с управляемыми сбоями.
 #[derive(Default)]
 struct MemoryStores {
-    accounts: Mutex<HashMap<AccountId, AccountRecord>>,
-    secrets: Mutex<HashMap<String, String>>,
-    fail_account_save: AtomicBool,
-    fail_secret_save: AtomicBool,
-    fail_secret_remove: AtomicBool,
+    accounts: Mutex<HashMap<AccountId, AccountRecord>>, // Записи аккаунтов по локальному идентификатору.
+    secrets: Mutex<HashMap<String, String>>,            // Токены по ключам защищённого хранилища.
+    fail_account_save: AtomicBool, // Признак, что запись аккаунта должна завершиться ошибкой.
+    fail_secret_save: AtomicBool,  // Признак, что запись секрета должна завершиться ошибкой.
+    fail_secret_remove: AtomicBool, // Признак, что удаление секрета должно завершиться ошибкой.
 }
 
 impl AccountStore for MemoryStores {
+    /// Возвращает копии всех сохранённых тестовых аккаунтов.
     fn load(&self) -> Result<Vec<AccountRecord>, StoreError> {
         Ok(self.accounts.lock().unwrap().values().cloned().collect())
     }
 
+    /// Сохраняет тестовый аккаунт или имитирует ошибку записи.
     fn save(&self, record: &AccountRecord) -> Result<(), StoreError> {
         if self.fail_account_save.swap(false, Ordering::SeqCst) {
             return Err(StoreError);
@@ -46,6 +52,7 @@ impl AccountStore for MemoryStores {
         Ok(())
     }
 
+    /// Удаляет тестовый аккаунт по идентификатору.
     fn remove(&self, account_id: &AccountId) -> Result<(), StoreError> {
         self.accounts.lock().unwrap().remove(account_id);
         Ok(())
@@ -53,10 +60,12 @@ impl AccountStore for MemoryStores {
 }
 
 impl SecretStore for MemoryStores {
+    /// Возвращает копию секрета из памяти, если ключ существует.
     fn load(&self, key: &str) -> Result<Option<String>, StoreError> {
         Ok(self.secrets.lock().unwrap().get(key).cloned())
     }
 
+    /// Сохраняет секрет в памяти или имитирует ошибку записи.
     fn save(&self, key: &str, token: &str) -> Result<(), StoreError> {
         if self.fail_secret_save.swap(false, Ordering::SeqCst) {
             return Err(StoreError);
@@ -68,6 +77,7 @@ impl SecretStore for MemoryStores {
         Ok(())
     }
 
+    /// Удаляет секрет из памяти или имитирует ошибку очистки.
     fn remove(&self, key: &str) -> Result<(), StoreError> {
         if self.fail_secret_remove.swap(false, Ordering::SeqCst) {
             return Err(StoreError);
@@ -77,32 +87,39 @@ impl SecretStore for MemoryStores {
     }
 }
 
-struct TestClock(Mutex<Instant>);
+/// Часы, которые тест может двигать без ожидания.
+struct TestClock(Mutex<Instant>); // Текущий момент тестовых часов.
 
 impl TestClock {
+    /// Переводит тестовые часы вперёд на заданное число секунд.
     fn advance(&self, seconds: u64) {
         *self.0.lock().unwrap() += Duration::from_secs(seconds);
     }
 }
 
 impl Clock for TestClock {
+    /// Возвращает текущий момент тестовых часов.
     fn now(&self) -> Instant {
         *self.0.lock().unwrap()
     }
 }
 
+/// Правило ответа тестового IAM по токену обновления и номеру вызова.
 type RefreshResponse = dyn Fn(&str, usize) -> Result<IamToken, IamError> + Send + Sync;
 
+/// Подмена IAM с предсказуемым входом и настраиваемым обновлением.
 struct TestIam {
-    refreshes: AtomicUsize,
-    response: Box<RefreshResponse>,
+    refreshes: AtomicUsize,         // Счётчик запросов на обновление.
+    response: Box<RefreshResponse>, // Функция, которая задаёт ответ на обновление.
 }
 
 impl IamClient for TestIam {
+    /// Использует переданный адрес как есть для тестового сервера.
     fn normalize_server(&self, server: &str) -> Result<String, IamError> {
         Ok(server.to_owned())
     }
 
+    /// Возвращает заготовленный токен для указанного пользователя.
     fn login(
         &self,
         _server: &str,
@@ -120,6 +137,7 @@ impl IamClient for TestIam {
         })
     }
 
+    /// Возвращает список проектов, доступных в тесте.
     fn projects(&self, _server: &str, _token: &str) -> Result<Vec<IamProject>, IamError> {
         Ok(vec![IamProject {
             id: "project".into(),
@@ -128,6 +146,7 @@ impl IamClient for TestIam {
         }])
     }
 
+    /// Выдаёт заготовленный токен с выбранным проектом.
     fn select_project(
         &self,
         _server: &str,
@@ -139,12 +158,14 @@ impl IamClient for TestIam {
         Ok(issued)
     }
 
+    /// Считает вызов и возвращает ответ из сценария теста.
     fn refresh(&self, _server: &str, token: &str) -> Result<IamToken, IamError> {
         let attempt = self.refreshes.fetch_add(1, Ordering::SeqCst) + 1;
         (self.response)(token, attempt)
     }
 }
 
+/// Создаёт тестовый токен с указанным владельцем и секретами.
 fn project_token(user: &str, access: &str, refresh: Option<&str>) -> IamToken {
     IamToken {
         access_token: access.into(),
@@ -156,14 +177,16 @@ fn project_token(user: &str, access: &str, refresh: Option<&str>) -> IamToken {
     }
 }
 
+/// Готовый набор зависимостей и авторизации для одного теста.
 struct Fixture {
-    iam: Arc<TestIam>,
-    stores: Arc<MemoryStores>,
-    clock: Arc<TestClock>,
-    auth: Auth,
+    iam: Arc<TestIam>,         // Подмена сервера, которая считает обновления.
+    stores: Arc<MemoryStores>, // Хранилища аккаунтов и секретов в памяти.
+    clock: Arc<TestClock>,     // Часы, которыми управляет тест.
+    auth: Auth,                // Авторизация с тестовыми зависимостями.
 }
 
 impl Fixture {
+    /// Создаёт окружение с заданным ответом на запрос обновления.
     fn new(
         response: impl Fn(&str, usize) -> Result<IamToken, IamError> + Send + Sync + 'static,
     ) -> Self {
@@ -182,6 +205,7 @@ impl Fixture {
         }
     }
 
+    /// Имитирует перезапуск авторизации с теми же сохранёнными данными.
     fn restart(&self) -> Auth {
         Auth::with_clock(
             self.iam.clone(),
@@ -191,6 +215,7 @@ impl Fixture {
         )
     }
 
+    /// Проходит оба шага входа и возвращает контекст тестового пользователя.
     fn login(&self, user: &str) -> OwnerContext {
         let attempt = self
             .auth
@@ -200,6 +225,7 @@ impl Fixture {
     }
 }
 
+/// Проверяет отказ при неизвестном проекте, отмене и истечении попытки.
 #[test]
 fn project_selection_rejects_unknown_cancelled_and_expired_attempts() {
     let fixture = Fixture::new(|_, _| unreachable!());
@@ -229,6 +255,7 @@ fn project_selection_rejects_unknown_cancelled_and_expired_attempts() {
     assert!(fixture.stores.secrets.lock().unwrap().is_empty());
 }
 
+/// Проверяет, что сбой восстановления одного аккаунта не мешает другому и что отозванный токен требует входа.
 #[test]
 fn restore_is_independent_and_detects_rejected_credentials() {
     let fixture = Fixture::new(|user, _| {
@@ -262,6 +289,7 @@ fn restore_is_independent_and_detects_rejected_credentials() {
     );
 }
 
+/// Проверяет, что параллельные запросы делят обновление и сохраняют замену токена один раз даже при отмене ожидания.
 #[test]
 fn concurrent_refresh_survives_cancellation_and_persists_rotation_once() {
     let (started_tx, started_rx) = mpsc::channel();
@@ -304,6 +332,7 @@ fn concurrent_refresh_survives_cancellation_and_persists_rotation_once() {
     assert_eq!(fixture.auth.snapshot()[0].token_version, 2);
 }
 
+/// Проверяет повтор записи нового секрета без второго запроса к IAM.
 #[test]
 fn failed_rotation_save_retries_storage_without_replaying_network() {
     let fixture = Fixture::new(|user, _| Ok(project_token(user, "next", Some("rotated"))));
@@ -328,6 +357,7 @@ fn failed_rotation_save_retries_storage_without_replaying_network() {
     assert_eq!(fixture.auth.snapshot()[0].token_version, 2);
 }
 
+/// Проверяет, что сбой записи аккаунта сохраняет прежнюю сессию и секрет.
 #[test]
 fn failed_account_save_preserves_previous_session_and_secret() {
     let fixture = Fixture::new(|_, _| unreachable!());
@@ -351,6 +381,7 @@ fn failed_account_save_preserves_previous_session_and_secret() {
     assert!(block_on(fixture.auth.access_token(&account, Service::Messenger)).is_ok());
 }
 
+/// Проверяет продолжение очистки после перезапуска без восстановления сессии.
 #[test]
 fn failed_logout_cleanup_survives_restart_without_reauthenticating() {
     let fixture = Fixture::new(|_, _| unreachable!());
@@ -373,6 +404,7 @@ fn failed_logout_cleanup_survives_restart_without_reauthenticating() {
     assert!(fixture.stores.accounts.lock().unwrap().is_empty());
 }
 
+/// Проверяет, что запоздавший ответ не перезаписывает новый вход и не затрагивает другой аккаунт.
 #[test]
 fn a_late_refresh_cannot_replace_relogin_or_affect_another_account() {
     let (started_tx, started_rx) = mpsc::channel();
@@ -428,6 +460,7 @@ fn a_late_refresh_cannot_replace_relogin_or_affect_another_account() {
     assert_eq!(b_session.token_version, 1);
 }
 
+/// Проверяет использование ещё действующего токена при сбое и завершение сессии при смене владельца.
 #[test]
 fn temporary_failure_keeps_valid_token_but_owner_mismatch_ends_session() {
     let fixture = Fixture::new(|_, attempt| {
@@ -454,6 +487,7 @@ fn temporary_failure_keeps_valid_token_but_owner_mismatch_ends_session() {
     );
 }
 
+/// Проверяет, что медленный подписчик получает последнее состояние без секретов.
 #[test]
 fn slow_subscriber_receives_latest_snapshot_without_secrets() {
     let fixture = Fixture::new(|_, _| unreachable!());
@@ -467,18 +501,22 @@ fn slow_subscriber_receives_latest_snapshot_without_secrets() {
     assert_eq!(latest[0].context, b);
 }
 
+/// Подключение для теста. Первый элемент — параметры сессии, второй — канал подачи событий.
 type TestConnection = (
-    SourceSession,
-    async_mpsc::Sender<Result<Event, SourceError>>,
+    SourceSession, // Параметры, с которыми источник открыли.
+    async_mpsc::Sender<Result<Event, SourceError>>, // Канал для передачи событий или ошибок.
 );
 
-struct TestSource(async_mpsc::UnboundedSender<TestConnection>);
+/// Подмена источника событий, сообщающая тесту о каждом подключении.
+struct TestSource(async_mpsc::UnboundedSender<TestConnection>); // Канал уведомлений о новых подключениях.
 
 impl EventSource for TestSource {
+    /// Возвращает имя тестового источника мессенджера.
     fn id(&self) -> &str {
         "messenger"
     }
 
+    /// Передаёт тесту параметры подключения и возвращает поток событий из канала.
     fn connect(&self, session: SourceSession) -> BoxFuture<'_, Result<EventStream, SourceError>> {
         Box::pin(async move {
             let (send, receive) = async_mpsc::channel(4);
@@ -493,10 +531,12 @@ impl EventSource for TestSource {
     }
 }
 
+/// Создаёт тестовое событие с общим идентификатором сообщения.
 fn incoming(version: u64, text: &str) -> Event {
     incoming_with_id(version, "shared-message-id", text)
 }
 
+/// Создаёт событие с заданной позицией, идентификатором и текстом сообщения.
 fn incoming_with_id(version: u64, id: &str, text: &str) -> Event {
     Event::MessageCreated {
         cursor: Cursor {
@@ -510,6 +550,7 @@ fn incoming_with_id(version: u64, id: &str, text: &str) -> Event {
     }
 }
 
+/// Ждёт, пока условие выполнится, и ограничивает время ожидания.
 async fn wait_for(test: impl Fn() -> bool) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while !test() {
@@ -520,6 +561,7 @@ async fn wait_for(test: impl Fn() -> bool) {
     .expect("condition did not become true");
 }
 
+/// Проверяет отдельные потоки двух аккаунтов и возобновление с последней записанной позиции.
 #[tokio::test]
 async fn runtime_tracks_two_accounts_and_resumes_from_the_committed_cursor() {
     let fixture = Fixture::new(|user, _| Ok(project_token(user, "refreshed", None)));
@@ -677,6 +719,7 @@ async fn runtime_tracks_two_accounts_and_resumes_from_the_committed_cursor() {
     );
 }
 
+/// Проверяет, что чтение возобновляется после временного сбоя IAM при переподключении.
 #[tokio::test]
 async fn runtime_recovers_after_temporary_iam_failure_on_reconnect() {
     let fixture = Fixture::new(|user, attempt| {
@@ -721,6 +764,7 @@ async fn runtime_recovers_after_temporary_iam_failure_on_reconnect() {
         .unwrap();
 }
 
+/// Проверяет, что после отказа сервера токен обновляется с задержкой даже до истечения срока.
 #[tokio::test]
 async fn runtime_refreshes_a_token_rejected_before_expiry() {
     let fixture = Fixture::new(|user, _| Ok(project_token(user, "replacement", None)));
