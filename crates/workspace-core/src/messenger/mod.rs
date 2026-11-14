@@ -3,6 +3,7 @@
 
 pub mod catalog;
 pub mod history;
+pub mod read;
 mod rest;
 pub mod send;
 mod socket;

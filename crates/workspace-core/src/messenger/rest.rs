@@ -21,6 +21,7 @@ use crate::{
 };
 
 use super::history::OpenHistoryError;
+use super::read::ReadError;
 use super::send::SendError;
 use crate::storage::PreparedSend;
 
@@ -42,6 +43,46 @@ pub(super) struct RestClient {
 }
 
 impl RestClient {
+    /// Однократно отправляет отметку и проверяет адрес возвращённого сообщения.
+    pub(super) async fn read_up_to(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        scope: HistoryScope,
+        message_id: Uuid,
+    ) -> Result<(), ReadError> {
+        let mut url = workspace_origin(owner).map_err(|_| ReadError::InvalidInput)?;
+        url.set_path(&format!(
+            "{MESSAGES_PATH}{message_id}/actions/read_up_to/invoke"
+        ));
+        let response = self
+            .send
+            .post(url)
+            .header(ACCEPT, "application/json")
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|_| ReadError::Unknown)?;
+        if response.status() != StatusCode::OK {
+            return Err(ReadError::Http(response.status().as_u16()));
+        }
+        let row: WireHistoryMessage = response.json().await.map_err(|_| ReadError::Unknown)?;
+        if row.uuid != message_id
+            || row.stream_uuid != scope.stream_id
+            || scope.topic_id.is_some_and(|topic| topic != row.topic_uuid)
+            || !matches_owner(owner, row.project_id.as_deref(), row.user_uuid.as_deref())
+            || HistoryTime::parse(&row.created_at).is_none()
+            || row
+                .updated_at
+                .as_deref()
+                .is_some_and(|time| HistoryTime::parse(time).is_none())
+            || row.payload.kind.is_empty()
+        {
+            return Err(ReadError::Unknown);
+        }
+        Ok(())
+    }
+
     /// Читает одно сообщение и принимает его только при совпадении владельца и маршрута.
     pub(super) async fn lookup_prepared(
         &self,

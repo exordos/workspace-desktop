@@ -25,6 +25,8 @@ use workspace_core::sync::{Event, Sync as EventSync, SyncChange, SyncUpdate};
 
 #[path = "support/direct_history.rs"]
 mod direct_history;
+#[path = "support/read_boundary.rs"]
+mod read_boundary;
 
 const SERVER: &str = "https://workspace.test";
 
