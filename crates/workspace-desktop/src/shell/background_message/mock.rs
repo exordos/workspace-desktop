@@ -7,7 +7,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -66,6 +66,15 @@ pub(super) struct MockWorkspace {
 }
 
 impl MockWorkspace {
+    /// Заставляет следующий запрос старой страницы вернуть сетевую ошибку.
+    pub(super) fn fail_next_older_page(&self) {
+        self.journal.fail_older.store(true, Ordering::Relaxed);
+    }
+
+    /// Возвращает число запросов продолжения истории.
+    pub(super) fn older_requests(&self) -> usize {
+        self.journal.older_requests.load(Ordering::Relaxed)
+    }
     /// Меняет ответ REST для следующей попытки открыть историю.
     pub(super) fn set_history_failure(&self, mode: u8) {
         self.journal.history_failure.store(mode, Ordering::Relaxed);
@@ -244,6 +253,8 @@ struct Journal {
     recovery: AtomicU8,             // 0 — исходный журнал, 1 — обрезанный, 2 — новая эпоха для B.
     history_failure: AtomicU8,      // 0 — доступ есть, 1 — сообщение удалено, 2 — доступ отозван.
     fail_catalog: AtomicBool,       // Нужно ли вернуть ошибку при следующей загрузке каталога A.
+    fail_older: AtomicBool,         // Нужно ли отклонить следующую старую страницу.
+    older_requests: AtomicUsize,    // Число запросов продолжения истории.
 }
 
 impl Default for Journal {
@@ -255,6 +266,8 @@ impl Default for Journal {
             recovery: AtomicU8::new(0),
             history_failure: AtomicU8::new(0),
             fail_catalog: AtomicBool::new(false),
+            fail_older: AtomicBool::new(false),
+            older_requests: AtomicUsize::new(0),
         }
     }
 }
@@ -368,13 +381,34 @@ fn handle(mut request: Request<Incoming>, journal: Arc<Journal>) -> Response<Ful
         "/api/workspace/v1/messenger/messages/" if user == BACKGROUND => {
             assert_eq!(query_value(request.uri(), "stream_uuid"), Some(DIRECT));
             if query_value(request.uri(), "sort_dir") == Some("desc") {
-                json!((1..=20).rev().map(|day| json!({
+                if query_value(request.uri(), "page_marker") == Some("test-older") {
+                    journal.older_requests.fetch_add(1, Ordering::Relaxed);
+                    if journal.fail_older.swap(false, Ordering::Relaxed) {
+                        return response(StatusCode::SERVICE_UNAVAILABLE, Value::Null);
+                    }
+                    return response(StatusCode::OK, json!((1..=5).rev().map(|day| json!({
+                        "uuid": format!("30000000-0000-4000-8000-{day:012}"),
+                        "stream_uuid": DIRECT, "topic_uuid": TOPIC,
+                        "project_id": PROJECT, "user_uuid": user, "author_uuid": FOREGROUND,
+                        "created_at": format!("2024-12-{day:02}T12:00:00Z"),
+                        "payload": {"kind": "markdown", "content": format!("Предыдущее сообщение {day} {}", "длинная строка ".repeat(day * 4))},
+                    })).collect::<Vec<_>>()));
+                }
+                let mut page = response(
+                    StatusCode::OK,
+                    json!((1..=20).rev().map(|day| json!({
                     "uuid": format!("20000000-0000-4000-8000-{day:012}"),
                     "stream_uuid": DIRECT, "topic_uuid": TOPIC,
                     "project_id": PROJECT, "user_uuid": user, "author_uuid": FOREGROUND,
                     "created_at": format!("2025-01-{day:02}T12:00:00Z"),
                     "payload": {"kind": "markdown", "content": format!("Старое сообщение {day}")},
-                })).collect::<Vec<_>>())
+                })).collect::<Vec<_>>()),
+                );
+                page.headers_mut().insert(
+                    "X-Pagination-Marker",
+                    HeaderValue::from_static("test-older"),
+                );
+                return page;
             } else {
                 json!([])
             }

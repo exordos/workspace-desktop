@@ -824,9 +824,26 @@ async fn notification_click_scenario(
             bounds.y - dy >= viewport.y
                 && bounds.y + bounds.height - dy <= viewport.y + viewport.height
         );
-        drop(ui);
+        let cache = ui.into_cache();
 
+        load_older_scenario(shell, renderer, cache, mock).await;
+
+        let screen = shell.visible_history().unwrap();
+        let HistoryState::Ready(window) = &screen.state else {
+            panic!("история должна оставаться открытой")
+        };
+        let stale = Message::HistoryOlderLoaded {
+            revision: shell.navigation_revision,
+            window_id: window.id,
+            result: Ok(window.clone()),
+        };
+        shell.history.as_mut().unwrap().older_pending = true;
         refresh_open_history_scenario(shell, renderer).await;
+        assert!(
+            into_stream(shell.update(stale)).is_none(),
+            "поздняя страница не должна вернуть прежний маршрут"
+        );
+        assert!(shell.visible_history().is_none());
 
         for (mode, label) in [(1, "Сообщение недоступно"), (2, "Чат недоступен")]
         {
@@ -856,6 +873,17 @@ async fn notification_click_scenario(
     assert!(!RenderedText::from_shell(shell, renderer).contains(body));
 
     let loaded = load(shell, renderer).await;
+    let _ = shell.update(loaded.clone());
+    let screen = shell.visible_history().unwrap();
+    let HistoryState::Ready(window) = &screen.state else {
+        panic!("история должна быть загружена")
+    };
+    let stale_older = Message::HistoryOlderLoaded {
+        revision: shell.navigation_revision,
+        window_id: window.id,
+        result: Ok(window.clone()),
+    };
+    shell.history.as_mut().unwrap().older_pending = true;
     shell
         .sources
         .0
@@ -863,7 +891,271 @@ async fn notification_click_scenario(
         .logout(&click.target.context.account_id)
         .unwrap();
     assert!(into_stream(shell.update(loaded)).is_none());
+    assert!(
+        into_stream(shell.update(stale_older)).is_none(),
+        "страница прежней сессии не должна появиться после выхода"
+    );
     assert!(!RenderedText::from_shell(shell, renderer).contains(body));
+}
+
+/// Выполняет операции Iced над одной разметкой и возвращает сообщение задачи.
+async fn run_history_task(
+    shell: &Shell,
+    renderer: &mut iced::Renderer,
+    cache: Cache,
+    task: Task<Message>,
+) -> (Cache, Option<Message>) {
+    let mut ui = UserInterface::build(shell.view(), Size::new(620.0, 360.0), cache, renderer);
+    let Some(mut actions) = into_stream(task) else {
+        return (ui.into_cache(), None);
+    };
+    let mut output = None;
+    while let Some(action) = timeout(DEADLINE, actions.next()).await.unwrap() {
+        match action {
+            Action::Widget(mut operation) => {
+                ui.operate(renderer, operation.as_mut());
+                let _ = operation.finish();
+                drop(operation);
+            }
+            Action::Output(message) => output = Some(message),
+            action => panic!("неожиданное действие истории: {action:?}"),
+        }
+    }
+    (ui.into_cache(), output)
+}
+
+/// Посылает настоящее колесо мыши в область списка и возвращает событие оболочки.
+fn wheel_history(shell: &Shell, renderer: &mut iced::Renderer, cache: Cache) -> (Cache, Message) {
+    let mut ui = UserInterface::build(shell.view(), Size::new(620.0, 360.0), cache, renderer);
+    let mut viewport = HistoryViewport::default();
+    ui.operate(renderer, &mut viewport);
+    let mut messages = Vec::new();
+    ui.update(
+        &[Event::Mouse(mouse::Event::WheelScrolled {
+            delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+        })],
+        mouse::Cursor::Available(viewport.0.unwrap().0.center()),
+        renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    let message = messages
+        .into_iter()
+        .find(|message| matches!(message, Message::HistoryUserScrolled { .. }))
+        .expect("жест не дошёл до истории");
+    (ui.into_cache(), message)
+}
+
+/// Перетаскивает полосу истории из нижнего положения к верхнему краю.
+fn drag_history(shell: &Shell, renderer: &mut iced::Renderer, cache: Cache) -> (Cache, Message) {
+    let mut ui = UserInterface::build(shell.view(), Size::new(620.0, 360.0), cache, renderer);
+    let mut viewport = HistoryViewport::default();
+    ui.operate(renderer, &mut viewport);
+    let (bounds, _) = viewport.0.unwrap();
+    let start = iced::Point::new(
+        bounds.x + bounds.width - 5.0,
+        bounds.y + bounds.height - 5.0,
+    );
+    let end = iced::Point::new(start.x, bounds.y + 1.0);
+    let mut messages = Vec::new();
+    ui.update(
+        &[Event::Mouse(mouse::Event::ButtonPressed(
+            mouse::Button::Left,
+        ))],
+        mouse::Cursor::Available(start),
+        renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    ui.update(
+        &[Event::Mouse(mouse::Event::CursorMoved { position: end })],
+        mouse::Cursor::Available(end),
+        renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    ui.update(
+        &[Event::Mouse(mouse::Event::ButtonReleased(
+            mouse::Button::Left,
+        ))],
+        mouse::Cursor::Available(end),
+        renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    let message = messages
+        .into_iter()
+        .find(|message| matches!(message, Message::HistoryUserScrolled { .. }))
+        .expect("перетаскивание не дошло до истории");
+    (ui.into_cache(), message)
+}
+
+/// Считывает положение текста первой исходной строки внутри области списка.
+fn older_anchor_offset(shell: &Shell, renderer: &mut iced::Renderer, cache: Cache) -> (Cache, f32) {
+    let mut ui = UserInterface::build(shell.view(), Size::new(620.0, 360.0), cache, renderer);
+    let mut viewport = HistoryViewport::default();
+    let mut labels = RenderedText::default();
+    ui.operate(renderer, &mut viewport);
+    ui.operate(renderer, &mut labels);
+    let (view, scroll) = viewport.0.unwrap();
+    let (row, _) = labels
+        .0
+        .iter()
+        .find(|(_, label)| label == "Старое сообщение 1")
+        .unwrap();
+    (ui.into_cache(), row.y - scroll - view.y)
+}
+
+/// Проверяет колесо, отказ и повтор REST и сохранение позиции строки после вставки.
+async fn load_older_scenario(
+    shell: &mut Shell,
+    renderer: &mut iced::Renderer,
+    cache: Cache,
+    mock: &mock::MockWorkspace,
+) {
+    let revision = shell.navigation_revision;
+    let (mut cache, _) = run_history_task(
+        shell,
+        renderer,
+        cache,
+        operation::scroll_to(
+            history::list_id(revision),
+            operation::AbsoluteOffset {
+                x: None,
+                y: Some(0.0),
+            },
+        ),
+    )
+    .await;
+    let before;
+    (cache, before) = older_anchor_offset(shell, renderer, cache);
+    assert_eq!(
+        mock.older_requests(),
+        0,
+        "начальный переход не должен загружать страницу"
+    );
+    mock.fail_next_older_page();
+    for attempt in 0..2 {
+        let message;
+        if attempt == 0 {
+            (cache, _) = run_history_task(
+                shell,
+                renderer,
+                cache,
+                operation::scroll_to(
+                    history::list_id(revision),
+                    operation::AbsoluteOffset {
+                        x: None,
+                        y: Some(f32::MAX),
+                    },
+                ),
+            )
+            .await;
+            (cache, message) = drag_history(shell, renderer, cache);
+        } else {
+            (cache, message) = wheel_history(shell, renderer, cache);
+        }
+        let task = shell.update(message);
+        assert!(
+            into_stream(shell.update(Message::HistoryUserScrolled { revision })).is_none(),
+            "повторный жест не должен запускать второй запрос"
+        );
+        let measured;
+        (cache, measured) = run_history_task(shell, renderer, cache, task).await;
+        let task = shell.update(measured.unwrap());
+        let loaded;
+        (cache, loaded) = run_history_task(shell, renderer, cache, task).await;
+        let loaded = loaded.expect("REST не вернул страницу");
+        assert!(
+            matches!(&loaded, Message::HistoryOlderLoaded { result, .. } if result.is_err() == (attempt == 0))
+        );
+        if attempt == 1 {
+            // Пока страница уже сохранена, другое событие не должно вставить её без измерения.
+            use workspace_core::messenger::SOURCE_ID;
+            use workspace_core::storage::{
+                HistoryMetadata, HistoryTime, Message as StoredMessage, MessagePlacement,
+            };
+            use workspace_core::sync::Event as SyncEvent;
+            let screen = shell.visible_history().unwrap();
+            let HistoryState::Ready(window) = &screen.state else {
+                panic!("история должна быть открыта")
+            };
+            let owner = screen.target.context.clone();
+            let generation = screen.generation;
+            let stream = window.scope.stream_id;
+            let sync = shell.sources.0.sync.clone();
+            let mut updates = sync.subscribe();
+            let mut cursor = sync.cursor(&owner, SOURCE_ID).unwrap().unwrap();
+            cursor.epoch_version += 1;
+            sync.apply(
+                &owner,
+                generation,
+                SOURCE_ID,
+                SyncEvent::MessageCreated {
+                    cursor,
+                    message: StoredMessage {
+                        id: Uuid::new_v4().to_string(),
+                        text: "Событие во время догрузки".into(),
+                    },
+                    placement: Some(MessagePlacement {
+                        stream_id: stream.to_string(),
+                        topic_id: Uuid::new_v4().to_string(),
+                    }),
+                    metadata: Some(HistoryMetadata {
+                        author_id: None,
+                        created_at: HistoryTime::parse("2025-01-15T14:00:00Z").unwrap(),
+                        updated_at: None,
+                    }),
+                },
+            )
+            .unwrap();
+            let _ = shell.update(Message::Synced(updates.try_recv().unwrap()));
+            let rendered = RenderedText::from_shell(shell, renderer);
+            assert!(rendered.contains("Событие во время догрузки"));
+            assert!(
+                !rendered
+                    .0
+                    .iter()
+                    .any(|(_, label)| label.starts_with("Предыдущее сообщение 1")),
+                "страница не должна появиться до измерения"
+            );
+        }
+        let task = shell.update(loaded);
+        if attempt == 0 {
+            assert!(into_stream(task).is_none());
+            assert!(RenderedText::from_shell(shell, renderer).contains(
+                "Не удалось загрузить предыдущие сообщения. Прокрутите вверх для повтора."
+            ));
+            assert!(RenderedText::from_shell(shell, renderer).contains("Старое сообщение 1"));
+        } else {
+            let before_insert;
+            (cache, before_insert) = run_history_task(shell, renderer, cache, task).await;
+            let task = shell.update(before_insert.unwrap());
+            let after_insert;
+            (cache, after_insert) = run_history_task(shell, renderer, cache, task).await;
+            let task = shell.update(after_insert.unwrap());
+            (cache, _) = run_history_task(shell, renderer, cache, task).await;
+            let after;
+            (cache, after) = older_anchor_offset(shell, renderer, cache);
+            assert!(
+                (after - before).abs() < 1.0,
+                "положение строки изменилось: {before} -> {after}"
+            );
+            assert!(
+                RenderedText::from_shell(shell, renderer)
+                    .0
+                    .iter()
+                    .any(|(_, label)| label.starts_with("Предыдущее сообщение 1"))
+            );
+        }
+    }
+    assert_eq!(mock.older_requests(), 2);
+    let (_, message) = wheel_history(shell, renderer, cache);
+    assert!(
+        into_stream(shell.update(message)).is_none(),
+        "на конце истории запрос не нужен"
+    );
+    assert_eq!(mock.older_requests(), 2);
 }
 
 /// Запоминает положение прокрутки в разметке открытой истории.
