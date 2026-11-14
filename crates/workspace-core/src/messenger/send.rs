@@ -21,6 +21,16 @@ pub enum SendError {
 }
 
 impl MessengerSource {
+    /// Ищет подтверждение доставки по публичному UUID, не изменяя очередь.
+    pub async fn lookup_prepared_message(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        snapshot: &PreparedSend,
+    ) -> Result<HistoryMessage, SendError> {
+        self.rest.lookup_prepared(owner, token, snapshot).await
+    }
+
     /// Отправляет снимок с переданным токеном без повторов и без изменения очереди.
     pub async fn post_prepared_message(
         &self,

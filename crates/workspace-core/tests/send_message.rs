@@ -189,3 +189,108 @@ async fn sends_once_and_distinguishes_unknown_outcomes() {
     }
     worker.await.unwrap();
 }
+
+/// Проверяет чтение подтверждения и неопределённые ответы без повторной отправки.
+#[tokio::test]
+async fn lookup_confirms_only_matching_delivery() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = format!("https://{}", listener.local_addr().unwrap());
+    let config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from_pem_slice(CERT).unwrap()],
+            PrivateKeyDer::from_pem_slice(KEY).unwrap(),
+        )
+        .unwrap();
+    let tls = TlsAcceptor::from(Arc::new(config));
+    let canonical = Uuid::from_u128(1);
+    let topic = Uuid::from_u128(2);
+    let stream = Uuid::from_u128(3);
+    let author = Uuid::from_u128(4);
+    let public = Uuid::new_v5(&topic, canonical.to_string().as_bytes());
+    let snapshot = PreparedSend {
+        canonical_id: canonical,
+        public_id: public,
+        stream_id: stream,
+        topic_id: topic,
+        markdown: "hello".into(),
+    };
+    let worker = tokio::spawn(async move {
+        for mode in 0..10 {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(tls.accept(socket).await.unwrap());
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            assert_eq!(
+                line,
+                format!("GET /api/workspace/v1/messenger/messages/{public} HTTP/1.1\r\n")
+            );
+            let mut authorized = false;
+            loop {
+                line.clear();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if line.trim() == "authorization: Bearer owner-token" {
+                    authorized = true;
+                }
+            }
+            assert!(authorized);
+            if mode == 8 {
+                continue;
+            }
+            let mut body = json!({"uuid": public, "stream_uuid": stream, "topic_uuid": topic, "project_id":"project", "user_uuid":author, "author_uuid":author, "created_at":"2026-01-01T12:00:00Z", "payload":{"kind":"markdown", "content":"hello"}});
+            match mode {
+                2 => body["stream_uuid"] = json!(Uuid::from_u128(99)),
+                3 => body["topic_uuid"] = json!(Uuid::from_u128(99)),
+                4 => body["author_uuid"] = json!(Uuid::from_u128(99)),
+                5 => body["uuid"] = json!(Uuid::from_u128(99)),
+                6 => body = json!({}),
+                9 => body["project_id"] = json!("other-project"),
+                _ => {}
+            }
+            let status = match mode {
+                1 => "404 Not Found",
+                7 => "403 Forbidden",
+                _ => "200 OK",
+            };
+            let body = body.to_string();
+            socket.get_mut().write_all(format!("HTTP/1.1 {status}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            socket.get_mut().shutdown().await.unwrap();
+        }
+        if let Ok(Ok(_)) = timeout(Duration::from_millis(300), listener.accept()).await {
+            panic!("неожиданный дополнительный запрос");
+        }
+    });
+    let owner = OwnerContext {
+        account_id: AccountId("account".into()),
+        server,
+        organization_id: "org".into(),
+        project_id: "project".into(),
+        user_id: author.to_string(),
+    };
+    let source =
+        MessengerSource::with_private_ca(CertificateDer::from_pem_slice(CA).unwrap().as_ref())
+            .unwrap();
+    let found = source
+        .lookup_prepared_message(&owner, "owner-token", &snapshot)
+        .await
+        .unwrap();
+    assert_eq!(
+        (found.id, found.stream_id, found.topic_id, found.text),
+        (public, stream, topic, "hello".into())
+    );
+    for _ in 1..10 {
+        assert_eq!(
+            source
+                .lookup_prepared_message(&owner, "owner-token", &snapshot)
+                .await
+                .unwrap_err(),
+            SendError::Unknown
+        );
+    }
+    worker.await.unwrap();
+}

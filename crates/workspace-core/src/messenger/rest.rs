@@ -42,6 +42,48 @@ pub(super) struct RestClient {
 }
 
 impl RestClient {
+    /// Читает одно сообщение и принимает его только при совпадении владельца и маршрута.
+    pub(super) async fn lookup_prepared(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        snapshot: &PreparedSend,
+    ) -> Result<HistoryMessage, SendError> {
+        let mut url = workspace_origin(owner).map_err(|_| SendError::InvalidInput)?;
+        let author = Uuid::parse_str(&owner.user_id).map_err(|_| SendError::InvalidInput)?;
+        if snapshot.public_id
+            != Uuid::new_v5(
+                &snapshot.topic_id,
+                snapshot.canonical_id.to_string().as_bytes(),
+            )
+        {
+            return Err(SendError::InvalidInput);
+        }
+        url.set_path(&format!("{MESSAGES_PATH}{}", snapshot.public_id));
+        let response = self
+            .send
+            .get(url)
+            .header(ACCEPT, "application/json")
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|_| SendError::Unknown)?;
+        if response.status() != StatusCode::OK {
+            return Err(SendError::Unknown);
+        }
+        let row: WireHistoryMessage = response.json().await.map_err(|_| SendError::Unknown)?;
+        if row.uuid != snapshot.public_id
+            || row.stream_uuid != snapshot.stream_id
+            || row.topic_uuid != snapshot.topic_id
+            || row.author_uuid != author
+        {
+            return Err(SendError::Unknown);
+        }
+        row.into_history(owner, snapshot.stream_id)
+            .map_err(|_| SendError::Unknown)?
+            .ok_or(SendError::Unknown)
+    }
+
     /// Выполняет ровно одну попытку отправки снимка и разбирает ответ сервера.
     pub(super) async fn post_prepared(
         &self,
