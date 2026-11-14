@@ -776,6 +776,97 @@ mod tests {
         assert_eq!(storage.pending_sends(&b).unwrap(), [other]);
     }
 
+    /// Проверяет миграцию старой очереди, единственного победителя и восстановление после закрытия.
+    #[test]
+    fn first_send_claim_survives_reopen_and_preserves_legacy_pending() {
+        use std::sync::Barrier;
+        use uuid::Uuid;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workspace.sqlite");
+        let a = owner();
+        let b = OwnerContext {
+            project_id: "other-project".into(),
+            ..a.clone()
+        };
+        let first = PreparedSend {
+            canonical_id: Uuid::from_u128(1),
+            public_id: Uuid::from_u128(2),
+            stream_id: Uuid::from_u128(3),
+            topic_id: Uuid::from_u128(4),
+            markdown: "**Первая отправка**".into(),
+        };
+        let other = PreparedSend {
+            markdown: "Другой владелец".into(),
+            ..first.clone()
+        };
+
+        // Создаём файл со схемой и строками до появления закрепления.
+        let legacy = Connection::open(&path).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE messenger_outbox (
+                account_id TEXT NOT NULL, server TEXT NOT NULL, organization_id TEXT NOT NULL,
+                project_id TEXT NOT NULL, user_id TEXT NOT NULL, canonical_id BLOB NOT NULL,
+                public_id BLOB NOT NULL, stream_id BLOB NOT NULL, topic_id BLOB NOT NULL,
+                markdown TEXT NOT NULL, state TEXT NOT NULL CHECK (state = 'pending'),
+                PRIMARY KEY (account_id, server, organization_id, project_id, user_id, canonical_id)
+            );",
+            )
+            .unwrap();
+        for (owner, message) in [(&a, &first), (&b, &other)] {
+            legacy.execute(
+                "INSERT INTO messenger_outbox VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending')",
+                params![
+                    owner.account_id.0, owner.server, owner.organization_id, owner.project_id,
+                    owner.user_id, message.canonical_id.as_bytes(), message.public_id.as_bytes(),
+                    message.stream_id.as_bytes(), message.topic_id.as_bytes(), message.markdown,
+                ],
+            ).unwrap();
+        }
+        drop(legacy);
+
+        let left = Storage::open(&path).unwrap();
+        let right = Storage::open(&path).unwrap();
+        assert_eq!(
+            left.pending_sends(&a).unwrap(),
+            std::slice::from_ref(&first)
+        );
+        assert!(left.claimed_sends(&a).unwrap().is_empty());
+        let barrier = Barrier::new(2);
+        let canonical_id = first.canonical_id;
+        let snapshots = std::thread::scope(|scope| {
+            let left = scope.spawn(|| {
+                barrier.wait();
+                left.claim_first_send(&a, canonical_id).unwrap()
+            });
+            let right = scope.spawn(|| {
+                barrier.wait();
+                right.claim_first_send(&a, canonical_id).unwrap()
+            });
+            [left.join().unwrap(), right.join().unwrap()]
+        });
+        assert_eq!(
+            snapshots.into_iter().flatten().collect::<Vec<_>>(),
+            std::slice::from_ref(&first)
+        );
+        drop((left, right));
+
+        let reopened = Storage::open(&path).unwrap();
+        assert!(reopened.pending_sends(&a).unwrap().is_empty());
+        assert_eq!(reopened.claimed_sends(&a).unwrap(), [first]);
+        assert_eq!(reopened.claim_first_send(&a, canonical_id).unwrap(), None);
+        assert_eq!(
+            reopened.pending_sends(&b).unwrap(),
+            std::slice::from_ref(&other)
+        );
+        assert!(reopened.claimed_sends(&b).unwrap().is_empty());
+        assert_eq!(
+            reopened.claim_first_send(&b, canonical_id).unwrap(),
+            Some(other)
+        );
+    }
+
     /// Проверяет, что повтор или смена журнала не повреждают сообщения и позицию.
     #[test]
     fn preserves_cursor_and_messages_on_duplicate_or_epoch_change() {
