@@ -13,11 +13,30 @@ use crate::{
     storage::{
         Cursor, EventWrite, HistoryChange, HistoryMessage, HistoryMetadata, HistoryPageEdges,
         HistoryPageGuard, HistoryPageOutcome, HistoryPageTarget, HistoryScope, HistoryWindow,
-        Message, MessagePlacement, Storage, StorageError,
+        Message, MessagePlacement, PreparedSend, Storage, StorageError,
     },
 };
 
 pub use crate::storage::ApplyOutcome;
+
+/// Вычисляет UUID размещения из темы и строкового канонического UUID, как Workspace API.
+fn public_send_id(topic_id: uuid::Uuid, canonical_id: uuid::Uuid) -> uuid::Uuid {
+    uuid::Uuid::new_v5(&topic_id, canonical_id.to_string().as_bytes())
+}
+
+#[cfg(test)]
+mod send_identity_tests {
+    /// Сверяет формулу с контрольным примером Workspace UI.
+    #[test]
+    fn public_id_matches_workspace_reference() {
+        let topic = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let canonical = "00000000-0000-4000-8000-000000000002".parse().unwrap();
+        assert_eq!(
+            super::public_send_id(topic, canonical).to_string(),
+            "d2919e10-8c62-5b88-89e6-ed7da20fc912"
+        );
+    }
+}
 
 /// Изменение, которое оболочка показывает для одного аккаунта и проекта.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -119,6 +138,15 @@ pub enum SyncError {
     Auth(#[from] AuthError), // Ошибка проверки действующей сессии.
     #[error(transparent)]
     Storage(#[from] StorageError), // Ошибка локального хранилища.
+}
+
+/// Причина отказа подготовки снимка отправки.
+#[derive(Debug, Error)]
+pub enum PrepareSendError {
+    #[error(transparent)]
+    Sync(#[from] SyncError), // Сессия недействительна или база недоступна.
+    #[error("the generated message identifier is already in use")]
+    IdCollision, // Случайный UUID уже занят: исходная запись осталась без изменений.
 }
 
 /// Проверяет право сессии на запись и передаёт события в хранилище.
@@ -245,6 +273,37 @@ impl Sync {
         self.auth.with_active_generation(owner, generation, || {
             Ok(self.storage.confirm_http_send(owner, message)?)
         })?
+    }
+
+    /// Создаёт снимок отправки и возвращает его только после записи для действующего входа.
+    pub fn prepare_send(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        stream_id: uuid::Uuid,
+        topic_id: uuid::Uuid,
+        markdown: String,
+    ) -> Result<PreparedSend, PrepareSendError> {
+        self.auth
+            .with_active_generation(owner, generation, || {
+                let canonical_id = uuid::Uuid::new_v4();
+                let message = PreparedSend {
+                    canonical_id,
+                    public_id: public_send_id(topic_id, canonical_id),
+                    stream_id,
+                    topic_id,
+                    markdown,
+                };
+                if !self
+                    .storage
+                    .save_prepared_send(owner, &message)
+                    .map_err(SyncError::from)?
+                {
+                    return Err(PrepareSendError::IdCollision);
+                }
+                Ok(message)
+            })
+            .map_err(SyncError::from)?
     }
 
     /// Подписывает оболочку на изменения. После пропуска событий счётчик можно перечитать.

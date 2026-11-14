@@ -562,6 +562,53 @@ fn incoming_with_id(version: u64, id: &str, text: &str) -> Event {
     }
 }
 
+/// Проверяет запись снимков отправки, отказ базы и запрет записи после выхода.
+#[test]
+fn prepared_send_is_persisted_only_for_active_session() {
+    let fixture = Fixture::new(|_, _| unreachable!());
+    let owner = fixture.login("sender");
+    let generation = fixture.auth.snapshot()[0].generation;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("outbox.sqlite3");
+    let storage = Arc::new(Storage::open(&path).unwrap());
+    let sync = EventSync::new(fixture.auth.clone(), storage.clone());
+    let stream = uuid::Uuid::from_u128(1);
+    let topic = uuid::Uuid::from_u128(2);
+    let first = sync
+        .prepare_send(&owner, generation, stream, topic, "**Текст**\n".into())
+        .unwrap();
+    let second = sync
+        .prepare_send(&owner, generation, stream, topic, "**Текст**\n".into())
+        .unwrap();
+    assert_ne!(first.canonical_id, second.canonical_id);
+    assert_ne!(first.public_id, second.public_id);
+    assert_eq!(
+        (first.stream_id, first.topic_id, first.markdown.as_str()),
+        (stream, topic, "**Текст**\n")
+    );
+
+    // Триггер имитирует отказ SQLite именно во время сохранения новой записи.
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.execute_batch("CREATE TRIGGER reject_outbox BEFORE INSERT ON messenger_outbox BEGIN SELECT RAISE(FAIL, 'test write failure'); END;").unwrap();
+    assert!(
+        sync.prepare_send(&owner, generation, stream, topic, "error".into())
+            .is_err()
+    );
+    connection
+        .execute_batch("DROP TRIGGER reject_outbox;")
+        .unwrap();
+    fixture.auth.logout(&owner.account_id).unwrap();
+    assert!(
+        sync.prepare_send(&owner, generation, stream, topic, "stale".into())
+            .is_err()
+    );
+    drop(sync);
+    drop(storage);
+    drop(connection);
+    let reopened = Storage::open(&path).unwrap();
+    assert_eq!(reopened.pending_sends(&owner).unwrap(), vec![first, second]);
+}
+
 /// Проверяет восстановление счётчика, порядок снимков, повторы сообщений и выход из сессии.
 #[test]
 fn messenger_updates_are_committed_deduplicated_and_scoped_to_the_session() {
