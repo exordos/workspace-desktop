@@ -268,6 +268,37 @@ impl MessengerSource {
             stream_id,
             topic_id: None,
         };
+        self.open_anchor_history(sync, owner, generation, scope, anchor_id)
+            .await
+    }
+
+    /// Открывает окно известной темы вокруг сообщения после проверки доступа.
+    pub async fn open_topic_history(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        stream_id: Uuid,
+        topic_id: Uuid,
+        anchor_id: Uuid,
+    ) -> Result<HistoryWindow, OpenHistoryError> {
+        let scope = HistoryScope {
+            stream_id,
+            topic_id: Some(topic_id),
+        };
+        self.open_anchor_history(sync, owner, generation, scope, anchor_id)
+            .await
+    }
+
+    /// Проверяет область и цель, затем возвращает кэш или загружает соседние страницы.
+    async fn open_anchor_history(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        scope: HistoryScope,
+        anchor_id: Uuid,
+    ) -> Result<HistoryWindow, OpenHistoryError> {
         let auth = sync.auth();
         let token = auth
             .access_token_for_generation(owner, Service::Messenger, generation)
@@ -276,11 +307,20 @@ impl MessengerSource {
             .prepare_history_page(owner, generation, scope, HistoryPageTarget::New)?
             .ok_or(OpenHistoryError::StaleWindow)?;
         let verified = async {
+            match scope.topic_id {
+                Some(topic) => {
+                    self.rest
+                        .check_topic_access(owner, &token, scope.stream_id, topic)
+                        .await?
+                }
+                None => {
+                    self.rest
+                        .check_direct_access(owner, &token, scope.stream_id)
+                        .await?
+                }
+            }
             self.rest
-                .check_direct_access(owner, &token, stream_id)
-                .await?;
-            self.rest
-                .direct_anchor(owner, &token, stream_id, anchor_id)
+                .history_anchor(owner, &token, scope, anchor_id)
                 .await
         }
         .await;
@@ -303,7 +343,7 @@ impl MessengerSource {
 
         let fetched = self
             .rest
-            .direct_pages(owner, &token, stream_id, anchor_id)
+            .anchor_pages(owner, &token, scope, anchor_id)
             .await;
         // После сетевого запроса сначала проверяем сессию, даже если сервер вернул ошибку.
         auth.with_active_generation(owner, generation, || ())?;

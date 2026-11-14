@@ -51,6 +51,8 @@ const KEY: &[u8] =
 struct HistoryApi {
     access_mode: AtomicUsize, // 0 — доступ, 1 — 403, 2 — другой владелец, 3 — другой стрим, 4 — задержка, 5 — обрыв, 6 — другая тема.
     pages: AtomicUsize,       // Количество запросов соседних страниц.
+    anchor_other_topic: AtomicUsize, // 1 — целевое сообщение находится в соседней теме.
+    require_topic: AtomicUsize, // 1 — соседние страницы обязаны содержать фильтр темы.
     deny: AtomicUsize,        // 0 — доступ есть, 1 — скрыт чат, 2 — скрыто сообщение.
     delay: Notify,            // Запрос страницы дошёл до сервера.
     latest_mode: AtomicUsize, // 0 — обычная страница, 1 — сбой, 2 — задержка, 3 — чужая тема, 4 — маркер и в теме.
@@ -136,7 +138,11 @@ async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
         if api.deny.load(Relaxed) == 2 {
             ("404 Not Found", Value::Null)
         } else {
-            ("200 OK", message(ANCHOR, user))
+            let mut anchor = message(ANCHOR, user);
+            if api.anchor_other_topic.load(Relaxed) == 1 {
+                anchor["topic_uuid"] = json!(NEWER);
+            }
+            ("200 OK", anchor)
         }
     } else {
         assert!(request.path().ends_with("/messages/"));
@@ -200,7 +206,12 @@ async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
             }
         } else if let Some(anchor) = query.get("page_marker") {
             assert_eq!(anchor, &ANCHOR.to_string());
-            assert!(!query.contains_key("topic_uuid"));
+            assert_eq!(
+                query.get("topic_uuid").map(|topic| topic.as_ref()),
+                (api.require_topic.load(Relaxed) == 1)
+                    .then(|| TOPIC.to_string())
+                    .as_deref()
+            );
             let count = api.pages.fetch_add(1, Relaxed);
             if count == 4 {
                 api.delay.notify_one();
@@ -986,5 +997,139 @@ async fn verifies_conversation_access_for_current_generation() {
         result,
         Err(OpenHistoryError::Auth(AuthError::SessionUnavailable))
     ));
+    worker.abort();
+}
+
+/// Открывает тему двух аккаунтов, проверяет кэш, отсутствие цели и устаревший вход.
+#[tokio::test]
+async fn topic_anchor_history_checks_scope_and_isolates_sessions() {
+    let api = Arc::new(HistoryApi::default());
+    api.require_topic.store(1, Relaxed);
+    let (server, worker) = serve(api.clone()).await;
+    let fixture = Fixture::new(|_, _| unreachable!());
+    let first = fixture.login_at(&server, "first");
+    let second = fixture.login_at(&server, "second");
+    let generation = |owner: &_| {
+        fixture
+            .auth
+            .snapshot()
+            .into_iter()
+            .find(|session| session.context == *owner)
+            .unwrap()
+            .generation
+    };
+    let first_generation = generation(&first);
+    let second_generation = generation(&second);
+    let sync = Sync::new(
+        fixture.auth.clone(),
+        Arc::new(Storage::in_memory().unwrap()),
+    );
+    let source =
+        MessengerSource::with_private_ca(CertificateDer::from_pem_slice(CA).unwrap().as_ref())
+            .unwrap();
+    let scope = HistoryScope {
+        stream_id: CHAT,
+        topic_id: Some(TOPIC),
+    };
+    let cursor = Cursor {
+        epoch_generation: "test".into(),
+        epoch_version: 8,
+    };
+    sync.apply(
+        &second,
+        second_generation,
+        "messenger",
+        Event::Checkpoint(cursor.clone()),
+    )
+    .unwrap();
+    let first_window = source
+        .open_topic_history(&sync, &first, first_generation, CHAT, TOPIC, ANCHOR)
+        .await
+        .unwrap();
+    let second_window = source
+        .open_topic_history(&sync, &second, second_generation, CHAT, TOPIC, ANCHOR)
+        .await
+        .unwrap();
+    assert_eq!(
+        second_window
+            .messages
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        [OLDER, ANCHOR, NEWER]
+    );
+    assert!(first_window.messages.iter().all(|row| row.text == "first"));
+    assert!(
+        second_window
+            .messages
+            .iter()
+            .all(|row| row.text == "second")
+    );
+    assert_eq!(second_window.older, HistoryEdge::More(OLDER.to_string()));
+    assert_eq!(second_window.newer, HistoryEdge::End);
+    assert_eq!(sync.cursor(&second, "messenger").unwrap(), Some(cursor));
+    assert_eq!(
+        source
+            .open_topic_history(&sync, &second, second_generation, CHAT, TOPIC, ANCHOR)
+            .await
+            .unwrap(),
+        second_window
+    );
+    assert_eq!(api.pages.load(Relaxed), 4);
+    api.access_mode.store(1, Relaxed);
+    assert!(matches!(
+        source
+            .open_topic_history(&sync, &second, second_generation, CHAT, TOPIC, ANCHOR)
+            .await,
+        Err(OpenHistoryError::AccessLost)
+    ));
+    api.access_mode.store(0, Relaxed);
+    api.deny.store(2, Relaxed);
+    assert!(matches!(
+        source
+            .open_topic_history(&sync, &second, second_generation, CHAT, TOPIC, ANCHOR)
+            .await,
+        Err(OpenHistoryError::MessageMissing)
+    ));
+    api.deny.store(0, Relaxed);
+    api.anchor_other_topic.store(1, Relaxed);
+    assert!(matches!(
+        source
+            .open_topic_history(&sync, &second, second_generation, CHAT, TOPIC, ANCHOR)
+            .await,
+        Err(OpenHistoryError::MessageMissing)
+    ));
+    api.anchor_other_topic.store(0, Relaxed);
+    let empty = Sync::new(
+        fixture.auth.clone(),
+        Arc::new(Storage::in_memory().unwrap()),
+    );
+    let pending =
+        source.open_topic_history(&empty, &second, second_generation, CHAT, TOPIC, ANCHOR);
+    let relogin = async {
+        timeout(Duration::from_secs(3), api.delay.notified())
+            .await
+            .expect("страница темы B не запрошена");
+        fixture.auth.logout(&second.account_id).unwrap();
+        let fresh = fixture.login_at(&server, "second");
+        api.release.notify_one();
+        fresh
+    };
+    let (result, fresh) = tokio::join!(pending, relogin);
+    assert!(matches!(
+        result,
+        Err(OpenHistoryError::Auth(AuthError::SessionUnavailable))
+    ));
+    assert!(
+        empty
+            .history_windows(&fresh, generation(&fresh), scope)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        sync.history_windows(&first, first_generation, scope)
+            .unwrap(),
+        [first_window]
+    );
     worker.abort();
 }

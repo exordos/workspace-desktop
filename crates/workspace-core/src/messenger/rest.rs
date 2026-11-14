@@ -353,27 +353,50 @@ impl RestClient {
         Ok(response.json().await.map_err(request_error)?)
     }
 
-    /// Проверяет, что целевое текстовое сообщение ещё доступно в этом разговоре.
-    pub(super) async fn direct_anchor(
+    /// Повторно проверяет доступ к выбранной области после ошибки сообщения.
+    async fn check_history_scope(
         &self,
         owner: &OwnerContext,
         token: &str,
-        stream: Uuid,
+        scope: HistoryScope,
+    ) -> Result<(), OpenHistoryError> {
+        match scope.topic_id {
+            Some(topic) => {
+                self.check_topic_access(owner, token, scope.stream_id, topic)
+                    .await
+            }
+            None => {
+                self.check_direct_access(owner, token, scope.stream_id)
+                    .await
+            }
+        }
+    }
+
+    /// Проверяет, что целевое текстовое сообщение ещё доступно в этом разговоре.
+    pub(super) async fn history_anchor(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        scope: HistoryScope,
         anchor: Uuid,
     ) -> Result<HistoryMessage, OpenHistoryError> {
+        let stream = scope.stream_id;
         let request = self.request(owner, token, &format!("{MESSAGES_PATH}{anchor}"))?;
         let response = request.send().await.map_err(request_error)?;
         match response.status() {
             StatusCode::NOT_FOUND => {
                 // API скрывает недоступные сообщения за 404. Перечитываем доступ к чату.
-                self.check_direct_access(owner, token, stream).await?;
+                self.check_history_scope(owner, token, scope).await?;
                 return Err(OpenHistoryError::MessageMissing);
             }
             StatusCode::FORBIDDEN => return Err(OpenHistoryError::AccessLost),
             status => check_status(status)?,
         }
         let row: WireHistoryMessage = response.json().await.map_err(request_error)?;
-        if row.uuid != anchor || row.stream_uuid != stream {
+        if row.uuid != anchor
+            || row.stream_uuid != stream
+            || scope.topic_id.is_some_and(|topic| row.topic_uuid != topic)
+        {
             return Err(OpenHistoryError::MessageMissing);
         }
         row.into_history(owner, stream)?
@@ -381,32 +404,28 @@ impl RestClient {
     }
 
     /// Читает соседние страницы по публичному UUID и сохраняет маркер каждого края.
-    pub(super) async fn direct_pages(
+    pub(super) async fn anchor_pages(
         &self,
         owner: &OwnerContext,
         token: &str,
-        stream: Uuid,
+        scope: HistoryScope,
         anchor: Uuid,
     ) -> Result<(HistoryPage, HistoryPage), OpenHistoryError> {
         tokio::try_join!(
-            self.direct_page(owner, token, stream, anchor, "desc"),
-            self.direct_page(owner, token, stream, anchor, "asc")
+            self.anchor_page(owner, token, scope, anchor, "desc"),
+            self.anchor_page(owner, token, scope, anchor, "asc")
         )
     }
 
     /// Запрашивает страницу с одной стороны от сообщения.
-    async fn direct_page(
+    async fn anchor_page(
         &self,
         owner: &OwnerContext,
         token: &str,
-        stream: Uuid,
+        scope: HistoryScope,
         anchor: Uuid,
         direction: &str,
     ) -> Result<HistoryPage, OpenHistoryError> {
-        let scope = HistoryScope {
-            stream_id: stream,
-            topic_id: None,
-        };
         let response = self
             .history_page_request(owner, token, scope, direction)?
             .query(&[("page_marker", anchor)])
@@ -416,7 +435,7 @@ impl RestClient {
         match response.status() {
             StatusCode::FORBIDDEN => return Err(OpenHistoryError::AccessLost),
             StatusCode::NOT_FOUND => {
-                self.check_direct_access(owner, token, stream).await?;
+                self.check_history_scope(owner, token, scope).await?;
                 return Err(OpenHistoryError::MessageMissing);
             }
             status => check_status(status)?,
