@@ -1093,3 +1093,83 @@ async fn runtime_refreshes_a_token_rejected_before_expiry() {
         .unwrap()
         .unwrap();
 }
+
+/// Проверяет замену живых потоков, повтор сигнала и выход аккаунта перед восстановлением.
+#[tokio::test]
+async fn runtime_recovers_live_streams_on_wake() {
+    let fixture = Fixture::new(|user, _| Ok(project_token(user, "refreshed", None)));
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(Storage::open(directory.path().join("wake.sqlite3")).unwrap());
+    let sync = Arc::new(EventSync::new(fixture.auth.clone(), storage));
+    let (connections, mut receive) = async_mpsc::unbounded_channel();
+    let runtime = Runtime::new(sync.clone(), vec![Arc::new(TestSource(connections))]).unwrap();
+    let (wake, signals) = async_mpsc::channel(2);
+    let (shutdown, stopped) = oneshot::channel();
+    let worker = tokio::spawn(runtime.run_with_wake(
+        async {
+            let _ = stopped.await;
+        },
+        Some(signals),
+    ));
+    let a = fixture.login("a");
+    let b = fixture.login("b");
+    let mut streams = HashMap::new();
+    for _ in 0..2 {
+        let (session, send) = tokio::time::timeout(Duration::from_secs(5), receive.recv())
+            .await
+            .expect("initial connection")
+            .unwrap();
+        streams.insert(session.context, send);
+    }
+    let event_a = incoming(4, "for A");
+    let event_b = incoming(7, "for B");
+    streams[&a].send(Ok(event_a.clone())).await.unwrap();
+    streams[&b].send(Ok(event_b.clone())).await.unwrap();
+    wait_for(|| {
+        sync.cursor(&a, "messenger").unwrap().as_ref() == Some(event_a.cursor())
+            && sync.cursor(&b, "messenger").unwrap().as_ref() == Some(event_b.cursor())
+    })
+    .await;
+
+    // Оба потока ещё живы; два сигнала должны заменить каждый только один раз.
+    wake.try_send(()).unwrap();
+    wake.try_send(()).unwrap();
+    let mut restored = HashMap::new();
+    for _ in 0..2 {
+        let (session, send) = tokio::time::timeout(Duration::from_secs(5), receive.recv())
+            .await
+            .expect("connection after wake")
+            .unwrap();
+        let old = streams
+            .remove(&session.context)
+            .expect("one replacement per stream");
+        assert!(old.is_closed());
+        let expected = if session.context == a {
+            event_a.cursor()
+        } else {
+            event_b.cursor()
+        };
+        assert_eq!(session.cursor.as_ref(), Some(expected));
+        restored.insert(session.context, send);
+    }
+    assert!(restored.values().all(|send| !send.is_closed()));
+    assert!(receive.try_recv().is_err());
+
+    // Выход до запуска замены исключает B из свежего снимка, нужного для подключения.
+    wake.try_send(()).unwrap();
+    fixture.auth.logout(&b.account_id).unwrap();
+    let (session, send) = tokio::time::timeout(Duration::from_secs(5), receive.recv())
+        .await
+        .expect("second connection for A")
+        .unwrap();
+    assert_eq!(session.context, a);
+    assert_eq!(session.cursor.as_ref(), Some(event_a.cursor()));
+    assert!(restored[&a].is_closed());
+    tokio::time::timeout(Duration::from_secs(5), restored[&b].closed())
+        .await
+        .expect("B disconnected after logout");
+    assert!(!send.is_closed());
+    assert!(receive.try_recv().is_err());
+    shutdown.send(()).unwrap();
+    worker.await.unwrap().unwrap();
+}

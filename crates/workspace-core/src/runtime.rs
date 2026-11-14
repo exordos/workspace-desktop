@@ -1,12 +1,21 @@
 //! Поддерживает фоновые подключения к источникам событий.
 //! По состоянию сессий запускает и останавливает задачи, возобновляет чтение и передаёт события в Sync.
 
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use futures::{Stream, StreamExt, future::BoxFuture};
 use thiserror::Error;
 use tokio::{
-    sync::oneshot,
+    sync::{mpsc, oneshot},
     task::{JoinError, JoinSet, spawn_blocking},
     time::sleep,
 };
@@ -89,6 +98,7 @@ struct TaskKey {
 struct Task {
     generation: SessionGeneration, // Поколение сессии, с которым запустили задачу.
     token_version: u64,            // Версия токена, с которой запустили задачу.
+    connected: Arc<AtomicBool>, // Источник уже открыл поток. Пока идёт подключение, повторный сигнал не нужен.
     cancel: Option<oneshot::Sender<()>>, // Канал остановки. `None` означает, что сигнал уже отправлен.
 }
 
@@ -129,6 +139,16 @@ impl Runtime {
     /// Чтобы дождаться задач и начатых записей, передай сигнал и дождись результата этой функции.
     /// Если отменить ожидание функции, задачи прервутся, а начатые записи могут ещё выполняться.
     pub async fn run(self, shutdown: impl Future<Output = ()>) -> Result<(), RuntimeError> {
+        self.run_with_wake(shutdown, None).await
+    }
+
+    /// Принимает сигналы пробуждения и перезапускает открытые потоки с сохранённых позиций.
+    /// Закрытие канала отключает сигналы, фоновая работа при этом продолжается.
+    pub async fn run_with_wake(
+        self,
+        shutdown: impl Future<Output = ()>,
+        mut wake: Option<mpsc::Receiver<()>>,
+    ) -> Result<(), RuntimeError> {
         let snapshots = self.sync.auth().subscribe();
         tokio::pin!(snapshots, shutdown);
         let mut tasks = HashMap::new();
@@ -140,6 +160,17 @@ impl Runtime {
                 snapshot = snapshots.next() => {
                     let Some(snapshot) = snapshot else { break Ok(()); };
                     self.reconcile(snapshot, &mut tasks, &mut workers);
+                }
+                signal = async { wake.as_mut().expect("wake channel").recv().await }, if wake.is_some() => {
+                    if signal.is_some() {
+                        for task in tasks.values_mut() {
+                            if task.connected.load(Ordering::Relaxed) {
+                                task.cancel();
+                            }
+                        }
+                    } else {
+                        wake = None;
+                    }
                 }
                 completed = workers.join_next(), if !workers.is_empty() => match completed {
                     Some(Ok((key, Ok(())))) => {
@@ -201,7 +232,9 @@ impl Runtime {
                 };
                 tasks.entry(key.clone()).or_insert_with(|| {
                     let (cancel, cancelled) = oneshot::channel();
+                    let connected = Arc::new(AtomicBool::new(false));
                     let worker = Worker {
+                        connected: connected.clone(),
                         sync: self.sync.clone(),
                         source: source.clone(),
                         key: key.clone(),
@@ -211,6 +244,7 @@ impl Runtime {
                     Task {
                         generation: session.generation,
                         token_version: session.token_version,
+                        connected,
                         cancel: Some(cancel),
                     }
                 });
@@ -221,10 +255,11 @@ impl Runtime {
 
 /// Фоновая работа с одним источником событий для одной сессии.
 struct Worker {
-    sync: Arc<Sync>,              // Доступ к авторизации и локальному сохранению событий.
+    connected: Arc<AtomicBool>, // Показывает Runtime, что источник уже открыл поток.
+    sync: Arc<Sync>,            // Доступ к авторизации и локальному сохранению событий.
     source: Arc<dyn EventSource>, // Источник, у которого задача открывает поток.
-    key: TaskKey,                 // Аккаунт, проект и имя источника этой задачи.
-    session: SessionSnapshot,     // Снимок сессии и версии токена на момент запуска задачи.
+    key: TaskKey,               // Аккаунт, проект и имя источника этой задачи.
+    session: SessionSnapshot,   // Снимок сессии и версии токена на момент запуска задачи.
 }
 
 impl Worker {
@@ -232,7 +267,9 @@ impl Worker {
     async fn run(self, mut cancelled: oneshot::Receiver<()>) -> Result<(), JoinError> {
         let mut delay = INITIAL_RETRY_DELAY;
         loop {
-            match self.consume(&mut cancelled, &mut delay).await? {
+            let end = self.consume(&mut cancelled, &mut delay).await?;
+            self.connected.store(false, Ordering::Relaxed);
+            match end {
                 ConnectionEnd::Stopped => break,
                 ConnectionEnd::CursorRejected => {
                     // Повтор с той же позицией не поможет. Ждём замены или остановки задачи.
@@ -322,6 +359,7 @@ impl Worker {
             Some(Err(error)) => return Ok(self.source_failure(error)),
             None => return Ok(ConnectionEnd::Stopped),
         };
+        self.connected.store(true, Ordering::Relaxed);
         loop {
             let event = match until_cancelled(cancelled, stream.next()).await {
                 Some(Some(Ok(event))) => event,
