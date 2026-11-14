@@ -894,6 +894,128 @@ async fn wait_for(test: impl Fn() -> bool) {
     .expect("condition did not become true");
 }
 
+/// Проверяет повтор события после сбоя записи без остановки второго аккаунта.
+#[tokio::test]
+async fn runtime_replays_event_after_cursor_write_failure() {
+    let fixture = Fixture::new(|user, _| Ok(project_token(user, "refreshed", None)));
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("replay.sqlite3");
+    let storage = Arc::new(Storage::open(&path).unwrap());
+    let sync = Arc::new(EventSync::new(fixture.auth.clone(), storage.clone()));
+    let a = fixture.login("a");
+    let b = fixture.login("b");
+    let generations: HashMap<_, _> = fixture
+        .auth
+        .snapshot()
+        .into_iter()
+        .map(|session| (session.context.account_id, session.generation))
+        .collect();
+    let cursor = |version| Cursor {
+        epoch_generation: "test-epoch".into(),
+        epoch_version: version,
+    };
+    for owner in [&a, &b] {
+        sync.apply(
+            owner,
+            generations[&owner.account_id],
+            "messenger",
+            Event::Checkpoint(cursor(4)),
+        )
+        .unwrap();
+    }
+    let mut updates = sync.subscribe();
+    let (connections, mut receive) = async_mpsc::unbounded_channel();
+    let runtime = Runtime::new(sync.clone(), vec![Arc::new(TestSource(connections))]).unwrap();
+    let (shutdown, stopped) = oneshot::channel();
+    let worker = tokio::spawn(runtime.run(async {
+        let _ = stopped.await;
+    }));
+    let mut connected = HashMap::new();
+    for _ in 0..2 {
+        let (session, send) = tokio::time::timeout(Duration::from_secs(5), receive.recv())
+            .await
+            .expect("initial connection timed out")
+            .unwrap();
+        assert_eq!(session.cursor, Some(cursor(4)));
+        connected.insert(session.context.account_id, send);
+    }
+    let send_a = connected.remove(&a.account_id).unwrap();
+    let send_b = connected.remove(&b.account_id).unwrap();
+    let fault = rusqlite::Connection::open(&path).unwrap();
+    fault.execute_batch("CREATE TRIGGER fail_cursor_replay BEFORE UPDATE ON sync_cursors WHEN NEW.epoch_version = 8 BEGIN SELECT RAISE(ABORT, 'test cursor write failure'); END;").unwrap();
+    let event = Event::IncomingDirectMessage {
+        cursor: cursor(8),
+        message: Message {
+            id: "replayed".into(),
+            text: "for B".into(),
+        },
+        conversation_id: "conversation".into(),
+        placement: None,
+        metadata: None,
+    };
+    send_b.send(Ok(event.clone())).await.unwrap();
+    let (reconnected, send_b_new) = tokio::time::timeout(Duration::from_secs(5), receive.recv())
+        .await
+        .expect("B did not reconnect after write failure")
+        .unwrap();
+    assert_eq!(reconnected.context, b);
+    assert_eq!(reconnected.generation, generations[&b.account_id]);
+    assert_eq!(reconnected.cursor, Some(cursor(4)));
+    assert!(send_b.is_closed());
+    assert_eq!(storage.message(&b, "replayed").unwrap(), None);
+    assert_eq!(sync.cursor(&b, "messenger").unwrap(), Some(cursor(4)));
+    assert!(updates.try_recv().is_err());
+
+    // A продолжает обработку, пока ошибка записи B ещё включена.
+    send_a
+        .send(Ok(incoming_with_id(5, "message-a", "for A")))
+        .await
+        .unwrap();
+    wait_for(|| sync.cursor(&a, "messenger").unwrap() == Some(cursor(5))).await;
+    assert!(storage.message(&a, "message-a").unwrap().is_some());
+    assert!(!send_a.is_closed());
+    assert!(updates.try_recv().is_err());
+    fault
+        .execute_batch("DROP TRIGGER fail_cursor_replay")
+        .unwrap();
+    send_b_new.send(Ok(event.clone())).await.unwrap();
+    let update = tokio::time::timeout(Duration::from_secs(5), updates.recv())
+        .await
+        .expect("B update timed out")
+        .unwrap();
+    assert_eq!(
+        update,
+        SyncUpdate {
+            context: b.clone(),
+            generation: generations[&b.account_id],
+            change: SyncChange::IncomingDirectMessage {
+                conversation_id: "conversation".into(),
+                message_id: "replayed".into()
+            }
+        }
+    );
+    assert_eq!(
+        storage.message(&b, "replayed").unwrap(),
+        event.message().cloned()
+    );
+    assert_eq!(sync.cursor(&b, "messenger").unwrap(), Some(cursor(8)));
+    send_b_new.send(Ok(event)).await.unwrap();
+    send_b_new
+        .send(Ok(Event::Checkpoint(cursor(9))))
+        .await
+        .unwrap();
+    wait_for(|| sync.cursor(&b, "messenger").unwrap() == Some(cursor(9))).await;
+    assert!(updates.try_recv().is_err());
+    assert!(receive.try_recv().is_err());
+    assert!(!send_a.is_closed());
+    shutdown.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("runtime shutdown timed out")
+        .unwrap()
+        .unwrap();
+}
+
 /// Проверяет отдельные потоки двух аккаунтов и возобновление с последней записанной позиции.
 #[tokio::test]
 async fn runtime_tracks_two_accounts_and_resumes_from_the_committed_cursor() {
