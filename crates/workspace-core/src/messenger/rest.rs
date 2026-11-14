@@ -365,6 +365,30 @@ impl RestClient {
         Ok(Self::decode_history_page(response, owner, scope).await?)
     }
 
+    /// Запрашивает следующую страницу от маркера нового края.
+    pub(super) async fn ascending_page(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        scope: HistoryScope,
+        marker: &str,
+    ) -> Result<HistoryPage, OpenHistoryError> {
+        let response = self
+            .history_page_request(owner, token, scope, "asc")?
+            .query(&[("page_marker", marker)])
+            .send()
+            .await
+            .map_err(request_error)?;
+        if matches!(
+            response.status(),
+            StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+        ) {
+            return Err(OpenHistoryError::AccessLost);
+        }
+        check_status(response.status())?;
+        Ok(Self::decode_history_page(response, owner, scope).await?)
+    }
+
     /// Собирает запрос страницы для стрима или отдельной темы.
     fn history_page_request(
         &self,

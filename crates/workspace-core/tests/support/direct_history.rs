@@ -25,7 +25,10 @@ use workspace_core::{
     auth::AuthError,
     messenger::{MessengerSource, history::OpenHistoryError},
     notification_target::NotificationTarget,
-    storage::{Cursor, HistoryEdge, HistoryScope, Storage},
+    storage::{
+        Cursor, HistoryEdge, HistoryPageEdges, HistoryPageOutcome, HistoryPageTarget, HistoryScope,
+        Storage,
+    },
     sync::{Event, Sync},
 };
 
@@ -53,6 +56,8 @@ struct HistoryApi {
     latest_mode: AtomicUsize, // 0 — обычная страница, 1 — сбой, 2 — задержка, 3 — чужая тема, 4 — маркер и в теме.
     older_mode: AtomicUsize,  // 0 — конец, 1 — сбой, 2 — задержать один ответ, 3 — продолжение.
     older_pages: AtomicUsize, // Число запросов к старому краю.
+    newer_mode: AtomicUsize,  // 0 — конец, 1 — сбой, 2 — задержка, 3 — продолжение темы.
+    newer_pages: AtomicUsize, // Число запросов к новому краю.
     release: Notify,          // Можно вернуть задержанный ответ.
 }
 
@@ -143,6 +148,32 @@ async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
         assert_eq!(query["sort_key"], "created_at");
         if query
             .get("page_marker")
+            .is_some_and(|value| value == &NEWER.to_string())
+        {
+            assert_eq!(query["sort_dir"], "asc");
+            api.newer_pages.fetch_add(1, Relaxed);
+            let mode = api.newer_mode.load(Relaxed);
+            if mode == 1 {
+                ("500 Internal Server Error", Value::Null)
+            } else {
+                assert_eq!(
+                    query.get("topic_uuid").map(|value| value.as_ref()),
+                    (mode == 3).then(|| TOPIC.to_string()).as_deref()
+                );
+                if mode == 2 {
+                    api.newer_mode.store(0, Relaxed);
+                    api.delay.notify_one();
+                    api.release.notified().await;
+                }
+                if mode == 3 {
+                    marker = format!("X-Pagination-Marker: {ANCHOR}\r\n");
+                }
+                let mut newer = message(ANCHOR, user);
+                newer["created_at"] = json!("2026-01-01T13:00:00Z");
+                ("200 OK", json!([newer]))
+            }
+        } else if query
+            .get("page_marker")
             .is_some_and(|marker| marker == &OLDER.to_string())
         {
             assert_eq!(query["sort_dir"], "desc");
@@ -218,6 +249,138 @@ async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
         body.len()
     ).as_bytes()).await.unwrap();
     socket.get_mut().shutdown().await.unwrap();
+}
+
+/// Проверяет новый край, сетевой сбой и запоздалые ответы через локальный HTTPS.
+#[tokio::test]
+async fn newer_history_extends_only_the_current_edge() {
+    let api = Arc::new(HistoryApi::default());
+    let (server, worker) = serve(api.clone()).await;
+    let fixture = Fixture::new(|_, _| unreachable!());
+    let owner = fixture.login_at(&server, "first");
+    let generation = fixture.auth.snapshot()[0].generation;
+    let sync = Sync::new(
+        fixture.auth.clone(),
+        Arc::new(Storage::in_memory().unwrap()),
+    );
+    let source =
+        MessengerSource::with_private_ca(CertificateDer::from_pem_slice(CA).unwrap().as_ref())
+            .unwrap();
+    let stream = HistoryScope {
+        stream_id: CHAT,
+        topic_id: None,
+    };
+    let topic = HistoryScope {
+        topic_id: Some(TOPIC),
+        ..stream
+    };
+    let cursor = Cursor {
+        epoch_generation: "test".into(),
+        epoch_version: 8,
+    };
+    sync.apply(
+        &owner,
+        generation,
+        "messenger",
+        Event::Checkpoint(cursor.clone()),
+    )
+    .unwrap();
+    let seed = source
+        .load_latest_history(&sync, &owner, generation, stream)
+        .await
+        .unwrap();
+    let create = |scope| {
+        let guard = sync
+            .prepare_history_page(&owner, generation, scope, HistoryPageTarget::New)
+            .unwrap()
+            .unwrap();
+        let outcome = sync
+            .save_history_page(
+                guard,
+                &seed.messages,
+                HistoryPageEdges::New {
+                    older: HistoryEdge::More(OLDER.to_string()),
+                    newer: HistoryEdge::More(NEWER.to_string()),
+                },
+            )
+            .unwrap();
+        let HistoryPageOutcome::Saved(id) = outcome else {
+            panic!("окно не сохранено")
+        };
+        id
+    };
+    let stream_id = create(stream);
+    let topic_id = create(topic);
+    let load = |scope, id| source.load_newer_history(&sync, &owner, generation, scope, id);
+    let before = sync.history_windows(&owner, generation, stream).unwrap();
+    api.newer_mode.store(1, Relaxed);
+    assert!(load(stream, stream_id).await.is_err());
+    assert_eq!(
+        sync.history_windows(&owner, generation, stream).unwrap(),
+        before
+    );
+    api.newer_mode.store(3, Relaxed);
+    let topic_window = load(topic, topic_id).await.unwrap();
+    assert_eq!(topic_window.newer, HistoryEdge::More(ANCHOR.to_string()));
+    assert_eq!(topic_window.older, HistoryEdge::More(OLDER.to_string()));
+    assert_eq!(
+        topic_window
+            .messages
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        [OLDER, NEWER, ANCHOR]
+    );
+    api.newer_mode.store(2, Relaxed);
+    let replace = async {
+        timeout(Duration::from_secs(3), api.delay.notified())
+            .await
+            .expect("запрос нового края не дошёл до сервера");
+        let result = load(stream, stream_id).await.unwrap();
+        api.release.notify_one();
+        result
+    };
+    let (late, window) = tokio::join!(load(stream, stream_id), replace);
+    assert!(matches!(late, Err(OpenHistoryError::StaleWindow)));
+    assert_eq!(window.newer, HistoryEdge::End);
+    assert_eq!(window.older, HistoryEdge::More(OLDER.to_string()));
+    assert_eq!(
+        window.messages.iter().map(|row| row.id).collect::<Vec<_>>(),
+        [OLDER, NEWER, ANCHOR]
+    );
+    let count = api.newer_pages.load(Relaxed);
+    assert_eq!(load(stream, stream_id).await.unwrap(), window);
+    assert_eq!(api.newer_pages.load(Relaxed), count);
+    assert_eq!(sync.cursor(&owner, "messenger").unwrap(), Some(cursor));
+    let another = create(stream);
+    let before = sync.history_windows(&owner, generation, stream).unwrap();
+    api.newer_mode.store(2, Relaxed);
+    let relogin = async {
+        timeout(Duration::from_secs(3), api.delay.notified())
+            .await
+            .expect("запрос старой сессии не дошёл до сервера");
+        fixture.auth.logout(&owner.account_id).unwrap();
+        let fresh = fixture.login_at(&server, "first");
+        api.release.notify_one();
+        fresh
+    };
+    let (late, fresh) = tokio::join!(load(stream, another), relogin);
+    assert!(matches!(
+        late,
+        Err(OpenHistoryError::Auth(AuthError::SessionUnavailable))
+    ));
+    let current = fixture
+        .auth
+        .snapshot()
+        .into_iter()
+        .find(|session| session.context == fresh)
+        .unwrap()
+        .generation;
+    assert_eq!(
+        sync.history_windows(&fresh, current, stream).unwrap(),
+        before
+    );
+    worker.abort();
 }
 
 /// Запускает локальный сервер с тестовым сертификатом и общим счётчиком запросов.

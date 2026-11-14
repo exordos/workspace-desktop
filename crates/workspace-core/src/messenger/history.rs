@@ -1,4 +1,4 @@
-//! Открывает хвост истории, догружает старые сообщения и находит окно для уведомления.
+//! Открывает историю, догружает её края и находит окно для уведомления.
 
 use std::collections::HashSet;
 
@@ -161,6 +161,47 @@ impl MessengerSource {
         scope: HistoryScope,
         window_id: i64,
     ) -> Result<HistoryWindow, OpenHistoryError> {
+        self.extend_history(
+            sync,
+            owner,
+            generation,
+            scope,
+            window_id,
+            HistoryDirection::Older,
+        )
+        .await
+    }
+
+    /// Догружает новый край окна после подтверждения доступа к области.
+    pub async fn load_newer_history(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        scope: HistoryScope,
+        window_id: i64,
+    ) -> Result<HistoryWindow, OpenHistoryError> {
+        self.extend_history(
+            sync,
+            owner,
+            generation,
+            scope,
+            window_id,
+            HistoryDirection::Newer,
+        )
+        .await
+    }
+
+    /// Продолжает выбранный край и отклоняет ответ после его замены.
+    async fn extend_history(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        scope: HistoryScope,
+        window_id: i64,
+        direction: HistoryDirection,
+    ) -> Result<HistoryWindow, OpenHistoryError> {
         let read_window = || {
             sync.history_windows(owner, generation, scope)?
                 .into_iter()
@@ -169,11 +210,15 @@ impl MessengerSource {
         };
         let target = HistoryPageTarget::Extend {
             window_id,
-            direction: HistoryDirection::Older,
+            direction,
         };
         let Some(guard) = sync.prepare_history_page(owner, generation, scope, target)? else {
             let window = read_window()?;
-            return if window.older == HistoryEdge::End {
+            let edge = match direction {
+                HistoryDirection::Older => &window.older,
+                HistoryDirection::Newer => &window.newer,
+            };
+            return if *edge == HistoryEdge::End {
                 Ok(window)
             } else {
                 Err(OpenHistoryError::StaleWindow)
@@ -184,10 +229,14 @@ impl MessengerSource {
         let token = auth
             .access_token_for_generation(owner, Service::Messenger, generation)
             .await?;
-        let fetched = self
-            .rest
-            .descending_page(owner, &token, scope, Some(marker))
-            .await;
+        let fetched = match direction {
+            HistoryDirection::Older => {
+                self.rest
+                    .descending_page(owner, &token, scope, Some(marker))
+                    .await
+            }
+            HistoryDirection::Newer => self.rest.ascending_page(owner, &token, scope, marker).await,
+        };
         auth.with_active_generation(owner, generation, || ())?;
         let page = fetched?;
         // SQLite проверит, что с начала запроса край не успела заменить другая страница.
