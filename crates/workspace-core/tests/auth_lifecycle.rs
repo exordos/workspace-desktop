@@ -23,6 +23,8 @@ use workspace_core::runtime::{EventSource, EventStream, Runtime, SourceError, So
 use workspace_core::storage::{Cursor, Message, Storage};
 use workspace_core::sync::{Event, Sync as EventSync, SyncChange, SyncUpdate};
 
+#[path = "support/background_baseline.rs"]
+mod background_baseline;
 #[path = "support/direct_history.rs"]
 mod direct_history;
 #[path = "support/read_boundary.rs"]
