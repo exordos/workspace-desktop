@@ -49,7 +49,9 @@ struct HistoryApi {
     pages: AtomicUsize,       // Количество запросов соседних страниц.
     deny: AtomicUsize,        // 0 — доступ есть, 1 — скрыт чат, 2 — скрыто сообщение.
     delay: Notify,            // Запрос страницы дошёл до сервера.
-    latest_mode: AtomicUsize, // 0 — обычная страница, 1 — сбой, 2 — задержка, 3 — чужая тема.
+    latest_mode: AtomicUsize, // 0 — обычная страница, 1 — сбой, 2 — задержка, 3 — чужая тема, 4 — маркер и в теме.
+    older_mode: AtomicUsize,  // 0 — конец, 1 — сбой, 2 — задержать один ответ, 3 — продолжение.
+    older_pages: AtomicUsize, // Число запросов к старому краю.
     release: Notify,          // Можно вернуть задержанный ответ.
 }
 
@@ -116,7 +118,33 @@ async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
         assert_eq!(query["stream_uuid"], CHAT.to_string());
         assert_eq!(query["page_limit"], "50");
         assert_eq!(query["sort_key"], "created_at");
-        if let Some(anchor) = query.get("page_marker") {
+        if query
+            .get("page_marker")
+            .is_some_and(|marker| marker == &OLDER.to_string())
+        {
+            assert_eq!(query["sort_dir"], "desc");
+            api.older_pages.fetch_add(1, Relaxed);
+            let mut older = message(ANCHOR, user);
+            older["created_at"] = json!("2026-01-01T10:00:00Z");
+            match api.older_mode.load(Relaxed) {
+                1 => ("500 Internal Server Error", Value::Null),
+                mode => {
+                    assert_eq!(
+                        query.get("topic_uuid").map(|topic| topic.as_ref()),
+                        (mode == 3).then(|| TOPIC.to_string()).as_deref()
+                    );
+                    if mode == 2 {
+                        api.older_mode.store(0, Relaxed);
+                        api.delay.notify_one();
+                        api.release.notified().await;
+                    }
+                    if mode == 3 {
+                        marker = format!("X-Pagination-Marker: {ANCHOR}\r\n");
+                    }
+                    ("200 OK", json!([older]))
+                }
+            }
+        } else if let Some(anchor) = query.get("page_marker") {
             assert_eq!(anchor, &ANCHOR.to_string());
             assert!(!query.contains_key("topic_uuid"));
             let count = api.pages.fetch_add(1, Relaxed);
@@ -142,7 +170,8 @@ async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
             older["created_at"] = json!("2026-01-01T11:00:00Z");
             if let Some(topic) = query.get("topic_uuid") {
                 assert_eq!(topic, &TOPIC.to_string());
-            } else {
+            }
+            if !query.contains_key("topic_uuid") || api.latest_mode.load(Relaxed) == 4 {
                 marker = format!("X-Pagination-Marker: {OLDER}\r\n");
             }
             match api.latest_mode.load(Relaxed) {
@@ -450,6 +479,127 @@ async fn latest_history_preserves_windows_on_failure_and_session_change() {
             .history_windows(&fresh, fresh_generation, stream)
             .unwrap()
             .is_empty()
+    );
+    worker.abort();
+}
+
+/// Проверяет догрузку стрима и темы, повтор после сбоя и отклонение устаревших ответов.
+#[tokio::test]
+async fn older_history_extends_only_the_current_edge() {
+    let api = Arc::new(HistoryApi::default());
+    api.latest_mode.store(4, Relaxed);
+    let (server, worker) = serve(api.clone()).await;
+    let fixture = Fixture::new(|_, _| unreachable!());
+    let owner = fixture.login_at(&server, "first");
+    let current = fixture.auth.snapshot()[0].generation;
+    let sync = Sync::new(
+        fixture.auth.clone(),
+        Arc::new(Storage::in_memory().unwrap()),
+    );
+    let source =
+        MessengerSource::with_private_ca(CertificateDer::from_pem_slice(CA).unwrap().as_ref())
+            .unwrap();
+    let stream = HistoryScope {
+        stream_id: CHAT,
+        topic_id: None,
+    };
+    let topic = HistoryScope {
+        topic_id: Some(TOPIC),
+        ..stream
+    };
+    let cursor = Cursor {
+        epoch_generation: "test".into(),
+        epoch_version: 8,
+    };
+    sync.apply(
+        &owner,
+        current,
+        "messenger",
+        Event::Checkpoint(cursor.clone()),
+    )
+    .unwrap();
+
+    let original = source
+        .load_latest_history(&sync, &owner, current, stream)
+        .await
+        .unwrap();
+    let topic_window = source
+        .load_latest_history(&sync, &owner, current, topic)
+        .await
+        .unwrap();
+    let load = |scope, id| source.load_older_history(&sync, &owner, current, scope, id);
+    api.older_mode.store(1, Relaxed);
+    assert!(load(stream, original.id).await.is_err());
+    assert_eq!(
+        sync.history_windows(&owner, current, stream).unwrap(),
+        std::slice::from_ref(&original)
+    );
+
+    api.older_mode.store(3, Relaxed);
+    let extended_topic = load(topic, topic_window.id).await.unwrap();
+    assert_eq!(extended_topic.id, topic_window.id);
+    assert_eq!(extended_topic.older, HistoryEdge::More(ANCHOR.to_string()));
+    assert_eq!(extended_topic.newer, topic_window.newer);
+    assert_eq!(
+        sync.history_windows(&owner, current, stream).unwrap(),
+        std::slice::from_ref(&original)
+    );
+
+    api.older_mode.store(2, Relaxed);
+    let replace_edge = async {
+        timeout(Duration::from_secs(3), api.delay.notified())
+            .await
+            .expect("первая догрузка не дошла до сервера");
+        let result = load(stream, original.id).await;
+        api.release.notify_one();
+        result.unwrap()
+    };
+    let (late, extended) = tokio::join!(load(stream, original.id), replace_edge);
+    assert!(matches!(late, Err(OpenHistoryError::StaleWindow)));
+    assert_eq!(extended.id, original.id);
+    assert_eq!(extended.older, HistoryEdge::End);
+    assert_eq!(extended.newer, original.newer);
+    for window in [&extended, &extended_topic] {
+        assert_eq!(
+            window.messages.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [ANCHOR, OLDER, NEWER]
+        );
+    }
+    let count = api.older_pages.load(Relaxed);
+    assert_eq!(load(stream, original.id).await.unwrap(), extended);
+    assert_eq!(api.older_pages.load(Relaxed), count);
+    assert_eq!(sync.cursor(&owner, "messenger").unwrap(), Some(cursor));
+
+    let another = source
+        .load_latest_history(&sync, &owner, current, stream)
+        .await
+        .unwrap();
+    let before = sync.history_windows(&owner, current, stream).unwrap();
+    api.older_mode.store(2, Relaxed);
+    let relogin = async {
+        timeout(Duration::from_secs(3), api.delay.notified())
+            .await
+            .expect("догрузка уходящей сессии не дошла до сервера");
+        fixture.auth.logout(&owner.account_id).unwrap();
+        let fresh = fixture.login_at(&server, "first");
+        api.release.notify_one();
+        fresh
+    };
+    let (late, fresh) = tokio::join!(load(stream, another.id), relogin);
+    assert!(matches!(
+        late,
+        Err(OpenHistoryError::Auth(AuthError::SessionUnavailable))
+    ));
+    let generation = fixture
+        .auth
+        .snapshot()
+        .into_iter()
+        .find(|session| session.context == fresh)
+        .unwrap()
+        .generation;
+    assert_eq!(
+        sync.history_windows(&fresh, generation, stream).unwrap(),
+        before
     );
     worker.abort();
 }

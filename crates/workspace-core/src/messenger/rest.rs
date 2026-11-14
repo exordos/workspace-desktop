@@ -243,18 +243,20 @@ impl RestClient {
         Ok(Self::decode_history_page(response, owner, scope).await?)
     }
 
-    /// Запрашивает последние сообщения в уже проверенной области.
-    pub(super) async fn latest_page(
+    /// Запрашивает страницу от конца истории или от маркера старого края.
+    pub(super) async fn descending_page(
         &self,
         owner: &OwnerContext,
         token: &str,
         scope: HistoryScope,
+        marker: Option<&str>,
     ) -> Result<HistoryPage, OpenHistoryError> {
-        let response = self
-            .history_page_request(owner, token, scope, "desc")?
-            .send()
-            .await
-            .map_err(request_error)?;
+        let request = self.history_page_request(owner, token, scope, "desc")?;
+        let request = match marker {
+            Some(marker) => request.query(&[("page_marker", marker)]),
+            None => request,
+        };
+        let response = request.send().await.map_err(request_error)?;
         if matches!(
             response.status(),
             StatusCode::FORBIDDEN | StatusCode::NOT_FOUND

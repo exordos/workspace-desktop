@@ -1,4 +1,4 @@
-//! Загружает последнюю страницу истории и открывает окно вокруг сообщения из уведомления.
+//! Открывает хвост истории, догружает старые сообщения и находит окно для уведомления.
 
 use std::collections::HashSet;
 
@@ -11,8 +11,8 @@ use crate::{
     notification_target::NotificationTarget,
     runtime::SourceError,
     storage::{
-        HistoryEdge, HistoryPageEdges, HistoryPageOutcome, HistoryPageTarget, HistoryScope,
-        HistoryWindow,
+        HistoryDirection, HistoryEdge, HistoryPageEdges, HistoryPageOutcome, HistoryPageTarget,
+        HistoryScope, HistoryWindow,
     },
     sync::{Sync, SyncError},
 };
@@ -54,7 +54,7 @@ impl MessengerSource {
         let guard = sync
             .prepare_history_page(owner, generation, scope, HistoryPageTarget::New)?
             .ok_or(OpenHistoryError::StaleWindow)?;
-        let fetched = self.rest.latest_page(owner, &token, scope).await;
+        let fetched = self.rest.descending_page(owner, &token, scope, None).await;
         auth.with_active_generation(owner, generation, || ())?;
         let page = fetched?;
         // Запрос без маркера начинается с конца истории. Маркер ответа ведёт к старым сообщениям.
@@ -73,6 +73,54 @@ impl MessengerSource {
             .into_iter()
             .find(|window| window.id == id)
             .ok_or(OpenHistoryError::StaleWindow)
+    }
+
+    /// Догружает старый край окна в области, к которой вызывающий уже подтвердил доступ.
+    /// На конце истории возвращает текущее окно без запроса.
+    pub async fn load_older_history(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        scope: HistoryScope,
+        window_id: i64,
+    ) -> Result<HistoryWindow, OpenHistoryError> {
+        let read_window = || {
+            sync.history_windows(owner, generation, scope)?
+                .into_iter()
+                .find(|window| window.id == window_id && !window.needs_refresh)
+                .ok_or(OpenHistoryError::StaleWindow)
+        };
+        let target = HistoryPageTarget::Extend {
+            window_id,
+            direction: HistoryDirection::Older,
+        };
+        let Some(guard) = sync.prepare_history_page(owner, generation, scope, target)? else {
+            let window = read_window()?;
+            return if window.older == HistoryEdge::End {
+                Ok(window)
+            } else {
+                Err(OpenHistoryError::StaleWindow)
+            };
+        };
+        let marker = guard.marker().ok_or(OpenHistoryError::StaleWindow)?;
+        let auth = sync.auth();
+        let token = auth
+            .access_token_for_generation(owner, Service::Messenger, generation)
+            .await?;
+        let fetched = self
+            .rest
+            .descending_page(owner, &token, scope, Some(marker))
+            .await;
+        auth.with_active_generation(owner, generation, || ())?;
+        let page = fetched?;
+        // SQLite проверит, что с начала запроса край не успела заменить другая страница.
+        let outcome =
+            sync.save_history_page(guard, &page.messages, HistoryPageEdges::Extend(page.edge))?;
+        if outcome != HistoryPageOutcome::Saved(window_id) {
+            return Err(OpenHistoryError::StaleWindow);
+        }
+        read_window()
     }
 
     /// Открывает окно для ранее подтверждённого адреса и проверяет доступ перед чтением кэша.
