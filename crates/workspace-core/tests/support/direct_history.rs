@@ -627,6 +627,124 @@ async fn older_history_extends_only_the_current_edge() {
     worker.abort();
 }
 
+/// Проверяет раздельную выдачу сохранённого хвоста и сетевого обновления после проверки доступа.
+#[tokio::test]
+async fn opening_latest_history_checks_access_before_cache_and_refreshes_separately() {
+    let api = Arc::new(HistoryApi::default());
+    let (server, worker) = serve(api.clone()).await;
+    let fixture = Fixture::new(|_, _| unreachable!());
+    let owner = fixture.login_at(&server, "first");
+    let generation = fixture.auth.snapshot()[0].generation;
+    let sync = Sync::new(
+        fixture.auth.clone(),
+        Arc::new(Storage::in_memory().unwrap()),
+    );
+    let source =
+        MessengerSource::with_private_ca(CertificateDer::from_pem_slice(CA).unwrap().as_ref())
+            .unwrap();
+    let direct = HistoryScope {
+        stream_id: CHAT,
+        topic_id: None,
+    };
+    let topic = HistoryScope {
+        topic_id: Some(TOPIC),
+        ..direct
+    };
+    let cursor = Cursor {
+        epoch_generation: "test".into(),
+        epoch_version: 8,
+    };
+    sync.apply(
+        &owner,
+        generation,
+        "messenger",
+        Event::Checkpoint(cursor.clone()),
+    )
+    .unwrap();
+
+    let empty = source
+        .open_latest_history(&sync, &owner, generation, direct)
+        .await
+        .unwrap();
+    assert!(empty.cached.is_none());
+    let direct_window = empty.refresh().await.unwrap();
+    let topic_empty = source
+        .open_latest_history(&sync, &owner, generation, topic)
+        .await
+        .unwrap();
+    assert!(topic_empty.cached.is_none());
+    let topic_window = topic_empty.refresh().await.unwrap();
+    for (scope, expected) in [(direct, &direct_window), (topic, &topic_window)] {
+        let opening = source
+            .open_latest_history(&sync, &owner, generation, scope)
+            .await
+            .unwrap();
+        assert_eq!(opening.cached.as_ref(), Some(expected));
+        api.latest_mode.store(1, Relaxed);
+        assert!(opening.refresh().await.is_err());
+        assert_eq!(opening.cached.as_ref(), Some(expected));
+        api.latest_mode.store(0, Relaxed);
+        assert_eq!(opening.refresh().await.unwrap().scope, scope);
+    }
+    api.deny.store(1, Relaxed);
+    assert!(matches!(
+        source
+            .open_latest_history(&sync, &owner, generation, direct)
+            .await,
+        Err(OpenHistoryError::AccessLost)
+    ));
+    api.deny.store(0, Relaxed);
+    api.access_mode.store(1, Relaxed);
+    assert!(matches!(
+        source
+            .open_latest_history(&sync, &owner, generation, topic)
+            .await,
+        Err(OpenHistoryError::AccessLost)
+    ));
+    api.access_mode.store(0, Relaxed);
+
+    let opening = source
+        .open_latest_history(&sync, &owner, generation, direct)
+        .await
+        .unwrap();
+    api.latest_mode.store(2, Relaxed);
+    let release = async {
+        timeout(Duration::from_secs(3), api.delay.notified())
+            .await
+            .expect("обновление не дошло до сервера");
+        assert_eq!(
+            opening.cached.as_ref().unwrap().messages,
+            direct_window.messages
+        );
+        api.release.notify_one();
+    };
+    let (result, ()) = tokio::join!(opening.refresh(), release);
+    assert_eq!(result.unwrap().scope, direct);
+    assert_eq!(sync.cursor(&owner, "messenger").unwrap(), Some(cursor));
+    api.access_mode.store(4, Relaxed);
+    let relogin = async {
+        timeout(Duration::from_secs(3), api.delay.notified())
+            .await
+            .expect("проверка доступа не дошла до сервера");
+        fixture.auth.logout(&owner.account_id).unwrap();
+        fixture.login_at(&server, "first");
+        api.release.notify_one();
+    };
+    let (late, ()) = tokio::join!(
+        source.open_latest_history(&sync, &owner, generation, topic),
+        relogin
+    );
+    assert!(matches!(
+        late,
+        Err(OpenHistoryError::Auth(AuthError::SessionUnavailable))
+    ));
+    assert!(matches!(
+        opening.refresh().await,
+        Err(OpenHistoryError::Auth(AuthError::SessionUnavailable))
+    ));
+    worker.abort();
+}
+
 /// Проверяет ответы для обеих областей и отклоняет ответ после повторного входа.
 #[tokio::test]
 async fn verifies_conversation_access_for_current_generation() {

@@ -38,7 +38,53 @@ pub enum OpenHistoryError {
     Source(#[from] SourceError), // Сбой REST или неожиданный ответ.
 }
 
+/// Подтверждённое открытие: сохранённый хвост доступен до сетевого обновления.
+pub struct LatestHistoryOpening<'a> {
+    source: &'a MessengerSource,   // Источник для запроса последней страницы.
+    sync: &'a Sync,                // Хранилище и проверка текущей сессии.
+    owner: &'a OwnerContext,       // Владелец подтверждённого разговора.
+    generation: SessionGeneration, // Поколение входа при проверке доступа.
+    scope: HistoryScope,           // Точная область, подтверждённая сервером.
+    pub cached: Option<HistoryWindow>, // Пригодный хвост или None, если его нет.
+}
+
+impl LatestHistoryOpening<'_> {
+    /// Запрашивает последнюю страницу; ошибка не удаляет ранее прочитанное окно.
+    pub async fn refresh(&self) -> Result<HistoryWindow, OpenHistoryError> {
+        self.source
+            .load_latest_history(self.sync, self.owner, self.generation, self.scope)
+            .await
+    }
+}
+
 impl MessengerSource {
+    /// Проверяет доступ и возвращает сохранённый хвост до запроса последней страницы.
+    pub async fn open_latest_history<'a>(
+        &'a self,
+        sync: &'a Sync,
+        owner: &'a OwnerContext,
+        generation: SessionGeneration,
+        scope: HistoryScope,
+    ) -> Result<LatestHistoryOpening<'a>, OpenHistoryError> {
+        let scope = self
+            .verify_conversation_access(sync, owner, generation, scope)
+            .await?;
+        // Окна не склеиваем: выбираем последний сохранённый подтверждённый хвост.
+        let cached = sync
+            .history_windows(owner, generation, scope)?
+            .into_iter()
+            .filter(|window| !window.needs_refresh && window.newer == HistoryEdge::End)
+            .max_by_key(|window| window.id);
+        Ok(LatestHistoryOpening {
+            source: self,
+            sync,
+            owner,
+            generation,
+            scope,
+            cached,
+        })
+    }
+
     /// Подтверждает область на сервере для текущей сессии без чтения сохранённой истории.
     pub async fn verify_conversation_access(
         &self,
