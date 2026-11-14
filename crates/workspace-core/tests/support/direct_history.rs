@@ -46,6 +46,7 @@ const KEY: &[u8] =
 /// Даёт тесту управлять ответами и задержать одну страницу до выхода из аккаунта.
 #[derive(Default)]
 struct HistoryApi {
+    access_mode: AtomicUsize, // 0 — доступ, 1 — 403, 2 — другой владелец, 3 — другой стрим, 4 — задержка, 5 — обрыв, 6 — другая тема.
     pages: AtomicUsize,       // Количество запросов соседних страниц.
     deny: AtomicUsize,        // 0 — доступ есть, 1 — скрыт чат, 2 — скрыто сообщение.
     delay: Notify,            // Запрос страницы дошёл до сервера.
@@ -101,6 +102,28 @@ async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
                     "uuid": CHAT, "user_uuid": user, "project_id": "project",
                     "private": true, "is_archived": false, "direct_user_uuid": ANCHOR,
                     "notification_mode": "all_messages"
+                }),
+            )
+        }
+    } else if request.path().ends_with(&format!("/stream_topics/{TOPIC}")) {
+        let mode = api.access_mode.load(Relaxed);
+        if mode == 4 {
+            api.delay.notify_one();
+            api.release.notified().await;
+        }
+        if mode == 5 {
+            return;
+        }
+        if mode == 1 {
+            ("403 Forbidden", Value::Null)
+        } else {
+            (
+                "200 OK",
+                json!({
+                    "uuid": if mode == 6 { ANCHOR } else { TOPIC },
+                    "stream_uuid": if mode == 3 { ANCHOR } else { CHAT },
+                    "user_uuid": if mode == 2 { "other" } else { user },
+                    "project_id": "project", "notification_mode": "default"
                 }),
             )
         }
@@ -601,5 +624,86 @@ async fn older_history_extends_only_the_current_edge() {
         sync.history_windows(&fresh, generation, stream).unwrap(),
         before
     );
+    worker.abort();
+}
+
+/// Проверяет ответы для обеих областей и отклоняет ответ после повторного входа.
+#[tokio::test]
+async fn verifies_conversation_access_for_current_generation() {
+    let api = Arc::new(HistoryApi::default());
+    let (server, worker) = serve(api.clone()).await;
+    let fixture = Fixture::new(|_, _| unreachable!());
+    let owner = fixture.login_at(&server, "first");
+    let generation = fixture.auth.snapshot()[0].generation;
+    let sync = Sync::new(
+        fixture.auth.clone(),
+        Arc::new(Storage::in_memory().unwrap()),
+    );
+    let source =
+        MessengerSource::with_private_ca(CertificateDer::from_pem_slice(CA).unwrap().as_ref())
+            .unwrap();
+    let direct = HistoryScope {
+        stream_id: CHAT,
+        topic_id: None,
+    };
+    let topic = HistoryScope {
+        topic_id: Some(TOPIC),
+        ..direct
+    };
+    let cursor = Cursor {
+        epoch_generation: "test".into(),
+        epoch_version: 8,
+    };
+    sync.apply(
+        &owner,
+        generation,
+        "messenger",
+        Event::Checkpoint(cursor.clone()),
+    )
+    .unwrap();
+    let verify = |scope| source.verify_conversation_access(&sync, &owner, generation, scope);
+
+    assert_eq!(verify(direct).await.unwrap(), direct);
+    assert_eq!(verify(topic).await.unwrap(), topic);
+    api.deny.store(1, Relaxed);
+    assert!(matches!(
+        verify(direct).await,
+        Err(OpenHistoryError::AccessLost)
+    ));
+    api.access_mode.store(1, Relaxed);
+    assert!(matches!(
+        verify(topic).await,
+        Err(OpenHistoryError::AccessLost)
+    ));
+    for mode in [2, 3, 5, 6] {
+        api.access_mode.store(mode, Relaxed);
+        assert!(
+            matches!(verify(topic).await, Err(OpenHistoryError::Source(_))),
+            "режим {mode}"
+        );
+    }
+    assert_eq!(sync.cursor(&owner, "messenger").unwrap(), Some(cursor));
+    for scope in [direct, topic] {
+        assert!(
+            sync.history_windows(&owner, generation, scope)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    api.access_mode.store(4, Relaxed);
+    let relogin = async {
+        timeout(Duration::from_secs(3), api.delay.notified())
+            .await
+            .expect("запрос доступа к теме не дошёл до сервера");
+        fixture.auth.logout(&owner.account_id).unwrap();
+        fixture.login_at(&server, "first");
+        api.release.notify_one();
+    };
+    let (result, ()) = tokio::join!(verify(topic), relogin);
+    assert!(matches!(
+        result,
+        Err(OpenHistoryError::Auth(AuthError::SessionUnavailable))
+    ));
     worker.abort();
 }

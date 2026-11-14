@@ -39,6 +39,36 @@ pub enum OpenHistoryError {
 }
 
 impl MessengerSource {
+    /// Подтверждает область на сервере для текущей сессии без чтения сохранённой истории.
+    pub async fn verify_conversation_access(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        scope: HistoryScope,
+    ) -> Result<HistoryScope, OpenHistoryError> {
+        let auth = sync.auth();
+        let token = auth
+            .access_token_for_generation(owner, Service::Messenger, generation)
+            .await?;
+        let result = match scope.topic_id {
+            Some(topic) => {
+                self.rest
+                    .check_topic_access(owner, &token, scope.stream_id, topic)
+                    .await
+            }
+            None => {
+                self.rest
+                    .check_direct_access(owner, &token, scope.stream_id)
+                    .await
+            }
+        };
+        // Ответ от прежней сессии не даёт доступа к сохранённым сообщениям.
+        auth.with_active_generation(owner, generation, || ())?;
+        result?;
+        Ok(scope)
+    }
+
     /// Загружает хвост истории. До вызова нужно подтвердить доступ владельца к области.
     pub async fn load_latest_history(
         &self,

@@ -132,7 +132,7 @@ impl RestClient {
         }
         let topic_path = format!("{TOPICS_PATH}/{}", incoming.topic);
         let topic: WireTopic = get_json(self.request(owner, access_token, &topic_path)?).await?;
-        if !topic.matches(owner, incoming) {
+        if !topic.matches(owner, incoming.stream, incoming.topic) {
             return Err(SourceError::InvalidResponse);
         }
         Ok(topic.notification_mode.allows(stream.notification_mode))
@@ -145,16 +145,9 @@ impl RestClient {
         token: &str,
         stream: Uuid,
     ) -> Result<(), OpenHistoryError> {
-        let request = self.request(owner, token, &format!("{STREAMS_PATH}/{stream}"))?;
-        let response = request.send().await.map_err(request_error)?;
-        if matches!(
-            response.status(),
-            StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
-        ) {
-            return Err(OpenHistoryError::AccessLost);
-        }
-        check_status(response.status())?;
-        let row: WireStream = response.json().await.map_err(request_error)?;
+        let row: WireStream = self
+            .access_row(owner, token, &format!("{STREAMS_PATH}/{stream}"))
+            .await?;
         if parse_uuid(&row.uuid) != Some(stream)
             || !matches_owner(owner, row.project_id.as_deref(), row.user_uuid.as_deref())
         {
@@ -170,6 +163,42 @@ impl RestClient {
             return Err(OpenHistoryError::AccessLost);
         }
         Ok(())
+    }
+
+    /// Подтверждает, что тема нужного стрима видна владельцу токена.
+    pub(super) async fn check_topic_access(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        stream: Uuid,
+        topic: Uuid,
+    ) -> Result<(), OpenHistoryError> {
+        let row: WireTopic = self
+            .access_row(owner, token, &format!("{TOPICS_PATH}/{topic}"))
+            .await?;
+        if !row.matches(owner, stream, topic) {
+            return Err(SourceError::InvalidResponse.into());
+        }
+        Ok(())
+    }
+
+    /// Читает отдельную запись и отличает потерю доступа от других ошибок REST.
+    async fn access_row<T: DeserializeOwned>(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        path: &str,
+    ) -> Result<T, OpenHistoryError> {
+        let request = self.request(owner, token, path)?;
+        let response = request.send().await.map_err(request_error)?;
+        if matches!(
+            response.status(),
+            StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+        ) {
+            return Err(OpenHistoryError::AccessLost);
+        }
+        check_status(response.status())?;
+        Ok(response.json().await.map_err(request_error)?)
     }
 
     /// Проверяет, что целевое текстовое сообщение ещё доступно в этом разговоре.
@@ -645,9 +674,9 @@ struct WireTopic {
 
 impl WireTopic {
     /// Проверяет идентификаторы темы, разговора и владельца данных.
-    fn matches(&self, owner: &OwnerContext, incoming: &IncomingMessage) -> bool {
-        parse_uuid(&self.uuid) == Some(incoming.topic)
-            && parse_uuid(&self.stream_uuid) == Some(incoming.stream)
+    fn matches(&self, owner: &OwnerContext, stream: Uuid, topic: Uuid) -> bool {
+        parse_uuid(&self.uuid) == Some(topic)
+            && parse_uuid(&self.stream_uuid) == Some(stream)
             && matches_owner(owner, self.project_id.as_deref(), self.user_uuid.as_deref())
     }
 }
