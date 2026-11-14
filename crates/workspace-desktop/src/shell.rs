@@ -16,7 +16,7 @@ use workspace_core::bootstrap::{ChatCatalog, ChatListStatus, ChatLists};
 use workspace_core::context::{AccountId, OwnerContext, SessionGeneration};
 use workspace_core::messenger::{MessengerSource, history::OpenHistoryError};
 use workspace_core::notification_target::{NotificationTarget, NotificationTargetError};
-use workspace_core::storage::HistoryWindow;
+use workspace_core::storage::{HistoryScope, HistoryWindow};
 use workspace_core::sync::{Sync, SyncChange, SyncUpdate};
 
 use crate::platform::notifications::{NotificationClick, NotificationError, Notifications};
@@ -208,6 +208,9 @@ impl Shell {
             Message::Synced(update) => match update.change {
                 SyncChange::Unread(count) => self.accounts.set_unread(&update, count),
                 SyncChange::MessengerReset => self.accounts.replace(self.sources.0.snapshot()),
+                SyncChange::HistoryMessageCreated { scope, message_id } => {
+                    self.refresh_open_history(&update, scope, message_id);
+                }
                 SyncChange::IncomingDirectMessage {
                     ref conversation_id,
                     ref message_id,
@@ -524,6 +527,48 @@ impl Shell {
             .then_some(history)
     }
 
+    /// Меняет только строки открытого участка, сохраняя маршрут и положение списка.
+    fn refresh_open_history(
+        &mut self,
+        update: &SyncUpdate,
+        scope: HistoryScope,
+        message_id: uuid::Uuid,
+    ) {
+        let Some(history) = self.visible_history() else {
+            return;
+        };
+        let HistoryState::Ready(window) = &history.state else {
+            return;
+        };
+        if history.target.context != update.context
+            || history.generation != update.generation
+            || window.scope.stream_id != scope.stream_id
+            || (window.scope.topic_id.is_some() && window.scope.topic_id != scope.topic_id)
+        {
+            return;
+        }
+        let Ok(Some(fresh)) = self.sources.0.sync.refresh_history_window(
+            &update.context,
+            update.generation,
+            window.scope,
+            window.id,
+        ) else {
+            return;
+        };
+        // Строка за краем остаётся в базе отдельно от окна.
+        if fresh
+            .messages
+            .iter()
+            .any(|message| message.id == message_id)
+            && fresh != **window
+        {
+            self.history
+                .as_mut()
+                .expect("видимое окно существует")
+                .state = HistoryState::Ready(Arc::new(fresh));
+        }
+    }
+
     /// Сохраняет ответ, только если его маршрут и вход всё ещё открыты.
     fn finish_history(
         &mut self,
@@ -544,8 +589,27 @@ impl Shell {
             .expect("видимый экран истории существует");
         match result {
             Ok(window) => {
-                history.state = HistoryState::Ready(window);
-                history::measure_anchor(revision)
+                // Создание могло сохраниться после снимка, пока экран ещё загружался.
+                match self.sources.0.sync.refresh_history_window(
+                    &history.target.context,
+                    history.generation,
+                    window.scope,
+                    window.id,
+                ) {
+                    Ok(Some(fresh)) => {
+                        history.state = HistoryState::Ready(Arc::new(fresh));
+                        history::measure_anchor(revision)
+                    }
+                    Ok(None) => {
+                        history.state =
+                            HistoryState::Failed(Arc::new(OpenHistoryError::StaleWindow));
+                        Task::none()
+                    }
+                    Err(error) => {
+                        history.state = HistoryState::Failed(Arc::new(error.into()));
+                        Task::none()
+                    }
+                }
             }
             Err(error) => {
                 history.state = HistoryState::Failed(error);

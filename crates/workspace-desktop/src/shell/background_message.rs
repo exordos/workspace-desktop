@@ -565,6 +565,151 @@ async fn background_message_scenario(workspace: &impl TestWorkspace, check_catal
     .await;
 }
 
+/// Записывает события через Sync и проверяет обновление открытого списка Iced.
+async fn refresh_open_history_scenario(shell: &mut Shell, renderer: &mut iced::Renderer) {
+    use workspace_core::messenger::SOURCE_ID;
+    use workspace_core::storage::{
+        HistoryMetadata, HistoryTime, Message as StoredMessage, MessagePlacement,
+    };
+    use workspace_core::sync::{ApplyOutcome, Event};
+
+    let screen = shell.visible_history().unwrap();
+    let HistoryState::Ready(window) = &screen.state else {
+        panic!("ожидалось открытое окно")
+    };
+    let owner = screen.target.context.clone();
+    let generation = screen.generation;
+    let stream_id = window.scope.stream_id.to_string();
+    let mut cursor = shell
+        .sources
+        .0
+        .sync
+        .cursor(&owner, SOURCE_ID)
+        .unwrap()
+        .unwrap();
+    let sync = shell.sources.0.sync.clone();
+    let mut updates = sync.subscribe();
+    let make_event =
+        |cursor, timestamp: &str, stream_id: String, label: &str| Event::MessageCreated {
+            cursor,
+            message: StoredMessage {
+                id: Uuid::new_v4().to_string(),
+                text: label.into(),
+            },
+            placement: Some(MessagePlacement {
+                stream_id,
+                topic_id: Uuid::new_v4().to_string(),
+            }),
+            metadata: Some(HistoryMetadata {
+                author_id: None,
+                created_at: HistoryTime::parse(timestamp).unwrap(),
+                updated_at: None,
+            }),
+        };
+
+    cursor.epoch_version += 1;
+    let inside = make_event(
+        cursor.clone(),
+        "2025-01-10T13:00:00Z",
+        stream_id.clone(),
+        "Внутри участка",
+    );
+    assert_eq!(
+        sync.apply(&owner, generation, SOURCE_ID, inside.clone())
+            .unwrap(),
+        ApplyOutcome::Applied
+    );
+    let update = timeout(DEADLINE, updates.recv()).await.unwrap().unwrap();
+    let mut wrong_owner = update.clone();
+    wrong_owner.context = shell
+        .accounts
+        .summaries
+        .iter()
+        .find(|entry| entry.session.context != owner)
+        .unwrap()
+        .session
+        .context
+        .clone();
+    assert!(into_stream(shell.update(Message::Synced(wrong_owner))).is_none());
+    assert!(!RenderedText::from_shell(shell, renderer).contains("Внутри участка"));
+    assert!(into_stream(shell.update(Message::Synced(update.clone()))).is_none());
+    let rendered = RenderedText::from_shell(shell, renderer);
+    let labels = rendered
+        .0
+        .iter()
+        .map(|(_, value)| value.as_str())
+        .collect::<Vec<_>>();
+    let row = labels
+        .iter()
+        .position(|label| *label == "Внутри участка")
+        .unwrap();
+    assert_eq!(
+        &labels[row - 1..=row + 1],
+        &[
+            "Старое сообщение 10",
+            "Внутри участка",
+            "Старое сообщение 11"
+        ]
+    );
+    assert_eq!(
+        sync.apply(&owner, generation, SOURCE_ID, inside).unwrap(),
+        ApplyOutcome::Duplicate
+    );
+    assert!(matches!(
+        updates.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+
+    for (timestamp, stream, label) in [
+        ("2025-03-01T12:00:00Z", stream_id.clone(), "За краем"),
+        (
+            "2025-01-10T13:00:00Z",
+            Uuid::new_v4().to_string(),
+            "Другой чат",
+        ),
+    ] {
+        cursor.epoch_version += 1;
+        sync.apply(
+            &owner,
+            generation,
+            SOURCE_ID,
+            make_event(cursor.clone(), timestamp, stream, label),
+        )
+        .unwrap();
+        assert!(into_stream(shell.update(Message::Synced(updates.try_recv().unwrap()))).is_none());
+        assert!(!RenderedText::from_shell(shell, renderer).contains(label));
+    }
+
+    cursor.epoch_generation.push_str("-other");
+    assert!(
+        sync.apply(
+            &owner,
+            generation,
+            SOURCE_ID,
+            make_event(cursor, "2025-01-10T13:00:00Z", stream_id, "Отказ записи")
+        )
+        .is_err()
+    );
+    assert!(matches!(
+        updates.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+
+    let foreground = shell
+        .accounts
+        .summaries
+        .iter()
+        .find(|entry| entry.session.context != owner)
+        .unwrap()
+        .session
+        .context
+        .account_id
+        .clone();
+    let _ = shell.update(Message::Select(foreground));
+    assert!(into_stream(shell.update(Message::Synced(update))).is_none());
+    assert!(!RenderedText::from_shell(shell, renderer).contains("Внутри участка"));
+}
+
 /// Подтверждает точную цель из баннера, подъём окна и защиту от запоздалого ответа.
 async fn notification_click_scenario(
     shell: &mut Shell,
@@ -680,6 +825,8 @@ async fn notification_click_scenario(
                 && bounds.y + bounds.height - dy <= viewport.y + viewport.height
         );
         drop(ui);
+
+        refresh_open_history_scenario(shell, renderer).await;
 
         for (mode, label) in [(1, "Сообщение недоступно"), (2, "Чат недоступен")]
         {

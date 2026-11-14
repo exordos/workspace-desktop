@@ -634,6 +634,17 @@ impl Storage {
         Ok(HistoryPageOutcome::Saved(window_id))
     }
 
+    /// Перечитывает одно окно в его исходной области и у того же владельца.
+    pub(crate) fn history_window(
+        &self,
+        owner: &OwnerContext,
+        scope: HistoryScope,
+        id: i64,
+    ) -> Result<Option<HistoryWindow>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        read_history_window(&connection, owner, scope, id)
+    }
+
     /// Читает подтверждённые окна области. Сохранённые по отдельности сообщения в них не попадают.
     pub(crate) fn history_windows(
         &self,
@@ -661,19 +672,32 @@ impl Storage {
         let mut result = Vec::new();
         for id in ids {
             let id = id?;
-            if let Some(window) = read_window(&connection, owner, scope, id)? {
-                result.push(HistoryWindow {
-                    id,
-                    scope,
-                    messages: read_members(&connection, owner, id)?,
-                    older: window.older.into_edge(),
-                    newer: window.newer.into_edge(),
-                    needs_refresh: window.needs_refresh,
-                });
+            if let Some(window) = read_history_window(&connection, owner, scope, id)? {
+                result.push(window);
             }
         }
         Ok(result)
     }
+}
+
+/// Собирает снимок окна и его строки под одной блокировкой базы.
+fn read_history_window(
+    connection: &Connection,
+    owner: &OwnerContext,
+    scope: HistoryScope,
+    id: i64,
+) -> Result<Option<HistoryWindow>, StorageError> {
+    let Some(window) = read_window(connection, owner, scope, id)? else {
+        return Ok(None);
+    };
+    Ok(Some(HistoryWindow {
+        id,
+        scope,
+        messages: read_members(connection, owner, id)?,
+        older: window.older.into_edge(),
+        newer: window.newer.into_edge(),
+        needs_refresh: window.needs_refresh,
+    }))
 }
 
 /// Сохраняет тело страницы по общему ключу владельца и сообщения.

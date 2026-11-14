@@ -32,6 +32,10 @@ pub struct SyncUpdate {
 pub enum SyncChange {
     Unread(u32),    // Готовое число непрочитанных в папке «Все чаты».
     MessengerReset, // Кэш очищен. Счётчик неизвестен до снимка с сервера.
+    HistoryMessageCreated {
+        scope: HistoryScope,    // Стрим и тема сохранённого сообщения.
+        message_id: uuid::Uuid, // UUID новой строки в базе.
+    },
     IncomingDirectMessage {
         conversation_id: String, // Идентификатор личного разговора на сервере.
         message_id: String,      // Идентификатор нового сообщения.
@@ -215,6 +219,22 @@ impl Sync {
         })?
     }
 
+    /// Перечитывает подтверждённое окно того же входа без запроса к серверу.
+    pub fn refresh_history_window(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        scope: HistoryScope,
+        id: i64,
+    ) -> Result<Option<HistoryWindow>, SyncError> {
+        self.auth.with_active_generation(owner, generation, || {
+            Ok(self
+                .storage
+                .history_window(owner, scope, id)?
+                .filter(|window| !window.needs_refresh))
+        })?
+    }
+
     /// Подписывает оболочку на изменения. После пропуска событий счётчик можно перечитать.
     pub fn subscribe(&self) -> broadcast::Receiver<SyncUpdate> {
         self.updates.subscribe()
@@ -294,6 +314,28 @@ impl Sync {
             )?;
             if let Some(count) = unread.filter(|_| saved.unread_changed) {
                 self.publish(owner, generation, SyncChange::Unread(count));
+            }
+            // Оба пути создания проходят здесь после фиксации сообщения и курсора.
+            if saved.message_inserted
+                && let (Some(placement), Some(_), Some(message)) =
+                    (placement, metadata, event.message())
+                && let (Ok(stream_id), Ok(topic_id), Ok(message_id)) = (
+                    placement.stream_id.parse(),
+                    placement.topic_id.parse(),
+                    message.id.parse(),
+                )
+            {
+                self.publish(
+                    owner,
+                    generation,
+                    SyncChange::HistoryMessageCreated {
+                        scope: HistoryScope {
+                            stream_id,
+                            topic_id: Some(topic_id),
+                        },
+                        message_id,
+                    },
+                );
             }
             if saved.message_inserted
                 && let Event::IncomingDirectMessage {
