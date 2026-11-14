@@ -1,4 +1,4 @@
-//! Проверяет открытие истории по уведомлению через управляемый HTTPS-сервер.
+//! Проверяет открытие истории по уведомлению и загрузку последней страницы через HTTPS.
 
 use std::sync::{
     Arc,
@@ -46,10 +46,11 @@ const KEY: &[u8] =
 /// Даёт тесту управлять ответами и задержать одну страницу до выхода из аккаунта.
 #[derive(Default)]
 struct HistoryApi {
-    pages: AtomicUsize, // Количество запросов соседних страниц.
-    deny: AtomicUsize,  // 0 — доступ есть, 1 — скрыт чат, 2 — скрыто сообщение.
-    delay: Notify,      // Запрос страницы дошёл до сервера.
-    release: Notify,    // Можно вернуть задержанный ответ.
+    pages: AtomicUsize,       // Количество запросов соседних страниц.
+    deny: AtomicUsize,        // 0 — доступ есть, 1 — скрыт чат, 2 — скрыто сообщение.
+    delay: Notify,            // Запрос страницы дошёл до сервера.
+    latest_mode: AtomicUsize, // 0 — обычная страница, 1 — сбой, 2 — задержка, 3 — чужая тема.
+    release: Notify,          // Можно вернуть задержанный ответ.
 }
 
 /// Формирует серверное сообщение с одинаковыми UUID для обоих аккаунтов.
@@ -113,25 +114,51 @@ async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
             .query_pairs()
             .collect::<std::collections::HashMap<_, _>>();
         assert_eq!(query["stream_uuid"], CHAT.to_string());
-        assert_eq!(query["page_marker"], ANCHOR.to_string());
         assert_eq!(query["page_limit"], "50");
         assert_eq!(query["sort_key"], "created_at");
-        let count = api.pages.fetch_add(1, Relaxed);
-        if count == 4 {
-            api.delay.notify_one();
-            api.release.notified().await;
-        }
-        let neighbor = if query["sort_dir"] == "desc" {
-            marker = format!("X-Pagination-Marker: {OLDER}\r\n");
-            OLDER
+        if let Some(anchor) = query.get("page_marker") {
+            assert_eq!(anchor, &ANCHOR.to_string());
+            assert!(!query.contains_key("topic_uuid"));
+            let count = api.pages.fetch_add(1, Relaxed);
+            if count == 4 {
+                api.delay.notify_one();
+                api.release.notified().await;
+            }
+            let neighbor = if query["sort_dir"] == "desc" {
+                marker = format!("X-Pagination-Marker: {OLDER}\r\n");
+                OLDER
+            } else {
+                assert_eq!(query["sort_dir"], "asc");
+                NEWER
+            };
+            (
+                "200 OK",
+                json!([message(neighbor, user), message(ANCHOR, user)]),
+            )
         } else {
-            assert_eq!(query["sort_dir"], "asc");
-            NEWER
-        };
-        (
-            "200 OK",
-            json!([message(neighbor, user), message(ANCHOR, user)]),
-        )
+            assert_eq!(query["sort_dir"], "desc");
+            let mut latest = message(NEWER, user);
+            let mut older = message(OLDER, user);
+            older["created_at"] = json!("2026-01-01T11:00:00Z");
+            if let Some(topic) = query.get("topic_uuid") {
+                assert_eq!(topic, &TOPIC.to_string());
+            } else {
+                marker = format!("X-Pagination-Marker: {OLDER}\r\n");
+            }
+            match api.latest_mode.load(Relaxed) {
+                1 => ("500 Internal Server Error", Value::Null),
+                mode => {
+                    if mode == 2 {
+                        api.delay.notify_one();
+                        api.release.notified().await;
+                    }
+                    if mode == 3 {
+                        latest["topic_uuid"] = json!(ANCHOR);
+                    }
+                    ("200 OK", json!([latest, older]))
+                }
+            }
+        }
     };
     let body = body.to_string();
     socket.get_mut().write_all(format!(
@@ -301,6 +328,128 @@ async fn direct_history_checks_access_and_isolates_sessions() {
         sync.history_windows(&first, first_generation, scope)
             .unwrap(),
         [first_window]
+    );
+    worker.abort();
+}
+
+/// Последняя страница обновляет только запрошенную область и сохраняется только для текущего входа.
+#[tokio::test]
+async fn latest_history_preserves_windows_on_failure_and_session_change() {
+    let api = Arc::new(HistoryApi::default());
+    let (server, worker) = serve(api.clone()).await;
+    let fixture = Fixture::new(|_, _| unreachable!());
+    let owner = fixture.login_at(&server, "first");
+    let current = fixture.auth.snapshot()[0].generation;
+    let sync = Sync::new(
+        fixture.auth.clone(),
+        Arc::new(Storage::in_memory().unwrap()),
+    );
+    let source =
+        MessengerSource::with_private_ca(CertificateDer::from_pem_slice(CA).unwrap().as_ref())
+            .unwrap();
+    let stream = HistoryScope {
+        stream_id: CHAT,
+        topic_id: None,
+    };
+    let topic = HistoryScope {
+        topic_id: Some(TOPIC),
+        ..stream
+    };
+    let cursor = Cursor {
+        epoch_generation: "test".into(),
+        epoch_version: 8,
+    };
+    sync.apply(
+        &owner,
+        current,
+        "messenger",
+        Event::Checkpoint(cursor.clone()),
+    )
+    .unwrap();
+
+    let stream_window = source
+        .load_latest_history(&sync, &owner, current, stream)
+        .await
+        .unwrap();
+    assert!(
+        sync.history_windows(&owner, current, topic)
+            .unwrap()
+            .is_empty()
+    );
+    let topic_window = source
+        .load_latest_history(&sync, &owner, current, topic)
+        .await
+        .unwrap();
+    assert_eq!(
+        sync.history_windows(&owner, current, stream).unwrap(),
+        std::slice::from_ref(&stream_window)
+    );
+    for window in [&stream_window, &topic_window] {
+        assert_eq!(
+            window.messages.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [OLDER, NEWER]
+        );
+        assert_eq!(window.newer, HistoryEdge::End);
+    }
+    assert_eq!(stream_window.older, HistoryEdge::More(OLDER.to_string()));
+    assert_eq!(topic_window.older, HistoryEdge::End);
+    assert_eq!(sync.cursor(&owner, "messenger").unwrap(), Some(cursor));
+
+    api.latest_mode.store(1, Relaxed);
+    assert!(
+        source
+            .load_latest_history(&sync, &owner, current, stream)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        sync.history_windows(&owner, current, stream).unwrap(),
+        [stream_window]
+    );
+    api.latest_mode.store(3, Relaxed);
+    assert!(
+        source
+            .load_latest_history(&sync, &owner, current, topic)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        sync.history_windows(&owner, current, topic).unwrap(),
+        [topic_window]
+    );
+
+    api.latest_mode.store(2, Relaxed);
+    let empty = Sync::new(
+        fixture.auth.clone(),
+        Arc::new(Storage::in_memory().unwrap()),
+    );
+    let pending = source.load_latest_history(&empty, &owner, current, stream);
+    let relogin = async {
+        timeout(Duration::from_secs(3), api.delay.notified())
+            .await
+            .expect("последняя страница не запрошена");
+        fixture.auth.logout(&owner.account_id).unwrap();
+        let fresh = fixture.login_at(&server, "first");
+        api.release.notify_one();
+        fresh
+    };
+    let (result, fresh) = tokio::join!(pending, relogin);
+    assert!(matches!(
+        result,
+        Err(OpenHistoryError::Auth(AuthError::SessionUnavailable))
+    ));
+    let fresh_generation = fixture
+        .auth
+        .snapshot()
+        .into_iter()
+        .find(|session| session.context == fresh)
+        .unwrap()
+        .generation;
+    assert!(
+        empty
+            .history_windows(&fresh, fresh_generation, stream)
+            .unwrap()
+            .is_empty()
     );
     worker.abort();
 }

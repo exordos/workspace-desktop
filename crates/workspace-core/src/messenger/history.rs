@@ -1,4 +1,4 @@
-//! Открывает окно истории личного чата по адресу из уведомления.
+//! Загружает последнюю страницу истории и открывает окно вокруг сообщения из уведомления.
 
 use std::collections::HashSet;
 
@@ -7,11 +7,12 @@ use uuid::Uuid;
 
 use crate::{
     auth::{AuthError, Service},
-    context::SessionGeneration,
+    context::{OwnerContext, SessionGeneration},
     notification_target::NotificationTarget,
     runtime::SourceError,
     storage::{
-        HistoryPageEdges, HistoryPageOutcome, HistoryPageTarget, HistoryScope, HistoryWindow,
+        HistoryEdge, HistoryPageEdges, HistoryPageOutcome, HistoryPageTarget, HistoryScope,
+        HistoryWindow,
     },
     sync::{Sync, SyncError},
 };
@@ -22,7 +23,7 @@ use super::MessengerSource;
 #[derive(Debug, Error)]
 pub enum OpenHistoryError {
     #[error("the conversation is unavailable")]
-    AccessLost, // Сервер больше не показывает личный разговор владельцу.
+    AccessLost, // Сервер больше не показывает историю в этой области владельцу.
     #[error("the message is unavailable in this conversation")]
     MessageMissing, // Сервер не вернул цель или она больше не в этом разговоре.
     #[error("the notification address is invalid")]
@@ -38,6 +39,42 @@ pub enum OpenHistoryError {
 }
 
 impl MessengerSource {
+    /// Загружает хвост истории. До вызова нужно подтвердить доступ владельца к области.
+    pub async fn load_latest_history(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        scope: HistoryScope,
+    ) -> Result<HistoryWindow, OpenHistoryError> {
+        let auth = sync.auth();
+        let token = auth
+            .access_token_for_generation(owner, Service::Messenger, generation)
+            .await?;
+        let guard = sync
+            .prepare_history_page(owner, generation, scope, HistoryPageTarget::New)?
+            .ok_or(OpenHistoryError::StaleWindow)?;
+        let fetched = self.rest.latest_page(owner, &token, scope).await;
+        auth.with_active_generation(owner, generation, || ())?;
+        let page = fetched?;
+        // Запрос без маркера начинается с конца истории. Маркер ответа ведёт к старым сообщениям.
+        let outcome = sync.save_history_page(
+            guard,
+            &page.messages,
+            HistoryPageEdges::New {
+                older: page.edge,
+                newer: HistoryEdge::End,
+            },
+        )?;
+        let HistoryPageOutcome::Saved(id) = outcome else {
+            return Err(OpenHistoryError::StaleWindow);
+        };
+        sync.history_windows(owner, generation, scope)?
+            .into_iter()
+            .find(|window| window.id == id)
+            .ok_or(OpenHistoryError::StaleWindow)
+    }
+
     /// Открывает окно для ранее подтверждённого адреса и проверяет доступ перед чтением кэша.
     pub async fn open_direct_history(
         &self,

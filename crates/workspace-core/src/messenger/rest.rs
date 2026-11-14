@@ -1,5 +1,5 @@
 //! Читает начальную позицию и страницы журнала мессенджера по HTTPS.
-//! Здесь же разбирается общий формат событий, который используют HTTP и WebSocket.
+//! Загружает страницы истории и разбирает общий формат событий, который используют HTTP и WebSocket.
 
 use std::{collections::HashSet, time::Duration};
 
@@ -14,8 +14,8 @@ use crate::{
     context::OwnerContext,
     runtime::SourceError,
     storage::{
-        Cursor, HistoryChange, HistoryEdge, HistoryMessage, HistoryMetadata, HistoryTime, Message,
-        MessagePlacement,
+        Cursor, HistoryChange, HistoryEdge, HistoryMessage, HistoryMetadata, HistoryScope,
+        HistoryTime, Message, MessagePlacement,
     },
     sync::Event,
 };
@@ -206,7 +206,7 @@ impl RestClient {
         token: &str,
         stream: Uuid,
         anchor: Uuid,
-    ) -> Result<(DirectPage, DirectPage), OpenHistoryError> {
+    ) -> Result<(HistoryPage, HistoryPage), OpenHistoryError> {
         tokio::try_join!(
             self.direct_page(owner, token, stream, anchor, "desc"),
             self.direct_page(owner, token, stream, anchor, "asc")
@@ -221,16 +221,14 @@ impl RestClient {
         stream: Uuid,
         anchor: Uuid,
         direction: &str,
-    ) -> Result<DirectPage, OpenHistoryError> {
+    ) -> Result<HistoryPage, OpenHistoryError> {
+        let scope = HistoryScope {
+            stream_id: stream,
+            topic_id: None,
+        };
         let response = self
-            .request(owner, token, MESSAGES_PATH)?
-            .query(&[
-                ("stream_uuid", stream.to_string().as_str()),
-                ("page_marker", anchor.to_string().as_str()),
-                ("page_limit", WINDOW_LIMIT),
-                ("sort_key", "created_at"),
-                ("sort_dir", direction),
-            ])
+            .history_page_request(owner, token, scope, direction)?
+            .query(&[("page_marker", anchor)])
             .send()
             .await
             .map_err(request_error)?;
@@ -242,6 +240,57 @@ impl RestClient {
             }
             status => check_status(status)?,
         }
+        Ok(Self::decode_history_page(response, owner, scope).await?)
+    }
+
+    /// Запрашивает последние сообщения в уже проверенной области.
+    pub(super) async fn latest_page(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        scope: HistoryScope,
+    ) -> Result<HistoryPage, OpenHistoryError> {
+        let response = self
+            .history_page_request(owner, token, scope, "desc")?
+            .send()
+            .await
+            .map_err(request_error)?;
+        if matches!(
+            response.status(),
+            StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+        ) {
+            return Err(OpenHistoryError::AccessLost);
+        }
+        check_status(response.status())?;
+        Ok(Self::decode_history_page(response, owner, scope).await?)
+    }
+
+    /// Собирает запрос страницы для стрима или отдельной темы.
+    fn history_page_request(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        scope: HistoryScope,
+        direction: &str,
+    ) -> Result<RequestBuilder, SourceError> {
+        let request = self.request(owner, token, MESSAGES_PATH)?.query(&[
+            ("stream_uuid", scope.stream_id.to_string().as_str()),
+            ("page_limit", WINDOW_LIMIT),
+            ("sort_key", "created_at"),
+            ("sort_dir", direction),
+        ]);
+        Ok(match scope.topic_id {
+            Some(topic) => request.query(&[("topic_uuid", topic)]),
+            None => request,
+        })
+    }
+
+    /// Читает маркер и проверяет область каждой строки перед сохранением.
+    async fn decode_history_page(
+        response: reqwest::Response,
+        owner: &OwnerContext,
+        scope: HistoryScope,
+    ) -> Result<HistoryPage, SourceError> {
         let edge = match response.headers().get("X-Pagination-Marker") {
             None => HistoryEdge::End,
             Some(marker) => HistoryEdge::More(
@@ -256,9 +305,14 @@ impl RestClient {
         let rows: Vec<WireHistoryMessage> = response.json().await.map_err(request_error)?;
         let messages = rows
             .into_iter()
-            .filter_map(|row| row.into_history(owner, stream).transpose())
+            .filter_map(|row| {
+                if scope.topic_id.is_some_and(|topic| row.topic_uuid != topic) {
+                    return Some(Err(SourceError::InvalidResponse));
+                }
+                row.into_history(owner, scope.stream_id).transpose()
+            })
             .collect::<Result<_, _>>()?;
-        Ok(DirectPage { messages, edge })
+        Ok(HistoryPage { messages, edge })
     }
 
     /// Загружает и проверяет одну страницу событий строго после заданной позиции.
@@ -423,7 +477,7 @@ struct WirePayload {
 }
 
 /// Текстовые записи и серверная граница одной страницы.
-pub(super) struct DirectPage {
+pub(super) struct HistoryPage {
     pub(super) messages: Vec<HistoryMessage>, // Сообщения поддерживаемого формата.
     pub(super) edge: HistoryEdge,             // Серверный маркер продолжения или конец истории.
 }
