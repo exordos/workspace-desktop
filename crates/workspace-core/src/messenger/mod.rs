@@ -4,6 +4,7 @@
 pub mod catalog;
 pub mod history;
 mod rest;
+pub mod send;
 mod socket;
 
 use std::{sync::Arc, time::Duration, vec::IntoIter};

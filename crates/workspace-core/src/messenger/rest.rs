@@ -1,5 +1,5 @@
-//! Читает начальную позицию и страницы журнала мессенджера по HTTPS.
-//! Загружает страницы истории и разбирает общий формат событий, который используют HTTP и WebSocket.
+//! Работает с HTTPS API мессенджера: читает журнал и историю, отправляет подготовленные сообщения.
+//! Также разбирает общий формат событий, который используют HTTP и WebSocket.
 
 use std::{collections::HashSet, time::Duration};
 
@@ -21,6 +21,8 @@ use crate::{
 };
 
 use super::history::OpenHistoryError;
+use super::send::SendError;
+use crate::storage::PreparedSend;
 
 const MESSAGES_PATH: &str = "/api/workspace/v1/messenger/messages/";
 const WINDOW_LIMIT: &str = "50";
@@ -33,17 +35,84 @@ pub(super) const STREAMS_PATH: &str = "/api/workspace/v1/messenger/streams";
 pub(super) const TOPICS_PATH: &str = "/api/workspace/v1/messenger/stream_topics";
 const PAGE_LIMIT: usize = 100;
 
-/// HTTP-клиент для чтения журнала мессенджера.
-pub(super) struct RestClient(Client); // Настроенный HTTP-клиент для запросов к журналу.
+/// HTTP-клиенты для чтения и однократной отправки сообщений.
+pub(super) struct RestClient {
+    read: Client, // Клиент для чтения журнала и истории.
+    send: Client, // Клиент отправки с полностью отключёнными повторами.
+}
 
 impl RestClient {
+    /// Выполняет ровно одну попытку отправки снимка и разбирает ответ сервера.
+    pub(super) async fn post_prepared(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        snapshot: &PreparedSend,
+    ) -> Result<HistoryMessage, SendError> {
+        let mut url = workspace_origin(owner).map_err(|_| SendError::InvalidInput)?;
+        if snapshot.public_id
+            != Uuid::new_v5(
+                &snapshot.topic_id,
+                snapshot.canonical_id.to_string().as_bytes(),
+            )
+        {
+            return Err(SendError::InvalidInput);
+        }
+        url.set_path(MESSAGES_PATH);
+        let response = self
+            .send
+            .post(url)
+            .header(ACCEPT, "application/json")
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "uuid": snapshot.canonical_id,
+                "stream_uuid": snapshot.stream_id,
+                "topic_uuid": snapshot.topic_id,
+                "payload": { "kind": "markdown", "content": snapshot.markdown },
+            }))
+            .send()
+            .await
+            .map_err(|_| SendError::Unknown)?;
+        let status = response.status();
+        // Тайм-аут и ошибки сервера не доказывают, что запись не состоялась.
+        if status.is_client_error()
+            && status != StatusCode::REQUEST_TIMEOUT
+            && status != StatusCode::TOO_MANY_REQUESTS
+        {
+            return Err(SendError::Rejected(status.as_u16()));
+        }
+        if status != StatusCode::CREATED {
+            return Err(SendError::Unknown);
+        }
+        let row: WireHistoryMessage = response.json().await.map_err(|_| SendError::Unknown)?;
+        if row.uuid != snapshot.public_id {
+            return Err(SendError::Unknown);
+        }
+        // Маршрут ответа сохраняем как пришёл: сообщение могло быть перенесено.
+        let stream = row.stream_uuid;
+        row.into_history(owner, stream)
+            .map_err(|_| SendError::Unknown)?
+            .ok_or(SendError::Unknown)
+    }
+
     /// Создаёт HTTPS-клиент с тайм-аутами и запретом перенаправлений.
     pub(super) fn new(private_ca: Option<&[u8]>) -> Result<Self, SourceError> {
+        Ok(Self {
+            read: Self::client(private_ca, false)?,
+            send: Self::client(private_ca, true)?,
+        })
+    }
+
+    /// Настраивает TLS и при необходимости запрещает даже внутренние повторы транспорта.
+    fn client(private_ca: Option<&[u8]>, no_retry: bool) -> Result<Client, SourceError> {
         let mut builder = Client::builder()
             .https_only(true)
             .redirect(Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(20));
+        if no_retry {
+            builder = builder.retry(reqwest::retry::never());
+        }
         if let Some(private_ca) = private_ca {
             let certificate =
                 Certificate::from_der(private_ca).map_err(|_| SourceError::InvalidResponse)?;
@@ -52,7 +121,7 @@ impl RestClient {
                 .add_root_certificate(certificate);
         }
         let client = builder.build().map_err(|_| SourceError::Temporary)?;
-        Ok(Self(client))
+        Ok(client)
     }
 
     /// Получает текущую позицию журнала, с которой начинается первый запуск.
@@ -383,7 +452,7 @@ impl RestClient {
         let mut url = workspace_origin(owner)?;
         url.set_path(path);
         Ok(self
-            .0
+            .read
             .get(url)
             .header(ACCEPT, "application/json")
             .bearer_auth(access_token))
