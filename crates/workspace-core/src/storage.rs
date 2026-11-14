@@ -1,13 +1,16 @@
-//! Хранит сообщения, счётчики и позиции чтения в SQLite.
+//! Хранит сообщения, счётчики, позиции чтения и очередь отправки в SQLite.
 //! Сначала описаны данные и таблицы, затем чтение и запись.
 
 mod history;
+mod outbox;
 
 pub(crate) use history::HistoryPageGuard;
 pub use history::{
     HistoryDirection, HistoryEdge, HistoryMessage, HistoryMetadata, HistoryPageEdges,
     HistoryPageOutcome, HistoryPageTarget, HistoryScope, HistoryTime, HistoryWindow,
 };
+
+pub use outbox::PreparedSend;
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -219,6 +222,7 @@ impl Storage {
         transaction.execute_batch("CREATE INDEX IF NOT EXISTS sync_messages_by_placement
             ON sync_messages (account_id, server, organization_id, project_id, user_id, stream_id, topic_id)")?;
         history::initialize(&transaction)?;
+        outbox::initialize(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -713,6 +717,63 @@ mod tests {
             id: id.into(),
             text: text.into(),
         }
+    }
+
+    /// Проверяет запись очереди после закрытия базы, повторного сохранения и сброса источника.
+    #[test]
+    fn prepared_send_survives_reopen_duplicate_and_source_reset() {
+        use uuid::Uuid;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workspace.sqlite");
+        let a = owner();
+        let b = OwnerContext {
+            project_id: "other-project".into(),
+            ..a.clone()
+        };
+        let first = PreparedSend {
+            canonical_id: Uuid::from_u128(1),
+            public_id: Uuid::from_u128(2),
+            stream_id: Uuid::from_u128(3),
+            topic_id: Uuid::from_u128(4),
+            markdown: "**Привет**\n".into(),
+        };
+        let other = PreparedSend {
+            public_id: Uuid::from_u128(5),
+            stream_id: Uuid::from_u128(6),
+            topic_id: Uuid::from_u128(7),
+            markdown: "Другая запись".into(),
+            ..first.clone()
+        };
+
+        let storage = Storage::open(&path).unwrap();
+        assert!(storage.save_prepared_send(&a, &first).unwrap());
+        assert!(storage.save_prepared_send(&b, &other).unwrap());
+        drop(storage);
+
+        let storage = Storage::open(&path).unwrap();
+        assert!(!storage.save_prepared_send(&a, &other).unwrap());
+        assert_eq!(
+            storage.pending_sends(&a).unwrap(),
+            std::slice::from_ref(&first)
+        );
+        assert_eq!(
+            storage.pending_sends(&b).unwrap(),
+            std::slice::from_ref(&other)
+        );
+
+        apply_message(
+            &storage,
+            &a,
+            SOURCE,
+            cursor("epoch", 1),
+            message("msg", "cache"),
+        )
+        .unwrap();
+        storage.reset_source(&a, SOURCE).unwrap();
+        assert_eq!(storage.cursor(&a, SOURCE).unwrap(), None);
+        assert_eq!(storage.pending_sends(&a).unwrap(), [first]);
+        assert_eq!(storage.pending_sends(&b).unwrap(), [other]);
     }
 
     /// Проверяет, что повтор или смена журнала не повреждают сообщения и позицию.
