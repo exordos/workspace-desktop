@@ -1096,7 +1096,7 @@ async fn runtime_refreshes_a_token_rejected_before_expiry() {
 
 /// Проверяет замену живых потоков, повтор сигнала и выход аккаунта перед восстановлением.
 #[tokio::test]
-async fn runtime_recovers_live_streams_on_wake() {
+async fn bootstrap_recovers_live_streams_on_wake() {
     let fixture = Fixture::new(|user, _| Ok(project_token(user, "refreshed", None)));
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(Storage::open(directory.path().join("wake.sqlite3")).unwrap());
@@ -1105,11 +1105,17 @@ async fn runtime_recovers_live_streams_on_wake() {
     let runtime = Runtime::new(sync.clone(), vec![Arc::new(TestSource(connections))]).unwrap();
     let (wake, signals) = async_mpsc::channel(2);
     let (shutdown, stopped) = oneshot::channel();
-    let worker = tokio::spawn(runtime.run_with_wake(
+    let worker = tokio::spawn(workspace_core::bootstrap::run_with_wake(
+        runtime,
+        None,
+        Some(signals),
         async {
             let _ = stopped.await;
         },
-        Some(signals),
+        |restored| {
+            restored.expect("restore accounts");
+            Ok::<(), workspace_core::runtime::RuntimeError>(())
+        },
     ));
     let a = fixture.login("a");
     let b = fixture.login("b");

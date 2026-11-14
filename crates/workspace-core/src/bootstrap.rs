@@ -165,11 +165,25 @@ pub async fn run<E: From<RuntimeError>>(
     shutdown: impl Future<Output = ()>,
     after_restore: impl FnOnce(Result<(), AuthError>) -> Result<(), E>,
 ) -> Result<(), E> {
+    run_with_wake(runtime, catalog, None, shutdown, after_restore).await
+}
+
+/// Запускает тот же порядок загрузки и передаёт Runtime сигналы пробуждения от окна.
+pub async fn run_with_wake<E: From<RuntimeError>>(
+    runtime: Runtime,
+    catalog: Option<CatalogStartup>,
+    wake: Option<mpsc::Receiver<()>>,
+    shutdown: impl Future<Output = ()>,
+    after_restore: impl FnOnce(Result<(), AuthError>) -> Result<(), E>,
+) -> Result<(), E> {
     let auth = runtime.auth().clone();
     let (stop, stopped) = oneshot::channel();
-    let background = runtime.run(async {
-        let _ = stopped.await;
-    });
+    let background = runtime.run_with_wake(
+        async {
+            let _ = stopped.await;
+        },
+        wake,
+    );
     tokio::pin!(background, shutdown);
 
     // Runtime может запустить задачи первого готового аккаунта, пока остальные ещё восстанавливаются.

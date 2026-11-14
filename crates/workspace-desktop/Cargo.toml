@@ -18,13 +18,14 @@ workspace-core = { path = "../workspace-core" }
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = { version = "0.5", optional = true }
 objc2 = { version = "0.5", optional = true }
-objc2-foundation = { version = "0.2", features = ["NSBundle", "NSUUID"], optional = true }
+objc2-app-kit = { version = "0.2", features = ["NSWorkspace"], optional = true }
+objc2-foundation = { version = "0.2", features = ["NSBundle", "NSUUID", "NSOperation", "block2"], optional = true }
 objc2-user-notifications = { version = "0.2", features = ["UNError", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationSettings", "UNNotificationTrigger", "UNUserNotificationCenter", "block2"], optional = true }
 security-framework = "3"
 
 [features]
 default = ["ui-kit"]
-ui-kit = ["dep:iced", "dep:iced_runtime", "dep:block2", "dep:objc2", "dep:objc2-foundation", "dep:objc2-user-notifications"]
+ui-kit = ["dep:iced", "dep:iced_runtime", "dep:block2", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:objc2-user-notifications"]
 
 [dev-dependencies]
 http-body-util = "0.1"

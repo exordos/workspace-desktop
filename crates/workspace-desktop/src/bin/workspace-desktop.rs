@@ -27,7 +27,8 @@ mod macos {
     use std::sync::Mutex;
     use std::thread;
 
-    use tokio::sync::oneshot;
+    use objc2_foundation::MainThreadMarker;
+    use tokio::sync::{mpsc, oneshot};
     use workspace_core::auth::Auth;
     use workspace_core::bootstrap;
     use workspace_core::context::AccountId;
@@ -36,6 +37,7 @@ mod macos {
     use workspace_core::runtime::{Runtime, RuntimeError};
     use workspace_core::storage::Storage;
     use workspace_core::sync::Sync;
+    use workspace_desktop::platform::wake::WakeObserver;
     use workspace_desktop::platform::{JsonAccountStore, MacKeychain, state_directory};
     use workspace_desktop::shell::Shell;
 
@@ -79,6 +81,9 @@ mod macos {
         let (stop, mut stopped) = oneshot::channel();
         let (subscribed, subscription_ready) = oneshot::channel();
         let subscribed = Mutex::new(Some(subscribed));
+        let main_thread = MainThreadMarker::new().ok_or("Workspace needs the main thread")?;
+        let (wake, wake_signals) = mpsc::channel(1);
+        let wake_observer = WakeObserver::subscribe(main_thread, wake);
         let worker = thread::Builder::new()
             .name("workspace-sync".into())
             .spawn(move || {
@@ -91,9 +96,10 @@ mod macos {
                         }
                         _ = &mut stopped => return Ok(()),
                     }
-                    bootstrap::run(
+                    bootstrap::run_with_wake(
                         runtime,
                         Some(catalog_startup),
+                        Some(wake_signals),
                         async {
                             let _ = stopped.await;
                         },
@@ -136,6 +142,7 @@ mod macos {
         .subscription(Shell::subscription)
         .run();
 
+        drop(wake_observer);
         // Дожидаемся отмены сетевых задач и уже начатых записей перед выходом.
         let _ = stop.send(());
         let result = worker
