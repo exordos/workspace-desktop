@@ -127,6 +127,9 @@ pub use keychain::MacKeychain;
 pub mod notifications;
 
 #[cfg(all(target_os = "macos", feature = "ui-kit"))]
+pub mod tray;
+
+#[cfg(all(target_os = "macos", feature = "ui-kit"))]
 pub mod wake;
 
 #[cfg(test)]

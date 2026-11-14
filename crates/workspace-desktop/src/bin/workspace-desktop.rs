@@ -1,4 +1,4 @@
-//! Запускает окно Iced, восстанавливает аккаунты и держит синхронизацию до закрытия окна.
+//! Запускает окно Iced, восстанавливает аккаунты и держит синхронизацию до выхода из приложения.
 
 #[cfg(target_os = "macos")]
 /// Запускает окно и сообщает о сбое при запуске или завершении.
@@ -27,7 +27,10 @@ mod macos {
     use std::sync::Mutex;
     use std::thread;
 
+    use futures::{StreamExt, channel::mpsc as menu_channel};
+    use iced::{Element, Subscription, Task, window};
     use objc2_foundation::MainThreadMarker;
+    use std::hash::{Hash, Hasher};
     use tokio::sync::{mpsc, oneshot};
     use workspace_core::auth::Auth;
     use workspace_core::bootstrap;
@@ -37,9 +40,10 @@ mod macos {
     use workspace_core::runtime::{Runtime, RuntimeError};
     use workspace_core::storage::Storage;
     use workspace_core::sync::Sync;
+    use workspace_desktop::platform::tray::{Command, Tray};
     use workspace_desktop::platform::wake::WakeObserver;
     use workspace_desktop::platform::{JsonAccountStore, MacKeychain, state_directory};
-    use workspace_desktop::shell::Shell;
+    use workspace_desktop::shell::{Message as ShellMessage, Shell};
 
     const USAGE: &str = "Usage: workspace-desktop [--active ACCOUNT_ID] [--label ACCOUNT_ID NAME]…";
 
@@ -48,6 +52,80 @@ mod macos {
     struct Options {
         active: Option<AccountId>, // Аккаунт, который следует выбрать при запуске.
         labels: HashMap<AccountId, String>, // Подписи для переключателя аккаунтов.
+    }
+
+    /// Связывает события единственного окна, оболочки и меню macOS.
+    #[derive(Debug, Clone)]
+    enum Message {
+        Shell(ShellMessage), // Событие экрана или фоновой подписки.
+        Opened(window::Id),  // Оконный цикл готов, можно создать меню.
+        Close(window::Id),   // Пользователь запросил закрытие окна.
+        Menu(Command),       // Пользователь выбрал команду в строке меню.
+    }
+
+    /// Владеет экраном и меню до выхода из Iced.
+    struct App {
+        shell: Shell,           // Состояние экрана остаётся в памяти при скрытии.
+        id: Option<window::Id>, // ID главного окна после его открытия.
+        tray: Option<Tray>,     // Если меню нет, окно должно закрыться штатно.
+        commands: menu_channel::UnboundedSender<Command>, // Передаёт команды от AppKit.
+    }
+
+    impl App {
+        /// Меняет видимость окна и делегирует остальные события оболочке.
+        fn update(&mut self, message: Message) -> Task<Message> {
+            match message {
+                Message::Shell(message) => self.shell.update(message).map(Message::Shell),
+                Message::Opened(id) => {
+                    self.id = Some(id);
+                    if std::env::var_os("WORKSPACE_DESKTOP_DISABLE_TRAY").is_none() {
+                        self.tray = MainThreadMarker::new()
+                            .and_then(|main| Tray::install(main, self.commands.clone()));
+                    }
+                    Task::none()
+                }
+                Message::Close(id) if self.tray.is_some() => {
+                    log::info!("Скрываем окно Workspace {id:?}");
+                    window::set_mode(id, window::Mode::Hidden)
+                }
+                Message::Close(_) | Message::Menu(Command::Quit) => iced::exit(),
+                Message::Menu(Command::Show) => self.id.map_or_else(Task::none, |id| {
+                    log::info!("Возвращаем окно Workspace {id:?}");
+                    window::set_mode(id, window::Mode::Windowed)
+                        .chain(window::minimize(id, false))
+                        .chain(window::gain_focus(id))
+                }),
+            }
+        }
+
+        /// Показывает существующую оболочку без отдельного экрана для меню.
+        fn view(&self) -> Element<'_, Message> {
+            self.shell.view().map(Message::Shell)
+        }
+    }
+
+    /// Хранит приёмник до запуска постоянной подписки Iced.
+    #[derive(Clone)]
+    struct MenuEvents(Arc<Mutex<Option<menu_channel::UnboundedReceiver<Command>>>>); // Общий приёмник для одного запуска.
+
+    impl Hash for MenuEvents {
+        /// Опознаёт подписку по её каналу.
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            Arc::as_ptr(&self.0).hash(state);
+        }
+    }
+
+    impl MenuEvents {
+        /// Передаёт входящие команды в обновление окна.
+        fn stream(&self) -> impl futures::Stream<Item = Message> + use<> {
+            let receiver = self
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .expect("one menu subscription");
+            receiver.map(Message::Menu)
+        }
     }
 
     /// Разбирает параметры, открывает профиль и запускает окно на главном потоке.
@@ -116,6 +194,8 @@ mod macos {
                     .inspect_err(|error| log::error!("Workspace synchronization stopped: {error}"))
             })?;
 
+        let (commands, menu_events) = menu_channel::unbounded();
+        let menu_events = MenuEvents(Arc::new(Mutex::new(Some(menu_events))));
         let window = iced::application(
             move || {
                 let shell = Shell::new(
@@ -131,15 +211,34 @@ mod macos {
                         .expect("Iced opens one window"),
                 );
                 let prepare = shell.prepare_notifications();
-                (shell, prepare)
+                (
+                    App {
+                        shell,
+                        id: None,
+                        tray: None,
+                        commands: commands.clone(),
+                    },
+                    prepare.map(Message::Shell),
+                )
             },
-            Shell::update,
-            Shell::view,
+            App::update,
+            App::view,
         )
         .title("Workspace Desktop")
-        .window_size((620.0, 360.0))
-        .theme(Shell::theme)
-        .subscription(Shell::subscription)
+        .window(window::Settings {
+            size: iced::Size::new(620.0, 360.0),
+            exit_on_close_request: false,
+            ..window::Settings::default()
+        })
+        .theme(|app: &App| app.shell.theme())
+        .subscription(move |app| {
+            Subscription::batch([
+                app.shell.subscription().map(Message::Shell),
+                window::open_events().map(Message::Opened),
+                window::close_requests().map(Message::Close),
+                Subscription::run_with(menu_events.clone(), MenuEvents::stream),
+            ])
+        })
         .run();
 
         drop(wake_observer);
@@ -150,6 +249,7 @@ mod macos {
             .map_err(|_| "Workspace sync thread panicked")?;
         window?;
         result?;
+        log::info!("Фоновая работа Workspace остановлена");
         Ok(())
     }
 
