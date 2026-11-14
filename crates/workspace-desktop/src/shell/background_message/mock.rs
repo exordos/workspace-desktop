@@ -109,6 +109,20 @@ impl MockWorkspace {
             .unwrap();
     }
 
+    /// Сбрасывает журнал B, сохраняя исходное сообщение с новым текстом в REST.
+    pub(super) fn reject_cursor_with_updated_anchor(&self, id: &str, body: &str) {
+        let entries = self.journal.entries.lock().unwrap();
+        let mut anchor = entries
+            .iter()
+            .find(|event| event["payload"]["uuid"] == id)
+            .expect("якорь должен существовать до сброса")
+            .clone();
+        anchor["payload"]["payload"]["content"] = json!(body);
+        *self.journal.anchor_after_reset.lock().unwrap() = Some(anchor);
+        drop(entries);
+        self.reject_cursor(false);
+    }
+
     /// Открывает только локальный порт и запускает обработку соединений.
     pub(super) async fn start() -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -251,6 +265,7 @@ struct Journal {
     entries: Mutex<Vec<Value>>,     // События получателя в порядке версий.
     live: broadcast::Sender<Value>, // Поток новых событий после установки сокета.
     recovery: AtomicU8,             // 0 — исходный журнал, 1 — обрезанный, 2 — новая эпоха для B.
+    anchor_after_reset: Mutex<Option<Value>>, // Сообщение, которое REST сохраняет после сброса.
     history_failure: AtomicU8,      // 0 — доступ есть, 1 — сообщение удалено, 2 — доступ отозван.
     fail_catalog: AtomicBool,       // Нужно ли вернуть ошибку при следующей загрузке каталога A.
     fail_older: AtomicBool,         // Нужно ли отклонить следующую старую страницу.
@@ -264,6 +279,7 @@ impl Default for Journal {
             entries: Mutex::new(Vec::new()),
             live: broadcast::channel(16).0,
             recovery: AtomicU8::new(0),
+            anchor_after_reset: Mutex::new(None),
             history_failure: AtomicU8::new(0),
             fail_catalog: AtomicBool::new(false),
             fail_older: AtomicBool::new(false),
@@ -415,7 +431,11 @@ fn handle(mut request: Request<Incoming>, journal: Arc<Journal>) -> Response<Ful
         }
         path if path.starts_with("/api/workspace/v1/messenger/messages/") && user == BACKGROUND => {
             let id = path.rsplit('/').next().unwrap();
-            let entry = entries.iter().find(|event| event["payload"]["uuid"] == id);
+            let anchor = journal.anchor_after_reset.lock().unwrap();
+            let entry = anchor
+                .iter()
+                .chain(entries.iter())
+                .find(|event| event["payload"]["uuid"] == id);
             let Some(entry) =
                 entry.filter(|_| journal.history_failure.load(Ordering::Relaxed) != 1)
             else {

@@ -872,8 +872,38 @@ async fn notification_click_scenario(
     assert!(into_stream(shell.update(loaded)).is_none());
     assert!(!RenderedText::from_shell(shell, renderer).contains(body));
 
-    let loaded = load(shell, renderer).await;
+    let mut loaded = load(shell, renderer).await;
     let _ = shell.update(loaded.clone());
+    if let Some(mock) = mock {
+        // После настоящего сброса новое окно должно прочитать обновлённый текст через REST.
+        let updated_body = "Свежий текст после сброса истории";
+        let mut updates = shell.sources.0.sync.subscribe();
+        mock.reject_cursor_with_updated_anchor(&click.target.message_id, updated_body);
+        let reset = timeout(DEADLINE, async {
+            loop {
+                let update = updates.recv().await.unwrap();
+                if update.context == click.target.context
+                    && matches!(update.change, SyncChange::MessengerReset)
+                {
+                    break update;
+                }
+            }
+        })
+        .await
+        .expect("Runtime должен передать сброс истории B");
+        let mut reload = into_stream(shell.update(Message::Synced(reset))).unwrap();
+        assert!(!RenderedText::from_shell(shell, renderer).contains(body));
+        assert!(into_stream(shell.update(loaded.clone())).is_none());
+        let Some(Action::Output(result)) = timeout(DEADLINE, reload.next()).await.unwrap() else {
+            panic!("повторное открытие после сброса не завершилось");
+        };
+        loaded = result;
+        let _ = shell.update(loaded.clone());
+        let rendered = RenderedText::from_shell(shell, renderer);
+        assert!(rendered.contains(updated_body));
+        assert!(!rendered.contains(body));
+    }
+
     let screen = shell.visible_history().unwrap();
     let HistoryState::Ready(window) = &screen.state else {
         panic!("история должна быть загружена")
@@ -895,6 +925,7 @@ async fn notification_click_scenario(
         into_stream(shell.update(stale_older)).is_none(),
         "страница прежней сессии не должна появиться после выхода"
     );
+    assert!(shell.visible_history().is_none());
     assert!(!RenderedText::from_shell(shell, renderer).contains(body));
 }
 
