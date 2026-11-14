@@ -72,7 +72,7 @@ mod macos {
             bootstrap::chat_catalog(messenger.catalog(storage.clone()));
         let chat_catalog = Arc::new(chat_catalog);
         let sync = Arc::new(Sync::new(auth.clone(), storage));
-        let runtime = Runtime::new(sync.clone(), vec![messenger])?;
+        let runtime = Runtime::new(sync.clone(), vec![messenger.clone()])?;
         let executor = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -116,7 +116,7 @@ mod macos {
                     auth.clone(),
                     options.labels.clone(),
                     sync.clone(),
-                    chat_catalog.clone(),
+                    (chat_catalog.clone(), messenger.clone()),
                     options.active.clone(),
                     subscribed
                         .lock()

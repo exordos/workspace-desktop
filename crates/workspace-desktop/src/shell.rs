@@ -14,7 +14,9 @@ use tokio::sync::{broadcast, oneshot};
 use workspace_core::auth::{Auth, SessionSnapshot, SessionStatus};
 use workspace_core::bootstrap::{ChatCatalog, ChatListStatus, ChatLists};
 use workspace_core::context::{AccountId, OwnerContext, SessionGeneration};
+use workspace_core::messenger::{MessengerSource, history::OpenHistoryError};
 use workspace_core::notification_target::{NotificationTarget, NotificationTargetError};
+use workspace_core::storage::HistoryWindow;
 use workspace_core::sync::{Sync, SyncChange, SyncUpdate};
 
 use crate::platform::notifications::{NotificationClick, NotificationError, Notifications};
@@ -22,6 +24,9 @@ use crate::ui_kit::{
     BadgeSize, BadgeTone, ButtonVariant, IconName, IconTone, ThemeMode, button, icon,
     unread_count_badge, workspace_theme,
 };
+
+mod history;
+use history::{HistoryScreen, HistoryState};
 
 /// Состояние окна, которое Iced меняет в ответ на действия пользователя и события `core`.
 pub struct Shell {
@@ -31,6 +36,7 @@ pub struct Shell {
     sources: Sources, // Входные потоки авторизации и мессенджера.
     notifications: Box<dyn NotificationDelivery>, // Получатель запросов оболочки на баннер.
     notification_error: Option<NotificationError>, // Причина, по которой ОС не показала баннер.
+    history: Option<HistoryScreen>, // История, которую открыл последний клик.
     navigation_revision: u64, // Номер последнего клика по баннеру или выбора аккаунта.
 }
 
@@ -55,6 +61,14 @@ pub enum Message {
         revision: u64,                 // Номер действия, которое запустило проверку.
         generation: SessionGeneration, // Вход, к которому относился баннер.
         result: Result<NotificationTarget, Arc<NotificationTargetError>>, // Проверенная цель или причина отказа.
+    },
+    HistoryLoaded {
+        revision: u64, // Номер клика, запустившего чтение.
+        result: Result<Arc<HistoryWindow>, Arc<OpenHistoryError>>, // Окно или причина отказа.
+    },
+    ScrollToHistory {
+        revision: u64,       // Номер клика, для которого измерены координаты.
+        offset: Option<f32>, // Положение цели от начала списка в пикселях.
     },
     MoveFocus(bool), // Перейти назад по Shift+Tab или вперёд по Tab.
 }
@@ -116,7 +130,7 @@ impl Shell {
         auth: Auth,
         labels: HashMap<AccountId, String>,
         sync: Arc<Sync>,
-        catalog: Arc<ChatCatalog>,
+        messenger: (Arc<ChatCatalog>, Arc<MessengerSource>),
         preferred_account: Option<AccountId>,
         subscribed: oneshot::Sender<()>,
     ) -> Self {
@@ -124,7 +138,7 @@ impl Shell {
             auth,
             labels,
             sync,
-            catalog,
+            messenger,
             preferred_account,
             subscribed,
             Box::new(Notifications::new()),
@@ -136,11 +150,12 @@ impl Shell {
         auth: Auth,
         labels: HashMap<AccountId, String>,
         sync: Arc<Sync>,
-        catalog: Arc<ChatCatalog>,
+        messenger: (Arc<ChatCatalog>, Arc<MessengerSource>),
         preferred_account: Option<AccountId>,
         subscribed: oneshot::Sender<()>,
         notifications: Box<dyn NotificationDelivery>,
     ) -> Self {
+        let (catalog, messenger) = messenger;
         let clicks = notifications.take_clicks();
         Self {
             accounts: Accounts {
@@ -153,12 +168,14 @@ impl Shell {
                 auth,
                 sync,
                 catalog,
+                messenger,
                 subscribed: Mutex::new(Some(subscribed)),
                 clicks: Mutex::new(clicks),
             })),
             notifications,
             notification_error: None,
             navigation_revision: 0,
+            history: None,
         }
     }
 
@@ -172,6 +189,7 @@ impl Shell {
         match message {
             Message::Select(account) => {
                 self.navigation_revision += 1;
+                self.history = None;
                 self.accounts.select(account);
             }
             Message::Snapshot(accounts) => self.accounts.replace(accounts),
@@ -210,9 +228,29 @@ impl Shell {
                 revision,
                 generation,
                 result,
-            } => self.finish_open_notification(revision, generation, result),
+            } => return self.finish_open_notification(revision, generation, result),
+            Message::HistoryLoaded { revision, result } => {
+                return self.finish_history(revision, result);
+            }
+            Message::ScrollToHistory { revision, offset } => {
+                if revision == self.navigation_revision
+                    && self.visible_history().is_some()
+                    && let Some(y) = offset
+                {
+                    return operation::scroll_to(
+                        history::list_id(revision),
+                        operation::AbsoluteOffset {
+                            x: None,
+                            y: Some(y),
+                        },
+                    );
+                }
+            }
             Message::MoveFocus(true) => return operation::focus_previous(),
             Message::MoveFocus(false) => return operation::focus_next(),
+        }
+        if self.visible_history().is_none() {
+            self.history = None;
         }
         Task::none()
     }
@@ -256,6 +294,13 @@ impl Shell {
             },
         );
         let mut content = column![text("Аккаунты").size(22), rows, text(current)].spacing(16);
+        if let Some(history) = self.visible_history() {
+            return container(content.push(history.view(self.navigation_revision)))
+                .padding(24)
+                .width(Fill)
+                .height(Fill)
+                .into();
+        }
         if let Some(current) = self.accounts.current()
             && current.session.status == SessionStatus::Active
         {
@@ -401,6 +446,7 @@ impl Shell {
     /// Поднимает окно и передаёт цель в core на исполнителе задач Iced.
     fn open_notification(&mut self, click: NotificationClick) -> Task<Message> {
         self.navigation_revision += 1;
+        self.history = None;
         let revision = self.navigation_revision;
         let sync = self.sources.0.sync.clone();
         let NotificationClick { target, generation } = click;
@@ -429,15 +475,15 @@ impl Shell {
         revision: u64,
         generation: SessionGeneration,
         result: Result<NotificationTarget, Arc<NotificationTargetError>>,
-    ) {
+    ) -> Task<Message> {
         if revision != self.navigation_revision {
-            return;
+            return Task::none();
         }
         let target = match result {
             Ok(target) => target,
             Err(error) => {
                 log::warn!("Цель уведомления Workspace недоступна: {error}");
-                return;
+                return Task::none();
             }
         };
         self.accounts.replace(self.sources.0.snapshot());
@@ -446,8 +492,65 @@ impl Shell {
                 && summary.session.generation == generation
                 && summary.session.status == SessionStatus::Active
         }) {
-            self.accounts.select(target.context.account_id);
-            log::info!("Core подтвердил аккаунт, чат и сообщение из уведомления");
+            self.accounts.select(target.context.account_id.clone());
+            self.history = Some(HistoryScreen {
+                target: target.clone(),
+                generation,
+                state: HistoryState::Loading,
+            });
+            let source = self.sources.0.clone();
+            return Task::perform(
+                async move {
+                    source
+                        .messenger
+                        .open_direct_history(&source.sync, &target, generation)
+                        .await
+                        .map(Arc::new)
+                        .map_err(Arc::new)
+                },
+                move |result| Message::HistoryLoaded { revision, result },
+            );
+        }
+        Task::none()
+    }
+
+    /// Показывает историю только в том входе, которому принадлежит запрос.
+    fn visible_history(&self) -> Option<&HistoryScreen> {
+        let history = self.history.as_ref()?;
+        let current = &self.accounts.current()?.session;
+        (current.context == history.target.context
+            && current.generation == history.generation
+            && current.status == SessionStatus::Active)
+            .then_some(history)
+    }
+
+    /// Сохраняет ответ, только если его маршрут и вход всё ещё открыты.
+    fn finish_history(
+        &mut self,
+        revision: u64,
+        result: Result<Arc<HistoryWindow>, Arc<OpenHistoryError>>,
+    ) -> Task<Message> {
+        if revision != self.navigation_revision {
+            return Task::none();
+        }
+        self.accounts.replace(self.sources.0.snapshot());
+        if self.visible_history().is_none() {
+            self.history = None;
+            return Task::none();
+        }
+        let history = self
+            .history
+            .as_mut()
+            .expect("видимый экран истории существует");
+        match result {
+            Ok(window) => {
+                history.state = HistoryState::Ready(window);
+                history::measure_anchor(revision)
+            }
+            Err(error) => {
+                history.state = HistoryState::Failed(error);
+                Task::none()
+            }
         }
     }
 }
@@ -522,9 +625,10 @@ struct Sources(Arc<SourceData>); // Одна и та же ссылка сохр�
 
 /// Источники изменений сессий и сохранённых счётчиков.
 struct SourceData {
-    auth: Auth,                // Снимки действующих и восстанавливаемых сессий.
-    sync: Arc<Sync>,           // Сводки SQLite и события после записи.
-    catalog: Arc<ChatCatalog>, // Состояния списков и команда повтора.
+    auth: Auth,                      // Снимки действующих и восстанавливаемых сессий.
+    sync: Arc<Sync>,                 // Сводки SQLite и события после записи.
+    messenger: Arc<MessengerSource>, // Запрос истории через штатный API core.
+    catalog: Arc<ChatCatalog>,       // Состояния списков и команда повтора.
     subscribed: Mutex<Option<oneshot::Sender<()>>>, // Разрешает фоновому потоку запустить восстановление.
     clicks: Mutex<Option<mpsc::Receiver<NotificationClick>>>, // Очередь системных нажатий для подписки Iced.
 }

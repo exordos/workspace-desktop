@@ -66,6 +66,11 @@ pub(super) struct MockWorkspace {
 }
 
 impl MockWorkspace {
+    /// Меняет ответ REST для следующей попытки открыть историю.
+    pub(super) fn set_history_failure(&self, mode: u8) {
+        self.journal.history_failure.store(mode, Ordering::Relaxed);
+    }
+
     /// Возвращает ошибку для следующего запроса списка чатов аккаунта A.
     pub(super) fn fail_next_catalog(&self) {
         self.journal.fail_catalog.store(true, Ordering::Relaxed);
@@ -166,6 +171,10 @@ impl TestWorkspace for MockWorkspace {
     }
 
     /// Создаёт рабочий транспорт с доверием к тестовому центру сертификации.
+    fn history_mock(&self) -> Option<&Self> {
+        Some(self)
+    }
+
     fn source(&self) -> MessengerSource {
         let ca = CertificateDer::from_pem_slice(include_bytes!("tls/ca.pem")).unwrap();
         MessengerSource::with_private_ca(ca.as_ref()).unwrap()
@@ -233,6 +242,7 @@ struct Journal {
     entries: Mutex<Vec<Value>>,     // События получателя в порядке версий.
     live: broadcast::Sender<Value>, // Поток новых событий после установки сокета.
     recovery: AtomicU8,             // 0 — исходный журнал, 1 — обрезанный, 2 — новая эпоха для B.
+    history_failure: AtomicU8,      // 0 — доступ есть, 1 — сообщение удалено, 2 — доступ отозван.
     fail_catalog: AtomicBool,       // Нужно ли вернуть ошибку при следующей загрузке каталога A.
 }
 
@@ -243,6 +253,7 @@ impl Default for Journal {
             entries: Mutex::new(Vec::new()),
             live: broadcast::channel(16).0,
             recovery: AtomicU8::new(0),
+            history_failure: AtomicU8::new(0),
             fail_catalog: AtomicBool::new(false),
         }
     }
@@ -354,6 +365,39 @@ fn handle(mut request: Request<Incoming>, journal: Arc<Journal>) -> Response<Ful
     let event_count = if user == BACKGROUND { entries.len() } else { 0 };
     let path = request.uri().path();
     let value = match path {
+        "/api/workspace/v1/messenger/messages/" if user == BACKGROUND => {
+            assert_eq!(query_value(request.uri(), "stream_uuid"), Some(DIRECT));
+            if query_value(request.uri(), "sort_dir") == Some("desc") {
+                json!((1..=20).rev().map(|day| json!({
+                    "uuid": format!("20000000-0000-4000-8000-{day:012}"),
+                    "stream_uuid": DIRECT, "topic_uuid": TOPIC,
+                    "project_id": PROJECT, "user_uuid": user, "author_uuid": FOREGROUND,
+                    "created_at": format!("2025-01-{day:02}T12:00:00Z"),
+                    "payload": {"kind": "markdown", "content": format!("Старое сообщение {day}")},
+                })).collect::<Vec<_>>())
+            } else {
+                json!([])
+            }
+        }
+        path if path.starts_with("/api/workspace/v1/messenger/messages/") && user == BACKGROUND => {
+            let id = path.rsplit('/').next().unwrap();
+            let entry = entries.iter().find(|event| event["payload"]["uuid"] == id);
+            let Some(entry) =
+                entry.filter(|_| journal.history_failure.load(Ordering::Relaxed) != 1)
+            else {
+                return response(StatusCode::NOT_FOUND, Value::Null);
+            };
+            json!({
+                "uuid": id, "stream_uuid": DIRECT, "topic_uuid": TOPIC,
+                "project_id": PROJECT, "user_uuid": user, "author_uuid": FOREGROUND,
+                "created_at": "2025-02-01T12:00:00Z", "payload": entry["payload"]["payload"],
+            })
+        }
+        "/api/workspace/v1/messenger/streams/10000000-0000-4000-8000-000000000005"
+            if journal.history_failure.load(Ordering::Relaxed) == 2 =>
+        {
+            return response(StatusCode::FORBIDDEN, Value::Null);
+        }
         "/api/workspace/v1/messenger/streams/" => {
             if user == FOREGROUND && journal.fail_catalog.swap(false, Ordering::Relaxed) {
                 return response(StatusCode::SERVICE_UNAVAILABLE, Value::Null);

@@ -34,6 +34,11 @@ trait TestWorkspace {
     /// Создаёт штатный сетевой источник с настройками доверия для этой среды.
     fn source(&self) -> MessengerSource;
 
+    /// Возвращает моки для управляемых отказов и фиксированной геометрии.
+    fn history_mock(&self) -> Option<&mock::MockWorkspace> {
+        None
+    }
+
     /// Отправляет сообщение от первого аккаунта второму и возвращает идентификаторы чата и сообщения.
     async fn send_direct_message(&self, body: &str) -> (String, String);
 }
@@ -361,7 +366,7 @@ async fn background_message_scenario(workspace: &impl TestWorkspace, check_catal
     let sync = Arc::new(Sync::new(auth.clone(), storage.clone()));
     let messenger = Arc::new(workspace.source());
     let (catalog, catalog_startup) = bootstrap::chat_catalog(messenger.catalog(storage.clone()));
-    let runtime = Runtime::new(sync.clone(), vec![messenger]).unwrap();
+    let runtime = Runtime::new(sync.clone(), vec![messenger.clone()]).unwrap();
     let (subscribed, ready) = oneshot::channel();
     let (stop, stopped) = oneshot::channel::<()>();
     let notifications = RecordedNotifications::default();
@@ -372,7 +377,7 @@ async fn background_message_scenario(workspace: &impl TestWorkspace, check_catal
             (background.account_id.clone(), "Аккаунт B".to_owned()),
         ]),
         sync.clone(),
-        Arc::new(catalog),
+        (Arc::new(catalog), messenger),
         Some(foreground.account_id.clone()),
         subscribed,
         Box::new(notifications.clone()),
@@ -550,7 +555,14 @@ async fn background_message_scenario(workspace: &impl TestWorkspace, check_catal
             message_id,
         }
     );
-    notification_click_scenario(&mut shell, &mut renderer, &click).await;
+    notification_click_scenario(
+        &mut shell,
+        &mut renderer,
+        &click,
+        &body,
+        workspace.history_mock(),
+    )
+    .await;
 }
 
 /// Подтверждает точную цель из баннера, подъём окна и защиту от запоздалого ответа.
@@ -558,6 +570,8 @@ async fn notification_click_scenario(
     shell: &mut Shell,
     renderer: &mut iced::Renderer,
     click: &NotificationClick,
+    body: &str,
+    mock: Option<&mock::MockWorkspace>,
 ) {
     let run_click = async |shell: &mut Shell, click: NotificationClick| {
         let window_id = window::Id::unique();
@@ -609,9 +623,123 @@ async fn notification_click_scenario(
     let _ = shell.update(result);
     assert!(RenderedText::from_shell(shell, renderer).shows_selected("Аккаунт A"));
 
-    let result = run_click(shell, click.clone()).await;
-    let _ = shell.update(result);
-    assert!(RenderedText::from_shell(shell, renderer).shows_selected("Аккаунт B"));
+    let load = async |shell: &mut Shell, renderer: &mut iced::Renderer| {
+        let resolved = run_click(shell, click.clone()).await;
+        let mut actions = into_stream(shell.update(resolved)).unwrap();
+        assert!(RenderedText::from_shell(shell, renderer).contains("Загрузка истории…"));
+        let Some(Action::Output(loaded)) = timeout(DEADLINE, actions.next()).await.unwrap() else {
+            panic!("история не вернула результат");
+        };
+        loaded
+    };
+    let loaded = load(shell, renderer).await;
+    let mut measure = into_stream(shell.update(loaded)).unwrap();
+    let rendered = RenderedText::from_shell(shell, renderer);
+    assert!(rendered.shows_selected("Аккаунт B"));
+    assert!(rendered.contains(body));
+    assert!(!rendered.contains("Канал A"));
+
+    if let Some(mock) = mock {
+        let Some(Action::Widget(mut operation)) = measure.next().await else {
+            panic!("Iced не запросил положение цели");
+        };
+        let mut ui = UserInterface::build(
+            shell.view(),
+            Size::new(620.0, 360.0),
+            Cache::new(),
+            renderer,
+        );
+        ui.operate(renderer, operation.as_mut());
+        let _ = operation.finish();
+        drop(operation);
+        let Some(Action::Output(
+            scroll @ Message::ScrollToHistory {
+                offset: Some(y), ..
+            },
+        )) = timeout(DEADLINE, measure.next()).await.unwrap()
+        else {
+            panic!("целевое сообщение не найдено в разметке");
+        };
+        assert!(y > 360.0);
+        let cache = ui.into_cache();
+        let mut scroll = into_stream(shell.update(scroll)).unwrap();
+        let Some(Action::Widget(mut operation)) = scroll.next().await else {
+            panic!("Iced не запросил прокрутку");
+        };
+        let mut ui = UserInterface::build(shell.view(), Size::new(620.0, 360.0), cache, renderer);
+        ui.operate(renderer, operation.as_mut());
+        let mut layout = HistoryViewport::default();
+        ui.operate(renderer, &mut layout);
+        let mut labels = RenderedText::default();
+        ui.operate(renderer, &mut labels);
+        let (bounds, _) = labels.0.iter().find(|(_, value)| value == body).unwrap();
+        let (viewport, dy) = layout.0.unwrap();
+        assert!(dy > 0.0);
+        assert!(
+            bounds.y - dy >= viewport.y
+                && bounds.y + bounds.height - dy <= viewport.y + viewport.height
+        );
+        drop(ui);
+
+        for (mode, label) in [(1, "Сообщение недоступно"), (2, "Чат недоступен")]
+        {
+            mock.set_history_failure(mode);
+            let loaded = load(shell, renderer).await;
+            let _ = shell.update(loaded);
+            let rendered = RenderedText::from_shell(shell, renderer);
+            assert!(rendered.contains(label));
+            assert!(!rendered.contains(body));
+        }
+        mock.set_history_failure(0);
+    }
+
+    let loaded = load(shell, renderer).await;
+    let foreground = shell.accounts.summaries[0]
+        .session
+        .context
+        .account_id
+        .clone();
+    let _ = shell.update(Message::Select(foreground));
+    assert!(into_stream(shell.update(loaded)).is_none());
+    assert!(!RenderedText::from_shell(shell, renderer).contains(body));
+
+    let loaded = load(shell, renderer).await;
+    let _ = shell.update(Message::NotificationClicked(click.clone()));
+    assert!(into_stream(shell.update(loaded)).is_none());
+    assert!(!RenderedText::from_shell(shell, renderer).contains(body));
+
+    let loaded = load(shell, renderer).await;
+    shell
+        .sources
+        .0
+        .auth
+        .logout(&click.target.context.account_id)
+        .unwrap();
+    assert!(into_stream(shell.update(loaded)).is_none());
+    assert!(!RenderedText::from_shell(shell, renderer).contains(body));
+}
+
+/// Запоминает положение прокрутки в разметке открытой истории.
+#[derive(Default)]
+struct HistoryViewport(Option<(Rectangle, f32)>); // Область просмотра и сдвиг содержимого.
+
+impl Operation for HistoryViewport {
+    /// Доходит до прокручиваемого списка истории.
+    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+        visit(self);
+    }
+
+    /// Сохраняет размеры области и фактический сдвиг после команды Iced.
+    fn scrollable(
+        &mut self,
+        _: Option<&Id>,
+        bounds: Rectangle,
+        _: Rectangle,
+        translation: iced::Vector,
+        _: &mut dyn iced::advanced::widget::operation::Scrollable,
+    ) {
+        self.0 = Some((bounds, translation.y));
+    }
 }
 
 /// Проверяет повтор загрузки каталога и фоновое уведомление через локальный HTTPS и WebSocket.
