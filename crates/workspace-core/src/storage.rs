@@ -443,6 +443,20 @@ impl Storage {
         } else {
             false
         };
+        // Подтверждение очереди фиксируется вместе с сообщением и позицией события.
+        if source == crate::messenger::SOURCE_ID
+            && let (Some(message), Some(placement), Some(metadata)) =
+                (change.message, change.placement, change.metadata)
+        {
+            outbox::confirm(
+                &transaction,
+                owner,
+                &message.id,
+                &placement.stream_id,
+                &placement.topic_id,
+                metadata.author_id,
+            )?;
+        }
         // Цель уведомления доступна вместе с новым сообщением и его курсором.
         if message_inserted
             && let (Some(message), Some(conversation_id)) =
@@ -865,6 +879,294 @@ mod tests {
             reopened.claim_first_send(&b, canonical_id).unwrap(),
             Some(other)
         );
+    }
+
+    /// Проверяет оба порядка подтверждения, несовпадения и откат транзакции события.
+    #[test]
+    fn outbox_confirmation_is_atomic_and_preserves_newer_history() {
+        use uuid::Uuid;
+        let storage = Storage::in_memory().unwrap();
+        let mut owner = owner();
+        let author = Uuid::from_u128(10);
+        owner.user_id = author.to_string();
+        let entry = PreparedSend {
+            canonical_id: Uuid::from_u128(1),
+            public_id: Uuid::from_u128(2),
+            stream_id: Uuid::from_u128(3),
+            topic_id: Uuid::from_u128(4),
+            markdown: "sent".into(),
+        };
+        let response = HistoryMessage {
+            id: entry.public_id,
+            stream_id: entry.stream_id,
+            topic_id: entry.topic_id,
+            text: "sent".into(),
+            metadata: HistoryMetadata {
+                author_id: Some(author),
+                created_at: HistoryTime::parse("2026-01-01T00:00:00Z").unwrap(),
+                updated_at: None,
+            },
+        };
+        let address = MessagePlacement {
+            stream_id: entry.stream_id.to_string(),
+            topic_id: entry.topic_id.to_string(),
+        };
+        let sent = message(&entry.public_id.to_string(), "sent");
+        let create = |version| {
+            storage.apply(
+                &owner,
+                SOURCE,
+                &cursor("epoch", version),
+                EventWrite {
+                    message: Some(&sent),
+                    placement: Some(&address),
+                    metadata: Some(&response.metadata),
+                    ..Default::default()
+                },
+            )
+        };
+        assert!(storage.save_prepared_send(&owner, &entry).unwrap());
+        storage
+            .claim_first_send(&owner, entry.canonical_id)
+            .unwrap()
+            .unwrap();
+        let other_owner = OwnerContext {
+            project_id: "other".into(),
+            ..owner.clone()
+        };
+        assert!(!storage.confirm_http_send(&other_owner, &response).unwrap());
+        let mut wrong = response.clone();
+        wrong.id = Uuid::from_u128(19);
+        assert!(!storage.confirm_http_send(&owner, &wrong).unwrap());
+        wrong = response.clone();
+        wrong.stream_id = Uuid::from_u128(18);
+        assert!(!storage.confirm_http_send(&owner, &wrong).unwrap());
+        wrong = response.clone();
+        wrong.topic_id = Uuid::from_u128(20);
+        assert!(!storage.confirm_http_send(&owner, &wrong).unwrap());
+        wrong = response.clone();
+        wrong.metadata.author_id = Some(Uuid::from_u128(21));
+        assert!(!storage.confirm_http_send(&owner, &wrong).unwrap());
+        assert!(storage.confirm_http_send(&owner, &response).unwrap());
+        assert!(storage.cursor(&owner, SOURCE).unwrap().is_none());
+        assert!(storage.claimed_sends(&owner).unwrap().is_empty());
+        create(1).unwrap();
+        assert_eq!(
+            storage.message(&owner, &sent.id).unwrap(),
+            Some(sent.clone())
+        );
+        assert!(!storage.confirm_http_send(&owner, &response).unwrap());
+
+        // Новая запись с тем же публичным UUID позволяет проверить событие первым и откат.
+        let next = PreparedSend {
+            canonical_id: Uuid::from_u128(11),
+            ..entry.clone()
+        };
+        storage.save_prepared_send(&owner, &next).unwrap();
+        storage
+            .claim_first_send(&owner, next.canonical_id)
+            .unwrap()
+            .unwrap();
+        storage
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_confirmation_cursor BEFORE UPDATE ON sync_cursors
+             BEGIN SELECT RAISE(ABORT, 'test cursor failure'); END",
+            )
+            .unwrap();
+        assert!(create(2).is_err());
+        assert_eq!(storage.claimed_sends(&owner).unwrap(), vec![next.clone()]);
+        assert_eq!(
+            storage.cursor(&owner, SOURCE).unwrap(),
+            Some(cursor("epoch", 1))
+        );
+        storage
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_confirmation_cursor")
+            .unwrap();
+        create(2).unwrap();
+        assert!(storage.claimed_sends(&owner).unwrap().is_empty());
+        let edited = HistoryChange::Edit {
+            message: message(&sent.id, "edited"),
+            placement: Some(address.clone()),
+        };
+        storage
+            .apply(
+                &owner,
+                SOURCE,
+                &cursor("epoch", 3),
+                EventWrite {
+                    history: Some(&edited),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!storage.confirm_http_send(&owner, &response).unwrap());
+        assert_eq!(
+            storage.message(&owner, &sent.id).unwrap().unwrap().text,
+            "edited"
+        );
+        let removed = HistoryChange::RemoveMessage(sent.id.clone());
+        storage
+            .apply(
+                &owner,
+                SOURCE,
+                &cursor("epoch", 4),
+                EventWrite {
+                    history: Some(&removed),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!storage.confirm_http_send(&owner, &response).unwrap());
+        assert_eq!(storage.message(&owner, &sent.id).unwrap(), None);
+    }
+
+    /// Проверяет событие первым и запоздавший HTTP-ответ после правки и удаления.
+    #[test]
+    fn event_first_and_late_http_do_not_restore_old_messages() {
+        use uuid::Uuid;
+        let storage = Storage::in_memory().unwrap();
+        let mut owner = owner();
+        let author = Uuid::from_u128(10);
+        owner.user_id = author.to_string();
+        let entry = PreparedSend {
+            canonical_id: Uuid::from_u128(1),
+            public_id: Uuid::from_u128(2),
+            stream_id: Uuid::from_u128(3),
+            topic_id: Uuid::from_u128(4),
+            markdown: "sent".into(),
+        };
+        let response = HistoryMessage {
+            id: entry.public_id,
+            stream_id: entry.stream_id,
+            topic_id: entry.topic_id,
+            text: "sent".into(),
+            metadata: HistoryMetadata {
+                author_id: Some(author),
+                created_at: HistoryTime::parse("2026-01-01T00:00:00Z").unwrap(),
+                updated_at: None,
+            },
+        };
+        let address = MessagePlacement {
+            stream_id: entry.stream_id.to_string(),
+            topic_id: entry.topic_id.to_string(),
+        };
+        let sent = message(&entry.public_id.to_string(), "sent");
+        storage.save_prepared_send(&owner, &entry).unwrap();
+        storage
+            .claim_first_send(&owner, entry.canonical_id)
+            .unwrap()
+            .unwrap();
+        storage
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_first_cursor BEFORE INSERT ON sync_cursors
+             BEGIN SELECT RAISE(ABORT, 'test cursor failure'); END",
+            )
+            .unwrap();
+        assert!(
+            storage
+                .apply(
+                    &owner,
+                    SOURCE,
+                    &cursor("epoch", 1),
+                    EventWrite {
+                        message: Some(&sent),
+                        placement: Some(&address),
+                        metadata: Some(&response.metadata),
+                        ..Default::default()
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(storage.message(&owner, &sent.id).unwrap(), None);
+        assert_eq!(storage.claimed_sends(&owner).unwrap(), vec![entry.clone()]);
+        assert_eq!(storage.cursor(&owner, SOURCE).unwrap(), None);
+        storage
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_first_cursor")
+            .unwrap();
+        storage
+            .apply(
+                &owner,
+                SOURCE,
+                &cursor("epoch", 1),
+                EventWrite {
+                    message: Some(&sent),
+                    placement: Some(&address),
+                    metadata: Some(&response.metadata),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(storage.claimed_sends(&owner).unwrap().is_empty());
+        assert!(!storage.confirm_http_send(&owner, &response).unwrap());
+        assert_eq!(
+            storage.message(&owner, &sent.id).unwrap(),
+            Some(sent.clone())
+        );
+
+        let edit = HistoryChange::Edit {
+            message: message(&sent.id, "edited"),
+            placement: Some(address),
+        };
+        storage
+            .apply(
+                &owner,
+                SOURCE,
+                &cursor("epoch", 2),
+                EventWrite {
+                    history: Some(&edit),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let again = PreparedSend {
+            canonical_id: Uuid::from_u128(11),
+            ..entry.clone()
+        };
+        storage.save_prepared_send(&owner, &again).unwrap();
+        storage
+            .claim_first_send(&owner, again.canonical_id)
+            .unwrap()
+            .unwrap();
+        assert!(storage.confirm_http_send(&owner, &response).unwrap());
+        assert_eq!(
+            storage.message(&owner, &sent.id).unwrap().unwrap().text,
+            "edited"
+        );
+        let remove = HistoryChange::RemoveMessage(sent.id.clone());
+        storage
+            .apply(
+                &owner,
+                SOURCE,
+                &cursor("epoch", 3),
+                EventWrite {
+                    history: Some(&remove),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let third = PreparedSend {
+            canonical_id: Uuid::from_u128(12),
+            ..entry
+        };
+        storage.save_prepared_send(&owner, &third).unwrap();
+        storage
+            .claim_first_send(&owner, third.canonical_id)
+            .unwrap()
+            .unwrap();
+        assert!(storage.confirm_http_send(&owner, &response).unwrap());
+        assert_eq!(storage.message(&owner, &sent.id).unwrap(), None);
     }
 
     /// Проверяет, что повтор или смена журнала не повреждают сообщения и позицию.

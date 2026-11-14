@@ -907,6 +907,15 @@ pub(super) fn before_change(
     Ok(true)
 }
 
+/// Проверяет, менялось ли сообщение после начала отправки или уже сохранялось в истории.
+pub(super) fn has_message_revision(
+    connection: &Connection,
+    owner: &OwnerContext,
+    id: &str,
+) -> Result<bool, StorageError> {
+    Ok(message_revision(connection, owner, id)?.revision != 0)
+}
+
 /// Проверяет отметку удаления перед повторным созданием того же публичного UUID.
 pub(super) fn can_create(
     connection: &Connection,

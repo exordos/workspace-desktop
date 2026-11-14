@@ -3,7 +3,7 @@
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use uuid::Uuid;
 
-use super::{Storage, StorageError};
+use super::{HistoryMessage, Message, MessagePlacement, Storage, StorageError, history};
 use crate::context::OwnerContext;
 
 /// Неизменный снимок подготовленного текстового сообщения.
@@ -62,7 +62,91 @@ fn read_prepared_send(row: &Row<'_>) -> rusqlite::Result<PreparedSend> {
     })
 }
 
+/// Закрывает только закреплённую отправку, совпавшую с автором и исходным адресом.
+pub(super) fn confirm(
+    connection: &Connection,
+    owner: &OwnerContext,
+    id: &str,
+    stream: &str,
+    topic: &str,
+    author: Option<Uuid>,
+) -> Result<bool, StorageError> {
+    if author.map(|id| id.to_string()).as_deref() != Some(owner.user_id.as_str()) {
+        return Ok(false);
+    }
+    let (Ok(id), Ok(stream), Ok(topic)) = (
+        id.parse::<Uuid>(),
+        stream.parse::<Uuid>(),
+        topic.parse::<Uuid>(),
+    ) else {
+        return Ok(false);
+    };
+    Ok(connection.execute(
+        "DELETE FROM messenger_outbox WHERE account_id = ?1 AND server = ?2
+         AND organization_id = ?3 AND project_id = ?4 AND user_id = ?5
+         AND public_id = ?6 AND stream_id = ?7 AND topic_id = ?8 AND first_attempt_claimed = 1",
+        params![
+            owner.account_id.0,
+            owner.server,
+            owner.organization_id,
+            owner.project_id,
+            owner.user_id,
+            id.as_bytes(),
+            stream.as_bytes(),
+            topic.as_bytes()
+        ],
+    )? != 0)
+}
+
 impl Storage {
+    /// Сохраняет подтверждение HTTP и закрывает подходящую запись одной транзакцией.
+    pub(crate) fn confirm_http_send(
+        &self,
+        owner: &OwnerContext,
+        message: &HistoryMessage,
+    ) -> Result<bool, StorageError> {
+        let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = message.id.to_string();
+        let stream = message.stream_id.to_string();
+        let topic = message.topic_id.to_string();
+        let confirmed = confirm(
+            &transaction,
+            owner,
+            &id,
+            &stream,
+            &topic,
+            message.metadata.author_id,
+        )?;
+        if confirmed && !history::has_message_revision(&transaction, owner, &id)? {
+            let inserted = transaction.execute(
+                "INSERT OR IGNORE INTO sync_messages (account_id, server, organization_id, project_id, user_id,
+                 message_id, text, stream_id, topic_id, author_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id,
+                    id, message.text, stream, topic, message.metadata.author_id.map(|id| id.to_string()),
+                    message.metadata.created_at.as_str(), message.metadata.updated_at.as_ref().map(|time| time.as_str())],
+            )? != 0;
+            if inserted {
+                history::record_creation(
+                    &transaction,
+                    owner,
+                    &Message {
+                        id,
+                        text: message.text.clone(),
+                    },
+                    Some(&MessagePlacement {
+                        stream_id: stream,
+                        topic_id: topic,
+                    }),
+                    Some(&message.metadata),
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(confirmed)
+    }
+
     /// Сохраняет подготовленный текст. Возвращает false, если такой ключ уже занят.
     pub fn save_prepared_send(
         &self,

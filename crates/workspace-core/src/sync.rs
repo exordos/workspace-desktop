@@ -235,6 +235,18 @@ impl Sync {
         })?
     }
 
+    /// Принимает ответ отправки только для действующего входа, не изменяя курсор событий.
+    pub fn confirm_http_send(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        message: &HistoryMessage,
+    ) -> Result<bool, SyncError> {
+        self.auth.with_active_generation(owner, generation, || {
+            Ok(self.storage.confirm_http_send(owner, message)?)
+        })?
+    }
+
     /// Подписывает оболочку на изменения. После пропуска событий счётчик можно перечитать.
     pub fn subscribe(&self) -> broadcast::Receiver<SyncUpdate> {
         self.updates.subscribe()
