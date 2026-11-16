@@ -11,6 +11,7 @@ use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{Column, column, container, operation, row, scrollable, text};
 use iced::{Alignment, Element, Event, Fill, Subscription, Task, Theme, event, window};
 use tokio::sync::{broadcast, oneshot};
+use unicode_segmentation::UnicodeSegmentation;
 use workspace_core::auth::{Auth, SessionSnapshot, SessionStatus};
 use workspace_core::bootstrap::{ChatCatalog, ChatListStatus, ChatLists};
 use workspace_core::context::{AccountId, OwnerContext, SessionGeneration};
@@ -21,8 +22,8 @@ use workspace_core::sync::{Sync, SyncChange, SyncUpdate};
 
 use crate::platform::notifications::{NotificationClick, NotificationError, Notifications};
 use crate::ui_kit::{
-    BadgeSize, BadgeTone, ButtonVariant, IconName, IconTone, ThemeMode, button, icon,
-    unread_count_badge, workspace_theme,
+    AvatarContent, AvatarSize, BadgeSize, BadgeTone, ButtonVariant, ChatRowOptions, ThemeMode,
+    avatar, button, chat_row, unread_count_badge, workspace_theme,
 };
 
 mod history;
@@ -527,19 +528,23 @@ impl Shell {
                 list = list.push(text("У вас пока нет чатов"));
             }
             for chat in chats {
-                let symbol = if chat.direct {
-                    IconName::Profile
-                } else {
-                    IconName::ChatBubbleOutline
-                };
-                list = list.push(
-                    row![
-                        icon(symbol, 20, IconTone::Inherit, None),
-                        text(&chat.name).width(Fill),
-                    ]
-                    .spacing(10)
-                    .align_y(Alignment::Center),
-                );
+                // Оставляем составную букву или эмодзи целиком.
+                let avatar_content = chat
+                    .name
+                    .trim_start()
+                    .graphemes(true)
+                    .next()
+                    .map_or(AvatarContent::Placeholder, AvatarContent::Initials);
+                list = list.push(chat_row(ChatRowOptions {
+                    avatar: avatar(AvatarSize::Medium, avatar_content, None),
+                    title: &chat.name,
+                    preview: None,
+                    time: None,
+                    unread: None,
+                    mention: false,
+                    selected: false,
+                    on_press: None,
+                }));
                 for topic in &chat.topics {
                     list = list.push(
                         container(text(format!("# {}", topic.name)).width(Fill)).padding([0, 30]),

@@ -1,6 +1,6 @@
 # Каталог функций Workspace Desktop
 
-[План проекта](../workspace-desktop.md) · [Приоритеты первого этапа](../workspace-desktop.md#первый-этап) · [Архитектура Rust + Iced](../workspace-desktop-architecture.md)
+[Дорожная карта](../workspace-desktop-roadmap.md) · [План проекта](../workspace-desktop.md) · [Приоритеты первого этапа](../workspace-desktop.md#первый-этап) · [Архитектура Rust + Iced](../workspace-desktop-architecture.md)
 
 ## Дерево модулей
 

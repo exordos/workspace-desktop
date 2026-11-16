@@ -448,6 +448,8 @@ async fn background_message_scenario(workspace: &impl TestWorkspace, check_catal
         let other = RenderedText::from_shell(&shell, &mut renderer);
         assert!(other.contains("Канал B"));
         assert!(other.contains("Алиса"));
+        assert!(other.contains("К"));
+        assert!(other.contains("А"));
         assert!(!other.contains("Повторить"));
         let _ = shell.update(Message::Select(foreground.account_id.clone()));
         let mut ui = UserInterface::build(
@@ -633,11 +635,16 @@ async fn refresh_open_history_scenario(shell: &mut Shell, renderer: &mut iced::R
     assert!(into_stream(shell.update(Message::Synced(wrong_owner))).is_none());
     assert!(!RenderedText::from_shell(shell, renderer).contains("Внутри участка"));
     assert!(into_stream(shell.update(Message::Synced(update.clone()))).is_none());
+    let HistoryState::Ready(window) = &shell.visible_history().unwrap().state else {
+        panic!("после входящего сообщения история должна остаться открытой");
+    };
     let rendered = RenderedText::from_shell(shell, renderer);
+    // Берём порядок из разметки. Окно истории нужно только для отбора текста сообщений.
     let labels = rendered
         .0
         .iter()
         .map(|(_, value)| value.as_str())
+        .filter(|label| window.messages.iter().any(|message| message.text == *label))
         .collect::<Vec<_>>();
     let row = labels
         .iter()

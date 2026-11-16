@@ -35,7 +35,7 @@ pub struct HistoryTime(String); // Строка UTC с фиксированно�
 
 impl HistoryTime {
     /// Возвращает нормализованное представление для записи в SQLite.
-    pub(super) fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         &self.0
     }
 

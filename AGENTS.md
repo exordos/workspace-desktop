@@ -3,10 +3,15 @@
 - `crates/workspace-core` содержит контекст Workspace, авторизацию и тесты жизненного цикла сессии.
 - `crates/workspace-desktop` подключает системные адаптеры и содержит UI-компоненты Iced.
 - [Архитектура](docs/plans/workspace-desktop-architecture.md) и [контракт авторизации](docs/plans/modules/auth.md) описывают границы модулей.
+- [Дорожная карта](docs/plans/workspace-desktop-roadmap.md) ведёт от текущего блока к сценариям, контрактам и карточкам задач.
 
 ## Разработка фич
 
-При проектировании или реализации фичи, которая затрагивает и `workspace-core`, и `workspace-desktop`, используй [Workspace Desktop Feature](skills/workspace-desktop-feature/SKILL.md).
+При проектировании или реализации любой фичи используй [Workspace Desktop Feature](skills/workspace-desktop-feature/SKILL.md), даже если задача затрагивает только `workspace-core` или только `workspace-desktop`. До правок найди владельца поведения и проверь, что можно переиспользовать.
+
+## Ревью
+
+При ревью изменений или отдельного этапа используй [Workspace Desktop Review](skills/workspace-desktop-review/SKILL.md). Если делегируешь ревью, передай субагенту путь к этому скиллу, задачу, критерии этапа и точный diff.
 
 ## Запуск приложения
 
@@ -29,6 +34,16 @@
 ## Автотесты
 
 При изменении поведения, исправлении бага или работе с автотестами используй [Workspace Desktop Testing](skills/workspace-desktop-testing/SKILL.md).
+
+### Тестовые аккаунты
+
+Для ручных проверок на тестовом стенде бери данные из `.env.test.local` в корне основного checkout репозитория. Git игнорирует этот файл, поэтому в отдельном worktree его может не быть.
+
+- `WORKSPACE_TEST_URL` — базовый HTTPS-адрес организации.
+- `WORKSPACE_TEST_LOGIN_A` и `WORKSPACE_TEST_PASSWORD_A` — логин и пароль первого аккаунта.
+- `WORKSPACE_TEST_LOGIN_B` и `WORKSPACE_TEST_PASSWORD_B` — логин и пароль второго аккаунта.
+
+Если тест читает переменные окружения, загрузи их в той же оболочке: `set -a; . ./.env.test.local; set +a` (из корня основного checkout). Не выводи значения паролей в логи и отчёты.
 
 ## Проверки из корня workspace
 

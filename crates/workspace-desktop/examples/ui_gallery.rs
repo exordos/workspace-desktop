@@ -7,14 +7,14 @@ use iced::widget::{Column, column, container, operation, row, scrollable, text};
 use iced::{Element, Event, Fill, Subscription, Task, Theme, event};
 use workspace_desktop::ui_kit::{
     AvatarContent, AvatarDecoration, AvatarPhoto, AvatarSize, BadgeSize, BadgeTone,
-    ButtonAppearance, ButtonOptions, ButtonSize, ButtonVariant, FieldSize, IconName, IconTone,
-    IconVariant, InputSelectorOptions, ListboxOption, MessageComposerOptions, MessageDelivery,
-    MessageDirection, PanelMenuRowOptions, PresenceSize, PresenceStatus, SelectionSize, ThemeMode,
-    avatar, avatar_group, button, button_with, form_field, icon, input_selector, listbox,
-    member_row, member_row_content, mention_badge, message_bubble, message_composer,
-    panel_menu_row, presence_indicator, search_input, select, selectable_row, selection_checkbox,
-    selection_indicator, switch, text_input, text_input_with_error, unread_count_badge,
-    workspace_theme,
+    ButtonAppearance, ButtonOptions, ButtonSize, ButtonVariant, ChatRowOptions, ChatRowPreview,
+    FieldSize, IconName, IconTone, IconVariant, InputSelectorOptions, ListboxOption,
+    MessageComposerOptions, MessageDelivery, MessageDirection, PanelMenuRowOptions, PresenceSize,
+    PresenceStatus, SelectionSize, ThemeMode, avatar, avatar_group, button, button_with, chat_row,
+    day_divider, form_field, icon, input_selector, listbox, member_row, member_row_content,
+    mention_badge, message_bubble, message_composer, panel_menu_row, presence_indicator,
+    search_input, select, selectable_row, selection_checkbox, selection_indicator, switch,
+    text_input, text_input_with_error, unread_count_badge, workspace_theme,
 };
 
 const FIELD_EXAMPLES: [(FieldSize, &str); 2] = [
@@ -57,7 +57,7 @@ enum GalleryTab {
     Icons,      // Каталог иконок.
     Indicators, // Выбор, переключатели, статусы присутствия и бейджи.
     Fields,     // Поля формы и поиск.
-    Rows,       // Аватары, карточки и строки действий.
+    Rows,       // Строки чатов, аватары, карточки и строки действий.
     Selectors,  // Выбор из списка и ввод с подсказками.
     Messages,   // Сообщения и редактор.
 }
@@ -77,6 +77,7 @@ struct Gallery {
     switch_on: bool,                   // Включён ли демонстрационный переключатель.
     avatar_photo: AvatarPhoto,         // Искусственное изображение для проверки обрезки аватара.
     member_selected: bool,             // Отмечен ли участник в примере выбора.
+    selected_chat: usize,              // Индекс выбранного чата в примере.
     last_panel_action: Option<&'static str>, // Подпись последнего действия панели.
     selectors: [SelectorExample; 2],   // Значения примеров для обоих размеров.
     selector_options: Vec<ListboxOption>, // Подсказки для выбора часового пояса.
@@ -105,6 +106,7 @@ impl Default for Gallery {
             switch_on: true,
             avatar_photo: example_avatar_photo(),
             member_selected: false,
+            selected_chat: 0,
             last_panel_action: None,
             selectors: std::array::from_fn(|_| SelectorExample {
                 selected: Some("Europe/Moscow".to_owned()),
@@ -150,6 +152,7 @@ enum Message {
     SelectionChanged(bool),                // Чекбокс передал новую отметку.
     SwitchChanged(bool),                   // Переключатель передал новое положение.
     MemberSelectionChanged(bool),          // Новая отметка в строке выбора участника.
+    ChatSelected(usize),                   // Индекс выбранного чата в примере.
     PanelActionPressed(&'static str),      // Подпись нажатой строки действия.
     SelectorChanged(usize, String),        // Индекс и значение выбранной опции.
     SuggestionInputChanged(usize, String), // Индекс и свободный текст поля.
@@ -173,6 +176,7 @@ impl Gallery {
             Message::SelectionChanged(selected) => self.selected = selected,
             Message::SwitchChanged(on) => self.switch_on = on,
             Message::MemberSelectionChanged(selected) => self.member_selected = selected,
+            Message::ChatSelected(index) => self.selected_chat = index,
             Message::PanelActionPressed(action) => self.last_panel_action = Some(action),
             Message::SelectorChanged(index, value) => self.selectors[index].selected = Some(value),
             Message::SuggestionInputChanged(index, value) => self.selectors[index].value = value,
@@ -511,7 +515,7 @@ impl Gallery {
         .into()
     }
 
-    /// Показывает аватары разных размеров, выбираемые строки и действия панели.
+    /// Показывает строки чатов, аватары разных размеров, выбираемые строки и действия панели.
     fn rows(&self) -> Element<'_, Message> {
         use AvatarContent::{Initials, Photo, Placeholder};
         use AvatarDecoration::{Presence, Selection};
@@ -634,6 +638,7 @@ impl Gallery {
         .max_width(340);
 
         column![
+            self.chat_rows(),
             text("Аватары").size(20),
             avatars,
             row![
@@ -650,6 +655,58 @@ impl Gallery {
         .spacing(18)
         .width(Fill)
         .max_width(760)
+        .into()
+    }
+
+    /// Показывает две выбираемые строки с метаданными и строку с данными каталога.
+    fn chat_rows(&self) -> Element<'_, Message> {
+        column![
+            text("Список чатов").size(20),
+            chat_row(ChatRowOptions {
+                avatar: avatar(
+                    AvatarSize::Medium,
+                    AvatarContent::Photo(self.avatar_photo.clone()),
+                    Some(AvatarDecoration::Presence(PresenceStatus::Online)),
+                ),
+                title: "Вера Новикова",
+                preview: Some(ChatRowPreview {
+                    sender: None,
+                    text: "Созвонимся через пять минут?",
+                }),
+                time: Some("14:25"),
+                unread: Some((3, BadgeTone::Unread)),
+                mention: false,
+                selected: self.selected_chat == 0,
+                on_press: Some(Message::ChatSelected(0)),
+            }),
+            chat_row(ChatRowOptions {
+                avatar: avatar(AvatarSize::Medium, AvatarContent::Initials("Д"), None),
+                title: "Дизайн 🎨 и разработка интерфейсов рабочего пространства",
+                preview: Some(ChatRowPreview {
+                    sender: Some("Аня"),
+                    text: "Проверила 👩🏻‍💻 новый список чатов и оставила комментарии",
+                }),
+                time: Some("12:08"),
+                unread: Some((42, BadgeTone::Muted)),
+                mention: true,
+                selected: self.selected_chat == 1,
+                on_press: Some(Message::ChatSelected(1)),
+            }),
+            chat_row(ChatRowOptions {
+                avatar: avatar(AvatarSize::Medium, AvatarContent::Initials("П"), None),
+                title: "Поддержка",
+                preview: None,
+                time: None,
+                unread: None,
+                mention: false,
+                selected: false,
+                on_press: None,
+            }),
+        ]
+        .spacing(6)
+        .width(Fill)
+        // У стандартной панели в workspace_ui ширина 299 px.
+        .max_width(299)
         .into()
     }
 
@@ -842,6 +899,7 @@ impl Gallery {
             .align_y(iced::Center)
             .wrap(),
             composer,
+            day_divider("16.11.2026".to_owned()),
             bubbles,
         ]
         .spacing(16)

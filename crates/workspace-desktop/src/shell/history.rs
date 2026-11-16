@@ -3,6 +3,7 @@
 use super::{
     Message, NotificationTarget, OpenHistoryError, SessionGeneration, history_input::HistoryInput,
 };
+use chrono::{DateTime, Local, NaiveDate, TimeZone};
 use iced::advanced::widget::{Id, Operation, operation::Outcome};
 use iced::widget::{column, container, scrollable, text};
 use iced::{Element, Fill, Rectangle, Task};
@@ -39,14 +40,7 @@ impl HistoryScreen {
             })
             .into(),
             HistoryState::Ready(window) => {
-                let mut messages = column![].spacing(8);
-                for message in &window.messages {
-                    let row = container(text(&message.text))
-                        .padding(8)
-                        .width(Fill)
-                        .id(row_id(revision, message.id));
-                    messages = messages.push(row);
-                }
+                let messages = history_messages(window, revision, &Local);
                 let list = scrollable(messages)
                     .id(list_id(revision))
                     .height(Fill)
@@ -61,6 +55,145 @@ impl HistoryScreen {
             }
         };
         column![heading, body].spacing(8).height(Fill).into()
+    }
+}
+
+/// Собирает строки и подписи дней, не меняя идентификаторы сообщений.
+fn history_messages<'a, T: TimeZone>(
+    window: &'a HistoryWindow,
+    revision: u64,
+    zone: &T,
+) -> Element<'a, Message> {
+    let mut messages = column![].spacing(8);
+    let mut previous_day = None;
+    for message in &window.messages {
+        let day = local_day(&message.metadata.created_at, zone);
+        if day != previous_day {
+            if let Some(day) = day {
+                messages = messages.push(crate::ui_kit::day_divider(
+                    day.format("%d.%m.%Y").to_string(),
+                ));
+            }
+            previous_day = day;
+        }
+        messages = messages.push(
+            container(text(&message.text))
+                .padding(8)
+                .width(Fill)
+                .id(row_id(revision, message.id)),
+        );
+    }
+    messages.into()
+}
+
+/// Определяет календарный день сообщения в часовом поясе читателя.
+fn local_day<T: TimeZone>(
+    time: &workspace_core::storage::HistoryTime,
+    zone: &T,
+) -> Option<NaiveDate> {
+    DateTime::parse_from_rfc3339(time.as_str())
+        .ok()
+        .map(|value| value.with_timezone(zone).date_naive())
+}
+
+#[cfg(test)]
+mod day_tests {
+    use super::*;
+    use chrono::FixedOffset;
+    use iced::advanced::widget::Operation;
+    use iced::{Font, Pixels, Size};
+    use iced_runtime::user_interface::{Cache, UserInterface};
+    use workspace_core::storage::HistoryTime;
+    use workspace_core::storage::{
+        HistoryEdge, HistoryMessage, HistoryMetadata, HistoryScope, HistoryWindow,
+    };
+
+    /// Граница дня определяется часовым поясом, а не датой UTC.
+    #[test]
+    fn groups_by_local_calendar_day() {
+        let zone = FixedOffset::east_opt(3 * 3600).unwrap();
+        let day = |value| local_day(&HistoryTime::parse(value).unwrap(), &zone).unwrap();
+        assert_eq!(day("2026-01-01T22:00:00Z"), day("2026-01-02T01:00:00Z"));
+        assert_ne!(day("2026-01-01T20:00:00Z"), day("2026-01-01T22:00:00Z"));
+    }
+
+    /// Проверяет подписи, порядок и идентификатор строки в разметке Iced.
+    #[test]
+    fn renders_dividers_and_keeps_message_anchor() {
+        let zone = FixedOffset::east_opt(3 * 3600).unwrap();
+        let stream = uuid::Uuid::from_u128(1);
+        let mut window = HistoryWindow {
+            id: 1,
+            scope: HistoryScope {
+                stream_id: stream,
+                topic_id: None,
+            },
+            messages: Vec::new(),
+            older: HistoryEdge::End,
+            newer: HistoryEdge::End,
+            needs_refresh: false,
+        };
+        let mut renderer = iced::Renderer::new(Font::DEFAULT, Pixels(16.0));
+        assert!(render(&window, &zone, &mut renderer).0.is_empty());
+        for (id, timestamp, body) in [
+            (2, "2026-01-01T20:00:00Z", "Первое"),
+            (3, "2026-01-01T22:00:00Z", "Второе"),
+            (4, "2026-01-02T01:00:00Z", "Третье"),
+        ] {
+            window.messages.push(HistoryMessage {
+                id: uuid::Uuid::from_u128(id),
+                stream_id: stream,
+                topic_id: stream,
+                text: body.into(),
+                metadata: HistoryMetadata {
+                    author_id: None,
+                    created_at: HistoryTime::parse(timestamp).unwrap(),
+                    updated_at: None,
+                },
+            });
+        }
+        let (labels, anchored) = render(&window, &zone, &mut renderer);
+        assert_eq!(
+            labels,
+            ["01.01.2026", "Первое", "02.01.2026", "Второе", "Третье"]
+        );
+        assert!(anchored);
+    }
+
+    /// Читает реальные текстовые виджеты и наличие ID цели после разметки.
+    fn render(
+        window: &HistoryWindow,
+        zone: &FixedOffset,
+        renderer: &mut iced::Renderer,
+    ) -> (Vec<String>, bool) {
+        #[derive(Default)]
+        struct Observed {
+            labels: Vec<String>,
+            anchor: bool,
+        }
+        impl Operation for Observed {
+            /// Обходит дочерние виджеты списка.
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            /// Запоминает видимые подписи.
+            fn text(&mut self, _: Option<&Id>, _: Rectangle, value: &str) {
+                self.labels.push(value.into());
+            }
+            /// Проверяет ID второй строки.
+            fn container(&mut self, id: Option<&Id>, _: Rectangle) {
+                self.anchor |= id == Some(&row_id(7, uuid::Uuid::from_u128(3)));
+            }
+        }
+        let mut ui = UserInterface::build(
+            history_messages(window, 7, zone),
+            Size::new(620.0, 500.0),
+            Cache::new(),
+            renderer,
+        );
+        let mut observed = Observed::default();
+        ui.operate(renderer, &mut observed);
+        (observed.labels, observed.anchor)
     }
 }
 

@@ -4,6 +4,8 @@
 mod avatar;
 mod badge;
 mod button;
+mod chat_row;
+mod day_divider;
 mod field_size;
 mod form_field;
 mod icon;
@@ -25,6 +27,8 @@ mod theme;
 pub use avatar::{AvatarContent, AvatarDecoration, AvatarPhoto, AvatarSize, avatar, avatar_group};
 pub use badge::{BadgeSize, BadgeTone, mention_badge, unread_count_badge};
 pub use button::{ButtonAppearance, ButtonOptions, ButtonSize, ButtonVariant, button, button_with};
+pub use chat_row::{ChatRowOptions, ChatRowPreview, chat_row};
+pub use day_divider::day_divider;
 pub use field_size::FieldSize;
 pub use form_field::form_field;
 pub use icon::{IconName, IconTone, IconVariant, icon};
