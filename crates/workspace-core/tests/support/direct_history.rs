@@ -6,6 +6,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use futures::{SinkExt, StreamExt};
 use reqwest::Url;
 use rustls::{
     ServerConfig,
@@ -20,16 +21,21 @@ use tokio::{
     time::timeout,
 };
 use tokio_rustls::TlsAcceptor;
+use tokio_tungstenite::{
+    WebSocketStream,
+    tungstenite::{Message as Frame, handshake::derive_accept_key, protocol::Role},
+};
 use uuid::Uuid;
 use workspace_core::{
     auth::AuthError,
     messenger::{MessengerSource, history::OpenHistoryError},
     notification_target::NotificationTarget,
+    runtime::{EventSource, SourceSession},
     storage::{
         Cursor, HistoryEdge, HistoryPageEdges, HistoryPageOutcome, HistoryPageTarget, HistoryScope,
         Storage,
     },
-    sync::{Event, Sync},
+    sync::{Event, Sync, SyncChange},
 };
 
 use super::Fixture;
@@ -39,6 +45,9 @@ const TOPIC: Uuid = Uuid::from_u128(11);
 const OLDER: Uuid = Uuid::from_u128(12);
 const ANCHOR: Uuid = Uuid::from_u128(13);
 const NEWER: Uuid = Uuid::from_u128(14);
+const OTHER_TOPIC: Uuid = Uuid::from_u128(15);
+const LIVE: Uuid = Uuid::from_u128(16);
+const OUTSIDE: Uuid = Uuid::from_u128(17);
 const CA: &[u8] =
     include_bytes!("../../../workspace-desktop/src/shell/background_message/tls/ca.pem");
 const CERT: &[u8] =
@@ -61,6 +70,7 @@ struct HistoryApi {
     newer_mode: AtomicUsize,  // 0 — конец, 1 — сбой, 2 — задержка, 3 — продолжение темы.
     newer_pages: AtomicUsize, // Число запросов к новому краю.
     release: Notify,          // Можно вернуть задержанный ответ.
+    topic_realtime: AtomicUsize, // 1 — включить отдельный сценарий событий двух тем.
 }
 
 /// Формирует серверное сообщение с одинаковыми UUID для обоих аккаунтов.
@@ -92,6 +102,29 @@ async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
         }
         headers.push_str(&line);
     }
+    if api.topic_realtime.load(Relaxed) == 1 && request.path().ends_with("/events/ws") {
+        let key = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("sec-websocket-key")
+                    .then(|| value.trim())
+            })
+            .unwrap();
+        let accept = derive_accept_key(key.as_bytes());
+        socket.get_mut().write_all(format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: workspace.events.v1\r\n\r\n").as_bytes()).await.unwrap();
+        let mut socket =
+            WebSocketStream::from_raw_socket(socket.into_inner(), Role::Server, None).await;
+        for (version, id, created) in [
+            (9, LIVE, "2026-01-01T11:30:00Z"),
+            (9, LIVE, "2026-01-01T11:30:00Z"),
+            (10, OUTSIDE, "2026-01-01T13:00:00Z"),
+        ] {
+            let event = json!({"schema_version": 1, "uuid": format!("event-{version}"), "epoch_generation": "test", "epoch_version": version, "project_id": "project", "user_uuid": "first", "object_type": "message", "action": "created", "payload": {"kind": "message.created", "uuid": id, "stream_uuid": CHAT, "topic_uuid": TOPIC, "author_uuid": ANCHOR, "created_at": created, "payload": {"kind": "markdown", "content": "live"}}});
+            socket.send(Frame::text(event.to_string())).await.unwrap();
+        }
+        return;
+    }
     let user = if headers.contains("authorization: Bearer second") {
         "second"
     } else {
@@ -99,7 +132,11 @@ async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
         "first"
     };
     let mut marker = String::new();
-    let (status, body) = if request.path().ends_with(&format!("/streams/{CHAT}")) {
+    let (status, body) = if api.topic_realtime.load(Relaxed) == 1
+        && request.path().ends_with("/events/")
+    {
+        ("200 OK", json!([]))
+    } else if request.path().ends_with(&format!("/streams/{CHAT}")) {
         if api.deny.load(Relaxed) == 1 {
             ("404 Not Found", Value::Null)
         } else {
@@ -112,7 +149,12 @@ async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
                 }),
             )
         }
-    } else if request.path().ends_with(&format!("/stream_topics/{TOPIC}")) {
+    } else if request.path().ends_with(&format!("/stream_topics/{TOPIC}"))
+        || (api.topic_realtime.load(Relaxed) == 1
+            && request
+                .path()
+                .ends_with(&format!("/stream_topics/{OTHER_TOPIC}")))
+    {
         let mode = api.access_mode.load(Relaxed);
         if mode == 4 {
             api.delay.notify_one();
@@ -127,7 +169,7 @@ async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
             (
                 "200 OK",
                 json!({
-                    "uuid": if mode == 6 { ANCHOR } else { TOPIC },
+                    "uuid": if mode == 6 { ANCHOR } else if request.path().ends_with(&OTHER_TOPIC.to_string()) { OTHER_TOPIC } else { TOPIC },
                     "stream_uuid": if mode == 3 { ANCHOR } else { CHAT },
                     "user_uuid": if mode == 2 { "other" } else { user },
                     "project_id": "project", "notification_mode": "default"
@@ -234,7 +276,14 @@ async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
             let mut older = message(OLDER, user);
             older["created_at"] = json!("2026-01-01T11:00:00Z");
             if let Some(topic) = query.get("topic_uuid") {
-                assert_eq!(topic, &TOPIC.to_string());
+                if api.topic_realtime.load(Relaxed) == 1 && topic == &OTHER_TOPIC.to_string() {
+                    latest["topic_uuid"] = json!(OTHER_TOPIC);
+                    older["topic_uuid"] = json!(OTHER_TOPIC);
+                    latest["uuid"] = json!(Uuid::from_u128(18));
+                    older["uuid"] = json!(Uuid::from_u128(19));
+                } else {
+                    assert_eq!(topic, &TOPIC.to_string());
+                }
             }
             if !query.contains_key("topic_uuid") || api.latest_mode.load(Relaxed) == 4 {
                 marker = format!("X-Pagination-Marker: {OLDER}\r\n");
@@ -260,6 +309,168 @@ async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
         body.len()
     ).as_bytes()).await.unwrap();
     socket.get_mut().shutdown().await.unwrap();
+}
+
+/// Проверяет сетевые события темы и границы окон двух аккаунтов.
+#[tokio::test]
+async fn realtime_topic_windows_remain_isolated() {
+    timeout(Duration::from_secs(10), async {
+        let api = Arc::new(HistoryApi::default());
+        api.topic_realtime.store(1, Relaxed);
+        let (server, worker) = serve(api).await;
+        let fixture = Fixture::new(|_, _| unreachable!());
+        let first = fixture.login_at(&server, "first");
+        let second = fixture.login_at(&server, "second");
+        let generation = |owner: &_| {
+            fixture
+                .auth
+                .snapshot()
+                .into_iter()
+                .find(|session| &session.context == owner)
+                .unwrap()
+                .generation
+        };
+        let first_generation = generation(&first);
+        let second_generation = generation(&second);
+        let sync = Sync::new(
+            fixture.auth.clone(),
+            Arc::new(Storage::in_memory().unwrap()),
+        );
+        let source =
+            MessengerSource::with_private_ca(CertificateDer::from_pem_slice(CA).unwrap().as_ref())
+                .unwrap();
+        let scope = HistoryScope {
+            stream_id: CHAT,
+            topic_id: Some(TOPIC),
+        };
+        let neighbor = HistoryScope {
+            topic_id: Some(OTHER_TOPIC),
+            ..scope
+        };
+        let first_window = source
+            .open_latest_history(&sync, &first, first_generation, scope)
+            .await
+            .unwrap()
+            .refresh()
+            .await
+            .unwrap();
+        let neighbor_window = source
+            .open_latest_history(&sync, &first, first_generation, neighbor)
+            .await
+            .unwrap()
+            .refresh()
+            .await
+            .unwrap();
+        let second_window = source
+            .open_latest_history(&sync, &second, second_generation, scope)
+            .await
+            .unwrap()
+            .refresh()
+            .await
+            .unwrap();
+        let initial = Cursor {
+            epoch_generation: "test".into(),
+            epoch_version: 8,
+        };
+        sync.apply(
+            &first,
+            first_generation,
+            "messenger",
+            Event::Checkpoint(initial.clone()),
+        )
+        .unwrap();
+        let mut updates = sync.subscribe();
+        let mut events = source
+            .connect(SourceSession {
+                context: first.clone(),
+                generation: first_generation,
+                token_version: 1,
+                cursor: Some(initial),
+                access_token: "first".into(),
+            })
+            .await
+            .unwrap();
+        let inside = events.next().await.unwrap().unwrap();
+        assert_eq!(inside.cursor().epoch_version, 9);
+        sync.apply(&first, first_generation, "messenger", inside)
+            .unwrap();
+        assert_eq!(
+            updates.try_recv().unwrap().change,
+            SyncChange::HistoryMessageCreated {
+                scope,
+                message_id: LIVE
+            }
+        );
+        let updated = sync
+            .refresh_history_window(&first, first_generation, scope, first_window.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated
+                .messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            [OLDER, LIVE, NEWER]
+        );
+        assert_eq!(updated.scope, scope);
+        assert_eq!(
+            sync.cursor(&first, "messenger")
+                .unwrap()
+                .unwrap()
+                .epoch_version,
+            9
+        );
+        assert_eq!(
+            sync.refresh_history_window(&first, first_generation, neighbor, neighbor_window.id)
+                .unwrap(),
+            Some(neighbor_window.clone())
+        );
+        assert_eq!(
+            sync.refresh_history_window(&second, second_generation, scope, second_window.id)
+                .unwrap(),
+            Some(second_window.clone())
+        );
+        // Источник должен пропустить повтор версии 9 и вернуть следующее событие.
+        let outside = events.next().await.unwrap().unwrap();
+        assert_eq!(outside.cursor().epoch_version, 10);
+        assert!(updates.try_recv().is_err());
+        sync.apply(&first, first_generation, "messenger", outside)
+            .unwrap();
+        assert_eq!(
+            updates.try_recv().unwrap().change,
+            SyncChange::HistoryMessageCreated {
+                scope,
+                message_id: OUTSIDE
+            }
+        );
+        let after = sync
+            .refresh_history_window(&first, first_generation, scope, first_window.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.messages, updated.messages);
+        assert_eq!(after.newer, HistoryEdge::Unchecked);
+        assert_eq!(
+            sync.cursor(&first, "messenger")
+                .unwrap()
+                .unwrap()
+                .epoch_version,
+            10
+        );
+        assert_eq!(
+            sync.refresh_history_window(&first, first_generation, neighbor, neighbor_window.id)
+                .unwrap(),
+            Some(neighbor_window)
+        );
+        assert_eq!(
+            sync.refresh_history_window(&second, second_generation, scope, second_window.id)
+                .unwrap(),
+            Some(second_window)
+        );
+        worker.abort();
+    })
+    .await
+    .expect("сценарий событий темы не завершился вовремя");
 }
 
 /// Проверяет новый край, сетевой сбой и запоздалые ответы через локальный HTTPS.
