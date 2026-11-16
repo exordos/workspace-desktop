@@ -96,6 +96,8 @@ pub enum StorageError {
     Poisoned, // Доступ к соединению потерян после паники под блокировкой.
     #[error("invalid messenger history page")]
     InvalidHistoryPage, // Страница не подходит по области, направлению или формату.
+    #[error("the catalog changed while the request was in flight")]
+    StaleCatalog, // После начала запроса доступ к каналу изменился.
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error), // Исходная ошибка SQLite.
     #[error("the cached chat list has an invalid format")]
@@ -105,6 +107,7 @@ pub enum StorageError {
 /// Локальное хранилище сообщений, счётчиков и позиций чтения.
 pub struct Storage {
     connection: Mutex<Connection>, // Соединение с SQLite. Блокировка выдаёт его по одному запросу за раз.
+    catalog_changes: tokio::sync::watch::Sender<u64>, // Сигнал о зафиксированном отзыве доступа.
 }
 
 impl Storage {
@@ -114,21 +117,45 @@ impl Storage {
         owner: &OwnerContext,
     ) -> Result<Option<String>, StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
-        Ok(connection.query_row(
-            "SELECT snapshot FROM messenger_catalog
-             WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3 AND project_id = ?4 AND user_id = ?5",
-            params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id],
-            |row| row.get(0),
-        ).optional()?)
+        read_chat_catalog(&connection, owner)
     }
 
-    /// Целиком заменяет сохранённый список чатов указанного владельца.
+    /// Возвращает версию каталога перед началом сетевого запроса.
+    pub(crate) fn catalog_revision(&self, owner: &OwnerContext) -> Result<i64, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        read_catalog_revision(&connection, owner)
+    }
+
+    /// Даёт сигнал после каждого зафиксированного отзыва доступа.
+    pub(crate) fn catalog_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.catalog_changes.subscribe()
+    }
+
+    /// Читает все нужные снимки и публикует их до освобождения блокировки базы.
+    pub(crate) fn with_catalog_snapshots<T>(
+        &self,
+        owners: &[OwnerContext],
+        publish: impl FnOnce(Vec<Option<String>>) -> T,
+    ) -> Result<T, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let snapshots = owners
+            .iter()
+            .map(|owner| read_chat_catalog(&connection, owner))
+            .collect::<Result<_, _>>()?;
+        Ok(publish(snapshots))
+    }
+
+    /// Заменяет снимок, если после начала запроса доступ к каналам не менялся.
     pub(crate) fn save_chat_catalog(
         &self,
         owner: &OwnerContext,
         snapshot: &str,
+        revision: i64,
     ) -> Result<(), StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        if read_catalog_revision(&connection, owner)? != revision {
+            return Err(StorageError::StaleCatalog);
+        }
         connection.execute(
             "INSERT INTO messenger_catalog (account_id, server, organization_id, project_id, user_id, snapshot)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -196,6 +223,11 @@ impl Storage {
                 snapshot TEXT NOT NULL,
                 PRIMARY KEY (account_id, server, organization_id, project_id, user_id)
             );
+            CREATE TABLE IF NOT EXISTS messenger_catalog_revision (
+                account_id TEXT NOT NULL, server TEXT NOT NULL, organization_id TEXT NOT NULL,
+                project_id TEXT NOT NULL, user_id TEXT NOT NULL, revision INTEGER NOT NULL,
+                PRIMARY KEY (account_id, server, organization_id, project_id, user_id)
+            );
             CREATE TABLE IF NOT EXISTS messenger_unread (
                 account_id TEXT NOT NULL,
                 server TEXT NOT NULL,
@@ -226,6 +258,7 @@ impl Storage {
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
+            catalog_changes: tokio::sync::watch::channel(0).0,
         })
     }
 
@@ -406,6 +439,17 @@ impl Storage {
             apply_history(&transaction, owner, history)?;
         }
 
+        let revoked = if source == crate::messenger::SOURCE_ID {
+            if let Some(HistoryChange::RemoveStream(stream)) = change.history {
+                remove_catalog_stream(&transaction, owner, stream)?;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         let message_inserted = if let Some(message) = change.message
             && history::can_create(&transaction, owner, &message.id)?
         {
@@ -507,12 +551,97 @@ impl Storage {
             ],
         )?;
         transaction.commit()?;
+        if revoked {
+            self.catalog_changes
+                .send_modify(|version| *version = version.wrapping_add(1));
+        }
         Ok(AppliedEvent {
             outcome: ApplyOutcome::Applied,
             message_inserted,
             unread_changed,
         })
     }
+}
+
+/// Читает сохранённый каталог одного владельца внутри общей блокировки базы.
+fn read_chat_catalog(
+    connection: &Connection,
+    owner: &OwnerContext,
+) -> Result<Option<String>, StorageError> {
+    Ok(connection
+        .query_row(
+            "SELECT snapshot FROM messenger_catalog WHERE account_id = ?1 AND server = ?2
+         AND organization_id = ?3 AND project_id = ?4 AND user_id = ?5",
+            params![
+                owner.account_id.0,
+                owner.server,
+                owner.organization_id,
+                owner.project_id,
+                owner.user_id
+            ],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// Читает версию отзыва доступа; ноль означает отсутствие изменений.
+fn read_catalog_revision(
+    connection: &Connection,
+    owner: &OwnerContext,
+) -> Result<i64, StorageError> {
+    Ok(connection
+        .query_row(
+            "SELECT revision FROM messenger_catalog_revision WHERE account_id = ?1 AND server = ?2
+         AND organization_id = ?3 AND project_id = ?4 AND user_id = ?5",
+            params![
+                owner.account_id.0,
+                owner.server,
+                owner.organization_id,
+                owner.project_id,
+                owner.user_id
+            ],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
+
+/// Удаляет канал и увеличивает версию в той же транзакции, что и позиция журнала.
+fn remove_catalog_stream(
+    connection: &Connection,
+    owner: &OwnerContext,
+    stream: &str,
+) -> Result<(), StorageError> {
+    if let Some(snapshot) = read_chat_catalog(connection, owner)? {
+        let mut chats: Vec<crate::messenger::catalog::Chat> = serde_json::from_str(&snapshot)?;
+        chats.retain(|chat| chat.id.to_string() != stream);
+        let snapshot = serde_json::to_string(&chats)?;
+        connection.execute(
+            "UPDATE messenger_catalog SET snapshot = ?6 WHERE account_id = ?1 AND server = ?2
+             AND organization_id = ?3 AND project_id = ?4 AND user_id = ?5",
+            params![
+                owner.account_id.0,
+                owner.server,
+                owner.organization_id,
+                owner.project_id,
+                owner.user_id,
+                snapshot
+            ],
+        )?;
+    }
+    connection.execute(
+        "INSERT INTO messenger_catalog_revision VALUES (?1, ?2, ?3, ?4, ?5, 1)
+         ON CONFLICT (account_id, server, organization_id, project_id, user_id)
+         DO UPDATE SET revision = revision + 1",
+        params![
+            owner.account_id.0,
+            owner.server,
+            owner.organization_id,
+            owner.project_id,
+            owner.user_id
+        ],
+    )?;
+    Ok(())
 }
 
 /// Обновляет текст или удаляет затронутые строки и связанные цели уведомлений.

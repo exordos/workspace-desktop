@@ -1119,6 +1119,21 @@ mod tests {
         }
     }
 
+    /// Удаление привязки для оставшегося участника не означает отзыв канала.
+    #[test]
+    fn stream_binding_deletion_only_advances_cursor() {
+        let event = json!({
+            "schema_version": 1, "uuid": "event", "epoch_version": 1,
+            "project_id": "project", "user_uuid": "recipient",
+            "object_type": "stream_binding", "action": "deleted",
+            "payload": { "kind": "stream_binding.deleted", "project_id": "project", "user_uuid": "recipient", "uuid": "00000000-0000-0000-0000-000000000004" }
+        });
+        assert!(matches!(
+            wire_event(event, &owner(), "epoch").unwrap().0,
+            Event::Checkpoint(_)
+        ));
+    }
+
     /// Создаёт JSON события о новом сообщении для теста.
     fn message(version: u64) -> Value {
         json!({

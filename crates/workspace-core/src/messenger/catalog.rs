@@ -65,6 +65,30 @@ impl Catalog {
             .transpose()
     }
 
+    /// Подписывает загрузчик на изменения каталога после фиксации событий.
+    pub(crate) fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.storage.catalog_changes()
+    }
+
+    /// Передаёт снимки обработчику, пока отзыв доступа не может изменить базу.
+    pub(crate) fn with_snapshots<T>(
+        &self,
+        owners: &[OwnerContext],
+        publish: impl FnOnce(Vec<Option<Vec<Chat>>>) -> T,
+    ) -> Result<T, StorageError> {
+        self.storage.with_catalog_snapshots(owners, |snapshots| {
+            let parsed = snapshots
+                .into_iter()
+                .map(|snapshot| {
+                    snapshot
+                        .map(|value| serde_json::from_str::<Vec<Chat>>(&value))
+                        .transpose()
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(publish(parsed))
+        })?
+    }
+
     /// Обновляет каталог только для поколения, которое запросило загрузку.
     pub(crate) async fn refresh(
         &self,
@@ -72,13 +96,14 @@ impl Catalog {
         session: &SessionSnapshot,
     ) -> Result<Vec<Chat>, CatalogError> {
         let owner = &session.context;
+        let revision = self.storage.catalog_revision(owner)?;
         let token = auth
             .access_token_for_generation(owner, Service::Messenger, session.generation)
             .await?;
         let chats = self.fetch(owner, &token).await?;
         let snapshot = serde_json::to_string(&chats).map_err(StorageError::from)?;
         auth.with_active_generation(owner, session.generation, || {
-            self.storage.save_chat_catalog(owner, &snapshot)
+            self.storage.save_chat_catalog(owner, &snapshot, revision)
         })??;
         Ok(chats)
     }
@@ -221,4 +246,70 @@ struct WireUser {
     username: String,           // Имя учётной записи при отсутствии имени и фамилии.
     first_name: Option<String>, // Имя пользователя, если заполнено.
     last_name: Option<String>,  // Фамилия пользователя, если заполнена.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        bootstrap::{ChatList, ChatListStatus, ChatLists},
+        context::{AccountId, SessionGeneration},
+        storage::{Cursor, EventWrite, HistoryChange},
+    };
+
+    /// Снимок, уже ожидающий публикации, перечитывается после отзыва из базы.
+    #[test]
+    fn publication_reloads_snapshot_committed_before_revocation() {
+        let owner = OwnerContext {
+            account_id: AccountId("account".into()),
+            server: "https://test".into(),
+            organization_id: "org".into(),
+            project_id: "project".into(),
+            user_id: "user".into(),
+        };
+        let stream = Uuid::from_u128(1);
+        let old = vec![Chat {
+            id: stream,
+            name: "channel".into(),
+            direct: false,
+            topics: Vec::new(),
+        }];
+        let snapshot = serde_json::to_string(&old).unwrap();
+        let storage = Arc::new(Storage::in_memory().unwrap());
+        storage.save_chat_catalog(&owner, &snapshot, 0).unwrap();
+        let mut current = ChatLists::new();
+        current.insert(
+            owner.clone(),
+            ChatList {
+                generation: SessionGeneration(1),
+                chats: Some(Arc::from(old)),
+                status: ChatListStatus::Ready,
+            },
+        );
+        storage
+            .apply(
+                &owner,
+                crate::messenger::SOURCE_ID,
+                &Cursor {
+                    epoch_generation: "epoch".into(),
+                    epoch_version: 1,
+                },
+                EventWrite {
+                    history: Some(&HistoryChange::RemoveStream(stream.to_string())),
+                    ..EventWrite::default()
+                },
+            )
+            .unwrap();
+        let (lists, published) = tokio::sync::watch::channel(ChatLists::new());
+        let messenger = crate::messenger::MessengerSource::new().unwrap();
+        crate::bootstrap::publish_catalog(&messenger.catalog(storage), &mut current, &lists)
+            .unwrap();
+        assert!(
+            published.borrow()[&owner]
+                .chats
+                .as_ref()
+                .unwrap()
+                .is_empty()
+        );
+    }
 }

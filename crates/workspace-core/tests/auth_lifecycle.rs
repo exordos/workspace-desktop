@@ -25,6 +25,8 @@ use workspace_core::sync::{Event, Sync as EventSync, SyncChange, SyncUpdate};
 
 #[path = "support/background_baseline.rs"]
 mod background_baseline;
+#[path = "support/catalog_revocation.rs"]
+mod catalog_revocation;
 #[path = "support/direct_history.rs"]
 mod direct_history;
 #[path = "support/read_boundary.rs"]

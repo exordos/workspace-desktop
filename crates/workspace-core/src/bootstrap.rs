@@ -82,6 +82,7 @@ impl CatalogStartup {
         let mut sessions = Box::pin(auth.subscribe());
         let mut pending = FuturesUnordered::new();
         let mut current = HashMap::<OwnerContext, ChatList>::new();
+        let mut catalog_changes = catalog.changes();
 
         loop {
             tokio::select! {
@@ -124,6 +125,10 @@ impl CatalogStartup {
                         pending.push(load(&catalog, auth, session));
                     }
                 }
+                changed = catalog_changes.changed() => {
+                    if changed.is_err() { return; }
+                    // Публикация ниже перечитает снимки, зафиксированные вместе с событием.
+                }
                 Some((session, result)) = pending.next(), if !pending.is_empty() => {
                     if let Some(list) = current.get_mut(&session.context)
                         && list.generation == session.generation
@@ -141,9 +146,29 @@ impl CatalogStartup {
                     }
                 }
             }
-            lists.send_replace(current.clone());
+            if let Err(error) = publish_catalog(&catalog, &mut current, &lists) {
+                log::warn!("Не удалось опубликовать список чатов: {error}");
+            }
         }
     }
+}
+
+/// Публикует снимки, перечитанные под общей с записью отзыва блокировкой базы.
+pub(crate) fn publish_catalog(
+    catalog: &Catalog,
+    current: &mut ChatLists,
+    lists: &watch::Sender<ChatLists>,
+) -> Result<(), crate::storage::StorageError> {
+    let owners: Vec<_> = current.keys().cloned().collect();
+    catalog.with_snapshots(&owners, |snapshots| {
+        for (owner, chats) in owners.iter().zip(snapshots) {
+            current
+                .get_mut(owner)
+                .expect("владелец взят из текущего снимка")
+                .chats = chats.map(Arc::from);
+        }
+        lists.send_replace(current.clone());
+    })
 }
 
 /// Загружает каталог и возвращает вход, к которому относится ответ.
