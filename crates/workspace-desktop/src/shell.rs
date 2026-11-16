@@ -231,7 +231,7 @@ impl Shell {
             }
             Message::Synced(update) => match update.change {
                 SyncChange::Unread(count) => self.accounts.set_unread(&update, count),
-                SyncChange::MessengerReset => self.accounts.replace(self.sources.0.snapshot()),
+                SyncChange::MessengerReset => return self.reset_open_history(&update),
                 SyncChange::HistoryMessageCreated { scope, message_id } => {
                     self.refresh_open_history(&update, scope, message_id);
                 }
@@ -713,6 +713,40 @@ impl Shell {
             && current.generation == history.generation
             && current.status == SessionStatus::Active)
             .then_some(history)
+    }
+
+    /// Скрывает очищенную историю и заново проверяет доступ к прежней цели.
+    fn reset_open_history(&mut self, update: &SyncUpdate) -> Task<Message> {
+        self.accounts.replace(self.sources.0.snapshot());
+        let Some(history) = self.visible_history() else {
+            return Task::none();
+        };
+        if history.target.context != update.context || history.generation != update.generation {
+            return Task::none();
+        }
+        let target = history.target.clone();
+        let generation = history.generation;
+        self.navigation_revision += 1;
+        let revision = self.navigation_revision;
+        let history = self
+            .history
+            .as_mut()
+            .expect("видимый экран истории существует");
+        history.state = HistoryState::Loading;
+        history.older_pending = false;
+        history.older_failed = false;
+        let source = self.sources.0.clone();
+        Task::perform(
+            async move {
+                source
+                    .messenger
+                    .open_direct_history(&source.sync, &target, generation)
+                    .await
+                    .map(Arc::new)
+                    .map_err(Arc::new)
+            },
+            move |result| Message::HistoryLoaded { revision, result },
+        )
     }
 
     /// Меняет только строки открытого участка, сохраняя маршрут и положение списка.

@@ -524,9 +524,7 @@ async fn background_message_scenario(workspace: &impl TestWorkspace, check_catal
     .await
     .expect("сообщение не обновило бейдж и уведомление фонового аккаунта");
 
-    // После остановки фоновых задач обработаем всё, что они успели передать оболочке.
-    stop.send(()).unwrap();
-    timeout(DEADLINE, worker).await.unwrap().unwrap().unwrap();
+    // Обработаем обновления, которые фоновые задачи уже передали оболочке.
     while let Some(Some(message)) = futures::FutureExt::now_or_never(events.next()) {
         update_shell(&mut shell, message).await;
     }
@@ -565,6 +563,9 @@ async fn background_message_scenario(workspace: &impl TestWorkspace, check_catal
         workspace.history_mock(),
     )
     .await;
+    // Проверка истории отправляет сброс через WebSocket, поэтому поток нужен до её конца.
+    stop.send(()).unwrap();
+    timeout(DEADLINE, worker).await.unwrap().unwrap().unwrap();
 }
 
 /// Записывает события через Sync и проверяет обновление открытого списка Iced.
@@ -785,7 +786,7 @@ async fn notification_click_scenario(
         loaded
     };
     let loaded = load(shell, renderer).await;
-    let mut measure = into_stream(shell.update(loaded)).unwrap();
+    let mut measure = into_stream(shell.update(loaded.clone())).unwrap();
     let rendered = RenderedText::from_shell(shell, renderer);
     assert!(rendered.shows_selected("Аккаунт B"));
     assert!(rendered.contains(body));
@@ -834,6 +835,59 @@ async fn notification_click_scenario(
         let cache = ui.into_cache();
 
         load_older_scenario(shell, renderer, cache, mock).await;
+
+        // Сброс другого входа не должен трогать открытую историю.
+        let mut reset = SyncUpdate {
+            context: click.target.context.clone(),
+            generation: click.generation,
+            change: SyncChange::MessengerReset,
+        };
+        reset.generation = SessionGeneration(click.generation.0 + 1);
+        assert!(into_stream(shell.update(Message::Synced(reset.clone()))).is_none());
+        assert!(RenderedText::from_shell(shell, renderer).contains(body));
+        reset.generation = click.generation;
+        let mut other = reset.clone();
+        other.context = shell
+            .accounts
+            .summaries
+            .iter()
+            .find(|entry| entry.session.context != reset.context)
+            .unwrap()
+            .session
+            .context
+            .clone();
+        assert!(into_stream(shell.update(Message::Synced(other))).is_none());
+        assert!(RenderedText::from_shell(shell, renderer).contains(body));
+        let old = loaded.clone();
+        let mut reload = into_stream(shell.update(Message::Synced(reset.clone()))).unwrap();
+        assert!(RenderedText::from_shell(shell, renderer).contains("Загрузка истории…"));
+        assert!(!RenderedText::from_shell(shell, renderer).contains(body));
+        assert!(into_stream(shell.update(old)).is_none());
+        let Some(Action::Output(reloaded)) = timeout(DEADLINE, reload.next()).await.unwrap() else {
+            panic!("повторное открытие не вернуло результат");
+        };
+        let _ = shell.update(reloaded);
+        assert!(RenderedText::from_shell(shell, renderer).contains(body));
+
+        for (mode, label) in [(1, "Сообщение недоступно"), (2, "Чат недоступен")]
+        {
+            mock.set_history_failure(mode);
+            let mut reload = into_stream(shell.update(Message::Synced(reset.clone()))).unwrap();
+            let Some(Action::Output(failed)) = timeout(DEADLINE, reload.next()).await.unwrap()
+            else {
+                panic!("повторная проверка доступа не вернула ошибку");
+            };
+            let _ = shell.update(failed);
+            let rendered = RenderedText::from_shell(shell, renderer);
+            assert!(rendered.contains(label));
+            assert!(!rendered.contains(body));
+        }
+        mock.set_history_failure(0);
+        let mut reload = into_stream(shell.update(Message::Synced(reset))).unwrap();
+        let Some(Action::Output(reloaded)) = timeout(DEADLINE, reload.next()).await.unwrap() else {
+            panic!("повторное открытие не вернуло результат");
+        };
+        let _ = shell.update(reloaded);
 
         let screen = shell.visible_history().unwrap();
         let HistoryState::Ready(window) = &screen.state else {
