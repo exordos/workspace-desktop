@@ -23,6 +23,7 @@ fn main() -> std::process::ExitCode {
 mod macos {
     use std::collections::HashMap;
     use std::error::Error;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::thread;
@@ -57,10 +58,12 @@ mod macos {
     /// Связывает события единственного окна, оболочки и меню macOS.
     #[derive(Debug, Clone)]
     enum Message {
-        Shell(ShellMessage), // Событие экрана или фоновой подписки.
-        Opened(window::Id),  // Оконный цикл готов, можно создать меню.
-        Close(window::Id),   // Пользователь запросил закрытие окна.
-        Menu(Command),       // Пользователь выбрал команду в строке меню.
+        Shell(ShellMessage),             // Событие экрана или фоновой подписки.
+        Opened(window::Id),              // Оконный цикл готов, можно создать меню.
+        Close(window::Id),               // Пользователь запросил закрытие окна.
+        Resized(window::Id, iced::Size), // Изменился размер окна в логических пикселях.
+        CheckedSize(u64, iced::Size, window::Mode, bool), // Проверены режим и максимизация окна.
+        Menu(Command),                   // Пользователь выбрал команду в строке меню.
     }
 
     /// Владеет экраном и меню до выхода из Iced.
@@ -69,6 +72,8 @@ mod macos {
         id: Option<window::Id>, // ID главного окна после его открытия.
         tray: Option<Tray>,     // Если меню нет, окно должно закрыться штатно.
         commands: menu_channel::UnboundedSender<Command>, // Передаёт команды от AppKit.
+        size_path: PathBuf,     // Файл размера в текущем профиле.
+        size_revision: u64,     // Отсекает запоздавшие ответы о режиме окна.
     }
 
     impl App {
@@ -86,9 +91,29 @@ mod macos {
                 }
                 Message::Close(id) if self.tray.is_some() => {
                     log::info!("Скрываем окно Workspace {id:?}");
+                    // Ответ о режиме до скрытия больше не относится к видимому окну.
+                    self.size_revision += 1;
                     window::set_mode(id, window::Mode::Hidden)
                 }
                 Message::Close(_) | Message::Menu(Command::Quit) => iced::exit(),
+                Message::Resized(id, size) if self.id == Some(id) => {
+                    self.size_revision += 1;
+                    let revision = self.size_revision;
+                    window::mode(id).then(move |mode| {
+                        window::is_maximized(id).map(move |maximized| {
+                            Message::CheckedSize(revision, size, mode, maximized)
+                        })
+                    })
+                }
+                Message::Resized(_, _) => Task::none(),
+                Message::CheckedSize(revision, size, mode, maximized) => {
+                    if should_save_size(revision, self.size_revision, size, mode, maximized)
+                        && let Err(error) = save_size(&self.size_path, size)
+                    {
+                        log::warn!("Не удалось сохранить размер окна: {error}");
+                    }
+                    Task::none()
+                }
                 Message::Menu(Command::Show) => self.id.map_or_else(Task::none, |id| {
                     log::info!("Возвращаем окно Workspace {id:?}");
                     window::set_mode(id, window::Mode::Windowed)
@@ -141,6 +166,8 @@ mod macos {
         }
         let directory = state_directory()?;
         let accounts = Arc::new(JsonAccountStore::open(&directory)?);
+        let size_path = directory.join("window-size.json");
+        let initial_size = load_size(&size_path);
         let auth = Auth::new(
             Arc::new(WorkspaceIamHttp::new()),
             accounts,
@@ -217,6 +244,8 @@ mod macos {
                         id: None,
                         tray: None,
                         commands: commands.clone(),
+                        size_path: size_path.clone(),
+                        size_revision: 0,
                     },
                     prepare.map(Message::Shell),
                 )
@@ -226,7 +255,7 @@ mod macos {
         )
         .title("Workspace Desktop")
         .window(window::Settings {
-            size: iced::Size::new(620.0, 360.0),
+            size: initial_size,
             exit_on_close_request: false,
             ..window::Settings::default()
         })
@@ -236,6 +265,7 @@ mod macos {
                 app.shell.subscription().map(Message::Shell),
                 window::open_events().map(Message::Opened),
                 window::close_requests().map(Message::Close),
+                window::resize_events().map(|(id, size)| Message::Resized(id, size)),
                 Subscription::run_with(menu_events.clone(), MenuEvents::stream),
             ])
         })
@@ -250,6 +280,46 @@ mod macos {
         window?;
         result?;
         log::info!("Фоновая работа Workspace остановлена");
+        Ok(())
+    }
+
+    /// Проверяет границы размера в логических пикселях.
+    fn valid_size(size: iced::Size) -> bool {
+        (100.0..=10000.0).contains(&size.width) && (100.0..=10000.0).contains(&size.height)
+    }
+
+    /// Принимает только последний ответ для обычного видимого окна.
+    fn should_save_size(
+        revision: u64,
+        current_revision: u64,
+        size: iced::Size,
+        mode: window::Mode,
+        maximized: bool,
+    ) -> bool {
+        revision == current_revision
+            && mode == window::Mode::Windowed
+            && !maximized
+            && valid_size(size)
+    }
+
+    /// Читает размер профиля или возвращает штатный размер при любой ошибке.
+    fn load_size(path: &Path) -> iced::Size {
+        let size = std::fs::read(path).ok().and_then(|data| {
+            let [width, height]: [f32; 2] = serde_json::from_slice(&data).ok()?;
+            Some(iced::Size::new(width, height))
+        });
+        size.filter(|size| valid_size(*size))
+            .unwrap_or(iced::Size::new(620.0, 360.0))
+    }
+
+    /// Атомарно сохраняет обычный размер рядом с файлом профиля.
+    fn save_size(path: &Path, size: iced::Size) -> std::io::Result<()> {
+        let directory = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("missing profile directory"))?;
+        let mut file = tempfile::NamedTempFile::new_in(directory)?;
+        serde_json::to_writer(file.as_file_mut(), &[size.width, size.height])?;
+        file.persist(path).map_err(|error| error.error)?;
         Ok(())
     }
 
@@ -290,5 +360,43 @@ mod macos {
 
         /// Завершает вывод. Собственного буфера у журнала нет.
         fn flush(&self) {}
+    }
+    #[cfg(test)]
+    mod size_tests {
+        use super::*;
+
+        /// Старый ответ после скрытия или следующего изменения не перезаписывает размер.
+        #[test]
+        fn saves_only_the_current_ordinary_window_size() {
+            let size = iced::Size::new(800.0, 500.0);
+            assert!(should_save_size(2, 2, size, window::Mode::Windowed, false));
+            assert!(!should_save_size(1, 2, size, window::Mode::Windowed, false));
+            assert!(!should_save_size(2, 2, size, window::Mode::Hidden, false));
+            assert!(!should_save_size(
+                2,
+                2,
+                size,
+                window::Mode::Fullscreen,
+                false
+            ));
+            assert!(!should_save_size(2, 2, size, window::Mode::Windowed, true));
+        }
+
+        /// Проверяет независимость профилей и запасной размер при повреждённых данных.
+        #[test]
+        fn size_is_restored_only_from_valid_profile_data() {
+            let first = tempfile::tempdir().unwrap();
+            let second = tempfile::tempdir().unwrap();
+            let path = first.path().join("window-size.json");
+            let fallback = iced::Size::new(620.0, 360.0);
+            assert_eq!(load_size(&path), fallback);
+            save_size(&path, iced::Size::new(800.0, 500.0)).unwrap();
+            assert_eq!(load_size(&path), iced::Size::new(800.0, 500.0));
+            assert_eq!(load_size(&second.path().join("window-size.json")), fallback);
+            for invalid in ["oops", "[0, 500]", "[10001, 500]", "[null, 500]"] {
+                std::fs::write(&path, invalid).unwrap();
+                assert_eq!(load_size(&path), fallback);
+            }
+        }
     }
 }
