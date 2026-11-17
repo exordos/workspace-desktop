@@ -355,6 +355,16 @@ impl Conversation {
             );
         }
         match result {
+            Ok(Some(snapshot)) if self.needs_fresh_tail(flight, &snapshot.window) => {
+                // Подтверждённая запись может выйти за границу текущего окна. До свежей
+                // страницы сохраняем видимую очередь и не сдвигаем читаемую историю.
+                log::debug!(
+                    "gpui_history op_id={} event=tail_refresh_required",
+                    flight.id
+                );
+                self.start(Load::Open(ChatEntry::Latest), cx);
+                return;
+            }
             Ok(Some(snapshot)) => self.show(snapshot, flight, false, cx),
             Ok(None) if matches!(flight.load, Load::Read(_) | Load::Extend(_, _)) => {
                 self.restart(cx);
@@ -380,6 +390,15 @@ impl Conversation {
             self.queue_read(cx);
         }
         cx.notify();
+    }
+
+    /// Обновляет потерявший подтверждение хвост, только когда пользователь остался у него.
+    fn needs_fresh_tail(&self, flight: Flight, window: &HistoryWindow) -> bool {
+        matches!(flight.load, Load::Read(_))
+            && self.entry == ChatEntry::Latest
+            && window.newer == HistoryEdge::Unchecked
+            && matches!(&self.state, State::Ready(previous) if previous.newer == HistoryEdge::End)
+            && self.viewport.at_tail()
     }
 
     /// Устанавливает снимок и восстанавливает позицию чтения, когда пользователь ушёл от хвоста.

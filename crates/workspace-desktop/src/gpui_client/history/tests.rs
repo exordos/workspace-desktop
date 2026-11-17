@@ -409,3 +409,64 @@ fn cached_tail_refreshes_and_deduplicates_outbox(cx: &mut TestAppContext) {
         );
     });
 }
+
+/// Потеря подтверждённого хвоста не перемещает того, кто читает старые сообщения.
+#[gpui::test]
+fn losing_latest_edge_does_not_move_a_history_reader(cx: &mut TestAppContext) {
+    let address = address(ChatEntry::Latest);
+    let (view, ui, requests) = scenario(cx, &address);
+    answer(
+        request(&requests, Load::Open(ChatEntry::Latest)),
+        window(
+            address.route.scope,
+            20..80,
+            HistoryEdge::End,
+            HistoryEdge::End,
+        ),
+        ui,
+    );
+    ui.update(|_, app| {
+        view.update(app, |view, cx| {
+            view.viewport.list().scroll_to(gpui::ListOffset {
+                item_ix: 3,
+                offset_in_item: px(11.),
+            });
+            cx.notify();
+        });
+    });
+    ui.run_until_parked();
+    let anchor = Uuid::from_u128(23);
+    let before = ui.read(|app| {
+        let view = view.read(app);
+        assert!(!view.viewport.at_tail());
+        view.viewport.y(anchor).unwrap()
+    });
+    sync(
+        &view,
+        ui,
+        &address,
+        SyncChange::HistoryMessageCreated {
+            scope: address.route.scope,
+            message_id: Uuid::from_u128(80),
+        },
+    );
+    answer(
+        request(&requests, Load::Read(41)),
+        window(
+            address.route.scope,
+            20..80,
+            HistoryEdge::End,
+            HistoryEdge::Unchecked,
+        ),
+        ui,
+    );
+    assert!(
+        requests.try_recv().is_err(),
+        "Чтение истории не запрашивает хвост автоматически"
+    );
+    let after = ui.read(|app| view.read(app).viewport.y(anchor).unwrap());
+    assert!(
+        (before - after).abs() <= 1.,
+        "Позиция опоры: {before} → {after}"
+    );
+}

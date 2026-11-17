@@ -82,6 +82,34 @@ impl RuntimeClient {
         Self::start_using(move || WorkerParts::open(directory))
     }
 
+    /// Собирает рабочую подписку с отдельной базой и тестовым центром сертификации.
+    #[cfg(all(test, feature = "gpui-test"))]
+    pub(super) fn start_for_test(
+        directory: PathBuf,
+        account: AccountRecord,
+        iam: Arc<dyn workspace_core::auth::IamClient>,
+        secrets: Arc<dyn workspace_core::auth::SecretStore>,
+        ca: Vec<u8>,
+    ) -> io::Result<(Self, RuntimeEvents)> {
+        Self::start_using(move || {
+            let (accounts, released) =
+                ProfileAccounts::open(&directory).map_err(|_| StartupError::Profile)?;
+            accounts.save(&account).map_err(|_| StartupError::Profile)?;
+            let auth = Auth::new(iam, Arc::new(accounts), secrets);
+            let storage = Storage::open(directory.join("messenger.sqlite3"))
+                .map_err(|_| StartupError::Database)?;
+            let messenger =
+                MessengerSource::with_private_ca(&ca).map_err(|_| StartupError::Worker)?;
+            let parts = WorkerParts::with_sources(
+                auth,
+                Arc::new(storage),
+                Arc::new(messenger),
+                |services| Runtime::new(services.sync.clone(), vec![services.messenger.clone()]),
+            )?;
+            Ok((parts, released))
+        })
+    }
+
     /// Передаёт настройку на рабочий поток; на стороне окна создаются только каналы и поток.
     fn start_using(
         setup: impl FnOnce() -> Result<(WorkerParts, oneshot::Receiver<()>), StartupError>
