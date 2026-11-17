@@ -1,5 +1,6 @@
 //! Управляет открытием, фокусом, загрузкой и действиями правой панели разговора.
 
+mod avatar;
 mod picker;
 mod presentation;
 mod source;
@@ -57,20 +58,21 @@ struct PendingMutation {
 
 /// Хранит состояние и фокус панели одного экземпляра экрана.
 pub(super) struct Panel {
-    runtime: RuntimeClient, // Тот же рабочий поток, что читает историю.
-    state: Option<State>,   // None, пока панель закрыта.
+    runtime: RuntimeClient,   // Тот же рабочий поток, что читает историю.
+    state: Option<State>,     // None, пока панель закрыта.
+    avatars: avatar::Avatars, // Декодированные фото текущей панели.
     snapshot: Option<Arc<SidebarDetails>>, // Последний снимок до закрытия или сброса.
-    reopen_on_access: bool, // Перенос открытой панели при переходе в другую тему канала.
-    topics_expanded: bool,  // Показ списка тем в текущей панели.
+    reopen_on_access: bool,   // Перенос открытой панели при переходе в другую тему канала.
+    topics_expanded: bool,    // Показ списка тем в текущей панели.
     share_feedback: Option<Task<()>>, // Галочка после копирования ссылки.
     mutation: Option<PendingMutation>, // Текущее изменение, пока ждём подтверждение сервера.
     mutation_error: Option<MutationKind>, // Последняя ошибка рядом с действием.
-    picker: Option<Picker>, // Выбор участников внутри панели владельца.
-    refocus_close: bool,    // После успеха или потери прав поле поиска исчезает.
-    region: FocusHandle,    // Проверяет, был ли фокус внутри перед вынужденным закрытием.
-    trigger: FocusHandle,   // Кнопка сведений в шапке разговора.
-    close: FocusHandle,     // Первый фокус после открытия панели.
-    retry: FocusHandle,     // Кнопка повтора после временного сбоя.
+    picker: Option<Picker>,   // Выбор участников внутри панели владельца.
+    refocus_close: bool,      // После успеха или потери прав поле поиска исчезает.
+    region: FocusHandle,      // Проверяет, был ли фокус внутри перед вынужденным закрытием.
+    trigger: FocusHandle,     // Кнопка сведений в шапке разговора.
+    close: FocusHandle,       // Первый фокус после открытия панели.
+    retry: FocusHandle,       // Кнопка повтора после временного сбоя.
 }
 
 impl Panel {
@@ -79,6 +81,7 @@ impl Panel {
         Self {
             runtime,
             state: None,
+            avatars: avatar::Avatars::default(),
             snapshot: None,
             reopen_on_access: false,
             topics_expanded: true,
@@ -101,6 +104,7 @@ impl Panel {
         }
         self.state = None;
         self.snapshot = None;
+        self.avatars = avatar::Avatars::default();
         self.reopen_on_access = false;
         self.topics_expanded = true;
         self.share_feedback = None;
@@ -396,12 +400,14 @@ impl Conversation {
                         if !matches!(details.as_ref(), SidebarDetails::Channel(channel) if channel.can_add_members) {
                             panel.refocus_close |= panel.picker.take().is_some();
                         }
+                        panel.avatars.refresh(&details, view.address.clone(), panel.runtime.clone(), cx);
                         panel.snapshot = Some(details);
                         panel.state = Some(State::Ready);
                     }
                     Err(Problem::AccessLost) => view.fail(Failure::AccessLost, cx),
                     Err(error) => {
                         panel.snapshot = None;
+                        panel.avatars = avatar::Avatars::default();
                         panel.refocus_close |= panel.picker.take().is_some();
                         panel.state = Some(State::Failed(error));
                     }
@@ -616,6 +622,17 @@ impl Conversation {
     /// Возвращает снимок, из которого сейчас построена видимая карточка.
     pub(in crate::gpui_client) fn tested_details(&self) -> Option<&SidebarDetails> {
         self.details.as_ref()?.snapshot.as_deref()
+    }
+
+    /// Проверяет, что фото открытого профиля готово к отрисовке.
+    pub(in crate::gpui_client) fn tested_details_avatar(&self) -> bool {
+        let Some(SidebarDetails::Peer(peer)) = self.tested_details() else {
+            return false;
+        };
+        self.details
+            .as_ref()
+            .and_then(|panel| panel.avatars.image(Some(&peer.profile)))
+            .is_some()
     }
 
     /// Возвращает координату строки из текущего кадра для замера открытия панели.

@@ -245,14 +245,22 @@ struct TopicAcceptance {
     sent: Mutex<Vec<TopicPost>>, // Подтверждённые POST в тему.
 }
 
+const AVATAR_FILE: &str = "33333333-3333-4333-8333-333333333333";
+const AVATAR_PNG: &[u8] = &[
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2, 8, 2, 0,
+    0, 0, 253, 212, 154, 115, 0, 0, 0, 16, 73, 68, 65, 84, 120, 156, 99, 208, 205, 222, 13, 68, 12,
+    16, 10, 0, 34, 234, 5, 77, 31, 20, 234, 4, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+];
+
 /// Управляет ответами профиля и проверяет, какого пользователя запросил каждый вход.
 #[derive(Default)]
 struct DetailsFixture {
+    avatar_fetches: AtomicUsize, // Сколько раз сервер прочитал изображение собеседника.
     users: Mutex<Vec<(&'static str, &'static str)>>, // Токен владельца и UUID собеседника.
-    unblock: Mutex<Option<oneshot::Receiver<()>>>,   // Удерживает ровно один ответ профиля.
+    unblock: Mutex<Option<oneshot::Receiver<()>>>, // Удерживает ровно один ответ профиля.
     live: Mutex<Option<broadcast::Sender<RecoverySignal>>>, // Кадры журнала аккаунта A.
-    notifications_muted: AtomicBool,                 // Последняя настройка канала на сервере.
-    channel_requests: AtomicUsize,                   // Число чтений тем для построения сведений.
+    notifications_muted: AtomicBool, // Последняя настройка канала на сервере.
+    channel_requests: AtomicUsize, // Число чтений тем для построения сведений.
     omit_stream_user: AtomicBool, // Имитирует старый ответ, который не подтверждает владельца.
 }
 
@@ -521,6 +529,16 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
     }
 
     if let Some(details) = &state.details {
+        if path == format!("/api/workspace/v1/messenger/files/{AVATAR_FILE}/actions/download") {
+            assert_eq!(request.method(), Method::GET);
+            assert_eq!(user, USER);
+            details.avatar_fetches.fetch_add(1, Ordering::SeqCst);
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "image/png")
+                .body(Full::new(Bytes::from_static(AVATAR_PNG)))
+                .unwrap();
+        }
         if path == format!("/api/workspace/v1/users/{peer}") {
             assert_eq!(request.method(), Method::GET);
             details.users.lock().unwrap().push((user, peer));
@@ -538,6 +556,7 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
                 json!({
                     "uuid": peer, "username":"peer", "first_name":name, "last_name":null,
                     "email":"peer@fixture.test", "status":"idle",
+                    "avatar": (peer == PEER).then(|| format!("urn:image:{AVATAR_FILE}")),
                 }),
             );
         }
@@ -1194,6 +1213,12 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
         "аккаунт A видит проверенный профиль собеседника",
         |ui| ui.debug_bounds("conversation-details-peer").is_some(),
     );
+    until(
+        ui,
+        "загруженные байты аватара готовы к отрисовке",
+        |ui| ui.read(|app| first.read(app).tested_details_avatar()),
+    );
+    assert_eq!(details.avatar_fetches.load(Ordering::SeqCst), 1);
     assert_eq!(details.users.lock().unwrap().as_slice(), &[(USER, PEER)]);
     ui.read(|app| {
         let Some(SidebarDetails::Peer(peer)) = first.read(app).tested_details() else {
@@ -1248,6 +1273,12 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
             })
         },
     );
+    until(
+        ui,
+        "повторное открытие рисует фото из кэша core",
+        |ui| ui.read(|app| first.read(app).tested_details_avatar()),
+    );
+    assert_eq!(details.avatar_fetches.load(Ordering::SeqCst), 1);
     assert_eq!(details.users.lock().unwrap().as_slice(), &[(USER, PEER)]);
     assert_eq!(server.state.targets.load(Ordering::SeqCst), stream_reads);
 
@@ -1255,7 +1286,7 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
         "schema_version":1, "uuid":Uuid::new_v4(), "epoch_generation":"local", "epoch_version":2,
         "project_id":PROJECT, "user_uuid":USER, "object_type":"user", "action":"updated",
         "payload": {"kind":"user.updated", "uuid":PEER, "username":"peer",
-                    "first_name":"Профиль после события", "status":"active"},
+                    "first_name":"Профиль после события", "status":"active", "avatar":null},
     });
     assert!(live.send(RecoverySignal::Event(profile_updated)).is_ok());
     until(
@@ -1268,6 +1299,7 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
         ))
         },
     );
+    assert!(!ui.read(|app| first.read(app).tested_details_avatar()));
     assert_eq!(details.users.lock().unwrap().as_slice(), &[(USER, PEER)]);
 
     click_account(&client, ui, &b_id);

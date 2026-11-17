@@ -11,6 +11,7 @@ use workspace_core::{
 
 use super::{
     MutationKind, Panel, State,
+    avatar::Avatars,
     view::{
         Availability, AvatarView, ChannelView, MemberView, NotificationLevel, NotificationsView,
         PanelContent, PeerActions, PeerView, ProfileField, SelectedTopicView, TopicView,
@@ -62,7 +63,7 @@ fn peer_content(panel: &Panel, peer: &DirectSidebar, address: &ConversationAddre
     };
     PeerView {
         name: profile.display_name.clone().into(),
-        avatar: avatar(&profile.display_name, Some(profile)),
+        avatar: avatar(&profile.display_name, Some(profile), &panel.avatars),
         custom_status: custom_status(profile).map(Into::into),
         presence: presence_label(profile.presence).map(Into::into),
         fields: vec![
@@ -134,7 +135,7 @@ fn channel_content(
     let current_topic = address.route.scope.topic_id;
     ChannelView {
         name: channel.name.clone().into(),
-        avatar: avatar(&channel.name, None),
+        avatar: avatar(&channel.name, None, &panel.avatars),
         color: channel
             .color
             .filter(|color| *color <= 0xFF_FF_FF)
@@ -190,7 +191,7 @@ fn channel_content(
         members: channel
             .members
             .iter()
-            .map(|member| member_view(member, can_change))
+            .map(|member| member_view(member, can_change, &panel.avatars))
             .collect(),
         add_members: available(channel.can_add_members, can_change),
         member_error: (panel.mutation_error == Some(MutationKind::Remove))
@@ -208,7 +209,7 @@ pub(super) fn stream_mode(level: NotificationLevel) -> StreamNotificationMode {
 }
 
 /// Представляет привязку даже до появления её профиля в справочнике.
-fn member_view(member: &SidebarMember, can_change: bool) -> MemberView {
+fn member_view(member: &SidebarMember, can_change: bool, avatars: &Avatars) -> MemberView {
     let profile = member.profile.as_ref();
     let name = profile
         .map(|profile| profile.display_name.clone())
@@ -228,7 +229,7 @@ fn member_view(member: &SidebarMember, can_change: bool) -> MemberView {
     };
     MemberView {
         id: member.binding_id,
-        avatar: avatar(&name, profile),
+        avatar: avatar(&name, profile, avatars),
         name: name.into(),
         role: role.map(Into::into),
         secondary: secondary.map(Into::into),
@@ -246,7 +247,7 @@ fn available(visible: bool, enabled: bool) -> Availability {
 }
 
 /// Готовит заглушку и метку присутствия для аватара.
-pub(super) fn avatar(name: &str, profile: Option<&UserProfile>) -> AvatarView {
+fn avatar(name: &str, profile: Option<&UserProfile>, avatars: &Avatars) -> AvatarView {
     let initial: SharedString = name
         .chars()
         .next()
@@ -260,7 +261,7 @@ pub(super) fn avatar(name: &str, profile: Option<&UserProfile>) -> AvatarView {
     };
     AvatarView {
         initials: initial,
-        image: None,
+        image: avatars.image(profile),
         presence,
     }
 }
