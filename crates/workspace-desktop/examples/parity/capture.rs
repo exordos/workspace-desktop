@@ -1,13 +1,24 @@
 //! Ждёт отрисовку окна, сохраняет PNG и параметры, проверяет повтор и контрольный сдвиг.
 
-use std::{cell::Cell, path::Path, process::Command, rc::Rc, time::Duration};
+use std::{
+    cell::Cell,
+    fs::File,
+    io::{BufReader, BufWriter},
+    path::Path,
+    process::Command,
+    rc::Rc,
+    time::Duration,
+};
 
 use futures::{
     channel::oneshot,
     future::{Either, select},
 };
 use gpui::{AsyncApp, Bounds, Pixels, Window, WindowHandle};
-use image::{Rgba, RgbaImage};
+use image::{
+    ExtendedColorType, ImageDecoder as _, ImageEncoder as _, Rgba, RgbaImage,
+    codecs::png::{PngDecoder, PngEncoder},
+};
 use objc2::{msg_send, runtime::AnyObject};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use serde_json::{Value, json};
@@ -31,8 +42,8 @@ pub fn ensure_screen_access() -> Result<()> {
     }
 }
 
-/// Получает номер окна только у NSView, принадлежащего этой сцене.
-fn window_number(window: &Window) -> Result<isize> {
+/// Вызывает AppKit только для NSView, принадлежащего окну сцены.
+fn with_native_window<T>(window: &Window, read: impl FnOnce(&AnyObject) -> T) -> Result<T> {
     let handle = HasWindowHandle::window_handle(window)
         .map_err(|error| format!("Не удалось получить дескриптор окна: {error:?}"))?;
     let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
@@ -43,13 +54,45 @@ fn window_number(window: &Window) -> Result<isize> {
         let view = handle.ns_view.cast::<AnyObject>().as_ref();
         let window: *mut AnyObject = msg_send![view, window];
         let window = window.as_ref().ok_or("У сцены нет нативного окна")?;
-        let number: isize = msg_send![window, windowNumber];
-        if number > 0 {
-            Ok(number)
-        } else {
-            Err("У сцены нет номера окна WindowServer".into())
-        }
+        Ok(read(window))
     }
+}
+
+/// Отключает переход появления до первого показа окна сцены.
+pub fn disable_open_animation(window: &Window) -> Result<()> {
+    const NS_WINDOW_ANIMATION_BEHAVIOR_NONE: isize = 2;
+    with_native_window(window, |native| {
+        // NSWindow принимает NSInteger из NSWindowAnimationBehavior.
+        let _: () =
+            unsafe { msg_send![native, setAnimationBehavior: NS_WINDOW_ANIMATION_BEHAVIOR_NONE] };
+    })
+}
+
+/// Получает номер окна, который нужен screencapture.
+fn window_number(window: &Window) -> Result<isize> {
+    let number = with_native_window(window, |native| unsafe { msg_send![native, windowNumber] })?;
+    if number > 0 {
+        Ok(number)
+    } else {
+        Err("У сцены нет номера окна WindowServer".into())
+    }
+}
+
+/// Ждёт, пока AppKit активирует окно и WindowServer закончит оформление первого кадра.
+async fn wait_for_activation(window: WindowHandle<View>, cx: &mut AsyncApp) -> Result<()> {
+    for _ in 0..100 {
+        if window.update(cx, |_, window, _| window.is_window_active())? {
+            // На macOS 27 первые кадры после isKeyWindow ещё могут содержать переход.
+            cx.background_executor()
+                .timer(Duration::from_millis(300))
+                .await;
+            return Ok(());
+        }
+        cx.background_executor()
+            .timer(Duration::from_millis(25))
+            .await;
+    }
+    Err(format!("Сцена {ID}: за 2,5 секунды не дождались активации окна").into())
 }
 
 /// Сдвигает только контейнер сцены и ждёт кадр, в котором GPUI его нарисовала.
@@ -82,8 +125,20 @@ async fn prepare(
     Err(format!("Сцена {ID}, прогон {pass}: за 5 секунд не дождались отрисовки ChatRow").into())
 }
 
-/// Сохраняет кадр окна без системной рамки и проверяет физический размер PNG.
-fn save_frame(png: &Path, number: isize, expected: (u32, u32)) -> Result<RgbaImage> {
+/// Кадр области содержимого после проверки системного канта.
+struct CapturedPixels {
+    image: RgbaImage,        // Пиксели области содержимого.
+    source_size: (u32, u32), // Размер PNG, который вернул screencapture.
+    crop_inset: u32,         // Сколько физических пикселей снято с каждой стороны.
+}
+
+/// Сохраняет кадр окна и при необходимости удаляет системный кант.
+fn save_frame(
+    png: &Path,
+    number: isize,
+    expected: (u32, u32),
+    scale: f32,
+) -> Result<CapturedPixels> {
     let output = Command::new("/usr/sbin/screencapture")
         .args(["-x", "-o", "-l", &number.to_string()])
         .arg(png)
@@ -95,15 +150,54 @@ fn save_frame(png: &Path, number: isize, expected: (u32, u32)) -> Result<RgbaIma
         )
         .into());
     }
-    let image = image::open(png)?.into_rgba8();
-    if image.dimensions() != expected {
-        return Err(format!(
-            "Получен кадр {:?}, ожидался размер {expected:?}",
-            image.dimensions()
-        )
-        .into());
+    let mut decoder = PngDecoder::new(BufReader::new(File::open(png)?))?;
+    let profile = decoder.icc_profile()?;
+    let image = image::DynamicImage::from_decoder(decoder)?.into_rgba8();
+    let source_size = image.dimensions();
+    let crop_inset = capture_inset(&image, expected, scale)?;
+    let image = if crop_inset == 0 {
+        image
+    } else {
+        let cropped =
+            image::imageops::crop_imm(&image, crop_inset, crop_inset, expected.0, expected.1)
+                .to_image();
+        let mut encoder = PngEncoder::new(BufWriter::new(File::create(png)?));
+        if let Some(profile) = profile {
+            encoder.set_icc_profile(profile)?;
+        }
+        encoder.write_image(
+            cropped.as_raw(),
+            expected.0,
+            expected.1,
+            ExtendedColorType::Rgba8,
+        )?;
+        cropped
+    };
+    Ok(CapturedPixels {
+        image,
+        source_size,
+        crop_inset,
+    })
+}
+
+/// Допускает только симметричный кант macOS шириной в один логический пиксель.
+fn capture_inset(image: &RgbaImage, expected: (u32, u32), scale: f32) -> Result<u32> {
+    let (width, height) = image.dimensions();
+    if (width, height) == expected {
+        return Ok(0);
     }
-    Ok(image)
+    let inset = scale.round() as u32;
+    let transparent_edges = || {
+        (0..width).all(|x| image[(x, 0)].0[3] == 0 && image[(x, height - 1)].0[3] == 0)
+            && (0..height).all(|y| image[(0, y)].0[3] == 0 && image[(width - 1, y)].0[3] == 0)
+    };
+    if inset > 0
+        && (width, height) == (expected.0 + inset * 2, expected.1 + inset * 2)
+        && transparent_edges()
+    {
+        return Ok(inset);
+    }
+    Err(format!("Получен кадр {:?}, ожидался размер {expected:?} или симметричный системный кант с прозрачной кромкой", image.dimensions()).into())
 }
 
 /// Границы и количество пикселей, которые изменились между кадрами.
@@ -182,9 +276,11 @@ async fn capture(
     let dir = config.artifact_dir(pass);
     std::fs::create_dir(&dir)?;
     let png = dir.join("frame.png");
-    let image = cx
+    let pixels = cx
         .background_executor()
-        .spawn(async move { save_frame(&png, number, expected).map_err(|error| error.to_string()) })
+        .spawn(async move {
+            save_frame(&png, number, expected, scale).map_err(|error| error.to_string())
+        })
         .await?;
     let data = json!({
         "scene": ID,
@@ -198,13 +294,15 @@ async fn capture(
         "content_size_px": [f32::from(viewport.width), f32::from(viewport.height)],
         "scale": scale,
         "png_size_px": expected,
+        "native_capture_size_px": pixels.source_size,
+        "crop_inset_px": pixels.crop_inset,
         "window_number": number,
         "row": row_geometry(bounds),
     });
     std::fs::write(dir.join("run.json"), serde_json::to_vec_pretty(&data)?)?;
     println!("{}", dir.display());
     Ok(Frame {
-        image,
+        image: pixels.image,
         bounds,
         scale,
     })
@@ -228,6 +326,7 @@ pub async fn run(
     painted: Rc<Cell<Option<Bounds<Pixels>>>>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
+    wait_for_activation(window, cx).await?;
     let first = capture(config, window, &painted, cx, "baseline", INSET).await?;
     if !config.verify {
         return Ok(());
@@ -274,4 +373,35 @@ pub async fn run(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Принимает точный размер и симметричный системный кант, защищает от обрезки другого кадра.
+    #[test]
+    fn only_crops_the_window_server_border() {
+        let expected = (8, 10);
+        assert_eq!(
+            capture_inset(&RgbaImage::new(8, 10), expected, 2.).unwrap(),
+            0
+        );
+        let mut retina = RgbaImage::from_fn(12, 14, |x, y| {
+            Rgba([
+                255,
+                255,
+                255,
+                if x == 0 || y == 0 || x == 11 || y == 13 {
+                    0
+                } else {
+                    255
+                },
+            ])
+        });
+        assert_eq!(capture_inset(&retina, expected, 2.).unwrap(), 2);
+        assert!(capture_inset(&retina, expected, 1.).is_err());
+        retina.put_pixel(0, 5, Rgba([255, 255, 255, 255]));
+        assert!(capture_inset(&retina, expected, 2.).is_err());
+    }
 }

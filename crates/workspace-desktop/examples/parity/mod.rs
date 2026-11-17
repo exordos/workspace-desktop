@@ -170,6 +170,7 @@ pub fn run() -> Result<()> {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: None,
+                    show: false,
                     is_resizable: false,
                     ..WindowOptions::default()
                 },
@@ -184,9 +185,18 @@ pub fn run() -> Result<()> {
             match window {
                 Ok(window) => {
                     cx.activate(true);
-                    window
-                        .update(cx, |_, window, _| window.activate_window())
-                        .expect("активация окна сцены");
+                    let activation = window
+                        .update(cx, |_, window, _| {
+                            capture::disable_open_animation(window)?;
+                            window.activate_window();
+                            Ok::<_, Box<dyn std::error::Error>>(())
+                        })
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result.map_err(|error| error.to_string()));
+                    if let Err(error) = activation {
+                        eprintln!("Не удалось активировать окно сцены {ID}: {error}");
+                        exit(1);
+                    }
                     cx.spawn(async move |cx| {
                         if let Err(error) = capture::run(&config, window, painted, cx).await {
                             eprintln!("{error}");
