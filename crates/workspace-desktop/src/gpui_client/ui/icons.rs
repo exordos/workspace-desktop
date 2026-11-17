@@ -2,7 +2,12 @@
 
 use std::borrow::Cow;
 
-use gpui::{AssetSource, Hsla, Pixels, SharedString, Svg, prelude::*, svg};
+use gpui::{AssetSource, Hsla, Pixels, SharedString, Svg, prelude::*, px, svg};
+
+/// Слот иконки в компактной кнопке.
+pub(super) const BUTTON_ICON_SIZE: Pixels = px(16.);
+/// Слот лупы в поле поиска каталога.
+pub const SEARCH_ICON_SIZE: Pixels = px(18.);
 
 // Одно имя ресурса используется и при отрисовке, и при поиске в AssetSource.
 macro_rules! workspace_icons {

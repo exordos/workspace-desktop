@@ -5,7 +5,12 @@ use gpui::{
     px,
 };
 
-use super::{Icon, Palette, TextRole, label};
+use super::{
+    Icon, Palette, TextRole,
+    icons::BUTTON_ICON_SIZE,
+    label,
+    theme::{COMPACT_CONTROL_INSET, COMPACT_CONTROL_SIZE, CONTROL_BORDER, CONTROL_RADIUS},
+};
 
 /// Вид кнопки в зависимости от её роли в интерфейсе.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -59,21 +64,23 @@ impl Button {
         } else {
             foreground
         };
-        let hover = match self.appearance {
-            ButtonAppearance::Primary => palette.accent.opacity(0.85),
-            ButtonAppearance::Neutral | ButtonAppearance::Ghost => palette.card_hover,
+        let (hover, pressed) = match self.appearance {
+            ButtonAppearance::Primary => (palette.accent.opacity(0.9), palette.accent.opacity(0.8)),
+            ButtonAppearance::Neutral | ButtonAppearance::Ghost => {
+                (palette.card_hover, palette.card_hover.opacity(0.78))
+            }
         };
         let button = div()
             .id(self.id)
-            .h(px(32.))
-            .min_w(px(32.))
-            .px(px(8.))
+            .h(COMPACT_CONTROL_SIZE)
+            .min_w(COMPACT_CONTROL_SIZE)
+            .px(COMPACT_CONTROL_INSET)
             .flex()
             .items_center()
             .justify_center()
             .gap(px(6.))
-            .rounded(px(8.))
-            .border_1()
+            .rounded(CONTROL_RADIUS)
+            .border(CONTROL_BORDER)
             .border_color(gpui::transparent_black())
             .bg(
                 if self.disabled && self.appearance == ButtonAppearance::Primary {
@@ -82,7 +89,10 @@ impl Button {
                     background
                 },
             )
-            .children(self.icon.map(|icon| icon.element(px(16.), icon_color)))
+            .children(
+                self.icon
+                    .map(|icon| icon.element(BUTTON_ICON_SIZE, icon_color)),
+            )
             .when(!self.label.is_empty(), |button| {
                 button.child(
                     label(palette, TextRole::Label, self.label)
@@ -98,7 +108,7 @@ impl Button {
             activate(
                 button
                     .hover(|style| style.bg(hover))
-                    .active(|style| style.bg(hover.opacity(0.78))),
+                    .active(|style| style.bg(pressed)),
                 focus,
                 palette,
                 on_activate,
@@ -145,12 +155,12 @@ pub fn field(palette: Palette, appearance: FieldAppearance, control: impl IntoEl
     };
     div()
         .min_w_0()
-        .min_h(px(32.))
-        .px(px(8.))
+        .min_h(COMPACT_CONTROL_SIZE)
+        .px(COMPACT_CONTROL_INSET)
         .flex()
         .items_center()
-        .rounded(px(8.))
-        .border_1()
+        .rounded(CONTROL_RADIUS)
+        .border(CONTROL_BORDER)
         .border_color(border)
         .bg(palette.field)
         .text_color(match appearance {

@@ -11,7 +11,7 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::gpui_client::ui::{
-    Button, ButtonAppearance, FieldAppearance, Icon, Palette, ThemeMode, field,
+    Button, ButtonAppearance, FieldAppearance, Icon, Palette, SEARCH_ICON_SIZE, ThemeMode, field,
 };
 
 gpui::actions!(
@@ -419,8 +419,8 @@ impl Render for Search {
             .w_full()
             .min_w_0()
             .items_center()
-            .gap(px(6.))
-            .child(Icon::Search.element(px(16.), palette.text_secondary))
+            .gap_2()
+            .child(Icon::Search.element(SEARCH_ICON_SIZE, palette.text_secondary))
             .child(div().flex_1().min_w_0().child(input));
         if !self.text.is_empty() {
             let mut clear = Button::new("catalog-clear", "");

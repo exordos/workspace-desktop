@@ -7,6 +7,15 @@ use gpui::{
 
 use unicode_segmentation::UnicodeSegmentation;
 
+/// Радиус компактных панелей управления, поля и строки каталога.
+pub(super) const CONTROL_RADIUS: Pixels = px(8.);
+/// Толщина обычной и резервной границы компонентов UI-кита.
+pub(super) const CONTROL_BORDER: Pixels = px(1.);
+/// Высота стандартного компактного контрола и ширина кнопки с одной иконкой.
+pub(super) const COMPACT_CONTROL_SIZE: Pixels = px(32.);
+/// Горизонтальный отступ компактной кнопки и поля.
+pub(super) const COMPACT_CONTROL_INSET: Pixels = px(8.);
+
 /// Режим оформления окна Workspace.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ThemeMode {
@@ -28,7 +37,7 @@ impl From<WindowAppearance> for ThemeMode {
 /// Цвета Blue Mist, названные по назначению в интерфейсе.
 #[derive(Clone, Copy, Debug)]
 pub struct Palette {
-    pub background: Hsla,       // Фон основного окна.
+    pub background: Hsla,       // Фон окна и нейтральная подложка аватара.
     pub surface: Hsla,          // Верхняя панель, сайдбар и внешняя поверхность редактора.
     pub card: Hsla,             // Обычная строка или нейтральная кнопка.
     pub card_hover: Hsla,       // Строка чата под указателем.
@@ -38,13 +47,13 @@ pub struct Palette {
     pub text_secondary: Hsla,   // Второстепенный текст.
     pub text_muted: Hsla,       // Подсказка поля и неактивная подпись.
     pub accent: Hsla,           // Кнопка основного действия и фокус.
-    pub accent_soft: Hsla,      // Подложка мягкого акцента и аватара.
+    pub accent_soft: Hsla,      // Подложка мягкого акцента.
     pub on_accent: Hsla,        // Текст на кнопке основного действия.
     pub danger: Hsla,           // Ошибка или опасное действие.
     pub border: Hsla,           // Граница панелей и элементов.
     pub unread: Hsla,           // Бейдж непрочитанного.
     pub unread_muted: Hsla,     // Счётчик приглушённого разговора.
-    pub badge_text: Hsla,       // Символы внутри бейджа.
+    pub badge_text: Hsla,       // Контрастный текст синего бейджа.
     pub muted_badge_text: Hsla, // Символы на приглушённом бейдже.
     pub message: Hsla,          // Фон входящего сообщения.
     pub message_own: Hsla,      // Фон исходящего сообщения.
@@ -123,10 +132,12 @@ impl Palette {
 /// Размер, вес и базовый цвет текста по роли.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TextRole {
-    Heading, // Заголовок панели.
-    Label,   // Название строки или элемента.
-    Body,    // Текст сообщения или поля.
-    Caption, // Подпись, время или превью.
+    Heading,  // Заголовок панели.
+    Label,    // Название строки или элемента.
+    Body,     // Текст сообщения или поля.
+    Caption,  // Подпись, время или превью.
+    Initials, // Инициалы внутри компактного аватара.
+    Badge,    // Число или знак упоминания внутри бейджа.
 }
 
 impl TextRole {
@@ -137,6 +148,8 @@ impl TextRole {
             TextRole::Label => (14., 20., FontWeight::MEDIUM, palette.text),
             TextRole::Body => (14., 20., FontWeight::NORMAL, palette.text),
             TextRole::Caption => (12., 18., FontWeight::NORMAL, palette.text_secondary),
+            TextRole::Initials => (12., 16., FontWeight::SEMIBOLD, palette.text),
+            TextRole::Badge => (11., 11., FontWeight::MEDIUM, palette.badge_text),
         };
         (px(size), px(height), weight, color)
     }

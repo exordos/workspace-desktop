@@ -6,7 +6,12 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::{Icon, Palette, TextRole, controls::activate, label, theme::ellipsized_label};
+use super::{
+    Icon, Palette, TextRole,
+    controls::activate,
+    label,
+    theme::{CONTROL_BORDER, CONTROL_RADIUS, ellipsized_label},
+};
 
 /// Размер аватара в пределах рабочего среза.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -46,10 +51,11 @@ impl Avatar {
 
     /// Рисует фиксированный круг. При загрузке изображения остаются инициалы.
     pub fn render(self, palette: Palette) -> Div {
-        let size = px(match self.size {
+        let diameter = match self.size {
             AvatarSize::Small => 32.,
             AvatarSize::Medium => 40.,
-        });
+        };
+        let size = px(diameter);
         let presence = match self.presence {
             AvatarPresence::Hidden => None,
             AvatarPresence::Online => Some(palette.presence_online),
@@ -65,12 +71,12 @@ impl Avatar {
             .justify_center()
             .rounded_full()
             .overflow_hidden()
-            .bg(palette.accent_soft)
+            .bg(palette.background)
             .when(initials.trim().is_empty(), |avatar| {
                 avatar.child(Icon::Account.element(px(20.), palette.text_secondary))
             })
             .when(!initials.trim().is_empty(), |avatar| {
-                avatar.child(label(palette, TextRole::Label, initials))
+                avatar.child(label(palette, TextRole::Initials, initials))
             })
             .children(self.image.map(|image| {
                 img(image)
@@ -78,21 +84,33 @@ impl Avatar {
                     .inset_0()
                     .size_full()
                     .object_fit(ObjectFit::Cover)
-            }));
+            }))
+            // Обводка поверх фотографии совпадает с контуром аватара без фото.
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded_full()
+                    .border(CONTROL_BORDER)
+                    .border_color(palette.border),
+            );
         div()
             .relative()
             .size(size)
             .flex_none()
+            .debug_selector(|| "avatar".into())
             .child(avatar)
             .children(presence.map(|color| {
+                // Центр метки лежит на окружности под углом 45°, как в Electron.
+                let inset = px(diameter * 0.1465 - 6.);
                 div()
                     .absolute()
-                    .right_0()
-                    .bottom_0()
-                    .size(px(10.))
+                    .right(inset)
+                    .bottom(inset)
+                    .size(px(12.))
                     .rounded_full()
                     .border(px(2.))
-                    .border_color(palette.surface)
+                    .border_color(palette.background)
                     .bg(color)
             }))
     }
@@ -115,12 +133,12 @@ pub fn unread_badge(palette: Palette, count: u64, tone: BadgeTone) -> Option<Div
     } else {
         count.to_string()
     };
-    Some(badge(palette, text.into(), tone))
+    Some(badge(palette, text.into(), tone).debug_selector(|| "unread-badge".into()))
 }
 
 /// Рисует бейдж упоминания.
 pub fn mention_badge(palette: Palette) -> Div {
-    badge(palette, "@".into(), BadgeTone::Accent)
+    badge(palette, "@".into(), BadgeTone::Accent).debug_selector(|| "mention-badge".into())
 }
 
 /// Размещает текст внутри бейджа фиксированной высоты.
@@ -130,19 +148,16 @@ fn badge(palette: Palette, text: SharedString, tone: BadgeTone) -> Div {
         BadgeTone::Muted => (palette.unread_muted, palette.muted_badge_text),
     };
     div()
-        .h(px(16.))
-        .min_w(px(16.))
-        .px(px(4.))
+        .h(px(20.))
+        .min_w(px(20.))
+        .px(px(6.))
         .flex()
         .flex_none()
         .items_center()
         .justify_center()
         .rounded_full()
         .bg(background)
-        .text_color(foreground)
-        .text_size(px(11.))
-        .line_height(px(14.))
-        .child(text)
+        .child(label(palette, TextRole::Badge, text).text_color(foreground))
 }
 
 /// Готовые сведения для превью последнего сообщения.
@@ -192,8 +207,8 @@ impl ChatRow {
             .flex()
             .items_center()
             .gap(px(8.))
-            .rounded(px(8.))
-            .border_1()
+            .rounded(CONTROL_RADIUS)
+            .border(CONTROL_BORDER)
             .border_color(gpui::transparent_black())
             .bg(if self.selected {
                 palette.card_selected

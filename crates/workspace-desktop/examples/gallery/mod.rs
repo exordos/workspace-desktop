@@ -8,8 +8,8 @@ use workspace_desktop::gpui_client::{
     composer::Editor,
     ui::{
         Avatar, AvatarPresence, AvatarSize, BadgeTone, Button, ButtonAppearance, ChatRow,
-        ChatRowPreview, DeliveryMark, FieldAppearance, Icon, MessageBubble, Palette, TextRole,
-        ThemeMode, WorkspaceAssets, field, label,
+        ChatRowPreview, DeliveryMark, FieldAppearance, Icon, MessageBubble, Palette,
+        SEARCH_ICON_SIZE, TextRole, ThemeMode, WorkspaceAssets, field, label,
     },
 };
 
@@ -79,7 +79,7 @@ impl Panel {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(Icon::Search.element(px(16.), palette.icon))
+                    .child(Icon::Search.element(SEARCH_ICON_SIZE, palette.text_secondary))
                     .child(label(palette, TextRole::Body, "Поиск по чатам")),
             ))
             .child(self.chat_row(palette, 0, cx))
@@ -106,7 +106,8 @@ impl Panel {
             .child(field(
                 palette,
                 FieldAppearance::Disabled,
-                label(palette, TextRole::Body, "Редактирование недоступно"),
+                label(palette, TextRole::Body, "Редактирование недоступно")
+                    .text_color(palette.text_muted),
             ))
     }
 

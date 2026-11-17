@@ -152,6 +152,9 @@ fn chat_title_does_not_displace_metadata_in_narrow_window(cx: &mut TestAppContex
         let metadata = ui
             .debug_bounds("chat-row-metadata")
             .expect("время и счётчики");
+        let avatar = ui.debug_bounds("avatar").expect("аватар строки");
+        let unread = ui.debug_bounds("unread-badge").expect("бейдж счётчика");
+        let mention = ui.debug_bounds("mention-badge").expect("бейдж упоминания");
         assert!(title.size.width > px(0.), "{mode:?}. {title:?}");
         assert!(
             title.right() < metadata.left(),
@@ -166,5 +169,43 @@ fn chat_title_does_not_displace_metadata_in_narrow_window(cx: &mut TestAppContex
             px(60.),
             "{mode:?}. длинный текст не должен увеличить высоту: {row:?}"
         );
+        assert_eq!(avatar.size, size(px(40.), px(40.)));
+        assert_eq!(unread.size.height, px(20.));
+        assert!(unread.size.width >= px(20.));
+        assert_eq!(mention.size, size(px(20.), px(20.)));
     }
+}
+
+/// Не даёт светлому тексту на синем счётчике или приглушённому фону снизить читаемость.
+#[test]
+fn unread_badges_keep_text_contrast_in_both_themes() {
+    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        let palette = Palette::for_mode(mode);
+        for (foreground, background) in [
+            (palette.badge_text, palette.unread),
+            (palette.muted_badge_text, palette.unread_muted),
+        ] {
+            let a = relative_luminance(foreground);
+            let b = relative_luminance(background);
+            let contrast = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+            assert!(contrast >= 4.5, "{mode:?}: {contrast:.2}:1");
+        }
+    }
+}
+
+/// Переводит цвет sRGB в относительную яркость для проверки контраста.
+fn relative_luminance(color: gpui::Hsla) -> f32 {
+    let color = color.to_rgb();
+    [color.r, color.g, color.b]
+        .into_iter()
+        .zip([0.2126, 0.7152, 0.0722])
+        .map(|(channel, weight)| {
+            let linear = if channel <= 0.04045 {
+                channel / 12.92
+            } else {
+                ((channel + 0.055) / 1.055).powf(2.4)
+            };
+            linear * weight
+        })
+        .sum()
 }

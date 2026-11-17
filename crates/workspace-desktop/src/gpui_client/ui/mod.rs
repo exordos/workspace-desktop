@@ -14,5 +14,5 @@ pub use content::{
     MessageBubble, mention_badge, unread_badge,
 };
 pub use controls::{Button, ButtonAppearance, FieldAppearance, field};
-pub use icons::{Icon, WorkspaceAssets};
+pub use icons::{Icon, SEARCH_ICON_SIZE, WorkspaceAssets};
 pub use theme::{Palette, TextRole, ThemeMode, label};
