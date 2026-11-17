@@ -4,7 +4,7 @@
 use std::{cell::Cell, f32::consts::TAU, rc::Rc};
 
 use iced::advanced::renderer::{self, Renderer as _};
-use iced::advanced::widget::{Operation, Tree, operation::Focusable, tree};
+use iced::advanced::widget::{Id, Operation, Tree, operation::Focusable, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, overlay};
 use iced::keyboard::{self, Key, key::Named};
 use iced::time::{Duration, Instant};
@@ -174,10 +174,21 @@ pub(super) fn keyboard_button<'a, Message: Clone + 'a>(
     on_press: Option<Message>,
     keyboard_pressed: Rc<Cell<bool>>,
 ) -> Element<'a, Message> {
+    keyboard_button_with_id(inner, on_press, keyboard_pressed, None)
+}
+
+/// Добавляет кнопке идентификатор. При его смене отменяется начатое нажатие.
+pub(super) fn keyboard_button_with_id<'a, Message: Clone + 'a>(
+    inner: Button<'a, Message>,
+    on_press: Option<Message>,
+    keyboard_pressed: Rc<Cell<bool>>,
+    id: Option<Id>,
+) -> Element<'a, Message> {
     Element::new(KeyboardButton {
         inner,
         on_press,
         keyboard_pressed,
+        id,
     })
 }
 
@@ -294,6 +305,7 @@ struct KeyboardButton<'a, Message> {
     inner: Button<'a, Message>, // Кнопка Iced, которая рисует содержимое и обрабатывает указатель.
     on_press: Option<Message>,  // Сообщение при нажатии. `None` означает, что кнопка отключена.
     keyboard_pressed: Rc<Cell<bool>>, // Общий признак нажатия клавишей, который читает стиль кнопки.
+    id: Option<Id>, // Подсказывает Iced, когда новая кнопка заняла место прежней. Может отсутствовать.
 }
 
 /// Состояние клавиатуры, которое Iced хранит между обновлениями виджета.
@@ -302,6 +314,7 @@ struct FocusState {
     enabled: bool,    // Признак, что кнопку можно нажать.
     focused: bool,    // Признак, что кнопка сейчас принимает ввод с клавиатуры.
     space_held: bool, // Признак, что пробел удерживается до отпускания или потери фокуса.
+    id: Option<Id>, // Идентификатор кнопки при последнем обновлении или `None` без идентификатора.
 }
 
 impl Focusable for FocusState {
@@ -332,6 +345,7 @@ impl<'a, Message: Clone + 'a> Widget<Message, Theme, Renderer> for KeyboardButto
     fn state(&self) -> tree::State {
         tree::State::new(FocusState {
             enabled: self.on_press.is_some(),
+            id: self.id.clone(),
             ..FocusState::default()
         })
     }
@@ -343,12 +357,13 @@ impl<'a, Message: Clone + 'a> Widget<Message, Theme, Renderer> for KeyboardButto
         )]
     }
 
-    /// Обновляет дерево Iced и сбрасывает фокус, когда меняется доступность кнопки.
+    /// Сбрасывает фокус и нажатие при замене кнопки или изменении её доступности.
     fn diff(&self, tree: &mut Tree) {
         let state = tree.state.downcast_mut::<FocusState>();
         let enabled = self.on_press.is_some();
-        if enabled != state.enabled {
+        if enabled != state.enabled || state.id != self.id {
             state.enabled = enabled;
+            state.id.clone_from(&self.id);
             state.unfocus();
             tree.children = self.children();
         } else {
@@ -381,7 +396,7 @@ impl<'a, Message: Clone + 'a> Widget<Message, Theme, Renderer> for KeyboardButto
     ) {
         if self.on_press.is_some() {
             operation.focusable(
-                None,
+                self.id.as_ref(),
                 layout.bounds(),
                 tree.state.downcast_mut::<FocusState>(),
             );

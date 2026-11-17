@@ -8,8 +8,8 @@ use std::{path::Path, time::Duration};
 
 use futures::StreamExt;
 use iced::advanced::subscription::into_recipes;
-use iced::advanced::widget::{Id, Operation};
-use iced::{Font, Pixels, Rectangle, Size, mouse};
+use iced::advanced::widget::{Id, Operation, operation::Focusable};
+use iced::{Font, Pixels, Point, Rectangle, Size, mouse};
 use iced_runtime::Action;
 use iced_runtime::core::clipboard;
 use iced_runtime::task::into_stream;
@@ -23,6 +23,10 @@ use workspace_core::runtime::{Runtime, RuntimeError};
 use workspace_core::storage::Storage;
 
 use super::*;
+use crate::ui_kit::{
+    TOP_BAR_ACCOUNT_MENU_ID, TOP_BAR_ACCOUNT_ROW_ID_PREFIX, TOP_BAR_SELECTED_ACCOUNT_ID,
+    TOP_BAR_UNREAD_DOT_ID_PREFIX,
+};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -94,7 +98,10 @@ impl NotificationDelivery for RecordedNotifications {
 
 /// Считывает текст и расположение виджетов из разметки настоящего окна Iced.
 #[derive(Default)]
-struct RenderedText(Vec<(Rectangle, String)>); // Границы и текст видимых элементов оболочки.
+struct RenderedText(
+    Vec<(Rectangle, String)>, // Подписи и положение текста в окне.
+    Vec<(Id, Rectangle)>,     // Положение элементов, у которых есть идентификатор.
+);
 
 impl Operation for RenderedText {
     /// Обходит дочерние виджеты, включая содержимое строк аккаунтов.
@@ -106,6 +113,18 @@ impl Operation for RenderedText {
     fn text(&mut self, _: Option<&Id>, bounds: Rectangle, value: &str) {
         self.0.push((bounds, value.to_owned()));
     }
+
+    /// Запоминает положение строки аккаунта, точки или признака выбора.
+    fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+        if let Some(id) = id {
+            self.1.push((id.clone(), bounds));
+        }
+    }
+
+    /// Запоминает положение кнопки, которой можно передать фокус.
+    fn focusable(&mut self, id: Option<&Id>, bounds: Rectangle, _: &mut dyn Focusable) {
+        self.container(id, bounds);
+    }
 }
 
 impl RenderedText {
@@ -116,35 +135,137 @@ impl RenderedText {
 
     /// Строит разметку оболочки программным рендерером без открытия окна.
     fn from_shell(shell: &Shell, renderer: &mut iced::Renderer) -> Self {
-        let mut ui = UserInterface::build(
-            shell.view(),
-            Size::new(620.0, 360.0),
-            Cache::new(),
-            renderer,
-        );
+        Self::from_ui(&mut build_ui(shell, renderer), renderer)
+    }
+
+    /// Считывает разметку текущего окна, включая раскрытое меню.
+    fn from_ui(
+        ui: &mut UserInterface<'_, Message, Theme, iced::Renderer>,
+        renderer: &iced::Renderer,
+    ) -> Self {
         let mut text = Self::default();
         ui.operate(renderer, &mut text);
         text
     }
 
-    /// Возвращает число справа от подписи аккаунта. Пустой бейдж означает ноль.
-    fn badge_count(&self, account: &str) -> u32 {
-        let (label, _) = self.0.iter().find(|(_, text)| text == account).unwrap();
-        self.0
+    /// Находит границы элемента по идентификатору Iced.
+    fn bounds(&self, id: Id) -> Option<Rectangle> {
+        self.1
             .iter()
-            .find_map(|(bounds, text)| {
-                let center = bounds.y + bounds.height / 2.0;
-                (bounds.x > label.x && center >= label.y && center <= label.y + label.height)
-                    .then(|| text.parse().ok())
-                    .flatten()
-            })
-            .unwrap_or(0)
+            .find(|(widget, _)| *widget == id)
+            .map(|(_, bounds)| *bounds)
     }
 
-    /// Проверяет подпись открытого аккаунта в видимом содержимом.
-    fn shows_selected(&self, account: &str) -> bool {
-        let prefix = format!("Открыт аккаунт {account} ·");
-        self.0.iter().any(|(_, text)| text.starts_with(&prefix))
+    /// Возвращает границы строки аккаунта в раскрытом меню.
+    fn account_bounds(&self, account: &AccountId) -> Rectangle {
+        self.bounds(Id::from(format!(
+            "{TOP_BAR_ACCOUNT_ROW_ID_PREFIX}{}",
+            account.0
+        )))
+        .expect("в меню нет строки тестового аккаунта")
+    }
+
+    /// Возвращает текст числового бейджа в строке раскрытого меню.
+    fn badge(&self, account: &AccountId) -> Option<&str> {
+        let row = self.account_bounds(account);
+        self.0
+            .iter()
+            .find(|(bounds, text)| {
+                row.contains(bounds.center())
+                    && text
+                        .strip_suffix("k+")
+                        .unwrap_or(text)
+                        .parse::<u32>()
+                        .is_ok()
+            })
+            .map(|(_, text)| text.as_str())
+    }
+
+    /// Проверяет наличие точки непрочитанного рядом с быстрой кнопкой.
+    fn shows_unread_dot(&self, account: &AccountId) -> bool {
+        self.bounds(Id::from(format!(
+            "{TOP_BAR_UNREAD_DOT_ID_PREFIX}{}",
+            account.0
+        )))
+        .is_some()
+    }
+
+    /// Проверяет, какую строку меню шапка выделяет как выбранную.
+    fn shows_selected(&self, account: &AccountId) -> bool {
+        self.bounds(Id::new(TOP_BAR_SELECTED_ACCOUNT_ID))
+            .is_some_and(|selected| self.account_bounds(account).contains(selected.center()))
+    }
+}
+
+/// Строит штатное окно Iced без вывода на экран.
+fn build_ui<'a>(
+    shell: &'a Shell,
+    renderer: &mut iced::Renderer,
+) -> UserInterface<'a, Message, Theme, iced::Renderer> {
+    UserInterface::build(
+        shell.view(),
+        Size::new(620.0, 360.0),
+        Cache::new(),
+        renderer,
+    )
+}
+
+/// Передаёт виджетам Iced нажатие и отпускание мыши в одной точке.
+fn click_ui(
+    ui: &mut UserInterface<'_, Message, Theme, iced::Renderer>,
+    renderer: &mut iced::Renderer,
+    point: Point,
+) -> Vec<Message> {
+    let mut messages = Vec::new();
+    let _ = ui.update(
+        &[
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+        ],
+        mouse::Cursor::Available(point),
+        renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    messages
+}
+
+/// Открывает переключатель кликом по кнопке и возвращает разметку раскрытого меню.
+fn open_accounts(
+    ui: &mut UserInterface<'_, Message, Theme, iced::Renderer>,
+    renderer: &mut iced::Renderer,
+) -> RenderedText {
+    let button = RenderedText::from_ui(ui, renderer)
+        .bounds(Id::new(TOP_BAR_ACCOUNT_MENU_ID))
+        .expect("нет кнопки меню аккаунтов");
+    assert!(click_ui(ui, renderer, button.center()).is_empty());
+    RenderedText::from_ui(ui, renderer)
+}
+
+/// Считывает меню, открытое через штатную кнопку шапки.
+fn rendered_accounts(shell: &Shell, renderer: &mut iced::Renderer) -> RenderedText {
+    open_accounts(&mut build_ui(shell, renderer), renderer)
+}
+
+/// Выбирает аккаунт в настоящем меню и передаёт его событие оболочке.
+fn select_account(shell: &mut Shell, renderer: &mut iced::Renderer, account: &AccountId) {
+    let mut ui = build_ui(shell, renderer);
+    let menu = open_accounts(&mut ui, renderer);
+    let messages = click_ui(&mut ui, renderer, menu.account_bounds(account).center());
+    drop(ui);
+    let [message @ Message::Select(selected, _)] = messages.as_slice() else {
+        panic!("меню не отправило выбор аккаунта: {messages:?}");
+    };
+    assert_eq!(selected, account);
+    assert!(into_stream(shell.update(message.clone())).is_none());
+}
+
+/// Ожидаемый текст счётчика по формату референса в меню аккаунтов.
+fn expected_badge(count: u32) -> Option<String> {
+    match count {
+        0 => None,
+        1..=1_000 => Some(count.to_string()),
+        _ => Some(format!("{}k+", count / 1_000)),
     }
 }
 
@@ -444,36 +565,21 @@ async fn background_message_scenario(workspace: &impl TestWorkspace, check_catal
         let failed = RenderedText::from_shell(&shell, &mut renderer);
         assert!(failed.contains("Не удалось загрузить чаты"));
         assert!(failed.contains("Повторить"));
-        let _ = shell.update(Message::Select(background.account_id.clone()));
+        select_account(&mut shell, &mut renderer, &background.account_id);
         let other = RenderedText::from_shell(&shell, &mut renderer);
         assert!(other.contains("Канал B"));
         assert!(other.contains("Алиса"));
         assert!(other.contains("К"));
         assert!(other.contains("А"));
         assert!(!other.contains("Повторить"));
-        let _ = shell.update(Message::Select(foreground.account_id.clone()));
-        let mut ui = UserInterface::build(
-            shell.view(),
-            Size::new(620.0, 360.0),
-            Cache::new(),
-            &mut renderer,
-        );
+        select_account(&mut shell, &mut renderer, &foreground.account_id);
+        let mut ui = build_ui(&shell, &mut renderer);
         let (bounds, _) = failed
             .0
             .iter()
             .find(|(_, label)| label == "Повторить")
             .unwrap();
-        let mut messages = Vec::new();
-        let _ = ui.update(
-            &[
-                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-            ],
-            mouse::Cursor::Available(bounds.center()),
-            &mut renderer,
-            &mut clipboard::Null,
-            &mut messages,
-        );
+        let mut messages = click_ui(&mut ui, &mut renderer, bounds.center());
         drop(ui);
         assert!(matches!(messages.as_slice(), [Message::RetryChats]));
         let _ = shell.update(messages.remove(0));
@@ -495,12 +601,25 @@ async fn background_message_scenario(workspace: &impl TestWorkspace, check_catal
         assert!(!loaded.contains("Канал B"));
         assert!(!loaded.contains("Повторить"));
     }
-    let before = RenderedText::from_shell(&shell, &mut renderer);
-    assert!(before.shows_selected("Аккаунт A"));
-    let foreground_count = before.badge_count("Аккаунт A");
-    let previous_count = before.badge_count("Аккаунт B");
-    assert_eq!(sync.unread(&foreground).unwrap(), Some(foreground_count));
-    assert_eq!(sync.unread(&background).unwrap(), Some(previous_count));
+    let before = rendered_accounts(&shell, &mut renderer);
+    assert!(before.shows_selected(&foreground.account_id));
+    let foreground_count = sync.unread(&foreground).unwrap().unwrap();
+    let previous_count = sync.unread(&background).unwrap().unwrap();
+    let foreground_badge = expected_badge(foreground_count);
+    let background_badge = expected_badge(previous_count);
+    let updated_badge = expected_badge(previous_count + 1);
+    assert_eq!(
+        before.badge(&foreground.account_id),
+        foreground_badge.as_deref()
+    );
+    assert_eq!(
+        before.badge(&background.account_id),
+        background_badge.as_deref()
+    );
+    assert_eq!(
+        before.shows_unread_dot(&background.account_id),
+        previous_count > 0
+    );
     let body = format!("Workspace Desktop integration test {}", Uuid::new_v4());
     let (conversation_id, message_id) = timeout(DEADLINE, workspace.send_direct_message(&body))
         .await
@@ -513,8 +632,8 @@ async fn background_message_scenario(workspace: &impl TestWorkspace, check_catal
     timeout(DEADLINE, async {
         loop {
             next_update(&mut shell, &mut events, "новый бейдж и уведомление").await;
-            let rendered = RenderedText::from_shell(&shell, &mut renderer);
-            if rendered.badge_count("Аккаунт B") == previous_count + 1
+            let rendered = rendered_accounts(&shell, &mut renderer);
+            if rendered.badge(&background.account_id) == updated_badge.as_deref()
                 && !notifications.0.lock().unwrap().is_empty()
             {
                 break;
@@ -537,10 +656,19 @@ async fn background_message_scenario(workspace: &impl TestWorkspace, check_catal
             .text,
         body
     );
-    let after = RenderedText::from_shell(&shell, &mut renderer);
-    assert!(after.shows_selected("Аккаунт A"));
-    assert_eq!(after.badge_count("Аккаунт A"), foreground_count);
-    assert_eq!(after.badge_count("Аккаунт B"), previous_count + 1);
+    let after = rendered_accounts(&shell, &mut renderer);
+    assert!(after.shows_selected(&foreground.account_id));
+    assert_eq!(
+        after.badge(&foreground.account_id),
+        foreground_badge.as_deref()
+    );
+    assert_eq!(
+        after.badge(&background.account_id),
+        updated_badge.as_deref()
+    );
+    assert!(after.shows_unread_dot(&background.account_id));
+    assert_eq!(sync.unread(&foreground).unwrap(), Some(foreground_count));
+    assert_eq!(sync.unread(&background).unwrap(), Some(previous_count + 1));
     let click = {
         let requests = notifications.0.lock().unwrap();
         assert_eq!(requests.len(), 1);
@@ -713,7 +841,7 @@ async fn refresh_open_history_scenario(shell: &mut Shell, renderer: &mut iced::R
         .context
         .account_id
         .clone();
-    let _ = shell.update(Message::Select(foreground));
+    select_account(shell, renderer, &foreground);
     assert!(into_stream(shell.update(Message::Synced(update))).is_none());
     assert!(!RenderedText::from_shell(shell, renderer).contains("Внутри участка"));
 }
@@ -764,17 +892,26 @@ async fn notification_click_scenario(
         Message::NotificationResolved { result: Err(_), .. }
     ));
     let _ = shell.update(result);
-    assert!(RenderedText::from_shell(shell, renderer).shows_selected("Аккаунт A"));
+    let foreground = shell
+        .accounts
+        .summaries
+        .iter()
+        .find(|summary| summary.session.context != click.target.context)
+        .unwrap()
+        .session
+        .context
+        .account_id
+        .clone();
+    assert!(rendered_accounts(shell, renderer).shows_selected(&foreground));
 
     let result = run_click(shell, click.clone()).await;
     assert!(
         matches!(&result, Message::NotificationResolved { result: Ok(target), .. } if target == &click.target)
     );
     // Выбор пользователя, сделанный пока core готовил ответ, сохраняет текущий маршрут.
-    let selected = shell.accounts.selected.clone().unwrap();
-    let _ = shell.update(Message::Select(selected));
+    select_account(shell, renderer, &foreground);
     let _ = shell.update(result);
-    assert!(RenderedText::from_shell(shell, renderer).shows_selected("Аккаунт A"));
+    assert!(rendered_accounts(shell, renderer).shows_selected(&foreground));
 
     let load = async |shell: &mut Shell, renderer: &mut iced::Renderer| {
         let resolved = run_click(shell, click.clone()).await;
@@ -788,9 +925,24 @@ async fn notification_click_scenario(
     let loaded = load(shell, renderer).await;
     let mut measure = into_stream(shell.update(loaded.clone())).unwrap();
     let rendered = RenderedText::from_shell(shell, renderer);
-    assert!(rendered.shows_selected("Аккаунт B"));
+    let background = &click.target.context.account_id;
+    assert!(rendered_accounts(shell, renderer).shows_selected(background));
     assert!(rendered.contains(body));
     assert!(!rendered.contains("Канал A"));
+    let header_trigger = rendered
+        .bounds(Id::new(TOP_BAR_ACCOUNT_MENU_ID))
+        .expect("шапка осталась над открытой историей");
+
+    let revision = shell.navigation_revision;
+    select_account(shell, renderer, background);
+    let stale = SessionGeneration(click.generation.0 + 1);
+    let _ = shell.update(Message::Select(background.clone(), stale));
+    let _ = shell.update(Message::Select(
+        AccountId("unknown".to_owned()),
+        click.generation,
+    ));
+    assert_eq!(shell.navigation_revision, revision);
+    assert!(RenderedText::from_shell(shell, renderer).contains(body));
 
     if let Some(mock) = mock {
         let Some(Action::Widget(mut operation)) = measure.next().await else {
@@ -827,6 +979,11 @@ async fn notification_click_scenario(
         ui.operate(renderer, &mut labels);
         let (bounds, _) = labels.0.iter().find(|(_, value)| value == body).unwrap();
         let (viewport, dy) = layout.0.unwrap();
+        assert_eq!(
+            labels.bounds(Id::new(TOP_BAR_ACCOUNT_MENU_ID)),
+            Some(header_trigger)
+        );
+        assert!(header_trigger.y + header_trigger.height <= viewport.y);
         assert!(dy > 0.0);
         assert!(
             bounds.y - dy >= viewport.y
@@ -919,12 +1076,7 @@ async fn notification_click_scenario(
     }
 
     let loaded = load(shell, renderer).await;
-    let foreground = shell.accounts.summaries[0]
-        .session
-        .context
-        .account_id
-        .clone();
-    let _ = shell.update(Message::Select(foreground));
+    select_account(shell, renderer, &foreground);
     assert!(into_stream(shell.update(loaded)).is_none());
     assert!(!RenderedText::from_shell(shell, renderer).contains(body));
 

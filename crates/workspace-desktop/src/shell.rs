@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use futures::stream::{self, Stream, StreamExt};
 use futures::{channel::mpsc, future::BoxFuture};
 use iced::keyboard::{self, Key, key::Named};
-use iced::widget::{Column, column, container, operation, row, scrollable, text};
+use iced::widget::{column, container, operation, row, scrollable, text};
 use iced::{Alignment, Element, Event, Fill, Subscription, Task, Theme, event, window};
 use tokio::sync::{broadcast, oneshot};
 use unicode_segmentation::UnicodeSegmentation;
@@ -22,8 +22,8 @@ use workspace_core::sync::{Sync, SyncChange, SyncUpdate};
 
 use crate::platform::notifications::{NotificationClick, NotificationError, Notifications};
 use crate::ui_kit::{
-    AvatarContent, AvatarSize, BadgeSize, BadgeTone, ButtonVariant, ChatRowOptions, ThemeMode,
-    avatar, button, chat_row, unread_count_badge, workspace_theme,
+    AvatarContent, AvatarSize, ButtonVariant, ChatRowOptions, ThemeMode, TopBarAccount, avatar,
+    button, chat_row, top_bar, workspace_theme,
 };
 
 mod history;
@@ -52,11 +52,11 @@ pub struct AccountSummary {
 /// События, которые могут изменить окно или вызвать системное действие.
 #[derive(Clone, Debug)]
 pub enum Message {
-    Select(AccountId),                                   // Пользователь выбрал аккаунт.
-    Snapshot(Vec<AccountSummary>),                       // Свежий список сессий и счётчиков.
-    Chats(ChatLists),                                    // Свежие состояния загрузки каталогов.
-    RetryChats,         // Пользователь просит повторить загрузку списка.
-    Synced(SyncUpdate), // Синхронизация завершила запись события.
+    Select(AccountId, SessionGeneration), // Аккаунт и поколение входа на момент клика.
+    Snapshot(Vec<AccountSummary>),        // Свежий список сессий и счётчиков.
+    Chats(ChatLists),                     // Свежие состояния загрузки каталогов.
+    RetryChats,                           // Пользователь просит повторить загрузку списка.
+    Synced(SyncUpdate),                   // Синхронизация завершила запись события.
     NotificationFinished(Result<(), NotificationError>), // Результат обращения к ОС.
     NotificationClicked(NotificationClick), // macOS передала цель нажатого баннера.
     NotificationResolved {
@@ -211,7 +211,18 @@ impl Shell {
     /// Обрабатывает выбор аккаунта, новые счётчики и запросы на баннеры.
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Select(account) => {
+            Message::Select(account, generation) => {
+                if !self.accounts.summaries.iter().any(|summary| {
+                    summary.session.context.account_id == account
+                        && summary.session.generation == generation
+                }) {
+                    return Task::none();
+                }
+                if self.accounts.selected.as_ref() == Some(&account)
+                    && self.visible_history().is_some()
+                {
+                    return Task::none();
+                }
                 self.navigation_revision += 1;
                 self.history = None;
                 self.accounts.select(account);
@@ -462,39 +473,33 @@ impl Shell {
         workspace_theme(ThemeMode::Light)
     }
 
-    /// Показывает аккаунты, число непрочитанных и текущий экран.
+    /// Показывает шапку над текущим экраном, за пределами его прокрутки.
     pub fn view(&self) -> Element<'_, Message> {
-        let mut rows = Column::new().spacing(8);
-        for summary in &self.accounts.summaries {
-            rows = rows.push(self.account_row(summary));
-        }
-        let current = self.accounts.current().map_or_else(
-            || String::from("Ожидание сохранённых сессий"),
-            |active| {
-                format!(
-                    "Открыт аккаунт {} · {}",
-                    self.label(&active.session.context.account_id),
-                    session_status(active.session.status),
-                )
-            },
-        );
-        let mut content = column![text("Аккаунты").size(22), rows, text(current)].spacing(16);
-        if let Some(history) = self.visible_history() {
-            return container(content.push(history.view(self.navigation_revision)))
+        let screen: Element<'_, Message> = if let Some(history) = self.visible_history() {
+            container(history.view(self.navigation_revision))
                 .padding(24)
                 .width(Fill)
                 .height(Fill)
-                .into();
-        }
-        if let Some(current) = self.accounts.current()
-            && current.session.status == SessionStatus::Active
-        {
-            content = content.push(self.chat_list(&current.session));
-        }
-        if self.notification_error.is_some() {
-            content = content.push(text("Системные уведомления недоступны").size(13));
-        }
-        scrollable(container(content).padding(24).width(Fill)).into()
+                .into()
+        } else {
+            let current: Element<'_, Message> = match self.accounts.current() {
+                Some(current) if current.session.status == SessionStatus::Active => {
+                    self.chat_list(&current.session)
+                }
+                Some(current) => text(session_status(current.session.status)).into(),
+                None => text("Ожидание сохранённых сессий").into(),
+            };
+            let mut content = column![current].spacing(16);
+            if self.notification_error.is_some() {
+                content = content.push(text("Системные уведомления недоступны").size(13));
+            }
+            scrollable(container(content).padding(24).width(Fill))
+                .height(Fill)
+                .into()
+        };
+        column![top_bar(self.top_bar_accounts()), screen]
+            .height(Fill)
+            .into()
     }
 
     /// Показывает список выбранного входа, его темы и действие после ошибки.
@@ -555,29 +560,26 @@ impl Shell {
         list.into()
     }
 
-    /// Рисует кнопку аккаунта и число из последнего подтверждённого снимка.
-    fn account_row<'a>(&'a self, summary: &'a AccountSummary) -> Element<'a, Message> {
-        let account = &summary.session.context.account_id;
-        let variant = if Some(account) == self.accounts.selected.as_ref() {
-            ButtonVariant::Primary
-        } else {
-            ButtonVariant::Neutral
-        };
-        let mut account_row = row![button(
-            self.label(account),
-            variant,
-            Some(Message::Select(account.clone()))
-        )]
-        .spacing(12)
-        .align_y(Alignment::Center);
-        if let Some(count) = summary.unread.filter(|count| *count > 0) {
-            account_row = account_row.push(unread_count_badge(
-                u64::from(count),
-                BadgeTone::Unread,
-                BadgeSize::Regular,
-            ));
-        }
-        account_row.into()
+    /// Передаёт шапке снимки аккаунтов и действия, привязанные к этому входу.
+    fn top_bar_accounts(&self) -> Vec<TopBarAccount<'_, Message>> {
+        self.accounts
+            .summaries
+            .iter()
+            .map(|summary| {
+                let context = &summary.session.context;
+                let account = &context.account_id;
+                let server = context.server.trim_start_matches("https://");
+                TopBarAccount {
+                    id: &account.0,
+                    generation: summary.session.generation.0,
+                    label: self.label(account),
+                    detail: format!("{server} · {}", context.project_id),
+                    selected: self.accounts.selected.as_ref() == Some(account),
+                    unread: summary.unread,
+                    on_select: Message::Select(account.clone(), summary.session.generation),
+                }
+            })
+            .collect()
     }
 
     /// Выбирает короткую подпись, если настройки не содержат имени аккаунта.

@@ -23,6 +23,7 @@ mod selection;
 mod switch;
 mod text_input;
 mod theme;
+mod top_bar;
 
 pub use avatar::{AvatarContent, AvatarDecoration, AvatarPhoto, AvatarSize, avatar, avatar_group};
 pub use badge::{BadgeSize, BadgeTone, mention_badge, unread_count_badge};
@@ -46,6 +47,10 @@ pub use selection::{SelectionSize, selection_checkbox, selection_indicator};
 pub use switch::switch;
 pub use text_input::{text_input, text_input_with_error};
 pub use theme::{ThemeMode, workspace_theme};
+pub use top_bar::{
+    TOP_BAR_ACCOUNT_MENU_ID, TOP_BAR_ACCOUNT_ROW_ID_PREFIX, TOP_BAR_SELECTED_ACCOUNT_ID,
+    TOP_BAR_UNREAD_DOT_ID_PREFIX, TopBarAccount, top_bar,
+};
 
 const CONTROL_RADIUS: f32 = 8.0;
 const CONTROL_TEXT_SIZE: u32 = 14;

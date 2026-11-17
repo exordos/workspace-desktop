@@ -172,7 +172,7 @@ fn preview_line<'a, Message: 'a>(preview: Option<ChatRowPreview<'a>>) -> Element
 }
 
 /// Убирает переводы строк в заголовке и превью, чтобы текст занимал одну строку.
-fn one_line(content: &str) -> Cow<'_, str> {
+pub(super) fn one_line(content: &str) -> Cow<'_, str> {
     let content = content.trim();
     match content.contains(['\n', '\r', '\t', '\u{2028}', '\u{2029}']) {
         true => Cow::Owned(content.split_whitespace().collect::<Vec<_>>().join(" ")),
@@ -199,7 +199,7 @@ struct LineLayout {
 }
 
 /// Создаёт строку с заданным стилем и обрезкой по фактической ширине.
-fn single_line<'a, Message: 'a>(
+pub(super) fn single_line<'a, Message: 'a>(
     content: Cow<'a, str>,
     width: Length,
     size: f32,

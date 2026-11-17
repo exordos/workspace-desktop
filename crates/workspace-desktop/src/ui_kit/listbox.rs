@@ -98,6 +98,14 @@ pub fn listbox<'a, Message: Clone + 'a>(
     let active_index = options
         .iter()
         .position(|option| !option.disabled && Some(option.value.as_str()) == active);
+    popup_list(content, active_index)
+}
+
+/// Оформляет и прокручивает строки меню, сохраняя видимость подсвеченной с клавиатуры строки.
+pub(super) fn popup_list<'a, Message: 'a>(
+    content: iced::widget::Column<'a, Message>,
+    active_index: Option<usize>,
+) -> Element<'a, Message> {
     let scroll = Element::new(ListboxScroll {
         inner: scrollable(content).width(Fill),
         active_index,
@@ -196,6 +204,18 @@ impl<Message> Widget<Message, Theme, Renderer> for ListboxScroll<'_, Message> {
             }
         }
         node
+    }
+
+    /// Передаёт операциям Iced разметку строк и состояние прокрутки.
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.inner
+            .operate(&mut tree.children[0], layout, renderer, operation);
     }
 
     /// Делегирует события штатной прокрутке.
@@ -359,11 +379,56 @@ pub(super) fn anchored_popup<'a, Message: 'a>(
     tree: &'a mut Tree,
     on_dismiss: impl FnMut() + 'a,
 ) -> overlay::Element<'a, Message, Theme, Renderer> {
+    anchored_popup_with_width(
+        anchor,
+        anchor.width,
+        popup,
+        tree,
+        PopupInput::PassThrough,
+        on_dismiss,
+    )
+}
+
+/// Привязывает модальное меню к кнопке. Первый щелчок снаружи только закрывает меню.
+pub(super) fn anchored_modal_popup<'a, Message: 'a>(
+    anchor: Rectangle,
+    preferred_width: f32,
+    popup: Element<'a, Message>,
+    tree: &'a mut Tree,
+    on_dismiss: impl FnMut() + 'a,
+) -> overlay::Element<'a, Message, Theme, Renderer> {
+    anchored_popup_with_width(
+        anchor,
+        preferred_width,
+        popup,
+        tree,
+        PopupInput::Modal,
+        on_dismiss,
+    )
+}
+
+/// Определяет, кому достанутся щелчок и прокрутка за пределами открытой панели.
+enum PopupInput {
+    PassThrough, // Передаёт нажатие и прокрутку другим виджетам.
+    Modal,       // Забирает нажатие и прокрутку за пределами меню.
+}
+
+/// Создаёт общую панель с указанной шириной и поведением клика снаружи.
+fn anchored_popup_with_width<'a, Message: 'a>(
+    anchor: Rectangle,
+    preferred_width: f32,
+    popup: Element<'a, Message>,
+    tree: &'a mut Tree,
+    input: PopupInput,
+    on_dismiss: impl FnMut() + 'a,
+) -> overlay::Element<'a, Message, Theme, Renderer> {
     tree.diff(popup.as_widget());
     overlay::Element::new(Box::new(AnchoredPopup {
         anchor,
+        preferred_width,
         popup,
         tree,
+        input,
         on_dismiss,
         dismissed: false,
     }))
@@ -372,8 +437,10 @@ pub(super) fn anchored_popup<'a, Message: 'a>(
 /// Общая всплывающая панель селекторов. Она маршрутизирует мышь и закрывается после выбора.
 struct AnchoredPopup<'a, Message, Dismiss> {
     anchor: Rectangle,           // Границы поля в координатах окна.
+    preferred_width: f32,        // Желаемая ширина панели в логических пикселях.
     popup: Element<'a, Message>, // Список вариантов или подпись пустого списка.
     tree: &'a mut Tree,          // Состояние содержимого между событиями Iced.
+    input: PopupInput,           // Правила обработки событий за пределами панели.
     on_dismiss: Dismiss,         // Закрывает панель в состоянии поля.
     dismissed: bool,             // Текущая панель уже закрылась в этом наборе событий.
 }
@@ -384,8 +451,7 @@ impl<Message, Dismiss: FnMut()> overlay::Overlay<Message, Theme, Renderer>
     /// Выбирает место сверху или снизу и ограничивает список свободной высотой окна.
     fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
         let width = self
-            .anchor
-            .width
+            .preferred_width
             .clamp(0.0, (bounds.width - POPUP_MARGIN * 2.0).max(0.0));
         let below_y = self.anchor.y + self.anchor.height + POPUP_GAP;
         let above_y = self.anchor.y - POPUP_GAP;
@@ -411,6 +477,15 @@ impl<Message, Dismiss: FnMut()> overlay::Overlay<Message, Theme, Renderer>
         node.move_to(Point::new(x, y))
     }
 
+    /// Передаёт операциям Iced строки видимой панели.
+    fn operate(&mut self, layout: Layout<'_>, renderer: &Renderer, operation: &mut dyn Operation) {
+        if !self.dismissed {
+            self.popup
+                .as_widget_mut()
+                .operate(self.tree, layout, renderer, operation);
+        }
+    }
+
     /// Рисует панель поверх остального окна.
     fn draw(
         &self,
@@ -433,7 +508,7 @@ impl<Message, Dismiss: FnMut()> overlay::Overlay<Message, Theme, Renderer>
         }
     }
 
-    /// Передаёт указатель панели. Нажатие снаружи закрывает её и проходит в основное окно.
+    /// Передаёт указатель панели и закрывает её при нажатии снаружи.
     fn update(
         &mut self,
         event: &Event,
@@ -457,6 +532,13 @@ impl<Message, Dismiss: FnMut()> overlay::Overlay<Message, Theme, Renderer>
             _ => cursor,
         };
         let bounds = layout.bounds();
+        if matches!(self.input, PopupInput::Modal)
+            && matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. }))
+            && !cursor.is_over(bounds)
+        {
+            shell.capture_event();
+            return;
+        }
         let press = match event {
             Event::Mouse(mouse::Event::ButtonPressed(_)) => cursor.position(),
             Event::Touch(touch::Event::FingerPressed { position, .. }) => Some(*position),
@@ -465,6 +547,9 @@ impl<Message, Dismiss: FnMut()> overlay::Overlay<Message, Theme, Renderer>
         if press
             .is_some_and(|position| !bounds.contains(position) && !self.anchor.contains(position))
         {
+            if matches!(self.input, PopupInput::Modal) {
+                shell.capture_event();
+            }
             self.dismiss(shell);
             return;
         }

@@ -10,11 +10,12 @@ use workspace_desktop::ui_kit::{
     ButtonAppearance, ButtonOptions, ButtonSize, ButtonVariant, ChatRowOptions, ChatRowPreview,
     FieldSize, IconName, IconTone, IconVariant, InputSelectorOptions, ListboxOption,
     MessageComposerOptions, MessageDelivery, MessageDirection, PanelMenuRowOptions, PresenceSize,
-    PresenceStatus, SelectionSize, ThemeMode, avatar, avatar_group, button, button_with, chat_row,
-    day_divider, form_field, icon, input_selector, listbox, member_row, member_row_content,
-    mention_badge, message_bubble, message_composer, panel_menu_row, presence_indicator,
-    search_input, select, selectable_row, selection_checkbox, selection_indicator, switch,
-    text_input, text_input_with_error, unread_count_badge, workspace_theme,
+    PresenceStatus, SelectionSize, ThemeMode, TopBarAccount, avatar, avatar_group, button,
+    button_with, chat_row, day_divider, form_field, icon, input_selector, listbox, member_row,
+    member_row_content, mention_badge, message_bubble, message_composer, panel_menu_row,
+    presence_indicator, search_input, select, selectable_row, selection_checkbox,
+    selection_indicator, switch, text_input, text_input_with_error, top_bar, unread_count_badge,
+    workspace_theme,
 };
 
 const FIELD_EXAMPLES: [(FieldSize, &str); 2] = [
@@ -60,6 +61,7 @@ enum GalleryTab {
     Rows,       // Строки чатов, аватары, карточки и строки действий.
     Selectors,  // Выбор из списка и ввод с подсказками.
     Messages,   // Сообщения и редактор.
+    TopBar,     // Шапка приложения и переключение аккаунтов.
 }
 
 /// Хранит настройки галереи и состояние примеров.
@@ -84,6 +86,8 @@ struct Gallery {
     listbox_value: String,             // Выбранный вариант в отдельном примере списка.
     composer: Content,                 // Черновик в примере редактора сообщения.
     sent_preview: Option<String>,      // Последнее сообщение, отправленное из примера.
+    account_count: usize,              // Сколько вымышленных аккаунтов показывать в шапке.
+    current_account: usize,            // Индекс выбранного аккаунта в примере.
 }
 
 impl Default for Gallery {
@@ -129,6 +133,8 @@ impl Default for Gallery {
             listbox_value: "Europe/Moscow".to_owned(),
             composer: Content::new(),
             sent_preview: None,
+            account_count: 4,
+            current_account: 0,
         }
     }
 }
@@ -160,6 +166,8 @@ enum Message {
     ComposerEdited(text_editor::Action),   // Действие редактирования в поле сообщения.
     ComposerSent,                          // Отправка демонстрационного черновика.
     ComposerDraftLoaded,                   // Загрузка длинного текста для проверки редактора.
+    AccountCountChanged(usize),            // Новое количество аккаунтов в примере шапки.
+    AccountSelected(usize),                // Номер аккаунта, который выбрали в шапке.
 }
 
 impl Gallery {
@@ -183,6 +191,11 @@ impl Gallery {
             Message::ListboxValueChanged(value) => self.listbox_value = value,
             Message::ComposerEdited(action) => self.composer.perform(action),
             Message::ComposerDraftLoaded => self.composer = Content::with_text(LONG_MESSAGE_DRAFT),
+            Message::AccountCountChanged(count) => {
+                self.account_count = count;
+                self.current_account = self.current_account.min(count.saturating_sub(1));
+            }
+            Message::AccountSelected(index) => self.current_account = index,
             Message::ComposerSent => {
                 self.sent_preview = Some(self.composer.text());
                 self.composer = Content::new();
@@ -243,6 +256,7 @@ impl Gallery {
             ("Аватары и строки", GalleryTab::Rows),
             ("Селекторы", GalleryTab::Selectors),
             ("Сообщения", GalleryTab::Messages),
+            ("Шапка", GalleryTab::TopBar),
         ]
         .into_iter()
         .fold(row![].spacing(12), |row, (label, tab)| {
@@ -261,6 +275,7 @@ impl Gallery {
             GalleryTab::Selectors => self.selectors(),
             GalleryTab::Messages => self.messages(),
             GalleryTab::Icons => self.icons(),
+            GalleryTab::TopBar => self.top_bar_controls(),
         };
         let content = if self.tab == GalleryTab::Icons {
             section
@@ -270,21 +285,84 @@ impl Gallery {
                 .height(Fill)
                 .into()
         };
-        column![
-            container(
-                column![
-                    text("Workspace UI Kit").size(28),
-                    switch("Тёмная тема", self.dark, Some(Message::ThemeChanged)),
-                    tabs,
-                ]
-                .spacing(16)
-                .max_width(760)
+        let mut window = column![];
+        if self.tab == GalleryTab::TopBar {
+            window = window.push(self.top_bar_example());
+        }
+        window
+            .push(
+                container(
+                    column![
+                        text("Workspace UI Kit").size(28),
+                        switch("Тёмная тема", self.dark, Some(Message::ThemeChanged)),
+                        tabs,
+                    ]
+                    .spacing(16)
+                    .max_width(760),
+                )
+                .padding([20, 28])
+                .center_x(Fill),
             )
-            .padding([20, 28])
-            .center_x(Fill),
-            content,
-        ]
-        .into()
+            .push(content)
+            .into()
+    }
+
+    /// Показывает, как шапка ведёт себя при разном числе доступных аккаунтов.
+    fn top_bar_controls(&self) -> Element<'_, Message> {
+        let counts = [0, 1, 3, 4, 7]
+            .into_iter()
+            .fold(row![].spacing(8), |choices, count| {
+                choices.push(button(
+                    match count {
+                        0 => "0",
+                        1 => "1",
+                        3 => "3",
+                        4 => "4",
+                        _ => "7",
+                    },
+                    if self.account_count == count {
+                        ButtonVariant::Primary
+                    } else {
+                        ButtonVariant::Neutral
+                    },
+                    Some(Message::AccountCountChanged(count)),
+                ))
+            });
+        column![text("Число аккаунтов"), counts].spacing(8).into()
+    }
+
+    /// Собирает ту же шапку, что и рабочее окно, с демонстрационными данными.
+    fn top_bar_example(&self) -> Element<'_, Message> {
+        let accounts = [
+            ("a", "Анна", "workspace.example · design", Some(0)),
+            ("b", "Борис", "workspace.example · support", Some(4)),
+            (
+                "c",
+                "Длинное имя тестового аккаунта для проверки подписи в меню",
+                "second.example · engineering",
+                None,
+            ),
+            ("d", "Дина", "second.example · delivery", Some(1001)),
+            ("e", "Елена", "second.example · qa", Some(8)),
+            ("f", "Филипп", "workspace.example · tools", Some(1)),
+            ("g", "Георгий", "workspace.example · chat", Some(0)),
+        ];
+        top_bar(
+            accounts
+                .into_iter()
+                .take(self.account_count)
+                .enumerate()
+                .map(|(index, (id, label, detail, unread))| TopBarAccount {
+                    id,
+                    generation: 1,
+                    label,
+                    detail: detail.to_owned(),
+                    selected: index == self.current_account,
+                    unread,
+                    on_select: Message::AccountSelected(index),
+                })
+                .collect(),
+        )
     }
 
     /// Показывает варианты кнопок для ручной проверки.
