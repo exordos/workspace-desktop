@@ -36,6 +36,8 @@ const directTopic = "44444444-4444-4444-8444-444444444445";
 const emptyTopic = "44444444-4444-4444-8444-444444444446";
 const datePrefix = "2026-07-16T10:";
 const bubbles = "[data-workspace-message-bubble]";
+const loadingIndicator =
+  '[aria-label="Загрузка сообщений"][aria-busy="true"] span.animate-spin';
 const timeout = 15_000;
 
 function gate() {
@@ -226,7 +228,8 @@ async function installMock(
     }
   });
 
-  let emptyState = "error";
+  let emptyState: "loading" | "error" | "empty" = "loading";
+  let historyRequests = 0;
   let sendCount = 0;
   const load = gate();
   const send = gate();
@@ -295,15 +298,17 @@ async function installMock(
       await route.fulfill({ json: [] });
       return;
     }
-    if (q.get("topic_uuid") === emptyTopic && emptyState === "error") {
-      await route.fulfill({
-        status: 503,
-        json: { message: "Синтетический сбой истории" },
-      });
-      return;
+    if (q.get("topic_uuid") === emptyTopic) {
+      historyRequests += 1;
+      if (emptyState === "loading") await load.promise;
+      if (emptyState === "error") {
+        await route.fulfill({
+          status: 503,
+          json: { message: "Синтетический сбой истории" },
+        });
+        return;
+      }
     }
-    if (q.get("topic_uuid") === emptyTopic && emptyState === "loading")
-      await load.promise;
     const ids = q.getAll("uuid");
     const items = [...data.messages, ...committed].filter(
       (item) =>
@@ -323,15 +328,59 @@ async function installMock(
   });
   return {
     releaseSend: send.release,
-    holdHistory() {
-      emptyState = "loading";
-    },
-    releaseHistory() {
-      emptyState = "empty";
+    historyRequests: () => historyRequests,
+    failHistory() {
+      emptyState = "error";
       load.release();
+    },
+    emptyHistory() {
+      emptyState = "empty";
     },
     sendCount: () => sendCount,
   };
+}
+
+// Оригинал скрывает первичный индикатор, как только IndexedDB вернул даже пустое окно.
+// Удерживаем ответ чтения для одной темы, чтобы снять именно этот кадр.
+async function holdInitialCacheRead(page: Page) {
+  return page.evaluateHandle((topicUuid) => {
+    const originalGet = IDBObjectStore.prototype.get;
+    const success = Object.getOwnPropertyDescriptor(
+      IDBRequest.prototype,
+      "onsuccess",
+    )!;
+    let finish!: () => void;
+    let reads = 0;
+    const ready = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    IDBObjectStore.prototype.get = function (key) {
+      const request = originalGet.call(this, key);
+      if (
+        this.name === "messageWindows" &&
+        this.transaction.mode === "readonly" &&
+        typeof key === "string" &&
+        key.endsWith(`:${topicUuid}`)
+      ) {
+        reads += 1;
+        Object.defineProperty(request, "onsuccess", {
+          set(listener) {
+            success.set!.call(request, (event: Event) => {
+              void ready.then(() => listener.call(request, event));
+            });
+          },
+        });
+      }
+      return request;
+    };
+    return {
+      reads: () => reads,
+      release() {
+        IDBObjectStore.prototype.get = originalGet;
+        finish();
+      },
+    };
+  }, emptyTopic);
 }
 
 async function assertScene(page: Page, scene: Scene, config: typeof fixture) {
@@ -388,11 +437,10 @@ async function assertScene(page: Page, scene: Scene, config: typeof fixture) {
       ).toBeVisible({ timeout });
       break;
     case "loading":
-      await expect(
-        page.locator('[aria-label="Загрузка сообщений"][aria-busy="true"]'),
-      ).toBeVisible({ timeout });
+      await expect(page.locator(loadingIndicator)).toBeVisible({ timeout });
       break;
     case "empty":
+      await expectReadyMessageComposer(page);
       await expect(page.locator('[data-empty-state="true"]')).toBeVisible({
         timeout,
       });
@@ -415,7 +463,11 @@ async function prepareCapture(page: Page) {
       "*, *::before, *::after { animation-play-state: paused !important; transition: none !important; caret-color: transparent !important; }",
     );
     document.adoptedStyleSheets = [sheet];
-    for (const animation of document.getAnimations()) animation.currentTime = 0;
+    for (const animation of document.getAnimations()) {
+      animation.pause();
+      await animation.ready;
+      animation.currentTime = 0;
+    }
     if (document.activeElement instanceof HTMLElement)
       document.activeElement.blur();
     await new Promise<void>((resolve) =>
@@ -462,6 +514,9 @@ export async function capture(settings: Settings) {
     const runtime = await electronApp.evaluate(() => process.versions.electron);
     let last: Scene | undefined;
     let firstWindowId: number | undefined;
+    let initialCacheRead:
+      | Awaited<ReturnType<typeof holdInitialCacheRead>>
+      | undefined;
     const failures: Error[] = [];
     for (const scene of sceneConfig.scenes) {
       console.log(`Сцена ${scene.id}`);
@@ -470,6 +525,8 @@ export async function capture(settings: Settings) {
           (window, { width, height }) => window.setContentSize(width, height),
           scene,
         );
+        if (scene.state === "loading")
+          initialCacheRead = await holdInitialCacheRead(page);
         if (scene.route !== last?.route || scene.theme !== last.theme) {
           if (last)
             await page.evaluate(
@@ -520,11 +577,23 @@ export async function capture(settings: Settings) {
             .click();
           await expect.poll(mock.sendCount, { timeout }).toBe(2);
         } else if (scene.state === "loading") {
-          mock.holdHistory();
-          // После ошибочной загрузки заново открываем маршрут с пустым кэшем в памяти.
-          await page.reload();
+          await expect
+            .poll(() => initialCacheRead!.evaluate((gate) => gate.reads()), {
+              timeout,
+            })
+            .toBeGreaterThan(0);
+        } else if (scene.state === "error") {
+          await initialCacheRead?.evaluate((gate) => gate.release());
+          await initialCacheRead?.dispose();
+          await expect
+            .poll(mock.historyRequests, { timeout })
+            .toBeGreaterThan(0);
+          mock.failHistory();
         } else if (scene.state === "empty") {
-          mock.releaseHistory();
+          mock.emptyHistory();
+          await page
+            .getByRole("button", { name: "Повторить", exact: true })
+            .click();
         }
         await assertScene(page, scene, sceneConfig);
         const renderer = await prepareCapture(page);
@@ -541,6 +610,22 @@ export async function capture(settings: Settings) {
           sceneConfig.language,
           sceneConfig.timezone,
         ]);
+        let spinner = null;
+        if (scene.state === "loading") {
+          await assertScene(page, scene, sceneConfig);
+          spinner = await page.locator(loadingIndicator).evaluate((element) => {
+            const { x, y, width, height } = element.getBoundingClientRect();
+            return {
+              x,
+              y,
+              width,
+              height,
+              layoutWidth: element.offsetWidth,
+              layoutHeight: element.offsetHeight,
+            };
+          });
+          expect([spinner.layoutWidth, spinner.layoutHeight]).toEqual([32, 32]);
+        }
         const basename = join(output, scene.id);
         const { png, ...window } = await nativeWindow.evaluate(
           async (window) => {
@@ -563,6 +648,8 @@ export async function capture(settings: Settings) {
           scene.width,
           scene.height,
         ]);
+        if (scene.state === "loading")
+          await assertScene(page, scene, sceneConfig);
         await writeFile(`${basename}.png`, Buffer.from(png, "base64"));
         await writeFile(
           `${basename}.json`,
@@ -575,6 +662,7 @@ export async function capture(settings: Settings) {
               runtime,
               renderer,
               window,
+              ...(spinner === null ? {} : { spinner }),
             },
             null,
             2,

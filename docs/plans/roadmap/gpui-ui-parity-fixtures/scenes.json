@@ -6,7 +6,12 @@
   "palette": "blue-mist",
   "deviceScaleFactor": 1,
   "profiles": [
-    { "id": "a", "firstName": "Лина", "lastName": "Тестовая", "avatar": null },
+    {
+      "id": "a",
+      "firstName": "Лина",
+      "lastName": "Тестовая",
+      "avatar": null
+    },
     {
       "id": "b",
       "firstName": "Александра",
@@ -17,7 +22,11 @@
   "direct": {
     "title": "Александра Тестовая-Сопровождение-Городских-Проектов",
     "messages": [
-      { "author": "b", "minute": 0, "text": "Черновик готов." },
+      {
+        "author": "b",
+        "minute": 0,
+        "text": "Черновик готов."
+      },
       {
         "author": "a",
         "minute": 3,
@@ -28,7 +37,11 @@
         "minute": 5,
         "text": "Проверь две темы:\n\n- дневной режим;\n- ночной режим;\n- узкое окно с тем же текстом."
       },
-      { "author": "a", "minute": 7, "text": "Готово к сравнению." }
+      {
+        "author": "a",
+        "minute": 7,
+        "text": "Готово к сравнению."
+      }
     ],
     "outgoing": "Синтетическая проверка статуса отправки."
   },
@@ -39,13 +52,21 @@
         "title": "Проверка компоновки и переноса длинных заголовков",
         "unread": 3,
         "messages": [
-          { "author": "b", "minute": 10, "text": "Layout reviewed." },
+          {
+            "author": "b",
+            "minute": 10,
+            "text": "Layout reviewed."
+          },
           {
             "author": "b",
             "minute": 11,
             "text": "Compare the conversation title and the channel title.\n\nKeep the sidebar open in every frame."
           },
-          { "author": "a", "minute": 13, "text": "Окно подготовлено." }
+          {
+            "author": "a",
+            "minute": 13,
+            "text": "Окно подготовлено."
+          }
         ]
       },
       {
@@ -121,17 +142,17 @@
       "theme": "light"
     },
     {
-      "id": "topic-error-light",
+      "id": "topic-loading-light",
       "route": "empty-topic",
-      "state": "error",
+      "state": "loading",
       "width": 1440,
       "height": 900,
       "theme": "light"
     },
     {
-      "id": "topic-loading-light",
+      "id": "topic-error-light",
       "route": "empty-topic",
-      "state": "loading",
+      "state": "error",
       "width": 1440,
       "height": 900,
       "theme": "light"
