@@ -1,11 +1,39 @@
-//! Проверяет обычный режим окна и восстанавливает его из Dock через AppKit.
+//! Настраивает восстановление окна при запуске и связывает его режим с AppKit.
 
 use objc2::{
     class, msg_send, msg_send_id,
-    rc::Retained,
+    rc::{Retained, autoreleasepool},
     runtime::{Bool, NSObject},
 };
 use objc2_foundation::{MainThreadMarker, NSArray, NSString};
+
+/// Отключает системное восстановление окон до запуска GPUI.
+pub(in crate::gpui_client) fn disable_state_restoration() {
+    autoreleasepool(|_| {
+        // При восстановлении AppKit повторно вызывает обработчик GPUI 0.2.2,
+        // пока тот держит блокировку окна (zed-industries/zed#42821).
+        // Домен аргументов живёт в памяти процесса и сохраняет остальные ключи запуска.
+        unsafe {
+            let defaults: Retained<NSObject> =
+                msg_send_id![class!(NSUserDefaults), standardUserDefaults];
+            let domain = NSString::from_str("NSArgumentDomain");
+            let current: Retained<NSObject> =
+                msg_send_id![&defaults, volatileDomainForName: &*domain];
+            let arguments: Retained<NSObject> = msg_send_id![&current, mutableCopy];
+            for (key, value) in [
+                ("NSQuitAlwaysKeepsWindows", Bool::NO),
+                ("ApplePersistenceIgnoreState", Bool::YES),
+            ] {
+                let key = NSString::from_str(key);
+                let flag: Retained<NSObject> =
+                    msg_send_id![class!(NSNumber), numberWithBool: value];
+                let _: () = msg_send![&arguments, setObject: &*flag, forKey: &*key];
+            }
+            let _: () = msg_send![&defaults, removeVolatileDomainForName: &*domain];
+            let _: () = msg_send![&defaults, setVolatileDomain: &*arguments, forName: &*domain];
+        }
+    });
+}
 
 /// Удостоверяет главный поток перед вызовами AppKit.
 pub(super) fn main_thread() -> Option<MainThreadMarker> {

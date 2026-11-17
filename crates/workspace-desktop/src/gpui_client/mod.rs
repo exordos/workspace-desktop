@@ -36,6 +36,7 @@ pub struct Options {
 
 /// Открывает обычное окно с существующим профилем Workspace.
 pub fn run(options: Options) -> io::Result<()> {
+    platform_window::macos::disable_state_restoration();
     let profile = state_directory().map_err(|_| io::Error::other(StartupError::Profile))?;
     let (runtime, events) = RuntimeClient::start_in(profile.clone())
         .map_err(|_| io::Error::other(StartupError::Worker))?;
