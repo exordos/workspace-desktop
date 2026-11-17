@@ -7,7 +7,9 @@ use std::{
 
 use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, px, size};
 use workspace_core::{
+    bootstrap::ChatListStatus,
     context::{AccountId, OwnerContext, SessionGeneration},
+    messenger::catalog::{Chat, Topic},
     storage::{DeliveryStatus, HistoryMessage, HistoryMetadata, HistoryTime, PreparedSend},
 };
 
@@ -184,7 +186,7 @@ fn preserves_visible_uuid_during_pages_and_updates(cx: &mut TestAppContext) {
     let (view, ui, requests) = scenario(cx, &address);
     answer(
         request(&requests, Load::Open(ChatEntry::Around(anchor))),
-        reading(&address, 20..80),
+        reading(&address, 52..80),
         ui,
     );
     let original = ui.read(|cx| view.read(cx).viewport.y(anchor).expect("цель видна"));
@@ -228,7 +230,7 @@ fn preserves_visible_uuid_during_pages_and_updates(cx: &mut TestAppContext) {
     let after = ui.read(|cx| view.read(cx).viewport.y(anchor).unwrap());
     assert!(
         (before - after).abs() <= 1.,
-        "После старой страницы {before} → {after} px"
+        "После старой страницы дата переехала к началу дня, опора {before} → {after} px"
     );
 
     click(ui, "history-newer");
@@ -259,6 +261,151 @@ fn preserves_visible_uuid_during_pages_and_updates(cx: &mut TestAppContext) {
         (before - after).abs() <= 1.,
         "После обновления {before} → {after} px"
     );
+}
+
+/// Проверяет название темы, одну группу соседних сообщений и перенос в ширине из UI-05.
+#[gpui::test]
+fn fixed_topic_groups_and_wraps_at_both_panel_sizes(cx: &mut TestAppContext) {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/plans/roadmap/gpui-ui-parity-fixtures/scenes.json"
+    )))
+    .unwrap();
+    let topic_id = Uuid::from_u128(1001);
+    let mut address = address(ChatEntry::Latest);
+    address.route.scope.topic_id = Some(topic_id);
+    let topic = &fixture["channel"]["topics"][0];
+    let channel_name = fixture["channel"]["title"].as_str().unwrap();
+    let topic_name = topic["title"].as_str().unwrap();
+    let catalog = ChatList {
+        generation: address.generation,
+        chats: Some(Arc::from([Chat {
+            id: address.route.scope.stream_id,
+            name: channel_name.to_owned(),
+            direct: false,
+            topics: vec![Topic {
+                id: topic_id,
+                name: topic_name.to_owned(),
+            }],
+        }])),
+        status: ChatListStatus::Ready,
+    };
+    let mut session = AccountSession {
+        owner: address.route.owner.clone(),
+        generation: address.generation,
+    };
+    let (view, ui, requests) = scenario(cx, &address);
+    session.owner.account_id = AccountId("other".into());
+    ui.update(|_, app| {
+        view.update(app, |view, cx| {
+            view.set_catalog(Some(&session), Some(&catalog), cx)
+        })
+    });
+    assert!(ui.read(|app| view.read(app).heading.topic.is_none()));
+    session.owner = address.route.owner.clone();
+    session.generation.0 += 1;
+    ui.update(|_, app| {
+        view.update(app, |view, cx| {
+            view.set_catalog(Some(&session), Some(&catalog), cx)
+        })
+    });
+    assert!(ui.read(|app| view.read(app).heading.topic.is_none()));
+    session.generation = address.generation;
+    ui.update(|_, app| {
+        view.update(app, |view, cx| {
+            view.set_catalog(Some(&session), Some(&catalog), cx)
+        })
+    });
+    assert!(ui.read(|app| view.read(app).heading.topic.as_deref() == Some(topic_name)));
+
+    let mut page = window(
+        address.route.scope,
+        90..93,
+        HistoryEdge::End,
+        HistoryEdge::End,
+    );
+    for (message, row) in page
+        .messages
+        .iter_mut()
+        .zip(topic["messages"].as_array().unwrap())
+    {
+        message.text = row["text"].as_str().unwrap().to_owned();
+        message.metadata.author_id = if row["author"] == "a" {
+            address.route.owner.user_id.parse().ok()
+        } else {
+            Some(Uuid::from_u128(910))
+        };
+    }
+    // Ещё одно длинное сообщение от того же автора в следующем дне.
+    let mut next_day = page.messages[1].clone();
+    next_day.id = Uuid::from_u128(93);
+    next_day.metadata.created_at = HistoryTime::parse("2026-11-18T07:10:30Z").unwrap();
+    assert_eq!(next_day.topic_id, topic_id);
+    page.messages.push(next_day);
+    answer(request(&requests, Load::Open(ChatEntry::Latest)), page, ui);
+    for (width, height) in [(1061., 819.), (340., 519.)] {
+        ui.simulate_resize(size(px(width), px(height)));
+        ui.run_until_parked();
+        assert!(ui.debug_bounds("conversation-title").unwrap().size.width <= px(width));
+        assert!(ui.debug_bounds("conversation-channel").is_some());
+        assert!(
+            ui.debug_bounds("history-avatar-00000000-0000-0000-0000-00000000005a")
+                .is_none()
+        );
+        assert!(
+            ui.debug_bounds("history-avatar-00000000-0000-0000-0000-00000000005b")
+                .is_some()
+        );
+        assert!(
+            ui.debug_bounds("history-avatar-00000000-0000-0000-0000-00000000005c")
+                .is_none()
+        );
+        for id in [
+            "history-date-00000000-0000-0000-0000-00000000005a",
+            "history-date-00000000-0000-0000-0000-00000000005d",
+        ] {
+            assert!(ui.debug_bounds(id).is_some());
+        }
+        assert!(ui.debug_bounds("topic-send-unavailable").is_some());
+    }
+    let last_message = "history-message-00000000-0000-0000-0000-00000000005d";
+    let narrow = ui.debug_bounds(last_message).unwrap();
+    ui.simulate_resize(size(px(1061.), px(819.)));
+    ui.run_until_parked();
+    let wide = ui.debug_bounds(last_message).unwrap();
+    assert!(
+        narrow.size.height > wide.size.height,
+        "Длинная строка переносится: {wide:?} → {narrow:?}"
+    );
+}
+
+/// Проверяет, что первичная ошибка сменяется по кнопке загрузкой и пустой темой.
+#[gpui::test]
+fn initial_error_retries_into_empty_topic(cx: &mut TestAppContext) {
+    let mut address = address(ChatEntry::Latest);
+    address.route.scope.topic_id = Some(Uuid::from_u128(1001));
+    let (view, ui, requests) = scenario(cx, &address);
+    assert!(ui.debug_bounds("conversation-heading").is_some());
+    assert!(ui.debug_bounds("history-loading").is_some());
+    request(&requests, Load::Open(ChatEntry::Latest)).finish(Err(Failure::Unavailable));
+    ui.run_until_parked();
+    assert!(ui.debug_bounds("history-error").is_some());
+    click(ui, "history-retry");
+    assert!(ui.debug_bounds("history-loading").is_some());
+    answer(
+        request(&requests, Load::Open(ChatEntry::Latest)),
+        window(
+            address.route.scope,
+            0..0,
+            HistoryEdge::End,
+            HistoryEdge::End,
+        ),
+        ui,
+    );
+    assert!(ui.read(
+        |app| matches!(&view.read(app).state, State::Ready(history) if history.messages.is_empty())
+    ));
+    assert!(ui.debug_bounds("history-empty").is_some());
 }
 
 /// Проверяет, что после сброса и отзыва доступа запоздалые страницы не возвращают старые строки.

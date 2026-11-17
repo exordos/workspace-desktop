@@ -6,9 +6,10 @@ mod source;
 mod viewport;
 
 use futures::channel::oneshot;
-use gpui::{App, Context, Entity, IntoElement, Render, Subscription, Window, div, prelude::*};
+use gpui::{App, Context, Entity, IntoElement, Render, Subscription, Window, div, prelude::*, px};
 use uuid::Uuid;
 use workspace_core::{
+    bootstrap::ChatList,
     storage::{HistoryDirection, HistoryEdge, HistoryScope, HistoryWindow, OutboxEntry},
     sync::{HistoryRevocation, SyncChange, SyncUpdate},
 };
@@ -19,9 +20,9 @@ use self::{
 };
 use super::{
     composer::{Composer, ComposerEvent, SendSource, Submission},
-    contracts::{ChatEntry, ConversationAddress},
+    contracts::{AccountSession, ChatEntry, ConversationAddress},
     runtime::RuntimeClient,
-    ui::{Button, Palette, TextRole, ThemeMode, label},
+    ui::{Avatar, Button, ButtonAppearance, Icon, Palette, TextRole, ThemeMode, label},
 };
 
 /// Один запрос экрана и его идентификатор в журнале.
@@ -45,6 +46,14 @@ struct Sending {
     _intents: Subscription, // Передаёт действия редактора только этому экрану.
 }
 
+/// Подписи разговора из каталога того же входа.
+#[derive(Default, PartialEq, Eq)]
+struct Heading {
+    chat: Option<String>,  // Имя собеседника или канала.
+    topic: Option<String>, // Название темы, если открыт её адрес.
+    direct: bool,          // В заголовке лички показываем инициалы собеседника.
+}
+
 /// История, адрес открытия и очередь сообщений одного экрана.
 pub struct Conversation {
     address: ConversationAddress, // Владелец, область, поколение и ревизия от оболочки.
@@ -57,6 +66,7 @@ pub struct Conversation {
     outbox: Vec<OutboxEntry>, // Последний снимок очереди в области разговора.
     viewport: Viewport, // Виртуальный список и его положение.
     sending: Option<Sending>, // Рабочий редактор; изолированные тесты истории могут его не подключать.
+    heading: Heading,         // Отображаемые названия из текущего каталога.
 }
 
 impl Conversation {
@@ -87,6 +97,7 @@ impl Conversation {
             outbox: Vec::new(),
             viewport: Viewport::new(),
             sending: None,
+            heading: Heading::default(),
         };
         let target = cx.entity().downgrade();
         // GPUI держит состояние незавершённо созданной Entity до выхода из cx.new.
@@ -195,6 +206,39 @@ impl Conversation {
     /// Возвращает адрес, по которому оболочка доставляет события истории.
     pub fn address(&self) -> &ConversationAddress {
         &self.address
+    }
+
+    /// Обновляет названия по адресу экрана, когда каталог того же входа меняется.
+    pub(super) fn set_catalog(
+        &mut self,
+        session: Option<&AccountSession>,
+        catalog: Option<&ChatList>,
+        cx: &mut Context<Self>,
+    ) {
+        let scope = self.address.route.scope;
+        let heading = session
+            .filter(|session| {
+                session.owner == self.address.route.owner
+                    && session.generation == self.address.generation
+            })
+            .and(catalog)
+            .filter(|catalog| catalog.generation == self.address.generation)
+            .and_then(|catalog| catalog.chats.as_deref())
+            .and_then(|chats| chats.iter().find(|chat| chat.id == scope.stream_id))
+            .map(|chat| Heading {
+                chat: Some(chat.name.clone()),
+                topic: chat
+                    .topics
+                    .iter()
+                    .find(|topic| Some(topic.id) == scope.topic_id)
+                    .map(|topic| topic.name.clone()),
+                direct: chat.direct,
+            })
+            .unwrap_or_default();
+        if heading != self.heading {
+            self.heading = heading;
+            cx.notify();
+        }
     }
 
     /// Проверяет, что доступ к открытому окну подтверждён и история может быть показана.
@@ -530,94 +574,270 @@ impl Conversation {
     }
 }
 
+impl Conversation {
+    /// Рисует название чата или тему и название её канала из каталога.
+    fn render_heading(&self, palette: Palette) -> gpui::Div {
+        let chat = self.heading.chat.as_deref();
+        let (title, detail) = if self.address.route.scope.topic_id.is_some() {
+            (self.heading.topic.as_deref().unwrap_or("Тема"), chat)
+        } else {
+            (chat.unwrap_or("Разговор"), None)
+        };
+        div()
+            .debug_selector(|| "conversation-heading".into())
+            .h(px(54.))
+            .flex_none()
+            .flex()
+            .min_w_0()
+            .items_center()
+            .gap_3()
+            .px_4()
+            .rounded_md()
+            .bg(palette.surface)
+            .when(self.heading.direct, |heading| {
+                let initial = title
+                    .chars()
+                    .next()
+                    .map(|first| first.to_uppercase().collect::<String>())
+                    .unwrap_or_default();
+                heading.child(Avatar::from_initials(initial).render(palette))
+            })
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .child(
+                        label(palette, TextRole::Label, title.to_owned())
+                            .w_full()
+                            .truncate()
+                            .debug_selector(|| "conversation-title".into()),
+                    )
+                    .children(detail.map(|detail| {
+                        label(palette, TextRole::Caption, detail.to_owned())
+                            .w_full()
+                            .truncate()
+                            .debug_selector(|| "conversation-channel".into())
+                    })),
+            )
+    }
+
+    /// Рисует только те действия догрузки, для которых есть маркер на стороне сервера.
+    fn render_paging(
+        &self,
+        history: &HistoryWindow,
+        palette: Palette,
+        cx: &Context<Self>,
+    ) -> gpui::Div {
+        let disabled = self.active.is_some()
+            || self
+                .action_error
+                .is_some_and(|error| matches!(error.load, Load::Open(_)));
+        let mut paging = div().flex().flex_wrap().justify_center().gap_2().px_2();
+        for (edge, id, title, direction) in [
+            (
+                &history.older,
+                "history-older",
+                "Старые сообщения",
+                HistoryDirection::Older,
+            ),
+            (
+                &history.newer,
+                "history-newer",
+                "Новые сообщения",
+                HistoryDirection::Newer,
+            ),
+        ] {
+            if matches!(edge, HistoryEdge::More(_)) {
+                let mut button = Button::new(id, title);
+                button.disabled = disabled;
+                paging = paging.child(
+                    button
+                        .render(
+                            palette,
+                            None,
+                            action(cx, move |view, cx| view.extend(direction, cx)),
+                        )
+                        .debug_selector(move || id.into()),
+                );
+            }
+        }
+        paging
+    }
+
+    /// Рисует ошибку и только то действие, которое может исправить её в этом состоянии.
+    fn render_problem(
+        &self,
+        palette: Palette,
+        cause: Option<Failure>,
+        cx: &Context<Self>,
+    ) -> gpui::Div {
+        let retry: fn(&mut Self, &mut Context<Self>) = Self::retry;
+        let (message, command) = match cause {
+            Some(Failure::AccessLost) => ("Доступ к разговору отозван", None),
+            Some(Failure::MissingMessage) => (
+                "Сообщение больше недоступно",
+                Some((
+                    "history-latest",
+                    "К последним",
+                    Self::latest as fn(&mut Self, &mut Context<Self>),
+                )),
+            ),
+            Some(_) => (
+                "Не удалось загрузить сообщения",
+                Some(("history-retry", "Повторить", retry)),
+            ),
+            None => (
+                "Не удалось обновить историю",
+                Some(("history-retry", "Повторить", retry)),
+            ),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_2()
+            .p_2()
+            .child(
+                label(palette, TextRole::Body, message).debug_selector(|| "history-error".into()),
+            )
+            .children(command.map(|(id, title, handler)| {
+                let mut button = Button::new(id, title);
+                button.appearance = if cause.is_some() {
+                    ButtonAppearance::Primary
+                } else {
+                    ButtonAppearance::Neutral
+                };
+                button.disabled = self.active.is_some();
+                button
+                    .render(palette, None, action(cx, handler))
+                    .debug_selector(move || id.into())
+            }))
+    }
+
+    /// Возвращает кнопку перехода к хвосту, когда читатель находится выше последних сообщений.
+    fn render_latest(&self, palette: Palette, cx: &Context<Self>) -> gpui::Div {
+        let mut latest = Button::new("history-latest", "К последним");
+        latest.icon = Some(Icon::ChevronDown);
+        latest.disabled = self.active.is_some();
+        div().absolute().bottom_3().right_3().child(
+            latest
+                .render(palette, None, action(cx, Self::latest))
+                .debug_selector(|| "history-latest".into()),
+        )
+    }
+}
+
 impl Render for Conversation {
-    /// Показывает историю и действия, доступные для текущих краёв или ошибки.
+    /// Показывает шапку и историю, отделяя первые состояния от ошибок догрузки.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
-        let ready = self.has_access();
-        let busy = self.active.is_some();
-        let toolbar = match &self.state {
-            State::Ready(history) => {
-                let mut older = Button::new("history-older", "Старые сообщения");
-                let edge_invalid = self
-                    .action_error
-                    .is_some_and(|error| matches!(error.load, Load::Open(_)));
-                older.disabled = busy || edge_invalid;
-                let mut newer = Button::new("history-newer", "Новые сообщения");
-                newer.disabled = busy || edge_invalid;
-                let mut latest = Button::new("history-latest", "К последним");
-                latest.disabled = busy;
-                Some(
+        let root = div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h_0()
+            .min_w_0()
+            .bg(palette.background)
+            .child(self.render_heading(palette));
+        let centered = div()
+            .flex()
+            .flex_1()
+            .min_h_0()
+            .items_center()
+            .justify_center()
+            .m_3()
+            .rounded_md()
+            .bg(palette.field)
+            .border_1()
+            .border_color(palette.border);
+        match &self.state {
+            State::Opening => root.child(
+                centered.child(
                     div()
                         .flex()
-                        .flex_wrap()
+                        .items_center()
                         .gap_2()
-                        .p_2()
-                        .when(matches!(history.older, HistoryEdge::More(_)), |toolbar| {
-                            toolbar.child(
-                                older
-                                    .render(
-                                        palette,
-                                        None,
-                                        action(cx, |view, cx| {
-                                            view.extend(HistoryDirection::Older, cx)
-                                        }),
-                                    )
-                                    .debug_selector(|| "history-older".into()),
+                        .debug_selector(|| "history-loading".into())
+                        .child(Icon::Pending.element(px(24.), palette.accent))
+                        .child(label(palette, TextRole::Body, "Загружаем историю…")),
+                ),
+            ),
+            State::Failed(cause) => {
+                root.child(centered.child(self.render_problem(palette, Some(*cause), cx)))
+            }
+            State::Ready(history) => {
+                let latest = self.entry != ChatEntry::Latest
+                    || history.newer != HistoryEdge::End
+                    || !self.viewport.at_tail();
+                let empty = history.messages.is_empty()
+                    && (history.newer != HistoryEdge::End || self.outbox.is_empty());
+                let paging = self.render_paging(history, palette, cx);
+                let peer = self
+                    .heading
+                    .direct
+                    .then(|| self.heading.chat.clone())
+                    .flatten();
+                let problem = self
+                    .action_error
+                    .map(|_| self.render_problem(palette, None, cx));
+                let viewport = self.viewport.render(palette, peer);
+                root.child(
+                    div()
+                        .relative()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h_0()
+                        .min_w_0()
+                        .child(paging)
+                        .when(empty, |history| {
+                            history.child(
+                                label(palette, TextRole::Caption, "Сообщений пока нет")
+                                    .m_auto()
+                                    .debug_selector(|| "history-empty".into()),
                             )
                         })
-                        .when(matches!(history.newer, HistoryEdge::More(_)), |toolbar| {
-                            toolbar.child(
-                                newer
-                                    .render(
-                                        palette,
-                                        None,
-                                        action(cx, |view, cx| {
-                                            view.extend(HistoryDirection::Newer, cx)
-                                        }),
-                                    )
-                                    .debug_selector(|| "history-newer".into()),
+                        .when(!empty, |history| history.child(viewport))
+                        .children(problem.map(|problem| {
+                            div()
+                                .absolute()
+                                .top_10()
+                                .left_3()
+                                .right_3()
+                                .flex()
+                                .justify_center()
+                                .child(
+                                    problem
+                                        .rounded_md()
+                                        .bg(palette.surface)
+                                        .border_1()
+                                        .border_color(palette.border),
+                                )
+                        }))
+                        .when(latest, |history| {
+                            history.child(self.render_latest(palette, cx))
+                        }),
+                )
+                .children(self.sending.as_ref().map(|sending| sending.view.clone()))
+                .when(
+                    self.sending.is_none() && self.address.route.scope.topic_id.is_some(),
+                    |view| {
+                        view.child(
+                            label(
+                                palette,
+                                TextRole::Caption,
+                                "Отправка в теме пока недоступна",
                             )
-                        })
-                        .child(
-                            latest
-                                .render(palette, None, action(cx, Conversation::latest))
-                                .debug_selector(|| "history-latest".into()),
-                        ),
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(palette.surface)
+                            .debug_selector(|| "topic-send-unavailable".into()),
+                        )
+                    },
                 )
             }
-            _ => None,
-        };
-        let problem = match self.state {
-            State::Failed(Failure::AccessLost) => Some("Доступ к разговору отозван"),
-            State::Failed(Failure::MissingMessage) => Some("Сообщение больше недоступно"),
-            State::Failed(_) => Some("Не удалось загрузить историю"),
-            State::Ready(_) if self.action_error.is_some() => Some("Не удалось обновить историю"),
-            _ => None,
-        };
-        div().flex().flex_col().size_full().min_h_0().min_w_0().bg(palette.background)
-            .children(toolbar)
-            .when(matches!(self.state, State::Opening), |view| view.child(label(palette, TextRole::Body, "Загружаем историю…").p_3()))
-            .when_some(problem, |view, problem| {
-                let mut retry = Button::new("history-retry", "Повторить");
-                retry.disabled = busy;
-                view.child(div().flex().flex_wrap().items_center().gap_2().p_2()
-                    .child(label(palette, TextRole::Body, problem).text_color(palette.danger).debug_selector(|| "history-error".into()))
-                    .when(!matches!(self.state, State::Failed(Failure::AccessLost | Failure::MissingMessage)), |bar| {
-                        bar.child(retry.render(palette, None, action(cx, Conversation::retry)).debug_selector(|| "history-retry".into()))
-                    })
-                    .when(matches!(self.state, State::Failed(Failure::MissingMessage)), |bar| {
-                        bar.child(Button::new("history-latest", "К последним").render(palette, None,
-                            action(cx, Conversation::latest)).debug_selector(|| "history-latest".into()))
-                    }))
-            })
-            .when(matches!(&self.state, State::Ready(history) if history.messages.is_empty() && self.outbox.is_empty()), |view| {
-                view.child(label(palette, TextRole::Body, "Сообщений пока нет").p_3())
-            })
-            .when(ready, |view| {
-                view.child(self.viewport.render(palette))
-                    .children(self.sending.as_ref().map(|sending| sending.view.clone()))
-            })
+        }
     }
 }
 
@@ -630,11 +850,11 @@ fn includes(current: HistoryScope, changed: HistoryScope) -> bool {
 /// Доставляет нажатие кнопки экрану, если оболочка всё ещё его показывает.
 fn action(
     cx: &Context<Conversation>,
-    handle: fn(&mut Conversation, &mut Context<Conversation>),
+    handle: impl Fn(&mut Conversation, &mut Context<Conversation>) + 'static,
 ) -> impl Fn(&mut Window, &mut App) + 'static {
     let target = cx.entity().downgrade();
     move |_, app| {
-        let _ = target.update(app, handle);
+        let _ = target.update(app, &handle);
     }
 }
 

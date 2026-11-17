@@ -201,6 +201,11 @@ impl Client {
             .update(cx, |view, cx| view.set_accounts(accounts, cx));
         let catalog = self.shell.selected_catalog();
         let conversation = self.shell.conversation();
+        if let Some(view) = &self.conversation {
+            view.update(cx, |view, cx| {
+                view.set_catalog(self.shell.selected(), catalog, cx)
+            });
+        }
         self.sidebar.update(cx, |view, cx| {
             view.update_snapshot(self.shell.selected(), catalog, conversation, cx);
         });

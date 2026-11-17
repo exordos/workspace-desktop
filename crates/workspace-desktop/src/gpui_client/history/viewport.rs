@@ -7,22 +7,46 @@ use std::{
 };
 
 use gpui::{
-    Bounds, IntoElement, ListAlignment, ListOffset, ListState, Pixels, canvas, div, list,
+    Bounds, Div, IntoElement, ListAlignment, ListOffset, ListState, Pixels, canvas, div, list,
     prelude::*, px,
 };
 use uuid::Uuid;
 use workspace_core::storage::{DeliveryStatus, HistoryWindow, OutboxEntry, SendBlock};
 
-use crate::gpui_client::ui::{DeliveryMark, MessageBubble, Palette};
+use crate::gpui_client::ui::{Avatar, DeliveryMark, MessageBubble, Palette, TextRole, label};
+
+const DATE_SPACE: Pixels = px(32.);
 
 /// Строка, которую можно рисовать после переноса снимка на поток UI.
 #[derive(Clone, Eq, PartialEq)]
 struct Row {
     id: Uuid,                       // UUID сообщения или публичный UUID очереди.
     own: bool,                      // Сообщение текущего пользователя.
+    author: Option<Uuid>,           // UUID для группировки, неизвестные авторы не объединяются.
+    topic: Uuid,                    // Смена темы начинает новую группу.
+    date: Option<String>,           // День создания UTC, если сообщение принято сервером.
     body: String,                   // Текст, полученный из истории или очереди.
     time: Option<String>,           // Время сервера или пояснение рядом со статусом очереди.
     delivery: Option<DeliveryMark>, // Состояние отправки исходящей строки.
+    starts_day: bool,               // Над этой строкой виден новый день.
+    starts_group: bool,             // Имя автора и отступ перед началом группы.
+    ends_group: bool,               // Аватар собеседника рядом с последней строкой группы.
+}
+
+impl Row {
+    /// Возвращает высоту частей строки перед сообщением, чтобы выровнять сам пузырь.
+    fn inset(&self) -> Pixels {
+        let gap = if self.starts_group { px(6.) } else { px(3.) };
+        gap + if self.starts_day { DATE_SPACE } else { px(0.) }
+    }
+
+    /// Сравнивает авторство, тему и день двух соседних сообщений.
+    fn joins(&self, other: &Self) -> bool {
+        self.author.is_some()
+            && self.author == other.author
+            && self.topic == other.topic
+            && self.date == other.date
+    }
 }
 
 /// Что должен показать список после принятия снимка.
@@ -35,9 +59,8 @@ pub(super) enum Position {
 /// Видимая относительная координата строки и верхний отступ.
 #[derive(Clone, Copy)]
 struct Anchor {
-    id: Uuid,       // Идентификатор строки, которую продолжают читать.
-    y: Pixels,      // Координата верхней границы относительно списка, в логических px.
-    offset: Pixels, // Сколько строки скрыто над верхним краем списка.
+    id: Uuid,  // Идентификатор строки, которую продолжают читать.
+    y: Pixels, // Координата верхней границы относительно списка, в логических px.
 }
 
 /// Запись для сравнения координат после нового прохода GPUI.
@@ -101,14 +124,10 @@ impl Viewport {
         {
             let y = painted
                 .get(&row.id)
-                .map_or(-logical.offset_in_item, |bounds| {
+                .map_or(row.inset() - logical.offset_in_item, |bounds| {
                     bounds.top() - viewport.top()
                 });
-            return Some(Anchor {
-                id: row.id,
-                y,
-                offset: logical.offset_in_item,
-            });
+            return Some(Anchor { id: row.id, y });
         }
         self.rows
             .iter()
@@ -117,11 +136,7 @@ impl Viewport {
                 let bounds = painted.get(&row.id)?;
                 (bounds.bottom() > viewport.top() && bounds.top() < viewport.bottom()).then(|| {
                     let y = bounds.top() - viewport.top();
-                    Anchor {
-                        id: row.id,
-                        y,
-                        offset: -y,
-                    }
+                    Anchor { id: row.id, y }
                 })
             })
     }
@@ -184,15 +199,17 @@ impl Viewport {
                 if let Some(&item_ix) = index.get(&id) {
                     self.list.scroll_to(ListOffset {
                         item_ix,
-                        offset_in_item: px(0.),
+                        offset_in_item: self.rows[item_ix].inset(),
                     });
                 }
             }
             Position::Reading => {
                 if let Some(anchor) = anchor {
+                    let item_ix = index[&anchor.id];
+                    // При догрузке дата и отступ группы могут исчезнуть над тем же UUID.
                     self.list.scroll_to(ListOffset {
-                        item_ix: index[&anchor.id],
-                        offset_in_item: anchor.offset,
+                        item_ix,
+                        offset_in_item: self.rows[item_ix].inset() - anchor.y,
                     });
                 }
             }
@@ -200,7 +217,7 @@ impl Viewport {
     }
 
     /// Рисует список и пишет фактическую координату опоры, когда GPUI дойдёт до её строки.
-    pub(super) fn render(&mut self, palette: Palette) -> impl IntoElement {
+    pub(super) fn render(&mut self, palette: Palette, peer: Option<String>) -> impl IntoElement {
         self.painted.borrow_mut().clear();
         let rows = self.rows.clone();
         let painted = self.painted.clone();
@@ -212,18 +229,9 @@ impl Viewport {
             let painted = painted.clone();
             let measurement = measurement.clone();
             let list_state = list_state.clone();
-            div().relative().w_full().px_3().py_1()
-                .child(MessageBubble {
-                    author: None,
-                    body: row.body.clone().into(),
-                    time: row.time.clone().map(Into::into),
-                    own: row.own,
-                    delivery: row.delivery,
-                }.render(palette)
-                    .when(row.delivery == Some(DeliveryMark::Unknown), |bubble| {
-                        bubble.debug_selector(|| "history-delivery-unknown".into())
-                    }))
-                .child(canvas(|_, _, _| (), move |bounds, (), _, _| {
+            div().relative().w_full().px_3().pt(row.inset())
+                .children(row.date.as_deref().filter(|_| row.starts_day).map(|date| date_separator(palette, date, id)))
+                .child(message_row(row, palette, peer.as_deref()).relative().child(canvas(|_, _, _| (), move |bounds, (), _, _| {
                     painted.borrow_mut().insert(id, bounds);
                     let mut measurement = measurement.borrow_mut();
                     if measurement.as_ref().is_some_and(|m| m.anchor.id == id)
@@ -231,11 +239,11 @@ impl Viewport {
                     {
                         let y_after = bounds.top() - list_state.viewport_bounds().top();
                         log::debug!("gpui_history op_id={} event=anchor_measured anchor_uuid={id} y_before_px={} y_after_px={} target_inset_px={} observed_inset_px={} delta_px={}",
-                            m.op_id, f32::from(m.anchor.y), f32::from(y_after), f32::from(m.anchor.offset), f32::from(-y_after), f32::from(y_after - m.anchor.y));
+                            m.op_id, f32::from(m.anchor.y), f32::from(y_after), f32::from(-m.anchor.y), f32::from(-y_after), f32::from(y_after - m.anchor.y));
                     }
-                }).absolute().inset_0())
+                }).absolute().inset_0()))
                 .into_any_element()
-        }).flex_1().min_h_0().w_full()
+        }).flex_1().min_h_0().w_full().pb_3()
     }
 
     /// Возвращает координату реально показанной строки для теста геометрии.
@@ -248,6 +256,80 @@ impl Viewport {
     }
 }
 
+/// Рисует дату перед первым сообщением дня, не добавляя отдельный адрес в список.
+fn date_separator(palette: Palette, date: &str, id: Uuid) -> Div {
+    div()
+        .absolute()
+        .top_2()
+        .left_0()
+        .right_0()
+        .flex()
+        .justify_center()
+        .child(
+            label(palette, TextRole::Caption, date.to_owned())
+                .px_3()
+                .py_0p5()
+                .rounded_full()
+                .border_1()
+                .border_color(palette.border)
+                .bg(palette.surface)
+                .debug_selector(move || format!("history-date-{id}")),
+        )
+}
+
+/// Рисует сообщение с общим пузырём и оставляет место аватару в группе собеседника.
+fn message_row(row: &Row, palette: Palette, peer: Option<&str>) -> Div {
+    let author = peer.unwrap_or("Участник");
+    let id = row.id;
+    // Время и пояснения должны читаться и на более тёмной подложке исходящего.
+    let bubble_palette = if row.own {
+        Palette {
+            message_time: palette.text,
+            ..palette
+        }
+    } else {
+        Palette {
+            message_time: palette.text_secondary,
+            accent: palette.text_secondary,
+            ..palette
+        }
+    };
+    div()
+        .w_full()
+        .flex()
+        .items_end()
+        .gap_2()
+        .when(!row.own, |view| {
+            let avatar = peer
+                .and_then(|name| name.chars().next())
+                .map(|initial| initial.to_uppercase().collect::<String>())
+                .unwrap_or_default();
+            view.child(div().w(px(40.)).flex_none().when(row.ends_group, |slot| {
+                slot.child(
+                    Avatar::from_initials(avatar)
+                        .render(palette)
+                        .debug_selector(move || format!("history-avatar-{id}")),
+                )
+            }))
+        })
+        .child(
+            div().flex_1().min_w_0().child(
+                MessageBubble {
+                    author: (!row.own && row.starts_group).then(|| author.to_owned().into()),
+                    body: row.body.clone().into(),
+                    time: row.time.clone().map(Into::into),
+                    own: row.own,
+                    delivery: row.delivery,
+                }
+                .render(bubble_palette)
+                .debug_selector(move || format!("history-message-{id}"))
+                .when(row.delivery == Some(DeliveryMark::Unknown), |bubble| {
+                    bubble.debug_selector(|| "history-delivery-unknown".into())
+                }),
+            ),
+        )
+}
+
 /// Готовит историю и добавляет уникальные строки очереди только после подтверждённого хвоста.
 fn build_rows(history: &HistoryWindow, outbox: &[OutboxEntry], user: Option<Uuid>) -> Vec<Row> {
     let mut rows: Vec<_> = history
@@ -255,17 +337,24 @@ fn build_rows(history: &HistoryWindow, outbox: &[OutboxEntry], user: Option<Uuid
         .iter()
         .map(|message| {
             let own = user.is_some() && message.metadata.author_id == user;
+            let stamp = message.metadata.created_at.as_str();
             Row {
                 id: message.id,
                 own,
+                author: message.metadata.author_id,
+                topic: message.topic_id,
+                date: Some(format!(
+                    "{}.{}.{}",
+                    &stamp[8..10],
+                    &stamp[5..7],
+                    &stamp[0..4]
+                )),
                 body: message.text.clone(),
-                time: message
-                    .metadata
-                    .created_at
-                    .as_str()
-                    .get(11..16)
-                    .map(str::to_owned),
+                time: Some(stamp[11..16].to_owned()),
                 delivery: own.then_some(DeliveryMark::Sent),
+                starts_day: false,
+                starts_group: false,
+                ends_group: false,
             }
         })
         .collect();
@@ -278,6 +367,9 @@ fn build_rows(history: &HistoryWindow, outbox: &[OutboxEntry], user: Option<Uuid
                 .map(|entry| Row {
                     id: entry.snapshot.public_id,
                     own: true,
+                    author: user,
+                    topic: entry.snapshot.topic_id,
+                    date: None,
                     body: entry.snapshot.markdown.clone(),
                     time: Some(delivery_caption(entry.status).into()),
                     delivery: Some(match entry.status {
@@ -287,8 +379,23 @@ fn build_rows(history: &HistoryWindow, outbox: &[OutboxEntry], user: Option<Uuid
                             DeliveryMark::Failed
                         }
                     }),
+                    starts_day: false,
+                    starts_group: false,
+                    ends_group: false,
                 }),
         );
+    }
+    for ix in 0..rows.len() {
+        let previous = ix.checked_sub(1).and_then(|previous| rows.get(previous));
+        let current = &rows[ix];
+        let starts_day =
+            current.date.is_some() && previous.is_none_or(|row| row.date != current.date);
+        let starts_group = previous.is_none_or(|row| !row.joins(current));
+        let ends_group = rows.get(ix + 1).is_none_or(|row| !row.joins(current));
+        let current = &mut rows[ix];
+        current.starts_day = starts_day;
+        current.starts_group = starts_group;
+        current.ends_group = ends_group;
     }
     rows
 }
