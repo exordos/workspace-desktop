@@ -101,6 +101,27 @@ impl HistoryProbe {
         self.rows.len()
     }
 
+    /// Возвращает UUID сообщения в конце истории, даже если его нет на экране.
+    pub fn last_uuid(&self) -> Uuid {
+        self.rows[self.rows.len() - 1].uuid
+    }
+
+    /// Возвращает UUID строки, в которой начнётся виртуальная загрузка изображения.
+    #[allow(dead_code)] // Используется в общем прототипе чата.
+    pub fn above_anchor_uuid(&self) -> Option<Uuid> {
+        let index = self.list.logical_scroll_top().item_ix;
+        self.rows.get(index)?;
+        self.rows.get(index.checked_sub(1)?).map(|row| row.uuid)
+    }
+
+    /// Показывает, изменились ли данные строки после задержанной загрузки.
+    #[allow(dead_code)] // Используется в общем прототипе чата.
+    pub fn image_loaded(&self, uuid: Uuid) -> bool {
+        self.index
+            .get(&uuid)
+            .is_some_and(|&index| self.rows[index].image_loaded)
+    }
+
     /// Возвращает геометрию сообщения, которое было нарисовано в последнем кадре.
     pub fn geometry(&self, uuid: Uuid) -> Option<RowGeometry> {
         let viewport = self.list.viewport_bounds();
@@ -228,9 +249,7 @@ impl HistoryProbe {
 
     /// Печатает измерение текущей опоры или последней видимой строки.
     fn print_geometry(&self) {
-        let row = self
-            .anchor()
-            .or_else(|| self.geometry(self.rows[self.rows.len() - 1].uuid));
+        let row = self.anchor().or_else(|| self.geometry(self.last_uuid()));
         if let Some(row) = row {
             eprintln!(
                 "uuid={} y={} height={} viewport_height={} rows={} built={}",

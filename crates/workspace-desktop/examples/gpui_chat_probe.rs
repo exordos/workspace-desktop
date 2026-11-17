@@ -1,56 +1,20 @@
-//! Запускает отдельное окно, чтобы проверить сборку и отрисовку GPUI на macOS.
+//! Запускает общий прототип истории и редактора GPUI на фиксированных данных.
 
 #[cfg(target_os = "macos")]
-use gpui::{
-    App, Application, Bounds, Context, SharedString, Window, WindowBounds, WindowOptions, div,
-    prelude::*, px, rgb, size,
-};
-
-/// Содержимое окна для проверки, что GPUI рисует текст.
+#[path = "gpui_probe/chat.rs"]
+mod chat;
 #[cfg(target_os = "macos")]
-struct Probe;
-
+#[path = "gpui_probe/editor.rs"]
+mod editor;
 #[cfg(target_os = "macos")]
-impl Render for Probe {
-    /// Рисует различимую надпись по центру окна.
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgb(0x17191e))
-            .text_color(rgb(0xf7f8fa))
-            .text_size(px(24.))
-            .child("Workspace Desktop на GPUI")
-    }
-}
+#[path = "gpui_probe/history.rs"]
+mod history;
 
-/// Открывает окно без подключения к профилю, сети и системным секретам.
+/// Открывает окно. Флаг запускает воспроизведение после появления первого кадра.
 #[cfg(target_os = "macos")]
 fn main() {
-    Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(480.), px(240.)), cx);
-        cx.on_window_closed(|cx| {
-            if cx.windows().is_empty() {
-                cx.quit();
-            }
-        })
-        .detach();
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some(SharedString::from("Workspace GPUI Probe")),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            |_, cx| cx.new(|_| Probe),
-        )
-        .expect("Не удалось открыть окно GPUI");
-        cx.activate(true);
-    });
+    let reproduce = std::env::args().any(|arg| arg == "--reproduce-scroll-jump");
+    chat::open(reproduce);
 }
 
 /// Объясняет ограничение прототипа на других платформах.

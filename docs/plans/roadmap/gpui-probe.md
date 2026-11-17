@@ -16,19 +16,85 @@ macOS 27.0.1, Xcode 26.4.1 (macOS SDK 26.4), Rust 1.100.0.
 cargo run --locked -p workspace-desktop --no-default-features --features gpui --example gpui_chat_probe
 ```
 
-Должно появиться окно **Workspace GPUI Probe** с текстом «Workspace Desktop
-на GPUI». Закрытие окна завершает пример. Пример не читает профиль и не
+Откроется **Workspace GPUI Chat Probe** с тестовой историей и редактором.
+Закрытие окна завершает пример. Пример не читает профиль и не
 подключается к Workspace.
 
 Feature `gpui` включает GPUI и общие адаптеры macOS. Тесты с
 `#[gpui::test]` могут включить `gpui-test` для доступа к тестовому контексту
-GPUI. Точка входа `workspace-desktop-gpui` и примеры `gpui_history_probe`,
+GPUI. Точка входа `workspace-desktop-gpui` и отдельные примеры `gpui_history_probe`,
 `gpui_editor_probe`, `gpui_macos_window_probe`, `gpui_gallery` требуют
-`gpui`. Их реализацию добавят следующие карточки.
+`gpui`.
 
 Прежний клиент Iced остаётся в обычной сборке:
 
 ```sh
 cargo run --locked -p workspace-desktop --bin workspace-desktop
 cargo test --locked --workspace --no-default-features
+```
+
+## Воспроизвести скачок истории при догрузке сверху
+
+Из корня проекта в графической сессии macOS выполните:
+
+```sh
+cargo run --locked -p workspace-desktop --no-default-features --features gpui --example gpui_chat_probe -- --reproduce-scroll-jump 2>&1 | tee /tmp/gpui-scroll-jump.log
+```
+
+Откроется **Workspace GPUI Chat Probe**. Сценарий сам переходит к известному UUID и подаёт
+64 клавиши через GPUI с целевым интервалом 12 мс. В это время история вставляет 50 строк сверху,
+загружает изображение в строке выше опоры и получает новое сообщение снизу. В конце сценарий
+проверяет, что у нижнего края новое сообщение стало видимым. Не вводите свой текст и не скролльте
+окно до завершения сценария: эти действия меняют измеряемую позицию и черновик.
+
+- `op_id=prepend-1`: сопоставьте `update_requested`, `list_updated` и `anchor_measured`.
+  Там есть UUID, число строк до и после и координаты в логических пикселях от области прокрутки.
+  `target_inset_px` и `observed_inset_px` — заданное и фактическое смещения внутри опорной строки.
+  Смещение `delta_px` допустимо в пределах ±1 px при том же UUID.
+- `op_id=image-2` и `op_id=incoming-3` проверяют ту же опору после роста строки и прихода сообщения.
+  `op_id=follow-4 mode=follow_end` — штатное движение к новому хвосту, здесь нужен `bottom_gap_px`
+  в пределах ±1 px, а UUID должен смениться.
+- `typing_result` считает обработанные клавиши и проверяет весь результат ввода без записи текста.
+  `max_dispatch_us` — максимальное время обработки одного события внутри GPUI.
+  `max_gap_us` — максимальная пауза между подачами клавиш, включая ожидание таймера и работу цикла окна.
+  Для замеров на каждом шаге добавьте `WORKSPACE_GPUI_PROBE_TRACE_FRAMES=1` перед `cargo run`.
+  `paint_wait` измеряет ожидание подтверждённой отрисовки, а не длительность одного кадра.
+
+После `repro_finished result=ok` окно остаётся открытым. При расхождении оно останавливается
+на проверяемом шаге с `result=failed`. Чтобы совместить снимок с журналом, оставьте окно открытым
+и в отдельном терминале получите PID и номер окна этого прототипа:
+
+```sh
+probe_pid=$(pgrep -nx gpui_chat_probe)
+window_number=$(swift - "$probe_pid" <<'SWIFT'
+import CoreGraphics
+import Foundation
+guard CommandLine.arguments.count == 2,
+      let pid = Int32(CommandLine.arguments[1]),
+      let windows = CGWindowListCopyWindowInfo(
+        [.excludeDesktopElements, .optionOnScreenOnly], kCGNullWindowID
+      ) as? [[String: Any]],
+      let window = windows.first(where: {
+        $0[kCGWindowOwnerPID as String] as? Int32 == pid &&
+        $0[kCGWindowLayer as String] as? Int == 0
+      }),
+      let number = window[kCGWindowNumber as String] as? Int
+else { exit(1) }
+print(number)
+SWIFT
+)
+if [ -n "$window_number" ]; then
+  screencapture -x -o -l "$window_number" /tmp/gpui-scroll-jump.png
+fi
+```
+
+Эту команду используйте с одним запущенным прототипом. Если номер не найден,
+выведите окно на экран и проверьте разрешение macOS на запись экрана для терминала.
+На кадре будут только фиксированные данные тестового чата.
+
+Автотест подаёт клавиши до и после догрузки в том же окне и проверяет итоговый черновик,
+координату опоры и новое сообщение у нижнего края:
+
+```sh
+cargo test --locked -p workspace-desktop --no-default-features --features gpui-test --example gpui_chat_probe
 ```
