@@ -37,12 +37,9 @@ const B: &str = "00000000-0000-0000-0000-000000000003";
 const STREAM: &str = "00000000-0000-0000-0000-000000000004";
 const OTHER: &str = "00000000-0000-0000-0000-000000000005";
 const TOPIC: &str = "00000000-0000-0000-0000-000000000006";
-const CA: &[u8] =
-    include_bytes!("../../../workspace-desktop/src/shell/background_message/tls/ca.pem");
-const CERT: &[u8] =
-    include_bytes!("../../../workspace-desktop/src/shell/background_message/tls/localhost.pem");
-const KEY: &[u8] =
-    include_bytes!("../../../workspace-desktop/src/shell/background_message/tls/localhost-key.pem");
+const CA: &[u8] = include_bytes!("../../../../tests/fixtures/tls/ca.pem");
+const CERT: &[u8] = include_bytes!("../../../../tests/fixtures/tls/localhost.pem");
+const KEY: &[u8] = include_bytes!("../../../../tests/fixtures/tls/localhost-key.pem");
 const DEADLINE: Duration = Duration::from_secs(10);
 
 /// Выдаёт двум тестовым пользователям токены с UUID проекта.

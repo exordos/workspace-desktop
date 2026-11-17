@@ -123,13 +123,13 @@ mod keychain;
 #[cfg(target_os = "macos")]
 pub use keychain::MacKeychain;
 
-#[cfg(feature = "ui-kit")]
+#[cfg(feature = "macos-adapters")]
 pub mod notifications;
 
-#[cfg(all(target_os = "macos", feature = "ui-kit"))]
+#[cfg(all(target_os = "macos", feature = "macos-adapters"))]
 pub mod tray;
 
-#[cfg(all(target_os = "macos", feature = "ui-kit"))]
+#[cfg(all(target_os = "macos", feature = "macos-adapters"))]
 pub mod wake;
 
 #[cfg(test)]

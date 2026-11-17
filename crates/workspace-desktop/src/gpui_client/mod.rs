@@ -1,0 +1,119 @@
+//! Собирает окно GPUI, запускает обработку его событий и подключает системные адаптеры.
+//! Контракты отделяют фоновую работу от состояния окна.
+
+mod client;
+pub mod composer;
+pub mod contracts;
+pub mod conversation;
+pub mod platform_window;
+pub mod runtime;
+pub mod shell;
+pub mod sidebar;
+pub mod ui;
+
+use std::{cell::Cell, collections::HashMap, io, rc::Rc};
+
+use gpui::{App, AppContext, Application, KeyBinding, Window, actions};
+use workspace_core::context::AccountId;
+
+use crate::platform::state_directory;
+use client::Client;
+use composer::Editor;
+use contracts::ShellAction;
+use platform_window::WindowPlatform;
+use runtime::{RuntimeClient, StartupError};
+use sidebar::Sidebar;
+use ui::WorkspaceAssets;
+
+actions!(workspace_focus, [NextControl, PreviousControl]);
+
+/// Подписи аккаунтов и выбор первого входа, переданные при запуске.
+#[derive(Default)]
+pub struct Options {
+    pub active: Option<AccountId>, // Предпочитаемый сохранённый вход; None сохраняет обычный выбор.
+    pub labels: HashMap<AccountId, String>, // Временные подписи для окна и системных баннеров.
+}
+
+/// Открывает обычное окно с существующим профилем Workspace.
+pub fn run(options: Options) -> io::Result<()> {
+    platform_window::macos::disable_state_restoration();
+    let profile = state_directory().map_err(|_| io::Error::other(StartupError::Profile))?;
+    let (runtime, events) = RuntimeClient::start_in(profile.clone())
+        .map_err(|_| io::Error::other(StartupError::Worker))?;
+    let failed = Rc::new(Cell::new(false));
+    let startup_failure = Rc::clone(&failed);
+    let application = Application::new().with_assets(WorkspaceAssets);
+    application.on_reopen(WindowPlatform::show_window);
+    application.run(move |app| {
+        bind_keys(app);
+        let window_options = WindowPlatform::window_options(&profile, app);
+        let window = app.open_window(window_options, |_, app| {
+            app.new(|cx| Client::new(options, runtime.clone(), cx))
+        });
+        let Ok(window) = window else {
+            startup_failure.set(true);
+            return quit_after_window_failure(app, runtime);
+        };
+        let Ok(client) = window.update(app, |_, _, cx| cx.entity()) else {
+            startup_failure.set(true);
+            return quit_after_window_failure(app, runtime);
+        };
+
+        let target = client.downgrade();
+        if WindowPlatform::install(
+            app,
+            window.into(),
+            &profile,
+            runtime.clone(),
+            move |click, _, app| {
+                let _ = target.update(app, |client, cx| {
+                    client.handle_action(ShellAction::NotificationClicked(click), cx);
+                });
+            },
+        )
+        .is_err()
+        {
+            startup_failure.set(true);
+            return quit_after_window_failure(app, runtime);
+        }
+
+        // Передаём первый снимок той же подписке, которая затем обновляет живое окно.
+        let subscription = events.attach(&client, app, Client::handle_runtime);
+        client.update(app, |client, cx| client.attach(subscription, cx));
+        app.activate(true);
+    });
+    if failed.get() {
+        Err(io::Error::other("Не удалось открыть окно Workspace"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Регистрирует системный ввод и общий порядок фокуса для всех частей окна.
+fn bind_keys(app: &mut App) {
+    Sidebar::bind_keys(app);
+    Editor::bind_keys(app);
+    app.bind_keys([
+        KeyBinding::new("tab", NextControl, None),
+        KeyBinding::new("shift-tab", PreviousControl, None),
+    ]);
+}
+
+/// Включает общий обход интерактивных элементов на корневом контейнере.
+fn next_control(_: &NextControl, window: &mut Window, _: &mut App) {
+    window.focus_next();
+}
+
+/// Возвращает фокус предыдущему элементу того же окна.
+fn previous_control(_: &PreviousControl, window: &mut Window, _: &mut App) {
+    window.focus_prev();
+}
+
+/// При ошибке окна отключает фоновую работу до выхода, не печатая детали ОС или профиля.
+fn quit_after_window_failure(app: &mut App, runtime: RuntimeClient) {
+    app.spawn(async move |cx| {
+        runtime.shutdown().await;
+        let _ = cx.update(|app| app.quit());
+    })
+    .detach();
+}
