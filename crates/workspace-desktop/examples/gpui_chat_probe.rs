@@ -4,9 +4,6 @@
 #[path = "gpui_probe/chat.rs"]
 mod chat;
 #[cfg(target_os = "macos")]
-#[path = "gpui_probe/editor.rs"]
-mod editor;
-#[cfg(target_os = "macos")]
 #[path = "gpui_probe/history.rs"]
 mod history;
 

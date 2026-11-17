@@ -1,6 +1,8 @@
-//! Текстовое поле прототипа. Сначала состояние и действия, затем связь с системным вводом и разметка.
+//! Многострочное текстовое поле GPUI. Сначала состояние и действия, затем связь с системным вводом и разметка.
 
 use std::ops::Range;
+
+use crate::gpui_client::ui::{Palette, ThemeMode};
 
 use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Element, ElementId,
@@ -37,22 +39,26 @@ mod keys {
 const LINE_HEIGHT: Pixels = px(22.);
 const VIEWPORT_HEIGHT: Pixels = px(110.);
 
-/// Черновик прототипа и локальное состояние выделения. Индексы считаются в байтах UTF-8.
+/// Черновик разговора и локальное состояние выделения. Индексы считаются в байтах UTF-8.
 pub struct Editor {
-    text: String,                 // Текст с системными переводами строк, приведёнными к LF.
-    anchor: usize,                // Неподвижный конец выделения.
-    caret: usize,                 // Положение курсора или подвижный конец выделения.
+    version: u64,       // Меняется при каждом изменении текста, даже если его восстановили.
+    framed_probe: bool, // Демонстрационные окна сохраняют нейтральную рамку прототипа.
+    text: String,       // Текст с системными переводами строк, приведёнными к LF.
+    anchor: usize,      // Неподвижный конец выделения.
+    caret: usize,       // Положение курсора или подвижный конец выделения.
     marked: Option<Range<usize>>, // Незавершённая композиция IME.
-    focus: FocusHandle,           // Связь состояния редактора с фокусом GPUI.
-    layout: Option<TextLayout>,   // Последняя нарисованная геометрия для мыши и IME.
-    layout_current: bool,         // Геометрия относится к текущей версии текста.
-    dragging: bool,               // Зажата кнопка мыши при выделении текста.
+    focus: FocusHandle, // Связь состояния редактора с фокусом GPUI.
+    layout: Option<TextLayout>, // Последняя нарисованная геометрия для мыши и IME.
+    layout_current: bool, // Геометрия относится к текущей версии текста.
+    dragging: bool,     // Зажата кнопка мыши при выделении текста.
 }
 
 impl Editor {
     /// Готовит пустой редактор, доступный через Tab.
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
+            version: 0,
+            framed_probe: true,
             text: String::new(),
             anchor: 0,
             caret: 0,
@@ -64,23 +70,62 @@ impl Editor {
         }
     }
 
+    /// Создаёт поле разговора внутри общей рамки Workspace.
+    pub(super) fn for_conversation(cx: &mut Context<Self>) -> Self {
+        Self {
+            framed_probe: false,
+            ..Self::new(cx)
+        }
+    }
+
+    /// Возвращает версию текста, чтобы поздняя запись не очистила новый ввод.
+    pub(super) fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Не даёт отправить ещё не подтверждённую системную композицию.
+    pub(super) fn composing(&self) -> bool {
+        self.marked.is_some()
+    }
+
+    /// Очищает сохранённый текст, сохраняя фокус текущего редактора.
+    pub(super) fn clear(&mut self, cx: &mut Context<Self>) {
+        self.replace(0..self.text.len(), "", cx);
+    }
+
     /// Подключает клавиши редактора. Регистрируется один раз при запуске приложения.
     pub fn bind_keys(cx: &mut App) {
         cx.bind_keys([
-            KeyBinding::new("backspace", keys::Backspace, Some("ProbeEditor")),
-            KeyBinding::new("delete", keys::Delete, Some("ProbeEditor")),
-            KeyBinding::new("enter", keys::Newline, Some("ProbeEditor")),
-            KeyBinding::new("shift-enter", keys::Newline, Some("ProbeEditor")),
-            KeyBinding::new("left", keys::Left, Some("ProbeEditor")),
-            KeyBinding::new("right", keys::Right, Some("ProbeEditor")),
-            KeyBinding::new("up", keys::Up, Some("ProbeEditor")),
-            KeyBinding::new("down", keys::Down, Some("ProbeEditor")),
-            KeyBinding::new("shift-left", keys::SelectLeft, Some("ProbeEditor")),
-            KeyBinding::new("shift-right", keys::SelectRight, Some("ProbeEditor")),
-            KeyBinding::new("cmd-a", keys::SelectAll, Some("ProbeEditor")),
-            KeyBinding::new("cmd-c", keys::Copy, Some("ProbeEditor")),
-            KeyBinding::new("cmd-x", keys::Cut, Some("ProbeEditor")),
-            KeyBinding::new("cmd-v", keys::Paste, Some("ProbeEditor")),
+            KeyBinding::new(
+                "backspace",
+                keys::Backspace,
+                Some("WorkspaceComposerEditor"),
+            ),
+            KeyBinding::new("delete", keys::Delete, Some("WorkspaceComposerEditor")),
+            KeyBinding::new("enter", keys::Newline, Some("WorkspaceComposerEditor")),
+            KeyBinding::new(
+                "shift-enter",
+                keys::Newline,
+                Some("WorkspaceComposerEditor"),
+            ),
+            KeyBinding::new("left", keys::Left, Some("WorkspaceComposerEditor")),
+            KeyBinding::new("right", keys::Right, Some("WorkspaceComposerEditor")),
+            KeyBinding::new("up", keys::Up, Some("WorkspaceComposerEditor")),
+            KeyBinding::new("down", keys::Down, Some("WorkspaceComposerEditor")),
+            KeyBinding::new(
+                "shift-left",
+                keys::SelectLeft,
+                Some("WorkspaceComposerEditor"),
+            ),
+            KeyBinding::new(
+                "shift-right",
+                keys::SelectRight,
+                Some("WorkspaceComposerEditor"),
+            ),
+            KeyBinding::new("cmd-a", keys::SelectAll, Some("WorkspaceComposerEditor")),
+            KeyBinding::new("cmd-c", keys::Copy, Some("WorkspaceComposerEditor")),
+            KeyBinding::new("cmd-x", keys::Cut, Some("WorkspaceComposerEditor")),
+            KeyBinding::new("cmd-v", keys::Paste, Some("WorkspaceComposerEditor")),
         ]);
     }
 
@@ -147,6 +192,7 @@ impl Editor {
     fn replace(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) -> Range<usize> {
         if self.text[range.clone()] != *text {
             self.text.replace_range(range.clone(), text);
+            self.version = self.version.wrapping_add(1);
             self.layout_current = false;
         }
         let end = range.start + text.len();
@@ -374,16 +420,22 @@ impl Render for Editor {
             0x51545c
         };
         div()
-            .id("gpui-probe-editor")
+            .id("workspace-composer-editor")
+            .debug_selector(|| "workspace-composer-editor".into())
             .w_full()
-            .p_2()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(border))
-            .bg(rgb(0x24272d))
-            .text_color(rgb(0xf1f2f5))
+            .min_w_0()
+            .py_2()
+            .when(self.framed_probe, |field| {
+                field
+                    .px_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(border))
+                    .bg(rgb(0x24272d))
+                    .text_color(rgb(0xf1f2f5))
+            })
             .text_size(px(16.))
-            .key_context("ProbeEditor")
+            .key_context("WorkspaceComposerEditor")
             .track_focus(&self.focus)
             .cursor(CursorStyle::IBeam)
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
@@ -538,6 +590,7 @@ impl Element for EditorSurface {
     ) -> TextLayout {
         let editor = self.0.read(cx);
         let style = window.text_style();
+        let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
         let placeholder = editor.text.is_empty();
         let text = if placeholder {
             "Сообщение…"
@@ -557,7 +610,11 @@ impl Element for EditorSurface {
                 len: pair[1] - pair[0],
                 font: style.font(),
                 color: if placeholder {
-                    rgb(0x9a9da8).into()
+                    if editor.framed_probe {
+                        rgb(0x9a9da8).into()
+                    } else {
+                        palette.text_muted
+                    }
                 } else {
                     style.color
                 },
@@ -639,6 +696,11 @@ impl Element for EditorSurface {
             .then(|| layout.position(editor.caret))
             .flatten();
         let focused = focus.is_focused(window);
+        let caret_color = if editor.framed_probe {
+            rgb(0x94b3ff).into()
+        } else {
+            Palette::for_mode(ThemeMode::from(window.appearance())).accent
+        };
         window.handle_input(&focus, ElementInputHandler::new(bounds, self.0.clone()), cx);
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for line in &layout.lines {
@@ -658,7 +720,7 @@ impl Element for EditorSurface {
             if focused && let Some(caret) = caret {
                 window.paint_quad(fill(
                     Bounds::new(caret, size(px(1.5), LINE_HEIGHT)),
-                    rgb(0x94b3ff),
+                    caret_color,
                 ));
             }
         });

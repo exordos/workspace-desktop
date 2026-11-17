@@ -6,7 +6,7 @@ mod source;
 mod viewport;
 
 use futures::channel::oneshot;
-use gpui::{App, Context, IntoElement, Render, Window, div, prelude::*};
+use gpui::{App, Context, Entity, IntoElement, Render, Subscription, Window, div, prelude::*};
 use uuid::Uuid;
 use workspace_core::{
     storage::{HistoryDirection, HistoryEdge, HistoryScope, HistoryWindow, OutboxEntry},
@@ -18,6 +18,7 @@ use self::{
     viewport::{Position, Viewport},
 };
 use super::{
+    composer::{Composer, ComposerEvent, SendSource, Submission},
     contracts::{ChatEntry, ConversationAddress},
     runtime::RuntimeClient,
     ui::{Button, Palette, TextRole, ThemeMode, label},
@@ -37,6 +38,13 @@ enum State {
     Failed(Failure),      // Причина, которую окно показывает пользователю.
 }
 
+/// Связывает редактор с экраном и с рабочими операциями отправки.
+struct Sending {
+    view: Entity<Composer>, // Ввод текущего разговора.
+    source: SendSource,     // Проверка адреса и запись на исполнителе.
+    _intents: Subscription, // Передаёт действия редактора только этому экрану.
+}
+
 /// История, адрес открытия и очередь сообщений одного экрана.
 pub struct Conversation {
     address: ConversationAddress, // Владелец, область, поколение и ревизия от оболочки.
@@ -48,6 +56,7 @@ pub struct Conversation {
     action_error: Option<Flight>, // Запрос, который можно повторить, пока открыта история.
     outbox: Vec<OutboxEntry>, // Последний снимок очереди в области разговора.
     viewport: Viewport, // Виртуальный список и его положение.
+    sending: Option<Sending>, // Рабочий редактор; изолированные тесты истории могут его не подключать.
 }
 
 impl Conversation {
@@ -57,7 +66,11 @@ impl Conversation {
         runtime: RuntimeClient,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::with_source(address, runtime_source(runtime), cx)
+        let mut view = Self::with_source(address, runtime_source(runtime.clone()), cx);
+        if view.address.route.scope.topic_id.is_none() {
+            view.attach_composer(SendSource::runtime(runtime), cx);
+        }
+        view
     }
 
     /// Создаёт экран с заданным источником, в том числе с управляемыми ответами в GPUI-тестах.
@@ -73,6 +86,7 @@ impl Conversation {
             action_error: None,
             outbox: Vec::new(),
             viewport: Viewport::new(),
+            sending: None,
         };
         let target = cx.entity().downgrade();
         // GPUI держит состояние незавершённо созданной Entity до выхода из cx.new.
@@ -89,6 +103,93 @@ impl Conversation {
             });
         conversation.start(Load::Open(entry), cx);
         conversation
+    }
+
+    /// Подключает редактор после создания экрана, пока первое окно истории ещё загружается.
+    fn attach_composer(&mut self, source: SendSource, cx: &mut Context<Self>) {
+        let view = cx.new(|cx| Composer::new(self.address.clone(), cx));
+        let intents =
+            cx.subscribe(
+                &view,
+                |conversation, sender, event: &ComposerEvent, cx| match event {
+                    ComposerEvent::Send(submission) => {
+                        conversation.save_submission(sender, submission, cx)
+                    }
+                    ComposerEvent::RetryDestination(address)
+                        if conversation.has_access() && *address == conversation.address =>
+                    {
+                        if let Some(sending) = &conversation.sending {
+                            sending.view.update(cx, |editor, cx| {
+                                editor.retry_destination(&sending.source, cx)
+                            });
+                        }
+                    }
+                    ComposerEvent::RetryDestination(_) => {}
+                },
+            );
+        self.sending = Some(Sending {
+            view,
+            source,
+            _intents: intents,
+        });
+    }
+
+    /// Перепроверяет адрес экрана и запускает одну запись очереди для принятого намерения.
+    fn save_submission(
+        &mut self,
+        sender: Entity<Composer>,
+        submission: &Submission,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sending) = self
+            .sending
+            .as_ref()
+            .filter(|sending| sending.view == sender)
+        else {
+            return;
+        };
+        if submission.address != self.address {
+            return;
+        }
+        if !self.has_access() || !sender.read(cx).accepts(submission) {
+            sender.update(cx, |editor, cx| {
+                editor.finish(submission.attempt, false, cx)
+            });
+            return;
+        }
+
+        let save = sending.source.save.clone();
+        let editor = sender.downgrade();
+        let attempt = submission.attempt;
+        let submission = submission.clone();
+        cx.spawn(async move |conversation, cx| {
+            // Рабочая запись остаётся привязана к старому адресу и при закрытии разговора.
+            let reply = save(submission).await;
+            let _ = conversation.update(cx, |view, cx| {
+                let Some(public_id) = reply.for_current(Some(&view.address)) else {
+                    return;
+                };
+                let saved = public_id.is_some();
+                if view
+                    .sending
+                    .as_ref()
+                    .is_some_and(|sending| sending.view.downgrade() == editor)
+                {
+                    let _ = editor.update(cx, |editor, cx| editor.finish(attempt, saved, cx));
+                }
+                if saved {
+                    view.refresh_outbox(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Снимает подтверждение отправки, когда текущее окно истории больше нельзя показывать.
+    fn invalidate_send_destination(&self, cx: &mut Context<Self>) {
+        if let Some(sending) = &self.sending {
+            sending.view.update(cx, Composer::invalidate_destination);
+        }
     }
 
     /// Возвращает адрес, по которому оболочка доставляет события истории.
@@ -160,6 +261,7 @@ impl Conversation {
 
     /// Очищает недействительные данные и начинает проверку прежней цели заново.
     fn restart(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_send_destination(cx);
         self.state = State::Opening;
         self.active = None;
         self.read_pending = false;
@@ -171,6 +273,7 @@ impl Conversation {
 
     /// Скрывает историю и делает любые запоздавшие ответы неприменимыми.
     fn fail(&mut self, error: Failure, cx: &mut Context<Self>) {
+        self.invalidate_send_destination(cx);
         self.state = State::Failed(error);
         self.active = None;
         self.read_pending = false;
@@ -331,6 +434,11 @@ impl Conversation {
             flight.id,
         );
         self.state = State::Ready(window);
+        if let Some(sending) = &self.sending {
+            sending.view.update(cx, |editor, cx| {
+                editor.check_destination(&sending.source, cx)
+            });
+        }
         cx.notify();
     }
 
@@ -487,7 +595,10 @@ impl Render for Conversation {
             .when(matches!(&self.state, State::Ready(history) if history.messages.is_empty() && self.outbox.is_empty()), |view| {
                 view.child(label(palette, TextRole::Body, "Сообщений пока нет").p_3())
             })
-            .when(ready, |view| view.child(self.viewport.render(palette)))
+            .when(ready, |view| {
+                view.child(self.viewport.render(palette))
+                    .children(self.sending.as_ref().map(|sending| sending.view.clone()))
+            })
     }
 }
 
@@ -511,3 +622,7 @@ fn action(
 #[cfg(all(test, feature = "gpui-test"))]
 #[path = "history/tests.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "gpui-test"))]
+#[path = "composer/tests.rs"]
+mod send_tests;

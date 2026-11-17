@@ -1,16 +1,12 @@
 //! Запускает прототип многострочного редактора GPUI с отдельной точкой фокуса для проверки.
 
 #[cfg(target_os = "macos")]
-#[path = "gpui_probe/editor.rs"]
-mod editor;
-
-#[cfg(target_os = "macos")]
-use editor::Editor;
-#[cfg(target_os = "macos")]
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, Window,
     WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
 };
+#[cfg(target_os = "macos")]
+use workspace_desktop::gpui_client::composer::Editor;
 
 /// Переходы между редактором и контрольным элементом прототипа.
 #[cfg(target_os = "macos")]

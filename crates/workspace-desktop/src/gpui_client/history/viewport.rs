@@ -11,7 +11,7 @@ use gpui::{
     prelude::*, px,
 };
 use uuid::Uuid;
-use workspace_core::storage::{DeliveryStatus, HistoryWindow, OutboxEntry};
+use workspace_core::storage::{DeliveryStatus, HistoryWindow, OutboxEntry, SendBlock};
 
 use crate::gpui_client::ui::{DeliveryMark, MessageBubble, Palette};
 
@@ -21,7 +21,7 @@ struct Row {
     id: Uuid,                       // UUID сообщения или публичный UUID очереди.
     own: bool,                      // Сообщение текущего пользователя.
     body: String,                   // Текст, полученный из истории или очереди.
-    time: Option<String>,           // Подпись времени сервера.
+    time: Option<String>,           // Время сервера или пояснение рядом со статусом очереди.
     delivery: Option<DeliveryMark>, // Состояние отправки исходящей строки.
 }
 
@@ -219,7 +219,10 @@ impl Viewport {
                     time: row.time.clone().map(Into::into),
                     own: row.own,
                     delivery: row.delivery,
-                }.render(palette))
+                }.render(palette)
+                    .when(row.delivery == Some(DeliveryMark::Unknown), |bubble| {
+                        bubble.debug_selector(|| "history-delivery-unknown".into())
+                    }))
                 .child(canvas(|_, _, _| (), move |bounds, (), _, _| {
                     painted.borrow_mut().insert(id, bounds);
                     let mut measurement = measurement.borrow_mut();
@@ -276,7 +279,7 @@ fn build_rows(history: &HistoryWindow, outbox: &[OutboxEntry], user: Option<Uuid
                     id: entry.snapshot.public_id,
                     own: true,
                     body: entry.snapshot.markdown.clone(),
-                    time: None,
+                    time: Some(delivery_caption(entry.status).into()),
                     delivery: Some(match entry.status {
                         DeliveryStatus::Waiting | DeliveryStatus::Sending => DeliveryMark::Pending,
                         DeliveryStatus::Unknown => DeliveryMark::Unknown,
@@ -288,4 +291,18 @@ fn build_rows(history: &HistoryWindow, outbox: &[OutboxEntry], user: Option<Uuid
         );
     }
     rows
+}
+
+/// Подписывает временную строку до подтверждения, чтобы ожидание и неизвестный исход различались.
+fn delivery_caption(status: DeliveryStatus) -> &'static str {
+    match status {
+        DeliveryStatus::Waiting => "В очереди",
+        DeliveryStatus::Sending => "Отправляется…",
+        DeliveryStatus::Unknown => "Исход неизвестен. Ищем сообщение",
+        DeliveryStatus::Blocked(SendBlock::AccessLost) => "Чат или тема недоступны",
+        DeliveryStatus::Blocked(SendBlock::EncryptionUnavailable) => {
+            "Отправка открытого текста недоступна"
+        }
+        DeliveryStatus::Rejected(_) => "Не отправлено",
+    }
 }

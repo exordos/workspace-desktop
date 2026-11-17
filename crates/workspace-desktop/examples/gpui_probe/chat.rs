@@ -9,10 +9,9 @@ use gpui::{
 };
 use uuid::Uuid;
 
-use crate::{
-    editor::Editor,
-    history::{HistoryAction, HistoryProbe, JUMP_TARGET, RowGeometry},
-};
+use workspace_desktop::gpui_client::composer::Editor;
+
+use crate::history::{HistoryAction, HistoryProbe, JUMP_TARGET, RowGeometry};
 
 const TOLERANCE_PX: f32 = 1.;
 const KEY_INTERVAL: Duration = Duration::from_millis(12);

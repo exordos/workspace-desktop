@@ -1,0 +1,404 @@
+//! Проверяет отправку через кнопки разговора с управляемыми ответами истории и очереди.
+
+use std::{
+    sync::{Arc, mpsc},
+    time::Duration,
+};
+
+use gpui::{ClipboardItem, Modifiers, TestAppContext, VisualTestContext, px, size};
+use workspace_core::{
+    context::{AccountId, OwnerContext, SessionGeneration},
+    storage::{DeliveryStatus, HistoryMessage, HistoryMetadata, HistoryTime, PreparedSend},
+};
+
+use crate::gpui_client::{
+    composer::{DestinationError, Editor},
+    contracts::{ChatRoute, ConversationReply, NavigationRevision},
+};
+
+use super::*;
+
+const MESSAGE: Uuid = Uuid::from_u128(2001);
+const TOPIC: Uuid = Uuid::from_u128(2002);
+
+/// Запрос разговора, который тест может завершить после следующих действий пользователя.
+struct Request<T, U> {
+    input: T,                  // Данные начала операции.
+    reply: oneshot::Sender<U>, // Канал ответа, удерживаемый до нужного шага.
+}
+
+/// Три канала рабочего сценария: загрузка истории, проверка темы и запись очереди.
+struct Requests {
+    history: mpsc::Receiver<Request<(ConversationAddress, Load), ConversationReply<LoadResult>>>, // Открытие и обновление.
+    resolve: mpsc::Receiver<
+        Request<ConversationAddress, ConversationReply<Result<Uuid, DestinationError>>>,
+    >, // Проверка темы.
+    save: mpsc::Receiver<Request<Submission, ConversationReply<Option<Uuid>>>>, // Сохранение снимка.
+}
+
+/// Создаёт поток запросов с задержанным ответом.
+fn send_request<T: Send + 'static, U: Send + 'static>(
+    requests: &mpsc::Sender<Request<T, U>>,
+    input: T,
+) -> futures::future::BoxFuture<'static, U> {
+    let (reply, output) = oneshot::channel();
+    assert!(requests.send(Request { input, reply }).is_ok());
+    Box::pin(async move { output.await.expect("Тест должен отправить ответ") })
+}
+
+/// Ожидает нужный вызов через штатный обработчик GPUI.
+fn next<T, U>(requests: &mpsc::Receiver<Request<T, U>>, step: &str) -> Request<T, U> {
+    requests
+        .recv_timeout(Duration::from_millis(100))
+        .unwrap_or_else(|_| panic!("Экран не запросил: {step}"))
+}
+
+/// Собирает разговор с полным адресом и источниками, чьи ответы выдаёт тест.
+fn conversation(
+    name: &'static str,
+    revision: u64,
+    cx: &mut Context<Conversation>,
+) -> (Conversation, Requests) {
+    let address = ConversationAddress {
+        route: ChatRoute {
+            owner: OwnerContext {
+                account_id: AccountId(name.into()),
+                server: "https://workspace.test".into(),
+                organization_id: "test-org".into(),
+                project_id: "test-project".into(),
+                user_id: Uuid::from_u128(900).to_string(),
+            },
+            scope: HistoryScope {
+                stream_id: Uuid::from_u128(1000),
+                topic_id: None,
+            },
+            entry: ChatEntry::Latest,
+        },
+        generation: SessionGeneration(1),
+        revision: NavigationRevision(revision),
+    };
+    let (history, history_rx) = mpsc::channel();
+    let (resolve, resolve_rx) = mpsc::channel();
+    let (save, save_rx) = mpsc::channel();
+    let source: Source = Arc::new(move |address, load, _, cache| {
+        drop(cache);
+        send_request(&history, (address, load))
+    });
+    let mut view = Conversation::with_source(address, source, cx);
+    view.attach_composer(
+        SendSource {
+            resolve: Arc::new(move |address, _| send_request(&resolve, address)),
+            save: Arc::new(move |submission| send_request(&save, submission)),
+        },
+        cx,
+    );
+    (
+        view,
+        Requests {
+            history: history_rx,
+            resolve: resolve_rx,
+            save: save_rx,
+        },
+    )
+}
+
+/// Открывает тестовое окно на том же представлении разговора, что и приложение.
+fn start(cx: &mut TestAppContext) -> (Entity<Conversation>, &mut VisualTestContext, Requests) {
+    cx.update(Editor::bind_keys);
+    let mut requests = None;
+    let (view, ui) = cx.add_window_view(|_, cx| {
+        let (view, channels) = conversation("test-a", 5, cx);
+        requests = Some(channels);
+        view
+    });
+    ui.simulate_resize(size(px(650.), px(530.)));
+    ui.run_until_parked();
+    (view, ui, requests.unwrap())
+}
+
+/// Публикует в экран подтверждённый хвост и записи очереди из одного снимка.
+fn publish(
+    requests: &Requests,
+    expected: Load,
+    messages: Vec<HistoryMessage>,
+    outbox: Vec<OutboxEntry>,
+    ui: &mut VisualTestContext,
+) {
+    let Request {
+        input: (address, load),
+        reply,
+    } = next(&requests.history, "снимок истории");
+    assert_eq!(load, expected);
+    let scope = address.route.scope;
+    assert!(
+        reply
+            .send(ConversationReply {
+                address,
+                value: Ok(Some(Snapshot {
+                    window: HistoryWindow {
+                        id: 7,
+                        scope,
+                        older: HistoryEdge::End,
+                        newer: HistoryEdge::End,
+                        needs_refresh: false,
+                        messages
+                    },
+                    outbox: Some(outbox),
+                }))
+            })
+            .is_ok()
+    );
+    ui.run_until_parked();
+}
+
+/// Возвращает проверенную тему или отказ для исходного разговора.
+fn allow(requests: &Requests, value: Result<Uuid, DestinationError>, ui: &mut VisualTestContext) {
+    let Request {
+        input: address,
+        reply,
+    } = next(&requests.resolve, "проверка темы");
+    assert!(reply.send(ConversationReply { address, value }).is_ok());
+    ui.run_until_parked();
+}
+
+/// Нажимает видимую кнопку с реальным событием GPUI.
+fn click(ui: &mut VisualTestContext, selector: &'static str) {
+    let center = ui
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("На экране нет {selector}"))
+        .center();
+    ui.simulate_click(center, Modifiers::none());
+    ui.run_until_parked();
+}
+
+/// Вставляет текст тем же сочетанием клавиш, что используется в окне.
+fn paste(ui: &mut VisualTestContext, text: &str) {
+    click(ui, "workspace-composer-editor");
+    ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(text.into())));
+    ui.simulate_keystrokes("cmd-a cmd-v");
+    ui.run_until_parked();
+}
+
+/// Проверяет показанный ввод, который ещё принадлежит этому разговору.
+fn draft(view: &Entity<Conversation>, ui: &VisualTestContext) -> String {
+    ui.read(|app| {
+        view.read(app)
+            .sending
+            .as_ref()
+            .unwrap()
+            .view
+            .read(app)
+            .draft(app)
+            .to_owned()
+    })
+}
+
+/// Завершает задержанную запись с тем адресом, который был передан в исходный запрос.
+fn saved(
+    request: Request<Submission, ConversationReply<Option<Uuid>>>,
+    value: Option<Uuid>,
+    ui: &mut VisualTestContext,
+) {
+    assert!(
+        request
+            .reply
+            .send(ConversationReply {
+                address: request.input.address,
+                value
+            })
+            .is_ok()
+    );
+    ui.run_until_parked();
+}
+
+/// Отказ и пробелы не сохраняют сообщение. Ошибка SQLite оставляет текст; повтор даёт одну запись.
+#[gpui::test]
+fn accepts_only_valid_text_and_one_click_while_saving(cx: &mut TestAppContext) {
+    let (view, ui, requests) = start(cx);
+    publish(&requests, Load::Open(ChatEntry::Latest), vec![], vec![], ui);
+    allow(&requests, Err(DestinationError::EncryptionUnavailable), ui);
+    paste(ui, "Обычный текст");
+    click(ui, "conversation-send");
+    assert!(
+        requests.save.try_recv().is_err(),
+        "Запрещённая тема не допускает запись"
+    );
+
+    click(ui, "conversation-send-retry");
+    allow(&requests, Ok(TOPIC), ui);
+    paste(ui, " \n ");
+    click(ui, "conversation-send");
+    assert!(
+        requests.save.try_recv().is_err(),
+        "Пробелы не считаются сообщением"
+    );
+
+    paste(ui, "Обычный текст");
+    click(ui, "conversation-send");
+    let first = next(&requests.save, "первая запись очереди");
+    assert_eq!(first.input.topic, TOPIC);
+    assert_eq!(first.input.markdown, "Обычный текст");
+    click(ui, "conversation-send");
+    assert!(
+        requests.save.try_recv().is_err(),
+        "Второй клик не создаёт запись"
+    );
+    saved(first, None, ui);
+    assert_eq!(draft(&view, ui), "Обычный текст");
+    assert!(ui.debug_bounds("conversation-send-explanation").is_some());
+
+    click(ui, "conversation-send");
+    saved(
+        next(&requests.save, "успешный повтор записи"),
+        Some(MESSAGE),
+        ui,
+    );
+    assert!(
+        draft(&view, ui).is_empty(),
+        "Успешно записанная версия должна очиститься"
+    );
+    publish(&requests, Load::Read(7), vec![], vec![], ui);
+}
+
+/// Новая версия того же ввода и другой открытый разговор переживают поздний итог сохранения.
+#[gpui::test]
+fn late_results_keep_changed_text_and_the_next_account_draft(cx: &mut TestAppContext) {
+    let (view, ui, requests) = start(cx);
+    publish(&requests, Load::Open(ChatEntry::Latest), vec![], vec![], ui);
+    allow(&requests, Ok(TOPIC), ui);
+    paste(ui, "Первый черновик");
+    click(ui, "conversation-send");
+    let first = next(&requests.save, "старый черновик");
+    paste(ui, "Изменено");
+    paste(ui, "Первый черновик");
+    saved(first, Some(MESSAGE), ui);
+    assert_eq!(
+        draft(&view, ui),
+        "Первый черновик",
+        "Совпадения строки мало: версия уже другая"
+    );
+    publish(&requests, Load::Read(7), vec![], vec![], ui);
+
+    click(ui, "conversation-send");
+    let late = next(&requests.save, "отправка из A");
+    assert_eq!(late.input.address.route.owner.account_id.0, "test-a");
+    let mut second_requests = None;
+    let second = ui.update(|window, app| {
+        window.replace_root(app, |_, cx| {
+            let (view, channels) = conversation("test-b", 6, cx);
+            second_requests = Some(channels);
+            view
+        })
+    });
+    drop(view);
+    ui.run_until_parked();
+    let second_requests = second_requests.unwrap();
+    publish(
+        &second_requests,
+        Load::Open(ChatEntry::Latest),
+        vec![],
+        vec![],
+        ui,
+    );
+    allow(&second_requests, Ok(TOPIC), ui);
+    paste(ui, "Черновик B");
+    saved(late, Some(MESSAGE), ui);
+    assert_eq!(draft(&second, ui), "Черновик B");
+    assert!(
+        second_requests.save.try_recv().is_err(),
+        "Ответ A не записывает ничего в B"
+    );
+}
+
+/// Передаёт событие от core маршруту, который сейчас открыт в окне.
+fn changed(view: &Entity<Conversation>, ui: &mut VisualTestContext, change: SyncChange) {
+    ui.update(|_, app| {
+        view.update(app, |view, cx| {
+            let address = view.address().clone();
+            let update = SyncUpdate {
+                context: address.route.owner.clone(),
+                generation: address.generation,
+                change,
+            };
+            view.apply_sync(&address, update, cx);
+        })
+    });
+    ui.run_until_parked();
+}
+
+/// Запись с неизвестным исходом остаётся видимой. Подтверждения и повторы дают одну строку UUID.
+#[gpui::test]
+fn keeps_unknown_delivery_and_deduplicates_after_confirmation(cx: &mut TestAppContext) {
+    let (view, ui, requests) = start(cx);
+    publish(&requests, Load::Open(ChatEntry::Latest), vec![], vec![], ui);
+    allow(&requests, Ok(TOPIC), ui);
+    paste(ui, "Проверка отправки");
+    click(ui, "conversation-send");
+    let request = next(&requests.save, "запись текста");
+    let scope = request.input.address.route.scope;
+    let prepared = PreparedSend {
+        canonical_id: Uuid::from_u128(2000),
+        public_id: MESSAGE,
+        stream_id: scope.stream_id,
+        topic_id: TOPIC,
+        markdown: request.input.markdown.clone(),
+    };
+    saved(request, Some(MESSAGE), ui);
+    let waiting = OutboxEntry {
+        snapshot: prepared.clone(),
+        status: DeliveryStatus::Waiting,
+    };
+    publish(&requests, Load::Read(7), vec![], vec![waiting], ui);
+    ui.read(|app| assert!(view.read(app).viewport.y(MESSAGE).is_some()));
+
+    changed(&view, ui, SyncChange::OutboxChanged { scope });
+    let unknown = OutboxEntry {
+        snapshot: prepared,
+        status: DeliveryStatus::Unknown,
+    };
+    publish(&requests, Load::Read(7), vec![], vec![unknown.clone()], ui);
+    ui.read(|app| {
+        let conversation = view.read(app);
+        assert_eq!(conversation.outbox[0].status, DeliveryStatus::Unknown);
+        assert_eq!(conversation.viewport.list().item_count(), 1);
+        assert!(conversation.viewport.y(MESSAGE).is_some());
+    });
+
+    assert!(ui.debug_bounds("history-delivery-unknown").is_some());
+
+    let confirmed = HistoryMessage {
+        id: MESSAGE,
+        stream_id: scope.stream_id,
+        topic_id: TOPIC,
+        text: "Проверка отправки".into(),
+        metadata: HistoryMetadata {
+            author_id: Some(Uuid::from_u128(900)),
+            created_at: HistoryTime::parse("2026-11-17T07:10:30Z").unwrap(),
+            updated_at: None,
+        },
+    };
+    changed(
+        &view,
+        ui,
+        SyncChange::HistoryMessageCreated {
+            scope,
+            message_id: MESSAGE,
+        },
+    );
+    publish(
+        &requests,
+        Load::Read(7),
+        vec![confirmed.clone()],
+        vec![unknown],
+        ui,
+    );
+    ui.read(|app| assert_eq!(view.read(app).viewport.list().item_count(), 1));
+    changed(&view, ui, SyncChange::OutboxChanged { scope });
+    publish(&requests, Load::Read(7), vec![confirmed], vec![], ui);
+    ui.read(|app| {
+        let conversation = view.read(app);
+        assert!(conversation.outbox.is_empty());
+        assert_eq!(conversation.viewport.list().item_count(), 1);
+        assert!(conversation.viewport.y(MESSAGE).is_some());
+    });
+}
