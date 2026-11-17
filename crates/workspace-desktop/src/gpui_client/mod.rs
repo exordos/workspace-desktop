@@ -102,6 +102,7 @@ fn refresh_on_appearance(window: &Window) {
 fn bind_keys(app: &mut App) {
     Sidebar::bind_keys(app);
     Editor::bind_keys(app);
+    conversation::Conversation::bind_details_keys(app);
     app.bind_keys([
         KeyBinding::new("tab", NextControl, None),
         KeyBinding::new("shift-tab", PreviousControl, None),

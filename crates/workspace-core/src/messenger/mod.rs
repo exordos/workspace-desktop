@@ -2,6 +2,7 @@
 //! Сначала источник догоняет журнал по HTTP, затем читает новые события через WebSocket.
 
 pub mod catalog;
+pub mod details;
 pub mod history;
 mod outbox;
 pub mod read;

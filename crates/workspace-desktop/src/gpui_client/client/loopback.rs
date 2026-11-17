@@ -40,7 +40,7 @@ use workspace_core::{
         StoreError,
     },
     context::OwnerContext,
-    messenger::SOURCE_ID,
+    messenger::{SOURCE_ID, details::ConversationDetails},
     storage::{Message as StoredMessage, Storage},
     sync::Event,
 };
@@ -73,6 +73,10 @@ const CHANNEL_ROW: &str = "catalog-chat-10000000-0000-4000-8000-000000000007";
 const CHANNEL_TOPIC_ROW: &str =
     "catalog-topic-10000000-0000-4000-8000-000000000007-10000000-0000-4000-8000-000000000009";
 const CHANNEL_HISTORY: Uuid = Uuid::from_u128(84);
+const DETAILS_TRIGGER: &str = "conversation-details-trigger";
+const DETAILS_PANEL: &str = "conversation-details-panel";
+const DETAILS_FIRST_ROW: u128 = 200;
+const DETAILS_LAST_ROW: u128 = 240;
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Восстанавливает синтетическую сессию без системных токенов.
@@ -238,6 +242,15 @@ struct TopicAcceptance {
     sent: Mutex<Vec<TopicPost>>, // Подтверждённые POST в тему.
 }
 
+/// Управляет ответами профиля и проверяет, какого пользователя запросил каждый вход.
+#[derive(Default)]
+struct DetailsFixture {
+    users: Mutex<Vec<(&'static str, &'static str)>>, // Токен владельца и UUID собеседника.
+    unblock: Mutex<Option<oneshot::Receiver<()>>>,   // Удерживает ровно один ответ профиля.
+    denied_topic: AtomicBool, // Возвращает 403 для темы, которую уже показывает окно.
+    omit_stream_user: AtomicBool, // Имитирует старый ответ, который не подтверждает владельца.
+}
+
 /// Записывает наблюдения сервера о готовности подключений и принятой отправке.
 #[derive(Default)]
 struct Received {
@@ -247,6 +260,7 @@ struct Received {
     delayed: Option<DelayedHistory>, // Сценарий позднего ответа, если тест его включил.
     recovery: Option<Recovery>, // Сценарий сброса курсора, если тест его включил.
     topic: Option<TopicAcceptance>, // Канал с явной темой для UI-12.
+    details: Option<DetailsFixture>, // Ответы для правой панели UI-13.
 }
 
 /// Держит локальный сервер, пока существует сценарий.
@@ -493,11 +507,43 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         );
     }
 
-    let stream = json!({
+    if let Some(details) = &state.details {
+        if path == format!("/api/workspace/v1/users/{peer}") {
+            assert_eq!(request.method(), Method::GET);
+            details.users.lock().unwrap().push((user, peer));
+            let waiting = details.unblock.lock().unwrap().take();
+            let name = if let Some(waiting) = waiting {
+                let _ = waiting.await;
+                "Устаревший профиль"
+            } else if peer == PEER {
+                "Собеседник A"
+            } else {
+                "Собеседник B"
+            };
+            return json_response(
+                StatusCode::OK,
+                json!({
+                    "uuid": peer, "username":"peer", "first_name":name, "last_name":null,
+                    "email":"peer@fixture.test", "status":"idle",
+                }),
+            );
+        }
+        if path == format!("{TOPICS}{CHANNEL_TOPIC}") && details.denied_topic.load(Ordering::SeqCst)
+        {
+            return json_response(StatusCode::FORBIDDEN, Value::Null);
+        }
+    }
+
+    let mut stream = json!({
         "uuid": STREAM, "project_id": PROJECT, "user_uuid": user, "name":"Тестовый чат",
         "private": true, "direct_user_uuid": peer, "is_archived": false,
         "default_topic_uuid": TOPIC, "encryption": false, "notification_mode":"all_messages",
     });
+    if state.details.as_ref().is_some_and(|details| {
+        details.omit_stream_user.load(Ordering::SeqCst) && path == format!("{STREAMS}{STREAM}")
+    }) {
+        stream.as_object_mut().unwrap().remove("user_uuid");
+    }
     let (epoch, base, unread) = state
         .recovery
         .as_ref()
@@ -531,6 +577,20 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
             );
             json!(rows)
         }
+        MESSAGES if state.details.is_some() => json!(
+            (DETAILS_FIRST_ROW..DETAILS_LAST_ROW)
+                .rev()
+                .map(|number| json!({
+                    "uuid":Uuid::from_u128(number), "stream_uuid":STREAM, "topic_uuid":TOPIC,
+                    "user_uuid":user, "project_id":PROJECT, "author_uuid":if number % 2 == 0 { user } else { peer },
+                    "created_at":format!("2026-11-17T10:00:{:02}Z", number - DETAILS_FIRST_ROW),
+                    "payload":{
+                        "kind":"markdown",
+                        "content": "Тестовая строка разной длины. ".repeat(4 + (number as usize) % 5),
+                    },
+                }))
+                .collect::<Vec<_>>()
+        ),
         MESSAGES if state.delayed.is_some() => {
             let delayed = state.delayed.as_ref().unwrap();
             let id = if user == USER {
@@ -598,6 +658,7 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
 fn topic_channel(user: &str, encrypted: bool) -> Value {
     json!({
         "uuid": CHANNEL, "project_id": PROJECT, "user_uuid": user, "name": "Канал UI-12",
+        "description":"Описание синтетического канала",
         "private": false, "is_archived": false, "default_topic_uuid": CHANNEL_DEFAULT,
         "encryption": encrypted, "notification_mode": "all_messages",
     })
@@ -762,6 +823,12 @@ fn catalog_click_and_submission_reach_https_queue(cx: &mut TestAppContext) {
     let conversation = ui.read(|app| client.read(app).conversation.as_ref().unwrap().clone());
     ui.simulate_keystrokes("tab");
     ui.run_until_parked();
+    assert_eq!(
+        ui.update(|window, app| conversation.read(app).tested_details_focus(window)),
+        Some("сведения")
+    );
+    ui.simulate_keystrokes("tab");
+    ui.run_until_parked();
     let history_focus = ui.update(|window, app| window.focused(app).unwrap());
     assert_eq!(
         ui.update(|window, app| conversation.read(app).keyboard_focus(window, app)),
@@ -781,8 +848,14 @@ fn catalog_click_and_submission_reach_https_queue(cx: &mut TestAppContext) {
     assert!(ui.update(|window, _| history_focus.is_focused(window)));
     ui.simulate_keystrokes("shift-tab");
     ui.run_until_parked();
+    assert_eq!(
+        ui.update(|window, app| conversation.read(app).tested_details_focus(window)),
+        Some("сведения")
+    );
+    ui.simulate_keystrokes("shift-tab");
+    ui.run_until_parked();
     assert!(ui.update(|window, _| row_focus.is_focused(window)));
-    ui.simulate_keystrokes("tab tab");
+    ui.simulate_keystrokes("tab tab tab");
     ui.run_until_parked();
     assert!(ui.update(|window, _| editor_focus.is_focused(window)));
     ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(MARKER.to_owned())));
@@ -983,6 +1056,245 @@ fn wait_topic_confirmation(
     );
 }
 
+/// Проверяет доступ к профилю, точную тему, закрытие и фокус через обычный Client.
+#[gpui::test]
+fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
+    cx.update(bind_keys);
+    let server = Server::serve(Received {
+        topic: Some(TopicAcceptance::default()),
+        details: Some(DetailsFixture::default()),
+        ..Received::default()
+    });
+    let details = server.state.details.as_ref().unwrap();
+    let profile = tempfile::tempdir().unwrap();
+    let a = saved_account(&server, USER, Uuid::nil());
+    let b = saved_account(&server, PEER, PEER.parse().unwrap());
+    let a_id = a.context.account_id.clone();
+    let b_id = b.context.account_id.clone();
+    JsonAccountStore::open(profile.path())
+        .unwrap()
+        .save(&b)
+        .unwrap();
+    let (runtime, events) = start_runtime(profile.path(), a);
+    let (client, ui) = cx.add_window_view(|_, cx| {
+        Client::new(
+            Options {
+                active: Some(a_id.clone()),
+                ..Options::default()
+            },
+            runtime.clone(),
+            cx,
+        )
+    });
+    ui.update(|_, app| {
+        let subscription = events.attach(&client, app, Client::handle_runtime);
+        client.update(app, |client, cx| client.attach(subscription, cx));
+    });
+    ui.simulate_resize(size(px(1440.), px(900.)));
+    until(
+        ui,
+        "открыты оба синтетических входа",
+        |ui| server.state.ready.load(Ordering::SeqCst) >= 2 && ui.debug_bounds(CHAT_ROW).is_some(),
+    );
+
+    click(ui, CHAT_ROW);
+    until(ui, "личка доступна и видна", |ui| {
+        ui.debug_bounds("workspace-composer-editor").is_some()
+    });
+    let first = ui.read(|app| client.read(app).conversation.as_ref().unwrap().clone());
+    let composer = ui.read(|app| first.read(app).tested_composer().unwrap().clone());
+    click(ui, "workspace-composer-editor");
+    ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(MARKER.into())));
+    ui.simulate_keystrokes("cmd-v shift-tab pageup");
+    ui.run_until_parked();
+    assert_eq!(
+        ui.update(|window, app| first.read(app).keyboard_focus(window, app)),
+        Some("история")
+    );
+    let (anchor, before) = ui.read(|app| {
+        let view = first.read(app);
+        (DETAILS_FIRST_ROW + 1..DETAILS_LAST_ROW - 1)
+            .filter_map(|number| {
+                let id = Uuid::from_u128(number);
+                Some((id, view.tested_details_row_y(id)?))
+            })
+            .min_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))
+            .expect("В середине истории нужна видимая опора")
+    });
+
+    details.omit_stream_user.store(true, Ordering::SeqCst);
+    click(ui, DETAILS_TRIGGER);
+    until(
+        ui,
+        "старый ответ стрима не подтверждает владельца",
+        |ui| ui.debug_bounds("conversation-details-error").is_some(),
+    );
+    assert!(details.users.lock().unwrap().is_empty());
+    details.omit_stream_user.store(false, Ordering::SeqCst);
+    click(ui, "conversation-details-retry");
+    until(
+        ui,
+        "аккаунт A видит проверенный профиль собеседника",
+        |ui| ui.debug_bounds("conversation-details-peer").is_some(),
+    );
+    assert_eq!(details.users.lock().unwrap().as_slice(), &[(USER, PEER)]);
+    ui.read(|app| {
+        let Some(ConversationDetails::Peer(profile)) = first.read(app).tested_details() else {
+            panic!("Ожидался профиль собеседника");
+        };
+        assert_eq!(profile.display_name, "Собеседник A");
+        assert_eq!(profile.email.as_deref(), Some("peer@fixture.test"));
+        assert_eq!(
+            profile.presence,
+            Some(workspace_core::directory::ProfilePresence::Idle)
+        );
+    });
+    ui.read(|app| {
+        let y = first
+            .read(app)
+            .tested_details_row_y(anchor)
+            .expect("Опора видна рядом с панелью");
+        assert!(
+            (y - before).abs() <= 1.,
+            "Опора {anchor} сдвинулась: {before} → {y}"
+        );
+    });
+    let panel = ui.debug_bounds(DETAILS_PANEL).unwrap();
+    assert_eq!(panel.size.width, px(315.));
+    assert!(ui.debug_bounds("conversation-chat").unwrap().right() < panel.left());
+    assert_eq!(
+        ui.update(|window, app| first.read(app).tested_details_focus(window)),
+        Some("закрыть")
+    );
+    ui.simulate_keystrokes("escape");
+    until(ui, "Escape закрыл панель", |ui| {
+        !ui.read(|app| first.read(app).tested_details_is_open())
+    });
+    assert_eq!(
+        ui.update(|window, app| first.read(app).tested_details_focus(window)),
+        Some("сведения")
+    );
+    ui.read(|app| assert_eq!(composer.read(app).draft(app), MARKER));
+
+    let (release, unblock) = oneshot::channel();
+    *details.unblock.lock().unwrap() = Some(unblock);
+    press_enter(ui);
+    until(
+        ui,
+        "первый профиль после открытия задержан",
+        |ui| {
+            details.users.lock().unwrap().len() == 2
+                && ui.debug_bounds("conversation-details-loading").is_some()
+        },
+    );
+    ui.simulate_keystrokes("escape");
+    ui.run_until_parked();
+    press_enter(ui);
+    until(
+        ui,
+        "тот же адрес запросил профиль заново",
+        |ui| {
+            details.users.lock().unwrap().len() == 3
+                && ui.debug_bounds("conversation-details-peer").is_some()
+        },
+    );
+    let _ = release.send(());
+    ui.run_until_parked();
+    ui.read(|app| {
+        assert!(matches!(
+            first.read(app).tested_details(),
+            Some(ConversationDetails::Peer(profile)) if profile.display_name == "Собеседник A"
+        ));
+    });
+
+    click_account(&client, ui, &b_id);
+    assert!(ui.read(|app| client.read(app).conversation.is_none()));
+    click(ui, CHAT_ROW);
+    until(
+        ui,
+        "личка B использует другой аккаунт",
+        |ui| ui.debug_bounds("workspace-composer-editor").is_some(),
+    );
+    click(ui, DETAILS_TRIGGER);
+    until(
+        ui,
+        "токен B запросил своего собеседника",
+        |ui| {
+            details.users.lock().unwrap().last() == Some(&(PEER, USER))
+                && ui.debug_bounds("conversation-details-peer").is_some()
+        },
+    );
+    ui.simulate_resize(size(px(700.), px(600.)));
+    ui.run_until_parked();
+    click(ui, CHANNEL_ROW);
+    ui.run_until_parked();
+    click(ui, CHANNEL_TOPIC_ROW);
+    let _ = topic_ready(&client, ui, "в B открылась выбранная тема, панель закрыта");
+    let topic = ui.read(|app| client.read(app).conversation.as_ref().unwrap().clone());
+    assert!(!ui.read(|app| topic.read(app).tested_details_is_open()));
+    let chat_before = ui.debug_bounds("conversation-chat").unwrap();
+    let composer_before = ui.debug_bounds("workspace-composer-editor").unwrap();
+    for _ in 0..8 {
+        ui.simulate_keystrokes("tab");
+        if ui
+            .update(|window, app| topic.read(app).tested_details_focus(window))
+            .is_some()
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        ui.update(|window, app| topic.read(app).tested_details_focus(window)),
+        Some("сведения")
+    );
+    press_enter(ui);
+    until(
+        ui,
+        "сведения относятся к выбранной, а не к теме по умолчанию",
+        |ui| ui.debug_bounds("conversation-details-topic").is_some(),
+    );
+    ui.read(|app| {
+        assert!(matches!(
+            topic.read(app).tested_details(),
+            Some(ConversationDetails::Topic { channel, name, description: Some(description), done: Some(false) })
+                if channel == "Канал UI-12" && name == "Длинная тема" && description == "Описание синтетического канала"
+        ));
+    });
+    assert_eq!(ui.debug_bounds("conversation-chat").unwrap(), chat_before);
+    assert_eq!(
+        ui.debug_bounds("workspace-composer-editor").unwrap(),
+        composer_before
+    );
+    let panel = ui.debug_bounds(DETAILS_PANEL).unwrap();
+    assert_eq!(panel.right(), chat_before.right());
+    assert!(panel.left() >= chat_before.left());
+    ui.simulate_keystrokes("tab shift-tab");
+    assert_eq!(
+        ui.update(|window, app| topic.read(app).tested_details_focus(window)),
+        Some("закрыть"),
+    );
+    click(ui, "conversation-details-close");
+    assert!(!ui.read(|app| topic.read(app).tested_details_is_open()));
+
+    details.denied_topic.store(true, Ordering::SeqCst);
+    press_enter(ui);
+    until(
+        ui,
+        "запрет сервера скрывает историю и панель",
+        |ui| {
+            ui.debug_bounds("history-error").is_some()
+                && ui.read(|app| {
+                    let topic = topic.read(app);
+                    !topic.has_access() && !topic.tested_details_is_open()
+                })
+        },
+    );
+    assert_eq!(
+        futures::executor::block_on(runtime.shutdown()),
+        RuntimeExit::Clean
+    );
+}
+
 /// Проходит мышью и клавиатурой два входа, читает тему и проверяет доставку без дублей.
 #[gpui::test]
 fn explicit_topic_accepts_mouse_and_keyboard_in_each_account(cx: &mut TestAppContext) {
@@ -1103,6 +1415,11 @@ fn explicit_topic_accepts_mouse_and_keyboard_in_each_account(cx: &mut TestAppCon
     );
     ui.simulate_keystrokes("tab");
     let conversation = ui.read(|app| client.read(app).conversation.as_ref().unwrap().clone());
+    assert_eq!(
+        ui.update(|window, app| conversation.read(app).tested_details_focus(window)),
+        Some("сведения")
+    );
+    ui.simulate_keystrokes("tab");
     assert_eq!(
         ui.update(|window, app| conversation.read(app).keyboard_focus(window, app)),
         Some("история")

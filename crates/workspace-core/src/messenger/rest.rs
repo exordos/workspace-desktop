@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::{
     context::OwnerContext,
+    directory::ProfileRow,
     runtime::SourceError,
     storage::{
         Cursor, HistoryChange, HistoryEdge, HistoryMessage, HistoryMetadata, HistoryScope,
@@ -20,6 +21,7 @@ use crate::{
     sync::Event,
 };
 
+use super::details::{ConversationDetails, DetailsError};
 use super::history::OpenHistoryError;
 use super::read::ReadError;
 use super::send::{DirectSendError, SendError};
@@ -331,6 +333,64 @@ impl RestClient {
             return Err(SourceError::InvalidResponse.into());
         }
         Ok(row)
+    }
+
+    /// Загружает сведения для точного адреса. Профиль запрашивается только после проверки стрима.
+    pub(super) async fn conversation_details(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        scope: HistoryScope,
+    ) -> Result<ConversationDetails, DetailsError> {
+        let stream = self
+            .stream_access(owner, token, scope.stream_id)
+            .await
+            .map_err(details_access_error)?;
+        check_details_owner(
+            owner,
+            stream.project_id.as_deref(),
+            stream.user_uuid.as_deref(),
+        )?;
+        if let Some(topic_id) = scope.topic_id {
+            if stream.private || stream.direct_user_uuid.is_some() {
+                return Err(DetailsError::Unsupported);
+            }
+            let topic = self
+                .topic_access(owner, token, scope.stream_id, topic_id)
+                .await
+                .map_err(details_access_error)?;
+            check_details_owner(
+                owner,
+                topic.project_id.as_deref(),
+                topic.user_uuid.as_deref(),
+            )?;
+            return Ok(ConversationDetails::Topic {
+                channel: required_title(stream.name)?,
+                name: required_title(topic.name)?,
+                description: stream.description.filter(|value| !value.trim().is_empty()),
+                done: topic.is_done,
+            });
+        }
+
+        if !stream.private || !matches!(stream.encryption, Some(Value::Bool(false))) {
+            return Err(DetailsError::Unsupported);
+        }
+        let peer = stream
+            .direct_user_uuid
+            .as_deref()
+            .and_then(parse_uuid)
+            .ok_or(SourceError::InvalidResponse)?;
+        let profile: ProfileRow = self
+            .access_row(owner, token, &format!("/api/workspace/v1/users/{peer}"))
+            .await
+            .map_err(|error| match error {
+                OpenHistoryError::AccessLost => DetailsError::ProfileUnavailable,
+                other => details_access_error(other),
+            })?;
+        let profile = profile
+            .into_profile(peer)
+            .ok_or(SourceError::InvalidResponse)?;
+        Ok(ConversationDetails::Peer(profile))
     }
 
     /// Разрешает обычный текст в теме лички по умолчанию.
@@ -669,6 +729,35 @@ impl RestClient {
     }
 }
 
+/// Преобразует отказ в чтении стрима или темы в причину закрытия панели.
+fn details_access_error(error: OpenHistoryError) -> DetailsError {
+    match error {
+        OpenHistoryError::AccessLost => DetailsError::AccessLost,
+        OpenHistoryError::Source(error) => DetailsError::Source(error),
+        _ => SourceError::InvalidResponse.into(),
+    }
+}
+
+/// Требует проект и пользователя в ответе, прежде чем показывать данные панели.
+fn check_details_owner(
+    owner: &OwnerContext,
+    project: Option<&str>,
+    user: Option<&str>,
+) -> Result<(), SourceError> {
+    if project == Some(owner.project_id.as_str()) && user == Some(owner.user_id.as_str()) {
+        Ok(())
+    } else {
+        Err(SourceError::InvalidResponse)
+    }
+}
+
+/// Проверяет обязательное название в сведениях, сохраняя чтение старых ответов истории.
+fn required_title(value: Option<String>) -> Result<String, SourceError> {
+    value
+        .filter(|name| !name.trim().is_empty())
+        .ok_or(SourceError::InvalidResponse)
+}
+
 /// Проверяет, что адрес владельца содержит базовый HTTPS-адрес сервера.
 pub(super) fn workspace_origin(owner: &OwnerContext) -> Result<Url, SourceError> {
     let url = Url::parse(&owner.server).map_err(|_| SourceError::InvalidResponse)?;
@@ -924,14 +1013,16 @@ impl WireFolder {
 /// Сведения о разговоре, которые нужны для проверки системного уведомления.
 #[derive(Deserialize)]
 struct WireStream {
-    uuid: String,                              // Идентификатор запрошенного разговора.
-    project_id: Option<String>,                // Проект, если он есть в ответе.
-    user_uuid: Option<String>,                 // Пользователь, если он есть в ответе.
-    private: bool,                             // Признак личного разговора.
-    is_archived: bool,                         // Признак архивного разговора.
-    direct_user_uuid: Option<String>,          // Идентификатор собеседника для личного разговора.
+    name: Option<String>,        // Название, которое нужно только панели сведений.
+    description: Option<String>, // Описание канала, если оно заполнено.
+    uuid: String,                // Идентификатор запрошенного разговора.
+    project_id: Option<String>,  // Проект, если он есть в ответе.
+    user_uuid: Option<String>,   // Пользователь, если он есть в ответе.
+    private: bool,               // Признак личного разговора.
+    is_archived: bool,           // Признак архивного разговора.
+    direct_user_uuid: Option<String>, // Идентификатор собеседника для личного разговора.
     default_topic_uuid: Option<Value>, // Тема отправки, её формат проверяем отдельно от чтения.
-    encryption: Option<Value>,         // Только JSON false разрешает подготовить открытый текст.
+    encryption: Option<Value>,   // Только JSON false разрешает подготовить открытый текст.
     notification_mode: StreamNotificationMode, // Настройка уведомлений разговора.
 }
 
@@ -967,11 +1058,12 @@ impl WireStream {
 /// Сведения о теме, чья настройка может переопределить уведомления разговора.
 #[derive(Deserialize)]
 struct WireTopic {
-    uuid: String,                             // Идентификатор запрошенной темы.
-    stream_uuid: String,                      // Идентификатор разговора, которому принадлежит тема.
-    project_id: Option<String>,               // Проект, если он есть в ответе.
-    user_uuid: Option<String>,                // Пользователь, если он есть в ответе.
-    is_done: Option<bool>,                    // Закрытие темы, неизвестно у старых ответов.
+    name: Option<String>,       // Название, которое нужно только панели сведений.
+    uuid: String,               // Идентификатор запрошенной темы.
+    stream_uuid: String,        // Идентификатор разговора, которому принадлежит тема.
+    project_id: Option<String>, // Проект, если он есть в ответе.
+    user_uuid: Option<String>,  // Пользователь, если он есть в ответе.
+    is_done: Option<bool>,      // Закрытие темы, неизвестно у старых ответов.
     notification_mode: TopicNotificationMode, // Настройка уведомлений темы.
 }
 

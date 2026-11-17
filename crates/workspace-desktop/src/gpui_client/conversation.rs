@@ -1,5 +1,6 @@
 //! Экран открытого разговора. Здесь находятся запросы, переходы истории и отображение состояний.
 
+mod details;
 #[path = "history/source.rs"]
 mod source;
 #[path = "history/viewport.rs"]
@@ -18,6 +19,7 @@ use workspace_core::{
 };
 
 use self::{
+    details::Panel,
     source::{Failure, Load, LoadResult, Snapshot, Source, runtime_source},
     viewport::{Position, Viewport},
 };
@@ -68,9 +70,11 @@ pub struct Conversation {
     action_error: Option<Flight>, // Запрос, который можно повторить, пока открыта история.
     outbox: Vec<OutboxEntry>, // Последний снимок очереди в области разговора.
     viewport: Viewport, // Виртуальный список и его положение.
+    screen_focus: FocusHandle, // Запасной фокус при исчезновении истории и панели.
     history_focus: FocusHandle, // Точка клавиатурной прокрутки в открытом разговоре.
     sending: Option<Sending>, // Рабочий редактор; изолированные тесты истории могут его не подключать.
     heading: Heading,         // Отображаемые названия из текущего каталога.
+    details: Option<Panel>,   // Панель штатного разговора с доступом к рабочему потоку.
 }
 
 impl Conversation {
@@ -81,7 +85,8 @@ impl Conversation {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut view = Self::with_source(address, runtime_source(runtime.clone()), cx);
-        view.attach_composer(SendSource::runtime(runtime), cx);
+        view.attach_composer(SendSource::runtime(runtime.clone()), cx);
+        view.details = Some(Panel::new(runtime, cx));
         view
     }
 
@@ -98,9 +103,11 @@ impl Conversation {
             action_error: None,
             outbox: Vec::new(),
             viewport: Viewport::new(),
+            screen_focus: cx.focus_handle(),
             history_focus: cx.focus_handle().tab_stop(true),
             sending: None,
             heading: Heading::default(),
+            details: None,
         };
         let target = cx.entity().downgrade();
         // GPUI держит состояние незавершённо созданной Entity до выхода из cx.new.
@@ -308,6 +315,9 @@ impl Conversation {
 
     /// Очищает недействительные данные и начинает проверку прежней цели заново.
     fn restart(&mut self, cx: &mut Context<Self>) {
+        if let Some(details) = &mut self.details {
+            details.clear();
+        }
         self.invalidate_send_destination(cx);
         self.state = State::Opening;
         self.active = None;
@@ -320,6 +330,9 @@ impl Conversation {
 
     /// Скрывает историю и делает любые запоздавшие ответы неприменимыми.
     fn fail(&mut self, error: Failure, cx: &mut Context<Self>) {
+        if let Some(details) = &mut self.details {
+            details.clear();
+        }
         self.invalidate_send_destination(cx);
         self.state = State::Failed(error);
         self.active = None;
@@ -655,7 +668,7 @@ impl Conversation {
 
 impl Conversation {
     /// Рисует название чата или тему и название её канала из каталога.
-    fn render_heading(&self, palette: Palette) -> gpui::Div {
+    fn render_heading(&self, palette: Palette, cx: &Context<Self>) -> gpui::Div {
         let chat = self.heading.chat.as_deref();
         let (title, detail) = if self.address.route.scope.topic_id.is_some() {
             (self.heading.topic.as_deref().unwrap_or("Тема"), chat)
@@ -697,6 +710,12 @@ impl Conversation {
                             .truncate()
                             .debug_selector(|| "conversation-channel".into())
                     })),
+            )
+            .children(
+                self.details
+                    .as_ref()
+                    .filter(|_| self.can_open_details())
+                    .map(|panel| panel.trigger(palette, cx)),
             )
     }
 
@@ -806,18 +825,20 @@ impl Conversation {
     }
 }
 
-impl Render for Conversation {
+impl Conversation {
     /// Показывает шапку и историю, отделяя первые состояния от ошибок догрузки.
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
+    fn render_chat(&mut self, palette: Palette, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
         let root = div()
+            .id("conversation-chat")
+            .debug_selector(|| "conversation-chat".into())
             .flex()
             .flex_col()
-            .size_full()
+            .flex_1()
+            .h_full()
             .min_h_0()
             .min_w_0()
             .bg(palette.background)
-            .child(self.render_heading(palette));
+            .child(self.render_heading(palette, cx));
         let centered = div()
             .flex()
             .flex_1()
@@ -900,6 +921,29 @@ impl Render for Conversation {
                 .children(self.sending.as_ref().map(|sending| sending.view.clone()))
             }
         }
+    }
+}
+
+impl Render for Conversation {
+    /// Сохраняет историю и редактор на месте при показе правой панели.
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
+        let can_open = self.can_open_details();
+        let chat = self.render_chat(palette, cx);
+        let panel = self.details.as_ref().and_then(|panel| {
+            panel.return_focus_after_clear(window, cx, &self.screen_focus, can_open);
+            panel.render(palette, window.viewport_size().width, cx)
+        });
+        div()
+            .id("conversation-layout")
+            .relative()
+            .size_full()
+            .flex()
+            .min_h_0()
+            .min_w_0()
+            .track_focus(&self.screen_focus)
+            .child(chat)
+            .children(panel)
     }
 }
 
