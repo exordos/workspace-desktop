@@ -2,6 +2,7 @@
 
 use std::{cell::Cell, rc::Rc};
 
+use iced::advanced::widget::Id;
 use iced::widget::button::{Status, Style};
 use iced::widget::text_editor::{self, Action, Content};
 use iced::widget::{button, container, row, text_editor as iced_text_editor};
@@ -23,6 +24,7 @@ pub struct MessageComposerOptions<'a, Message> {
     pub placeholder: &'a str,                   // Подсказка в пустом редакторе.
     pub leading: Option<Element<'a, Message>>,  // Элементы перед текстом, например вложение.
     pub trailing: Option<Element<'a, Message>>, // Элементы после текста, например эмодзи.
+    pub send_id: Option<Id>,                    // ID кнопки для операций Iced. `None` без ID.
 }
 
 impl<Message> Default for MessageComposerOptions<'_, Message> {
@@ -32,6 +34,7 @@ impl<Message> Default for MessageComposerOptions<'_, Message> {
             placeholder: "Сообщение…",
             leading: None,
             trailing: None,
+            send_id: None,
         }
     }
 }
@@ -77,19 +80,19 @@ pub fn message_composer<'a, Message: Clone + 'a>(
             border: Border::default().rounded(COMPOSER_RADIUS),
             ..container::Style::default()
         });
-    container(
-        row![inset, send_button(on_send)]
-            .spacing(12)
-            .align_y(Bottom),
-    )
-    .width(Fill)
-    .padding(8)
-    .style(|theme: &Theme| container::Style {
-        background: Some(button_colors(theme).elevated.into()),
-        border: Border::default().rounded(COMPOSER_RADIUS),
-        ..container::Style::default()
-    })
-    .into()
+    let mut send = container(send_button(on_send));
+    if let Some(id) = options.send_id {
+        send = send.id(id);
+    }
+    container(row![inset, send].spacing(12).align_y(Bottom))
+        .width(Fill)
+        .padding(8)
+        .style(|theme: &Theme| container::Style {
+            background: Some(button_colors(theme).elevated.into()),
+            border: Border::default().rounded(COMPOSER_RADIUS),
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// Выделяет границу редактора при фокусе и применяет цвета темы к подсказке и черновику.

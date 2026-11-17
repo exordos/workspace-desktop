@@ -3,6 +3,7 @@
 
 pub mod catalog;
 pub mod history;
+mod outbox;
 pub mod read;
 mod rest;
 pub mod send;
@@ -12,12 +13,13 @@ use std::{sync::Arc, time::Duration, vec::IntoIter};
 
 use futures::{StreamExt, future::BoxFuture, stream};
 use rustls::{ClientConfig, RootCertStore, crypto::ring, pki_types::CertificateDer};
-use tokio::time::timeout;
+use tokio::{sync::watch, time::timeout};
 use tokio_tungstenite::Connector;
 
 use crate::{
+    auth::SessionSnapshot,
     runtime::{EventSource, EventStream, SourceError, SourceSession},
-    sync::Event,
+    sync::{Event, Sync},
 };
 
 use rest::RestClient;
@@ -87,6 +89,16 @@ impl EventSource for MessengerSource {
             });
             Ok(Box::pin(events) as EventStream)
         })
+    }
+
+    /// Обрабатывает очередь владельца рядом с потоком входящих событий.
+    fn run_session(
+        &self,
+        sync: Arc<Sync>,
+        session: SessionSnapshot,
+        ready: watch::Receiver<bool>,
+    ) -> BoxFuture<'_, ()> {
+        Box::pin(outbox::run(self, sync, session, ready))
     }
 }
 
@@ -203,6 +215,7 @@ impl Connection {
                         Err(error) => {
                             log::warn!("Messenger unread snapshot unavailable: {error}");
                             log::info!("Messenger WebSocket ready");
+                            return Ok(Some(Event::SourceReady(cursor)));
                         }
                     }
                 }

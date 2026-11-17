@@ -15,7 +15,7 @@ use std::{
 use futures::{Stream, StreamExt, future::BoxFuture};
 use thiserror::Error;
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     task::{JoinError, JoinSet, spawn_blocking},
     time::sleep,
 };
@@ -70,6 +70,16 @@ pub trait EventSource: Send + std::marker::Sync {
     /// Открывает поток. После ошибки или конца потока Runtime может открыть его снова.
     /// Отмена запроса или уничтожение потока должны освобождать соединение.
     fn connect(&self, session: SourceSession) -> BoxFuture<'_, Result<EventStream, SourceError>>;
+
+    /// Запускает дополнительную фоновую работу того же источника на срок жизни задачи.
+    fn run_session(
+        &self,
+        _sync: Arc<Sync>,
+        _session: SessionSnapshot,
+        _ready: watch::Receiver<bool>,
+    ) -> BoxFuture<'_, ()> {
+        Box::pin(std::future::pending())
+    }
 }
 
 /// Ошибка настройки или работы фоновой синхронизации.
@@ -264,10 +274,25 @@ struct Worker {
 
 impl Worker {
     /// Читает события, повторяет временные сбои с паузой и реагирует на отмену.
-    async fn run(self, mut cancelled: oneshot::Receiver<()>) -> Result<(), JoinError> {
+    async fn run(self, cancelled: oneshot::Receiver<()>) -> Result<(), JoinError> {
+        let (ready, state) = watch::channel(false);
+        tokio::select! {
+            biased;
+            result = self.run_events(cancelled, &ready) => result,
+            () = self.source.run_session(self.sync.clone(), self.session.clone(), state) => Ok(()),
+        }
+    }
+
+    /// Обновляет готовность соединения после догрузки событий и при каждом отключении.
+    async fn run_events(
+        &self,
+        mut cancelled: oneshot::Receiver<()>,
+        ready: &watch::Sender<bool>,
+    ) -> Result<(), JoinError> {
         let mut delay = INITIAL_RETRY_DELAY;
         loop {
-            let end = self.consume(&mut cancelled, &mut delay).await?;
+            let end = self.consume(&mut cancelled, &mut delay, ready).await?;
+            ready.send_if_modified(std::mem::take);
             self.connected.store(false, Ordering::Relaxed);
             match end {
                 ConnectionEnd::Stopped => break,
@@ -311,6 +336,7 @@ impl Worker {
         &self,
         cancelled: &mut oneshot::Receiver<()>,
         delay: &mut Duration,
+        ready: &watch::Sender<bool>,
     ) -> Result<ConnectionEnd, JoinError> {
         let sync = self.sync.clone();
         let key = self.key.clone();
@@ -370,12 +396,18 @@ impl Worker {
             let sync = self.sync.clone();
             let key = self.key.clone();
             let generation = self.session.generation;
+            let caught_up = matches!(event, Event::UnreadBaseline { .. } | Event::SourceReady(_));
             // Ждём начатую запись, чтобы следующая задача не прочитала старую позицию.
             let applied =
                 spawn_blocking(move || sync.apply(&key.context, generation, &key.source, event))
                     .await?;
             match applied {
-                Ok(_) => *delay = INITIAL_RETRY_DELAY,
+                Ok(_) => {
+                    *delay = INITIAL_RETRY_DELAY;
+                    if caught_up {
+                        ready.send_if_modified(|state| !std::mem::replace(state, true));
+                    }
+                }
                 Err(SyncError::Auth(_)) => return Ok(ConnectionEnd::Stopped),
                 Err(SyncError::Storage(StorageError::EpochChanged)) => {
                     return Ok(ConnectionEnd::Recover);

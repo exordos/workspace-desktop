@@ -3,7 +3,9 @@
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use uuid::Uuid;
 
-use super::{HistoryMessage, Message, MessagePlacement, Storage, StorageError, history};
+use super::{
+    HistoryMessage, HistoryScope, Message, MessagePlacement, Storage, StorageError, history,
+};
 use crate::context::OwnerContext;
 
 /// Неизменный снимок подготовленного текстового сообщения.
@@ -14,6 +16,30 @@ pub struct PreparedSend {
     pub stream_id: Uuid,    // Исходный стрим.
     pub topic_id: Uuid,     // Исходная тема.
     pub markdown: String,   // Неизменное содержимое payload вида markdown.
+}
+
+/// Состояние отправки, пока для неё нет подтверждённой строки истории.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliveryStatus {
+    Waiting,               // Снимок сохранён, первый запрос ещё не разрешён.
+    Sending,               // Первая попытка закреплена и выполняется.
+    Unknown,               // Запрос мог быть принят. Ищем подтверждение.
+    Blocked(SendBlock),    // Первая попытка остановлена до сетевого запроса.
+    Rejected(Option<u16>), // Отправка остановлена. Some содержит код отказа сервера.
+}
+
+/// Причина, по которой сохранённый снимок нельзя отправить.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SendBlock {
+    AccessLost,            // Личка или её исходная тема стали недоступны.
+    EncryptionUnavailable, // Нет явного разрешения отправлять открытый текст.
+}
+
+/// Строка очереди вместе с состоянием, которое показывает окно.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutboxEntry {
+    pub snapshot: PreparedSend, // Текст и исходные идентификаторы сообщения.
+    pub status: DeliveryStatus, // Последнее зафиксированное состояние отправки.
 }
 
 /// Создаёт отдельную таблицу очереди, которая не зависит от кэша источника.
@@ -48,6 +74,19 @@ pub(super) fn initialize(connection: &Connection) -> Result<(), StorageError> {
              INTEGER NOT NULL DEFAULT 0 CHECK (first_attempt_claimed IN (0, 1));",
         )?;
     }
+    let has_status: bool = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('messenger_outbox')
+                        WHERE name = 'final_status')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_status {
+        connection.execute_batch(
+            "ALTER TABLE messenger_outbox ADD COLUMN final_status INTEGER NOT NULL DEFAULT 0
+             CHECK (final_status IN (0, 1, 2, 3, 4) OR final_status BETWEEN 400 AND 499);
+             UPDATE messenger_outbox SET final_status = 1 WHERE first_attempt_claimed = 1;",
+        )?;
+    }
     Ok(())
 }
 
@@ -71,7 +110,7 @@ pub(super) fn confirm(
     topic: &str,
     author: Option<Uuid>,
 ) -> Result<bool, StorageError> {
-    if author.map(|id| id.to_string()).as_deref() != Some(owner.user_id.as_str()) {
+    if author.is_none() || author != owner.user_id.parse().ok() {
         return Ok(false);
     }
     let (Ok(id), Ok(stream), Ok(topic)) = (
@@ -96,6 +135,44 @@ pub(super) fn confirm(
             topic.as_bytes()
         ],
     )? != 0)
+}
+
+/// Останавливает ожидающий POST вместе с записью события об отзыве.
+pub(super) fn reject_revoked(
+    connection: &Connection,
+    owner: &OwnerContext,
+    stream: &str,
+    topic: Option<&str>,
+) -> Result<(), StorageError> {
+    let Ok(stream) = stream.parse::<Uuid>() else {
+        return Ok(());
+    };
+    let topic = match topic {
+        Some(topic) => {
+            let Ok(topic) = topic.parse::<Uuid>() else {
+                return Ok(());
+            };
+            Some(*topic.as_bytes())
+        }
+        None => None,
+    };
+    connection.execute(
+        "UPDATE messenger_outbox SET final_status = 3
+         WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
+           AND project_id = ?4 AND user_id = ?5
+           AND stream_id = ?6 AND (?7 IS NULL OR topic_id = ?7)
+           AND first_attempt_claimed = 0 AND final_status = 0",
+        params![
+            owner.account_id.0,
+            owner.server,
+            owner.organization_id,
+            owner.project_id,
+            owner.user_id,
+            stream.as_bytes(),
+            topic
+        ],
+    )?;
+    Ok(())
 }
 
 impl Storage {
@@ -202,7 +279,7 @@ impl Storage {
                 "UPDATE messenger_outbox SET first_attempt_claimed = 1
              WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
                AND project_id = ?4 AND user_id = ?5 AND canonical_id = ?6
-               AND first_attempt_claimed = 0
+               AND first_attempt_claimed = 0 AND final_status = 0
              RETURNING canonical_id, public_id, stream_id, topic_id, markdown",
                 params![
                     owner.account_id.0,
@@ -219,6 +296,122 @@ impl Storage {
         Ok(snapshot)
     }
 
+    /// Читает все статусы разговора или рабочие записи по всем чатам владельца.
+    pub(crate) fn outbox(
+        &self,
+        owner: &OwnerContext,
+        scope: Option<HistoryScope>,
+    ) -> Result<Vec<OutboxEntry>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut statement = connection.prepare(
+            "SELECT canonical_id, public_id, stream_id, topic_id, markdown,
+                    first_attempt_claimed, final_status
+             FROM messenger_outbox
+             WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
+               AND project_id = ?4 AND user_id = ?5
+               AND (?6 IS NULL OR stream_id = ?6)
+               AND (?7 IS NULL OR topic_id = ?7)
+               AND (?6 IS NOT NULL OR final_status IN (0, 1))
+             ORDER BY rowid",
+        )?;
+        let stream = scope.map(|scope| *scope.stream_id.as_bytes());
+        let topic = scope.and_then(|scope| scope.topic_id.map(|topic| *topic.as_bytes()));
+        let rows = statement.query_map(
+            params![
+                owner.account_id.0,
+                owner.server,
+                owner.organization_id,
+                owner.project_id,
+                owner.user_id,
+                stream,
+                topic
+            ],
+            |row| {
+                let claimed = row.get::<_, bool>(5)?;
+                let status = match (claimed, row.get::<_, u16>(6)?) {
+                    (false, 0) => DeliveryStatus::Waiting,
+                    (true, 0) => DeliveryStatus::Sending,
+                    (_, 1) => DeliveryStatus::Unknown,
+                    (_, 2) => DeliveryStatus::Rejected(None),
+                    (_, 3) => DeliveryStatus::Blocked(SendBlock::AccessLost),
+                    (_, 4) => DeliveryStatus::Blocked(SendBlock::EncryptionUnavailable),
+                    (_, status) => DeliveryStatus::Rejected(Some(status)),
+                };
+                Ok(OutboxEntry {
+                    snapshot: read_prepared_send(row)?,
+                    status,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// После смены фоновой задачи результат незавершённой попытки нужно сверить.
+    pub(crate) fn recover_interrupted_sends(
+        &self,
+        owner: &OwnerContext,
+    ) -> Result<Vec<HistoryScope>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut statement = connection.prepare(
+            "UPDATE messenger_outbox SET final_status = 1
+             WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
+               AND project_id = ?4 AND user_id = ?5 AND first_attempt_claimed = 1
+               AND final_status = 0
+             RETURNING stream_id, topic_id",
+        )?;
+        let scopes = statement.query_map(
+            params![
+                owner.account_id.0,
+                owner.server,
+                owner.organization_id,
+                owner.project_id,
+                owner.user_id
+            ],
+            |row| {
+                Ok(HistoryScope {
+                    stream_id: Uuid::from_bytes(row.get(0)?),
+                    topic_id: Some(Uuid::from_bytes(row.get(1)?)),
+                })
+            },
+        )?;
+        Ok(scopes.collect::<Result<_, _>>()?)
+    }
+
+    /// Записывает исход или запрет до отправки, если запись ещё не была закрыта.
+    pub(crate) fn set_send_status(
+        &self,
+        owner: &OwnerContext,
+        canonical_id: Uuid,
+        claimed: bool,
+        status: DeliveryStatus,
+    ) -> Result<bool, StorageError> {
+        let status = match status {
+            DeliveryStatus::Unknown => 1,
+            DeliveryStatus::Rejected(None) => 2,
+            DeliveryStatus::Blocked(SendBlock::AccessLost) => 3,
+            DeliveryStatus::Blocked(SendBlock::EncryptionUnavailable) => 4,
+            DeliveryStatus::Rejected(Some(code)) => code,
+            DeliveryStatus::Waiting | DeliveryStatus::Sending => return Ok(false),
+        };
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        Ok(connection.execute(
+            "UPDATE messenger_outbox SET final_status = ?8
+             WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
+               AND project_id = ?4 AND user_id = ?5 AND canonical_id = ?6
+               AND first_attempt_claimed = ?7 AND final_status = 0",
+            params![
+                owner.account_id.0,
+                owner.server,
+                owner.organization_id,
+                owner.project_id,
+                owner.user_id,
+                canonical_id.as_bytes(),
+                claimed,
+                status
+            ],
+        )? == 1)
+    }
+
     /// Читает записи владельца по признаку закрепления, в порядке добавления.
     fn sends_by_claim(
         &self,
@@ -231,6 +424,7 @@ impl Storage {
              FROM messenger_outbox
              WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
                AND project_id = ?4 AND user_id = ?5 AND first_attempt_claimed = ?6
+               AND (final_status IN (0, 1))
              ORDER BY rowid",
         )?;
         let rows = statement.query_map(

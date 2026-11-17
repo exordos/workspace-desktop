@@ -22,7 +22,7 @@ use crate::{
 
 use super::history::OpenHistoryError;
 use super::read::ReadError;
-use super::send::SendError;
+use super::send::{DirectSendError, SendError};
 use crate::storage::PreparedSend;
 
 const MESSAGES_PATH: &str = "/api/workspace/v1/messenger/messages/";
@@ -297,6 +297,17 @@ impl RestClient {
         token: &str,
         stream: Uuid,
     ) -> Result<(), OpenHistoryError> {
+        self.direct_stream(owner, token, stream).await?;
+        Ok(())
+    }
+
+    /// Читает сведения о личном разговоре и проверяет владельца токена.
+    async fn direct_stream(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        stream: Uuid,
+    ) -> Result<WireStream, OpenHistoryError> {
         let row: WireStream = self
             .access_row(owner, token, &format!("{STREAMS_PATH}/{stream}"))
             .await?;
@@ -314,7 +325,37 @@ impl RestClient {
         {
             return Err(OpenHistoryError::AccessLost);
         }
-        Ok(())
+        Ok(row)
+    }
+
+    /// Разрешает обычный текст в текущей теме или проверяет сохранённую тему очереди.
+    pub(super) async fn direct_send_topic(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        stream: Uuid,
+        saved_topic: Option<Uuid>,
+    ) -> Result<Uuid, DirectSendError> {
+        if let Some(topic) = saved_topic {
+            self.check_topic_access(owner, token, stream, topic).await?;
+        }
+        // Проверяем флаг последним, прямо перед разрешением первой попытки.
+        let row = self.direct_stream(owner, token, stream).await?;
+        if row.is_archived {
+            return Err(DirectSendError::AccessLost);
+        }
+        if !matches!(row.encryption, Some(Value::Bool(false))) {
+            return Err(DirectSendError::EncryptionUnavailable);
+        }
+        if let Some(topic) = saved_topic {
+            return Ok(topic);
+        }
+        row.default_topic_uuid
+            .as_ref()
+            .and_then(Value::as_str)
+            .and_then(parse_uuid)
+            .filter(|topic| !topic.is_nil())
+            .ok_or(DirectSendError::TopicUnavailable)
     }
 
     /// Подтверждает, что тема нужного стрима видна владельцу токена.
@@ -846,6 +887,8 @@ struct WireStream {
     private: bool,                             // Признак личного разговора.
     is_archived: bool,                         // Признак архивного разговора.
     direct_user_uuid: Option<String>,          // Идентификатор собеседника для личного разговора.
+    default_topic_uuid: Option<Value>, // Тема отправки, её формат проверяем отдельно от чтения.
+    encryption: Option<Value>,         // Только JSON false разрешает подготовить открытый текст.
     notification_mode: StreamNotificationMode, // Настройка уведомлений разговора.
 }
 

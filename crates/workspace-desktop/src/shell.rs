@@ -6,40 +6,46 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use futures::stream::{self, Stream, StreamExt};
-use futures::{channel::mpsc, future::BoxFuture};
+use futures::{SinkExt, channel::mpsc, future::BoxFuture};
 use iced::keyboard::{self, Key, key::Named};
-use iced::widget::{column, container, operation, row, scrollable, text};
-use iced::{Alignment, Element, Event, Fill, Subscription, Task, Theme, event, window};
+use iced::widget::{column, container, keyed, operation, responsive, row, rule, text, text_editor};
+use iced::{Element, Event, Fill, Subscription, Task, Theme, event, window};
 use tokio::sync::{broadcast, oneshot};
-use unicode_segmentation::UnicodeSegmentation;
+use uuid::Uuid;
 use workspace_core::auth::{Auth, SessionSnapshot, SessionStatus};
-use workspace_core::bootstrap::{ChatCatalog, ChatListStatus, ChatLists};
+use workspace_core::bootstrap::{ChatCatalog, ChatList, ChatLists};
 use workspace_core::context::{AccountId, OwnerContext, SessionGeneration};
+use workspace_core::messenger::send::DirectSendError;
 use workspace_core::messenger::{MessengerSource, history::OpenHistoryError};
 use workspace_core::notification_target::{NotificationTarget, NotificationTargetError};
 use workspace_core::storage::{HistoryEdge, HistoryScope, HistoryWindow};
-use workspace_core::sync::{Sync, SyncChange, SyncUpdate};
+use workspace_core::sync::{HistoryRevocation, Sync, SyncChange, SyncUpdate};
 
 use crate::platform::notifications::{NotificationClick, NotificationError, Notifications};
-use crate::ui_kit::{
-    AvatarContent, AvatarSize, ButtonVariant, ChatRowOptions, ThemeMode, TopBarAccount, avatar,
-    button, chat_row, top_bar, workspace_theme,
-};
+use crate::ui_kit::{ThemeMode, TopBarAccount, top_bar, workspace_theme};
 
+mod composer;
 mod history;
+mod history_anchor;
 mod history_input;
+mod history_layout;
+mod sidebar;
 use history::{HistoryScreen, HistoryState};
+pub use sidebar::SidebarAction;
 
 /// Состояние окна, которое Iced меняет в ответ на действия пользователя и события `core`.
 pub struct Shell {
-    accounts: Accounts,                            // Список аккаунтов и текущий выбор.
-    chats: ChatLists, // Каталог каждого владельца и состояние загрузки.
+    accounts: Accounts, // Список аккаунтов и текущий выбор.
+    chats: ChatLists,   // Каталог каждого владельца и состояние загрузки.
+    sidebars: HashMap<(OwnerContext, SessionGeneration), sidebar::Sidebar>, // Поиск и раскрытие каждого входа.
     labels: HashMap<AccountId, String>, // Читаемые имена для известных идентификаторов.
-    sources: Sources, // Входные потоки авторизации и мессенджера.
+    sources: Sources,                   // Входные потоки авторизации и мессенджера.
     notifications: Box<dyn NotificationDelivery>, // Получатель запросов оболочки на баннер.
     notification_error: Option<NotificationError>, // Причина, по которой ОС не показала баннер.
-    history: Option<HistoryScreen>, // История, которую открыл последний клик.
-    navigation_revision: u64, // Номер последнего клика по баннеру или выбора аккаунта.
+    notification_route_error: Option<&'static str>, // Причина, по которой цель баннера недоступна.
+    notification_revision: u64,         // Номер проверки баннера, независимый от открытой истории.
+    history: Option<HistoryScreen>,     // История, которую открыл последний переход.
+    navigation_revision: u64,           // Номер последнего перехода, повтора или выбора аккаунта.
 }
 
 /// Снимок сессии и сохранённое значение счётчика «Все чаты».
@@ -49,14 +55,39 @@ pub struct AccountSummary {
     unread: Option<u32>,      // Число с сервера. `None` до загрузки или после завершения сессии.
 }
 
+/// Адрес и начальная позиция открытого разговора.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChatRoute {
+    pub owner: OwnerContext, // Аккаунт и проект, которым принадлежит история.
+    pub scope: HistoryScope, // UUID разговора и, для канала, конкретной темы.
+    pub entry: ChatEntry,    // Место, которое нужно показать после загрузки.
+}
+
+/// Место открытия истории, которое задаёт действие пользователя.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChatEntry {
+    Latest,       // Конец текущей истории.
+    Around(Uuid), // Строка сообщения из уведомления.
+}
+
 /// События, которые могут изменить окно или вызвать системное действие.
 #[derive(Clone, Debug)]
 pub enum Message {
     Select(AccountId, SessionGeneration), // Аккаунт и поколение входа на момент клика.
     Snapshot(Vec<AccountSummary>),        // Свежий список сессий и счётчиков.
     Chats(ChatLists),                     // Свежие состояния загрузки каталогов.
-    RetryChats,                           // Пользователь просит повторить загрузку списка.
-    Synced(SyncUpdate),                   // Синхронизация завершила запись события.
+    Sidebar {
+        owner: OwnerContext,           // Владелец открытого каталога в момент действия.
+        generation: SessionGeneration, // Поколение этого входа.
+        action: SidebarAction,         // Поиск, раскрытие или повтор загрузки.
+    },
+    OpenChat {
+        route: ChatRoute,              // Разговор из показанного каталога.
+        generation: SessionGeneration, // Вход, к которому относится каталог.
+    },
+    RetryHistory(u64),  // Повтор загрузки для указанного номера перехода.
+    SyncLagged,         // Часть событий Sync потерялась, историю нужно прочитать заново.
+    Synced(SyncUpdate), // Синхронизация завершила запись события.
     NotificationFinished(Result<(), NotificationError>), // Результат обращения к ОС.
     NotificationClicked(NotificationClick), // macOS передала цель нажатого баннера.
     NotificationResolved {
@@ -68,6 +99,26 @@ pub enum Message {
         revision: u64, // Номер клика, запустившего чтение.
         result: Result<Arc<HistoryWindow>, Arc<OpenHistoryError>>, // Окно или причина отказа.
     },
+    HistoryCached {
+        revision: u64,              // Номер перехода, для которого доступ подтверждён.
+        window: Arc<HistoryWindow>, // Пригодный хвост, пока свежий запрос выполняется.
+    },
+    SendAddressResolved {
+        revision: u64,                              // Переход, для которого проверили личку.
+        result: Result<Uuid, Arc<DirectSendError>>, // Точная тема или объяснение отказа.
+    },
+    EditConversationText {
+        revision: u64,               // Переход, которому принадлежит поле.
+        action: text_editor::Action, // Действие в редакторе Iced.
+    },
+    SendConversationText(u64), // Клик по отправке в текущем переходе.
+    ConversationTextSaved {
+        revision: u64, // Редактор, чей текст сохраняли.
+        version: u64,  // Версия отправленного текста.
+        saved: bool,   // Снимок записан на диск.
+    },
+    RetrySendAddress(u64), // Повторить проверку в текущем разговоре.
+    SeeLatest(u64),        // Перейти к свежему хвосту той же истории.
     ScrollToHistory {
         revision: u64,       // Номер клика, для которого измерены координаты.
         offset: Option<f32>, // Положение цели от начала списка в пикселях.
@@ -75,9 +126,10 @@ pub enum Message {
     HistoryUserScrolled {
         revision: u64, // Номер открытого маршрута.
     }, // Пользователь прокрутил открытый список.
+    HistoryManualScroll(u64), // Жест, который отменяет коррекцию, не запуская догрузку вверх.
     HistoryEdgeMeasured {
-        revision: u64,                              // Номер открытого маршрута.
-        position: Option<history::HistoryPosition>, // Видимая строка или None, если список пуст.
+        revision: u64,                                   // Номер открытого маршрута.
+        position: Option<history_anchor::HistoryLayout>, // Разметка списка после жеста.
     }, // Позиция после жеста.
     HistoryOlderLoaded {
         revision: u64,  // Номер маршрута в начале запроса.
@@ -85,16 +137,20 @@ pub enum Message {
         result: Result<Arc<HistoryWindow>, Arc<OpenHistoryError>>, // Полученное окно или ошибка.
     }, // Ответ старой страницы.
     HistoryBeforeInsert {
-        revision: u64,                              // Номер открытого маршрута.
-        window: Arc<HistoryWindow>,                 // Окно, для которого пришла страница.
-        position: Option<history::HistoryPosition>, // Строка до вставки или None, если она не найдена.
-    }, // Видимая строка перед вставкой.
+        revision: u64,                                   // Номер открытого маршрута.
+        layout_revision: u64,                            // Номер ожидаемой перестройки строк.
+        scroll_revision: u64, // Ревизия ручной прокрутки на момент начала измерения.
+        position: Option<history_anchor::HistoryLayout>, // Координаты прежней разметки.
+    }, // Разметка до вставки, правки или удаления.
     HistoryAfterInsert {
-        revision: u64,                           // Номер открытого маршрута.
-        before: history::HistoryPosition,        // Положение строки до вставки.
-        after: Option<history::HistoryPosition>, // Новое положение или None, если строка исчезла.
-    }, // Координаты строки после вставки.
-    MoveFocus(bool), // Перейти назад по Shift+Tab или вперёд по Tab.
+        revision: u64,                                // Номер открытого маршрута.
+        layout_revision: u64,                         // Номер завершившейся перестройки строк.
+        scroll_revision: u64, // Ручной ввод после этой ревизии имеет приоритет.
+        before: history_anchor::HistoryLayout, // Координаты до перестройки.
+        after: Option<history_anchor::HistoryLayout>, // Координаты после перестройки.
+        follow_tail: bool,    // Читатель был у подтверждённого конца истории.
+    }, // Разметка после обновления.
+    MoveFocus(bool),          // Перейти назад по Shift+Tab или вперёд по Tab.
 }
 
 /// Хранит текущий экран независимо от входящих обновлений счётчиков.
@@ -187,6 +243,7 @@ impl Shell {
                 ..Accounts::default()
             },
             chats: ChatLists::new(),
+            sidebars: HashMap::new(),
             labels,
             sources: Sources(Arc::new(SourceData {
                 auth,
@@ -198,6 +255,8 @@ impl Shell {
             })),
             notifications,
             notification_error: None,
+            notification_route_error: None,
+            notification_revision: 0,
             navigation_revision: 0,
             history: None,
         }
@@ -218,6 +277,7 @@ impl Shell {
                 }) {
                     return Task::none();
                 }
+                self.cancel_notification_open();
                 if self.accounts.selected.as_ref() == Some(&account)
                     && self.visible_history().is_some()
                 {
@@ -227,24 +287,67 @@ impl Shell {
                 self.history = None;
                 self.accounts.select(account);
             }
-            Message::Snapshot(accounts) => self.accounts.replace(accounts),
+            Message::Snapshot(accounts) => {
+                self.sidebars.retain(|(owner, generation), _| {
+                    accounts.iter().any(|summary| {
+                        summary.session.context == *owner
+                            && summary.session.generation == *generation
+                    })
+                });
+                self.accounts.replace(accounts);
+            }
             Message::Chats(chats) => self.chats = chats,
-            Message::RetryChats => {
-                if let Some(current) = self.accounts.current()
-                    && current.session.status == SessionStatus::Active
+            Message::Sidebar {
+                owner,
+                generation,
+                action,
+            } => {
+                return self.update_sidebar(owner, generation, action);
+            }
+            Message::OpenChat { route, generation } => {
+                self.accounts.replace(self.sources.0.snapshot());
+                if self.is_selected_session(&route.owner, generation)
+                    && route.entry == ChatEntry::Latest
+                    && sidebar::catalog_title(self.catalog(&route.owner, generation), route.scope)
+                        .is_some()
                 {
-                    let session = &current.session;
-                    self.sources
-                        .0
-                        .catalog
-                        .retry(session.context.clone(), session.generation);
+                    self.cancel_notification_open();
+                    if route.scope.topic_id.is_some() {
+                        self.sidebars
+                            .entry((route.owner.clone(), generation))
+                            .or_default()
+                            .expanded
+                            .insert(route.scope.stream_id);
+                    }
+                    return self.open_history(route, generation);
                 }
+            }
+            Message::RetryHistory(revision) => {
+                self.accounts.replace(self.sources.0.snapshot());
+                if revision == self.navigation_revision
+                    && let Some(screen) = self.visible_history()
+                    && screen.can_retry()
+                {
+                    let (route, generation) = (screen.route.clone(), screen.generation);
+                    self.cancel_notification_open();
+                    return self.reopen_editor_history(route, generation);
+                }
+            }
+            Message::SyncLagged => {
+                self.accounts.replace(self.sources.0.snapshot());
+                if let Some(screen) = self.visible_history() {
+                    return self.open_history(screen.route.clone(), screen.generation);
+                }
+                self.history = None;
             }
             Message::Synced(update) => match update.change {
                 SyncChange::Unread(count) => self.accounts.set_unread(&update, count),
                 SyncChange::MessengerReset => return self.reset_open_history(&update),
                 SyncChange::HistoryMessageCreated { scope, message_id } => {
-                    self.refresh_open_history(&update, scope, message_id);
+                    return self.refresh_open_history(&update, scope, Some(message_id));
+                }
+                SyncChange::HistoryAccessRevoked(revocation) => {
+                    return self.revoke_open_history(&update, revocation);
                 }
                 SyncChange::IncomingDirectMessage {
                     ref conversation_id,
@@ -253,6 +356,24 @@ impl Shell {
                     // Авторизация может активировать сессию до того, как её снимок дошёл до окна.
                     self.accounts.replace(self.sources.0.snapshot());
                     return self.notify(&update, conversation_id, message_id);
+                }
+                SyncChange::HistoryMessageChanged { message_id } => {
+                    if let Some(screen) = self.visible_history()
+                        && let HistoryState::Ready(window) = &screen.state
+                        && (window.messages.iter().any(|row| row.id == message_id)
+                            || screen.layout.pending.as_ref().is_some_and(|patch| {
+                                patch.window.messages.iter().any(|row| row.id == message_id)
+                            }))
+                    {
+                        return self.refresh_open_history(&update, screen.route.scope, None);
+                    }
+                }
+                SyncChange::OutboxChanged { scope } => {
+                    if let Some(screen) = self.visible_history()
+                        && history_update_matches(screen, &update, scope)
+                    {
+                        return self.refresh_open_history(&update, scope, None);
+                    }
                 }
             },
             Message::NotificationFinished(result) => {
@@ -268,11 +389,75 @@ impl Shell {
                 result,
             } => return self.finish_open_notification(revision, generation, result),
             Message::HistoryLoaded { revision, result } => {
-                return self.finish_history(revision, result);
+                let task = self.finish_history(revision, result, false);
+                if revision == self.navigation_revision
+                    && self
+                        .history
+                        .as_ref()
+                        .is_some_and(|screen| !screen.layout.measuring)
+                {
+                    self.refresh_outbox();
+                }
+                return task;
+            }
+            Message::HistoryCached { revision, window } => {
+                let task = self.finish_history(revision, Ok(window), true);
+                if revision == self.navigation_revision {
+                    self.refresh_outbox();
+                }
+                return task;
+            }
+            Message::SendAddressResolved { revision, result } => {
+                if let Some(screen) = self.ready_send_screen(revision)
+                    && matches!(screen.send.address, composer::Address::Unchecked)
+                {
+                    screen.send.address = match result {
+                        Ok(topic) => composer::Address::Ready(topic),
+                        Err(error) => {
+                            composer::Address::Unavailable(composer::unavailable_reason(&error))
+                        }
+                    };
+                }
+            }
+            Message::RetrySendAddress(revision) => {
+                if let Some(screen) = self.ready_send_screen(revision)
+                    && matches!(screen.send.address, composer::Address::Unavailable(_))
+                {
+                    screen.send.address = composer::Address::Unchecked;
+                }
+            }
+            Message::EditConversationText { revision, action } => {
+                if let Some(screen) = self.ready_send_screen(revision)
+                    && matches!(screen.send.address, composer::Address::Ready(_))
+                {
+                    screen.send.composer.edit(action);
+                }
+            }
+            Message::SendConversationText(revision) => {
+                return self.send_conversation_text(revision);
+            }
+            Message::ConversationTextSaved {
+                revision,
+                version,
+                saved,
+            } => return self.finish_conversation_text(revision, version, saved),
+            Message::SeeLatest(revision) => {
+                self.accounts.replace(self.sources.0.snapshot());
+                if revision == self.navigation_revision
+                    && let Some(screen) = self.visible_history()
+                {
+                    let mut route = screen.route.clone();
+                    route.entry = ChatEntry::Latest;
+                    let generation = screen.generation;
+                    self.cancel_notification_open();
+                    return self.reopen_editor_history(route, generation);
+                }
             }
             Message::ScrollToHistory { revision, offset } => {
                 if revision == self.navigation_revision
-                    && self.visible_history().is_some()
+                    && self
+                        .visible_history()
+                        .is_some_and(|screen| !screen.user_scrolled)
                     && let Some(y) = offset
                 {
                     return operation::scroll_to(
@@ -288,19 +473,31 @@ impl Shell {
                 if revision != self.navigation_revision {
                     return Task::none();
                 }
-                let Some(screen) = self.visible_history() else {
+                if self.visible_history().is_none() {
                     return Task::none();
-                };
+                }
+                let screen = self.history.as_mut().unwrap();
+                screen.user_scrolled = true;
+                screen.scroll_revision = screen.scroll_revision.wrapping_add(1);
                 let HistoryState::Ready(window) = &screen.state else {
                     return Task::none();
                 };
-                if screen.older_pending || !matches!(window.older, HistoryEdge::More(_)) {
+                if screen.refreshing
+                    || screen.older_pending
+                    || !matches!(window.older, HistoryEdge::More(_))
+                {
                     return Task::none();
                 }
-                let ids = window.messages.iter().map(|message| message.id).collect();
-                self.history.as_mut().unwrap().older_pending = true;
-                return history::measure_position(revision, ids, None)
+                screen.older_pending = true;
+                return history_anchor::measure(history::list_id(revision), Vec::new())
                     .map(move |position| Message::HistoryEdgeMeasured { revision, position });
+            }
+            Message::HistoryManualScroll(revision) => {
+                if revision == self.navigation_revision && self.visible_history().is_some() {
+                    let screen = self.history.as_mut().unwrap();
+                    screen.user_scrolled = true;
+                    screen.scroll_revision = screen.scroll_revision.wrapping_add(1);
+                }
             }
             Message::HistoryEdgeMeasured { revision, position } => {
                 self.accounts.replace(self.sources.0.snapshot());
@@ -311,7 +508,7 @@ impl Shell {
                 if !screen.older_pending {
                     return Task::none();
                 }
-                if !position.is_some_and(|position| position.scroll <= 1.0) {
+                if !position.is_some_and(|position| position.scroll() <= 1.0) {
                     screen.older_pending = false;
                     return Task::none();
                 }
@@ -323,7 +520,7 @@ impl Shell {
                     screen.older_pending = false;
                     return Task::none();
                 }
-                let owner = screen.target.context.clone();
+                let owner = screen.route.owner.clone();
                 let generation = screen.generation;
                 let scope = window.scope;
                 let window_id = window.id;
@@ -361,91 +558,59 @@ impl Shell {
                     return Task::none();
                 }
                 match result {
+                    Err(error) if matches!(*error, OpenHistoryError::AccessLost) => {
+                        screen.fail(error);
+                    }
                     Err(_) => {
                         screen.older_pending = false;
                         screen.older_failed = true;
                     }
-                    Ok(window) => {
-                        let ids = current.messages.iter().map(|message| message.id).collect();
-                        return history::measure_position(revision, ids, None).map(
-                            move |position| Message::HistoryBeforeInsert {
-                                revision,
-                                window: window.clone(),
-                                position,
-                            },
-                        );
+                    Ok(window) if window.id == window_id => {
+                        return self.queue_history_patch(true);
+                    }
+                    Ok(_) => {
+                        screen.older_pending = false;
                     }
                 }
             }
             Message::HistoryBeforeInsert {
                 revision,
-                window,
+                layout_revision,
+                scroll_revision,
                 position,
             } => {
-                self.accounts.replace(self.sources.0.snapshot());
-                if revision != self.navigation_revision || self.visible_history().is_none() {
-                    return Task::none();
-                }
-                let screen = self.history.as_mut().unwrap();
-                let HistoryState::Ready(current) = &screen.state else {
-                    return Task::none();
-                };
-                if !screen.older_pending || current.id != window.id {
-                    return Task::none();
-                }
-                // Перечитываем окно: пока шла сеть, новые события могли обновить его содержимое.
-                let Ok(Some(fresh)) = self.sources.0.sync.refresh_history_window(
-                    &screen.target.context,
-                    screen.generation,
-                    window.scope,
-                    window.id,
-                ) else {
-                    screen.older_pending = false;
-                    screen.older_failed = true;
-                    return Task::none();
-                };
-                let ids = fresh.messages.iter().map(|message| message.id).collect();
-                screen.state = HistoryState::Ready(Arc::new(fresh));
-                screen.older_failed = false;
-                if let Some(before) = position {
-                    return history::measure_position(revision, ids, Some(before.id)).map(
-                        move |after| Message::HistoryAfterInsert {
-                            revision,
-                            before: before.clone(),
-                            after,
-                        },
-                    );
-                }
-                screen.older_pending = false;
+                return self.apply_history_patch(
+                    revision,
+                    layout_revision,
+                    scroll_revision,
+                    position,
+                );
             }
             Message::HistoryAfterInsert {
                 revision,
+                layout_revision,
+                scroll_revision,
                 before,
                 after,
+                follow_tail,
             } => {
-                self.accounts.replace(self.sources.0.snapshot());
-                if revision != self.navigation_revision || self.visible_history().is_none() {
-                    return Task::none();
-                }
-                let screen = self.history.as_mut().unwrap();
-                if !screen.older_pending {
-                    return Task::none();
-                }
-                screen.older_pending = false;
-                if let Some(after) = after {
-                    return operation::scroll_to(
-                        history::list_id(revision),
-                        operation::AbsoluteOffset {
-                            x: None,
-                            y: Some((after.scroll + after.offset - before.offset).max(0.0)),
-                        },
-                    );
-                }
+                return self.restore_history_position(
+                    revision,
+                    layout_revision,
+                    scroll_revision,
+                    before,
+                    after,
+                    follow_tail,
+                );
             }
             Message::MoveFocus(true) => return operation::focus_previous(),
             Message::MoveFocus(false) => return operation::focus_next(),
         }
-        if self.visible_history().is_none() {
+        if self
+            .history
+            .as_ref()
+            .is_some_and(|screen| !self.is_current_history_owner(screen))
+        {
             self.history = None;
         }
         Task::none()
@@ -455,6 +620,7 @@ impl Shell {
     pub fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
             Subscription::run_with(self.sources.clone(), Sources::events),
+            self.composer_subscription(),
             event::listen().filter_map(|event| match event {
                 Event::Keyboard(keyboard::Event::KeyPressed {
                     key: Key::Named(Named::Tab),
@@ -473,91 +639,129 @@ impl Shell {
         workspace_theme(ThemeMode::Light)
     }
 
-    /// Показывает шапку над текущим экраном, за пределами его прокрутки.
+    /// Показывает шапку над каталогом и разговором с независимой прокруткой.
     pub fn view(&self) -> Element<'_, Message> {
-        let screen: Element<'_, Message> = if let Some(history) = self.visible_history() {
-            container(history.view(self.navigation_revision))
-                .padding(24)
-                .width(Fill)
-                .height(Fill)
-                .into()
-        } else {
-            let current: Element<'_, Message> = match self.accounts.current() {
-                Some(current) if current.session.status == SessionStatus::Active => {
-                    self.chat_list(&current.session)
-                }
-                Some(current) => text(session_status(current.session.status)).into(),
-                None => text("Ожидание сохранённых сессий").into(),
-            };
-            let mut content = column![current].spacing(16);
-            if self.notification_error.is_some() {
-                content = content.push(text("Системные уведомления недоступны").size(13));
+        let screen: Element<'_, Message> = match self.accounts.current() {
+            Some(current) if current.session.status == SessionStatus::Active => {
+                responsive(move |size| self.messenger_view(&current.session, size.width)).into()
             }
-            scrollable(container(content).padding(24).width(Fill))
+            Some(current) => container(text(session_status(current.session.status)))
+                .padding(24)
                 .height(Fill)
-                .into()
+                .into(),
+            None => container(text("Ожидание сохранённых сессий"))
+                .padding(24)
+                .height(Fill)
+                .into(),
         };
-        column![top_bar(self.top_bar_accounts()), screen]
-            .height(Fill)
-            .into()
+        let mut content = column![top_bar(self.top_bar_accounts())].height(Fill);
+        if let Some(reason) = self.notification_route_error {
+            content = content.push(container(text(reason).size(13)).padding([8, 12]));
+        }
+        if self.notification_error.is_some() {
+            content = content.push(
+                container(text("Системные уведомления недоступны").size(13)).padding([8, 12]),
+            );
+        }
+        content.push(screen).into()
     }
 
-    /// Показывает список выбранного входа, его темы и действие после ошибки.
-    fn chat_list(&self, session: &SessionSnapshot) -> Element<'_, Message> {
-        let mut list = column![text("Чаты").size(18)].spacing(8);
-        let state = self
-            .chats
-            .get(&session.context)
-            .filter(|state| state.generation == session.generation);
-        match state.map(|state| state.status) {
-            Some(ChatListStatus::Failed) => {
-                list = list.push(
-                    row![
-                        text("Не удалось загрузить чаты"),
-                        button(
-                            "Повторить",
-                            ButtonVariant::Neutral,
-                            Some(Message::RetryChats)
-                        ),
-                    ]
-                    .spacing(12)
-                    .align_y(Alignment::Center),
+    /// Собирает две панели с независимой прокруткой каталога и истории.
+    fn messenger_view<'a>(
+        &'a self,
+        session: &'a SessionSnapshot,
+        width: f32,
+    ) -> Element<'a, Message> {
+        let catalog = self.catalog(&session.context, session.generation);
+        let visible = self.visible_history();
+        let selected = visible.map(|history| history.route.scope);
+        let sidebar_width = (width * 0.42).clamp(160.0, 320.0).min(width * 0.55);
+        let key = (session.context.clone(), session.generation);
+        let sidebar = keyed::Column::new()
+            .push(
+                session.generation,
+                sidebar::view(session, catalog, self.sidebars.get(&key), selected),
+            )
+            .width(sidebar_width)
+            .height(Fill);
+        let history = visible.map_or_else(
+            || text("Выберите чат или тему").into(),
+            |history| {
+                let title = sidebar::catalog_title(catalog, history.route.scope).unwrap_or(
+                    if history.route.scope.topic_id.is_some() {
+                        "Тема канала"
+                    } else {
+                        "Личный чат"
+                    },
                 );
-            }
-            Some(ChatListStatus::Ready) => {}
-            _ => list = list.push(text("Загрузка чатов…")),
+                history.view(self.navigation_revision, title)
+            },
+        );
+        row![
+            sidebar,
+            rule::vertical(1),
+            container(history).padding(16).width(Fill).height(Fill)
+        ]
+        .height(Fill)
+        .into()
+    }
+
+    /// Возвращает каталог только для поколения, которому он принадлежит.
+    fn catalog(&self, owner: &OwnerContext, generation: SessionGeneration) -> Option<&ChatList> {
+        self.chats
+            .get(owner)
+            .filter(|list| list.generation == generation)
+    }
+
+    /// Применяет поиск, раскрытие или повтор только к каталогу, который пользователь ещё видит.
+    fn update_sidebar(
+        &mut self,
+        owner: OwnerContext,
+        generation: SessionGeneration,
+        action: SidebarAction,
+    ) -> Task<Message> {
+        self.accounts.replace(self.sources.0.snapshot());
+        if !self.is_selected_session(&owner, generation) {
+            return Task::none();
         }
-        if let Some(chats) = state.and_then(|state| state.chats.as_deref()) {
-            if chats.is_empty() && state.is_some_and(|state| state.status == ChatListStatus::Ready)
-            {
-                list = list.push(text("У вас пока нет чатов"));
+        match action {
+            SidebarAction::Search(query) => {
+                self.sidebars.entry((owner, generation)).or_default().query = query;
+                operation::snap_to(
+                    sidebar::scroll_id(generation),
+                    operation::RelativeOffset::START,
+                )
             }
-            for chat in chats {
-                // Оставляем составную букву или эмодзи целиком.
-                let avatar_content = chat
-                    .name
-                    .trim_start()
-                    .graphemes(true)
-                    .next()
-                    .map_or(AvatarContent::Placeholder, AvatarContent::Initials);
-                list = list.push(chat_row(ChatRowOptions {
-                    avatar: avatar(AvatarSize::Medium, avatar_content, None),
-                    title: &chat.name,
-                    preview: None,
-                    time: None,
-                    unread: None,
-                    mention: false,
-                    selected: false,
-                    on_press: None,
-                }));
-                for topic in &chat.topics {
-                    list = list.push(
-                        container(text(format!("# {}", topic.name)).width(Fill)).padding([0, 30]),
-                    );
+            SidebarAction::ClearSearch => {
+                self.sidebars
+                    .entry((owner, generation))
+                    .or_default()
+                    .query
+                    .clear();
+                operation::snap_to(
+                    sidebar::scroll_id(generation),
+                    operation::RelativeOffset::START,
+                )
+                .chain(operation::focus(sidebar::search_id(generation)))
+            }
+            SidebarAction::ToggleChannel(stream) => {
+                if sidebar::can_toggle(self.catalog(&owner, generation), stream) {
+                    let expanded = &mut self
+                        .sidebars
+                        .entry((owner, generation))
+                        .or_default()
+                        .expanded;
+                    if !expanded.remove(&stream) {
+                        expanded.insert(stream);
+                    }
                 }
+                Task::none()
+            }
+            SidebarAction::Retry => {
+                self.sources.0.catalog.retry(owner, generation);
+                Task::none()
             }
         }
-        list.into()
     }
 
     /// Передаёт шапке снимки аккаунтов и действия, привязанные к этому входу.
@@ -636,9 +840,8 @@ impl Shell {
 
     /// Поднимает окно и передаёт цель в core на исполнителе задач Iced.
     fn open_notification(&mut self, click: NotificationClick) -> Task<Message> {
-        self.navigation_revision += 1;
-        self.history = None;
-        let revision = self.navigation_revision;
+        self.cancel_notification_open();
+        let revision = self.notification_revision;
         let sync = self.sources.0.sync.clone();
         let NotificationClick { target, generation } = click;
         let raise = window::oldest().then(|window| {
@@ -660,6 +863,12 @@ impl Shell {
         Task::batch([raise, resolve])
     }
 
+    /// Отменяет ещё не подтверждённый переход из уведомления при новом действии пользователя.
+    fn cancel_notification_open(&mut self) {
+        self.notification_revision += 1;
+        self.notification_route_error = None;
+    }
+
     /// Применяет ответ core, если пользователь всё ещё ждёт этот переход и сессия активна.
     fn finish_open_notification(
         &mut self,
@@ -667,140 +876,225 @@ impl Shell {
         generation: SessionGeneration,
         result: Result<NotificationTarget, Arc<NotificationTargetError>>,
     ) -> Task<Message> {
-        if revision != self.navigation_revision {
+        if revision != self.notification_revision {
             return Task::none();
         }
+        self.cancel_notification_open();
         let target = match result {
             Ok(target) => target,
             Err(error) => {
                 log::warn!("Цель уведомления Workspace недоступна: {error}");
+                self.notification_route_error = Some(match error.as_ref() {
+                    NotificationTargetError::Auth(_) => "Аккаунт из уведомления недоступен",
+                    NotificationTargetError::UnknownTarget => "Сообщение из уведомления недоступно",
+                    NotificationTargetError::Storage(_) => "Не удалось открыть уведомление",
+                });
                 return Task::none();
             }
         };
+        let (Ok(stream_id), Ok(message_id)) =
+            (target.conversation_id.parse(), target.message_id.parse())
+        else {
+            self.notification_route_error = Some("Сообщение из уведомления недоступно");
+            return Task::none();
+        };
         self.accounts.replace(self.sources.0.snapshot());
-        if self.accounts.summaries.iter().any(|summary| {
+        if !self.accounts.summaries.iter().any(|summary| {
             summary.session.context == target.context
                 && summary.session.generation == generation
                 && summary.session.status == SessionStatus::Active
         }) {
-            self.accounts.select(target.context.account_id.clone());
-            self.history = Some(HistoryScreen {
-                target: target.clone(),
-                generation,
-                state: HistoryState::Loading,
-                older_pending: false,
-                older_failed: false,
-            });
-            let source = self.sources.0.clone();
-            return Task::perform(
-                async move {
-                    source
-                        .messenger
-                        .open_direct_history(&source.sync, &target, generation)
-                        .await
-                        .map(Arc::new)
-                        .map_err(Arc::new)
-                },
-                move |result| Message::HistoryLoaded { revision, result },
-            );
+            self.notification_route_error = Some("Аккаунт из уведомления недоступен");
+            return Task::none();
         }
-        Task::none()
+        self.accounts.select(target.context.account_id.clone());
+        self.open_history(
+            ChatRoute {
+                owner: target.context,
+                scope: HistoryScope {
+                    stream_id,
+                    topic_id: None,
+                },
+                entry: ChatEntry::Around(message_id),
+            },
+            generation,
+        )
+    }
+
+    /// Меняет окно того же разговора, сохраняя черновик и текущую запись на диск.
+    fn reopen_editor_history(
+        &mut self,
+        route: ChatRoute,
+        generation: SessionGeneration,
+    ) -> Task<Message> {
+        let send = std::mem::take(&mut self.history.as_mut().unwrap().send);
+        let task = self.open_history(route, generation);
+        self.history.as_mut().unwrap().send = send;
+        task
+    }
+
+    /// Запускает переход. Для хвоста сначала показывает кэш после проверки доступа.
+    fn open_history(&mut self, route: ChatRoute, generation: SessionGeneration) -> Task<Message> {
+        self.navigation_revision += 1;
+        let revision = self.navigation_revision;
+        self.history = Some(HistoryScreen::loading(route.clone(), generation));
+        self.history.as_mut().unwrap().send.revision = revision;
+        let source = self.sources.0.clone();
+        Task::stream(iced::stream::channel(2, async move |mut output| {
+            let result = match route.entry {
+                ChatEntry::Latest => match source
+                    .messenger
+                    .open_latest_history(&source.sync, &route.owner, generation, route.scope)
+                    .await
+                {
+                    Ok(mut opening) => {
+                        if let Some(window) = opening.cached.take()
+                            && output
+                                .send(Message::HistoryCached {
+                                    revision,
+                                    window: Arc::new(window),
+                                })
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
+                        opening.refresh().await
+                    }
+                    Err(error) => Err(error),
+                },
+                ChatEntry::Around(message_id) => match route.scope.topic_id {
+                    Some(topic) => {
+                        source
+                            .messenger
+                            .open_topic_history(
+                                &source.sync,
+                                &route.owner,
+                                generation,
+                                route.scope.stream_id,
+                                topic,
+                                message_id,
+                            )
+                            .await
+                    }
+                    None => {
+                        let target = NotificationTarget {
+                            context: route.owner,
+                            conversation_id: route.scope.stream_id.to_string(),
+                            message_id: message_id.to_string(),
+                        };
+                        source
+                            .messenger
+                            .open_direct_history(&source.sync, &target, generation)
+                            .await
+                    }
+                },
+            };
+            let _ = output
+                .send(Message::HistoryLoaded {
+                    revision,
+                    result: result.map(Arc::new).map_err(Arc::new),
+                })
+                .await;
+        }))
+    }
+
+    /// Проверяет, что выбран тот же вход, из которого пришло действие.
+    fn is_selected_session(&self, owner: &OwnerContext, generation: SessionGeneration) -> bool {
+        self.accounts.current().is_some_and(|current| {
+            current.session.context == *owner
+                && current.session.generation == generation
+                && current.session.status == SessionStatus::Active
+        })
     }
 
     /// Показывает историю только в том входе, которому принадлежит запрос.
     fn visible_history(&self) -> Option<&HistoryScreen> {
         let history = self.history.as_ref()?;
-        let current = &self.accounts.current()?.session;
-        (current.context == history.target.context
-            && current.generation == history.generation
-            && current.status == SessionStatus::Active)
+        self.is_selected_session(&history.route.owner, history.generation)
             .then_some(history)
+    }
+
+    /// Проверяет владельца и поколение, даже когда авторизация временно недоступна.
+    fn is_current_history_owner(&self, screen: &HistoryScreen) -> bool {
+        self.accounts.current().is_some_and(|current| {
+            current.session.context == screen.route.owner
+                && current.session.generation == screen.generation
+        })
     }
 
     /// Скрывает очищенную историю и заново проверяет доступ к прежней цели.
     fn reset_open_history(&mut self, update: &SyncUpdate) -> Task<Message> {
         self.accounts.replace(self.sources.0.snapshot());
-        let Some(history) = self.visible_history() else {
+        let Some(history) = self.history.as_ref() else {
             return Task::none();
         };
-        if history.target.context != update.context || history.generation != update.generation {
+        if history.route.owner != update.context || history.generation != update.generation {
             return Task::none();
         }
-        let target = history.target.clone();
-        let generation = history.generation;
-        self.navigation_revision += 1;
-        let revision = self.navigation_revision;
-        let history = self
-            .history
-            .as_mut()
-            .expect("видимый экран истории существует");
-        history.state = HistoryState::Loading;
-        history.older_pending = false;
-        history.older_failed = false;
-        let source = self.sources.0.clone();
-        Task::perform(
-            async move {
-                source
-                    .messenger
-                    .open_direct_history(&source.sync, &target, generation)
-                    .await
-                    .map(Arc::new)
-                    .map_err(Arc::new)
-            },
-            move |result| Message::HistoryLoaded { revision, result },
-        )
+        if self.is_selected_session(&history.route.owner, history.generation) {
+            self.open_history(history.route.clone(), history.generation)
+        } else {
+            self.history = None;
+            Task::none()
+        }
     }
 
-    /// Меняет только строки открытого участка, сохраняя маршрут и положение списка.
+    /// Скрывает отозванную область и делает уже запущенные запросы устаревшими.
+    fn revoke_open_history(
+        &mut self,
+        update: &SyncUpdate,
+        revocation: HistoryRevocation,
+    ) -> Task<Message> {
+        let Some(screen) = self.history.as_ref() else {
+            return Task::none();
+        };
+        if screen.route.owner != update.context || screen.generation != update.generation {
+            return Task::none();
+        }
+        let scope = screen.route.scope;
+        let matches = match revocation {
+            HistoryRevocation::Stream(stream) => scope.stream_id == stream,
+            HistoryRevocation::Topic {
+                stream_id,
+                topic_id,
+            } => {
+                if scope.stream_id == stream_id && scope.topic_id.is_none() {
+                    // Личный чат открыт для всего стрима, а его окно содержало и строки темы.
+                    return if self.is_selected_session(&screen.route.owner, screen.generation) {
+                        self.open_history(screen.route.clone(), screen.generation)
+                    } else {
+                        self.history = None;
+                        Task::none()
+                    };
+                }
+                scope.stream_id == stream_id && scope.topic_id == Some(topic_id)
+            }
+        };
+        if matches {
+            self.navigation_revision += 1;
+            self.history
+                .as_mut()
+                .expect("видимый экран истории существует")
+                .fail(Arc::new(OpenHistoryError::AccessLost));
+        }
+        Task::none()
+    }
+
+    /// Запрашивает обновление разметки только для событий открытого разговора.
     fn refresh_open_history(
         &mut self,
         update: &SyncUpdate,
         scope: HistoryScope,
-        message_id: uuid::Uuid,
-    ) {
-        let Some(history) = self.visible_history() else {
-            return;
+        created: Option<Uuid>,
+    ) -> Task<Message> {
+        let Some(screen) = self.visible_history() else {
+            return Task::none();
         };
-        let HistoryState::Ready(window) = &history.state else {
-            return;
-        };
-        if history.target.context != update.context
-            || history.generation != update.generation
-            || window.scope.stream_id != scope.stream_id
-            || (window.scope.topic_id.is_some() && window.scope.topic_id != scope.topic_id)
-        {
-            return;
+        if !history_update_matches(screen, update, scope) {
+            return Task::none();
         }
-        let Ok(Some(mut fresh)) = self.sources.0.sync.refresh_history_window(
-            &update.context,
-            update.generation,
-            window.scope,
-            window.id,
-        ) else {
-            return;
-        };
-        if history.older_pending
-            && let Some(first) = window.messages.first()
-        {
-            // Страница уже могла попасть в SQLite, пока её ответ ещё ждёт измерения экрана.
-            // Добавим старые строки только вместе с восстановлением видимой позиции.
-            let boundary = (&first.metadata.created_at, first.id);
-            fresh
-                .messages
-                .retain(|message| (&message.metadata.created_at, message.id) >= boundary);
-        }
-        // Строка за краем остаётся в базе отдельно от окна.
-        if fresh
-            .messages
-            .iter()
-            .any(|message| message.id == message_id)
-            && fresh != **window
-        {
-            self.history
-                .as_mut()
-                .expect("видимое окно существует")
-                .state = HistoryState::Ready(Arc::new(fresh));
-        }
+        self.queue_history_change(false, created)
     }
 
     /// Сохраняет ответ, только если его маршрут и вход всё ещё открыты.
@@ -808,6 +1102,7 @@ impl Shell {
         &mut self,
         revision: u64,
         result: Result<Arc<HistoryWindow>, Arc<OpenHistoryError>>,
+        cached: bool,
     ) -> Task<Message> {
         if revision != self.navigation_revision {
             return Task::none();
@@ -821,39 +1116,83 @@ impl Shell {
             .history
             .as_mut()
             .expect("видимый экран истории существует");
+        if cached && !history.refreshing {
+            return Task::none();
+        }
+        if !cached {
+            history.refreshing = false;
+        }
         match result {
-            Ok(window) => {
+            Ok(window) if window.scope == history.route.scope => {
                 // Создание могло сохраниться после снимка, пока экран ещё загружался.
                 match self.sources.0.sync.refresh_history_window(
-                    &history.target.context,
+                    &history.route.owner,
                     history.generation,
                     window.scope,
                     window.id,
                 ) {
                     Ok(Some(fresh)) => {
+                        if matches!(&history.state, HistoryState::Ready(current) if **current != fresh)
+                        {
+                            return self.queue_refreshed_window(fresh);
+                        }
                         history.state = HistoryState::Ready(Arc::new(fresh));
-                        history.target.message_id.parse().map_or_else(
-                            |_| Task::none(),
-                            |id| history::measure_anchor(revision, id),
-                        )
+                        match history.route.entry {
+                            ChatEntry::Around(id) => history::measure_anchor(revision, id),
+                            ChatEntry::Latest if !history.user_scrolled => operation::snap_to(
+                                history::list_id(revision),
+                                operation::RelativeOffset::END,
+                            ),
+                            ChatEntry::Latest => Task::none(),
+                        }
                     }
                     Ok(None) => {
-                        history.state =
-                            HistoryState::Failed(Arc::new(OpenHistoryError::StaleWindow));
+                        if !cached {
+                            history.fail(Arc::new(OpenHistoryError::StaleWindow));
+                        }
                         Task::none()
                     }
                     Err(error) => {
-                        history.state = HistoryState::Failed(Arc::new(error.into()));
+                        if !cached {
+                            history.fail(Arc::new(error.into()));
+                        }
                         Task::none()
                     }
                 }
             }
+            Ok(_) => Task::none(),
             Err(error) => {
-                history.state = HistoryState::Failed(error);
+                if history.route.entry == ChatEntry::Latest
+                    && !matches!(error.as_ref(), OpenHistoryError::AccessLost)
+                    && let HistoryState::Ready(window) = &history.state
+                    && let Ok(Some(fresh)) = self.sources.0.sync.refresh_history_window(
+                        &history.route.owner,
+                        history.generation,
+                        history.route.scope,
+                        window.id,
+                    )
+                {
+                    history.state = HistoryState::Ready(Arc::new(fresh));
+                    history.refresh_failed = true;
+                } else {
+                    history.fail(error);
+                }
                 Task::none()
             }
         }
     }
+}
+
+/// Ограничивает изменения истории и очереди открытым входом, стримом и темой.
+fn history_update_matches(
+    screen: &HistoryScreen,
+    update: &SyncUpdate,
+    scope: HistoryScope,
+) -> bool {
+    screen.route.owner == update.context
+        && screen.generation == update.generation
+        && screen.route.scope.stream_id == scope.stream_id
+        && (screen.route.scope.topic_id.is_none() || screen.route.scope.topic_id == scope.topic_id)
 }
 
 impl Accounts {
@@ -985,7 +1324,7 @@ impl Sources {
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         updates = source.sync.subscribe();
-                        Message::Snapshot(source.snapshot())
+                        Message::SyncLagged
                     }
                     Err(broadcast::error::RecvError::Closed) => return None,
                 };

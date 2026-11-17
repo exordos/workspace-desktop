@@ -5,19 +5,22 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use tokio::sync::broadcast;
+use uuid::Uuid;
 
 use crate::{
     auth::{Auth, AuthError},
     context::{OwnerContext, SessionGeneration},
     notification_target::{NotificationTarget, NotificationTargetError},
     storage::{
-        Cursor, EventWrite, HistoryChange, HistoryMessage, HistoryMetadata, HistoryPageEdges,
-        HistoryPageGuard, HistoryPageOutcome, HistoryPageTarget, HistoryScope, HistoryWindow,
-        Message, MessagePlacement, PreparedSend, Storage, StorageError,
+        Cursor, DeliveryStatus, EventWrite, HistoryChange, HistoryMessage, HistoryMetadata,
+        HistoryPageEdges, HistoryPageGuard, HistoryPageOutcome, HistoryPageTarget, HistoryScope,
+        HistoryWindow, Message, MessagePlacement, OutboxEntry, PreparedSend, Storage, StorageError,
     },
 };
 
 pub use crate::storage::ApplyOutcome;
+
+const MAX_MESSAGE_CHARACTERS: usize = 40_000;
 
 /// Вычисляет UUID размещения из темы и строкового канонического UUID, как Workspace API.
 fn public_send_id(topic_id: uuid::Uuid, canonical_id: uuid::Uuid) -> uuid::Uuid {
@@ -55,9 +58,26 @@ pub enum SyncChange {
         scope: HistoryScope,    // Стрим и тема сохранённого сообщения.
         message_id: uuid::Uuid, // UUID новой строки в базе.
     },
+    HistoryMessageChanged {
+        message_id: Uuid, // UUID исправленной или удалённой строки.
+    },
+    HistoryAccessRevoked(HistoryRevocation), // Область, которую больше нельзя показывать.
+    OutboxChanged {
+        scope: HistoryScope, // Исходная тема, очередь которой нужно перечитать.
+    },
     IncomingDirectMessage {
         conversation_id: String, // Идентификатор личного разговора на сервере.
         message_id: String,      // Идентификатор нового сообщения.
+    },
+}
+
+/// Идентификатор области истории, удалённой по событию мессенджера.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistoryRevocation {
+    Stream(Uuid), // UUID стрима, доступ к которому отозван.
+    Topic {
+        stream_id: Uuid, // Стрим, включая его окно без фильтра темы.
+        topic_id: Uuid,  // Удалённая или отозванная тема.
     },
 }
 
@@ -89,7 +109,8 @@ pub enum Event {
         cursor: Cursor, // Позиция сервера перед чтением счётчика. Курсор сообщений не меняется.
         count: u32,     // Счётчик, загруженный отдельным запросом при подключении.
     },
-    Checkpoint(Cursor), // Новая позиция чтения без сообщения.
+    SourceReady(Cursor), // WebSocket готов, но отдельный снимок счётчика недоступен.
+    Checkpoint(Cursor),  // Новая позиция чтения без сообщения.
 }
 
 impl Event {
@@ -101,6 +122,7 @@ impl Event {
             | Self::HistoryChanged { cursor, .. }
             | Self::UnreadChanged { cursor, .. }
             | Self::UnreadBaseline { cursor, .. }
+            | Self::SourceReady(cursor)
             | Self::Checkpoint(cursor) => cursor,
         }
     }
@@ -147,6 +169,8 @@ pub enum PrepareSendError {
     Sync(#[from] SyncError), // Сессия недействительна или база недоступна.
     #[error("the generated message identifier is already in use")]
     IdCollision, // Случайный UUID уже занят: исходная запись осталась без изменений.
+    #[error("a message must contain non-whitespace text up to 40000 Unicode code points")]
+    InvalidText, // Пустой текст или превышение лимита Workspace.
 }
 
 /// Проверяет право сессии на запись и передаёт события в хранилище.
@@ -271,7 +295,95 @@ impl Sync {
         message: &HistoryMessage,
     ) -> Result<bool, SyncError> {
         self.auth.with_active_generation(owner, generation, || {
-            Ok(self.storage.confirm_http_send(owner, message)?)
+            let confirmed = self.storage.confirm_http_send(owner, message)?;
+            if confirmed {
+                let scope = HistoryScope {
+                    stream_id: message.stream_id,
+                    topic_id: Some(message.topic_id),
+                };
+                self.publish(
+                    owner,
+                    generation,
+                    SyncChange::HistoryMessageCreated {
+                        scope,
+                        message_id: message.id,
+                    },
+                );
+                self.publish(owner, generation, SyncChange::OutboxChanged { scope });
+            }
+            Ok(confirmed)
+        })?
+    }
+
+    /// Читает статус ожидающих сообщений в области истории действующей сессии.
+    pub fn outbox(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        scope: HistoryScope,
+    ) -> Result<Vec<OutboxEntry>, SyncError> {
+        self.read_outbox(owner, generation, Some(scope))
+    }
+
+    /// Читает очередь указанного входа для фоновой обработки или экрана.
+    pub(crate) fn read_outbox(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        scope: Option<HistoryScope>,
+    ) -> Result<Vec<OutboxEntry>, SyncError> {
+        self.auth.with_active_generation(owner, generation, || {
+            Ok(self.storage.outbox(owner, scope)?)
+        })?
+    }
+
+    /// Отмечает незавершённые запросы после запуска фоновой задачи.
+    pub(crate) fn recover_sends(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+    ) -> Result<(), SyncError> {
+        self.auth.with_active_generation(owner, generation, || {
+            for scope in self.storage.recover_interrupted_sends(owner)? {
+                self.publish(owner, generation, SyncChange::OutboxChanged { scope });
+            }
+            Ok(())
+        })?
+    }
+
+    /// Разрешает первый POST только после записи захвата в действующей сессии.
+    pub(crate) fn claim_send(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        canonical_id: Uuid,
+    ) -> Result<Option<PreparedSend>, SyncError> {
+        self.auth.with_active_generation(owner, generation, || {
+            let claimed = self.storage.claim_first_send(owner, canonical_id)?;
+            if let Some(snapshot) = &claimed {
+                self.publish_send(owner, generation, snapshot);
+            }
+            Ok(claimed)
+        })?
+    }
+
+    /// Фиксирует итог активной попытки или предварительный отказ для новой записи.
+    pub(crate) fn set_send_status(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        snapshot: &PreparedSend,
+        claimed: bool,
+        status: DeliveryStatus,
+    ) -> Result<(), SyncError> {
+        self.auth.with_active_generation(owner, generation, || {
+            if self
+                .storage
+                .set_send_status(owner, snapshot.canonical_id, claimed, status)?
+            {
+                self.publish_send(owner, generation, snapshot);
+            }
+            Ok(())
         })?
     }
 
@@ -284,6 +396,9 @@ impl Sync {
         topic_id: uuid::Uuid,
         markdown: String,
     ) -> Result<PreparedSend, PrepareSendError> {
+        if markdown.trim().is_empty() || markdown.chars().count() > MAX_MESSAGE_CHARACTERS {
+            return Err(PrepareSendError::InvalidText);
+        }
         self.auth
             .with_active_generation(owner, generation, || {
                 let canonical_id = uuid::Uuid::new_v4();
@@ -301,6 +416,7 @@ impl Sync {
                 {
                     return Err(PrepareSendError::IdCollision);
                 }
+                self.publish_send(owner, generation, &message);
                 Ok(message)
             })
             .map_err(SyncError::from)?
@@ -339,6 +455,9 @@ impl Sync {
         event: Event,
     ) -> Result<ApplyOutcome, SyncError> {
         self.auth.with_active_generation(owner, generation, || {
+            if matches!(event, Event::SourceReady(_)) {
+                return Ok(ApplyOutcome::Applied);
+            }
             if let Event::UnreadBaseline { cursor, count } = &event {
                 if self.storage.apply_unread_baseline(owner, cursor, *count)? {
                     self.publish(owner, generation, SyncChange::Unread(*count));
@@ -386,8 +505,7 @@ impl Sync {
             if let Some(count) = unread.filter(|_| saved.unread_changed) {
                 self.publish(owner, generation, SyncChange::Unread(count));
             }
-            // Оба пути создания проходят здесь после фиксации сообщения и курсора.
-            if saved.message_inserted
+            if (saved.message_inserted || saved.send_confirmed)
                 && let (Some(placement), Some(_), Some(message)) =
                     (placement, metadata, event.message())
                 && let (Ok(stream_id), Ok(topic_id), Ok(message_id)) = (
@@ -396,17 +514,26 @@ impl Sync {
                     message.id.parse(),
                 )
             {
-                self.publish(
-                    owner,
-                    generation,
-                    SyncChange::HistoryMessageCreated {
-                        scope: HistoryScope {
-                            stream_id,
-                            topic_id: Some(topic_id),
-                        },
-                        message_id,
-                    },
-                );
+                let scope = HistoryScope {
+                    stream_id,
+                    topic_id: Some(topic_id),
+                };
+                if saved.message_inserted {
+                    self.publish(
+                        owner,
+                        generation,
+                        SyncChange::HistoryMessageCreated { scope, message_id },
+                    );
+                }
+                if saved.send_confirmed {
+                    self.publish(owner, generation, SyncChange::OutboxChanged { scope });
+                }
+            }
+            if saved.outcome == ApplyOutcome::Applied
+                && source == crate::messenger::SOURCE_ID
+                && let Some(change) = history.and_then(history_update)
+            {
+                self.publish(owner, generation, change);
             }
             if saved.message_inserted
                 && let Event::IncomingDirectMessage {
@@ -428,6 +555,25 @@ impl Sync {
         })?
     }
 
+    /// Сообщает, что очередь указанной темы изменилась.
+    fn publish_send(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        snapshot: &PreparedSend,
+    ) {
+        self.publish(
+            owner,
+            generation,
+            SyncChange::OutboxChanged {
+                scope: HistoryScope {
+                    stream_id: snapshot.stream_id,
+                    topic_id: Some(snapshot.topic_id),
+                },
+            },
+        );
+    }
+
     /// Публикует изменение под блокировкой действующей сессии после записи в базу.
     fn publish(&self, owner: &OwnerContext, generation: SessionGeneration, change: SyncChange) {
         let _ = self.updates.send(SyncUpdate {
@@ -436,4 +582,26 @@ impl Sync {
             change,
         });
     }
+}
+
+/// Выбирает изменение, которое открытая история должна показать после записи.
+fn history_update(change: &HistoryChange) -> Option<SyncChange> {
+    let update = match change {
+        HistoryChange::Edit { message, .. } => SyncChange::HistoryMessageChanged {
+            message_id: message.id.parse().ok()?,
+        },
+        HistoryChange::RemoveMessage(id) => SyncChange::HistoryMessageChanged {
+            message_id: id.parse().ok()?,
+        },
+        HistoryChange::RemoveStream(id) => {
+            SyncChange::HistoryAccessRevoked(HistoryRevocation::Stream(id.parse().ok()?))
+        }
+        HistoryChange::RemoveTopic(address) => {
+            SyncChange::HistoryAccessRevoked(HistoryRevocation::Topic {
+                stream_id: address.stream_id.parse().ok()?,
+                topic_id: address.topic_id.parse().ok()?,
+            })
+        }
+    };
+    Some(update)
 }

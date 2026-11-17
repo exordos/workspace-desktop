@@ -1,23 +1,45 @@
-//! Показывает историю личного чата и измеряет положение сообщения из уведомления.
+//! Показывает историю разговора и измеряет положение сообщения из уведомления.
 
+use super::composer::{Address, ConversationSend, pending_bubble};
 use super::{
-    Message, NotificationTarget, OpenHistoryError, SessionGeneration, history_input::HistoryInput,
+    ChatEntry, ChatRoute, Message, OpenHistoryError, SessionGeneration, history_input::HistoryInput,
 };
+use crate::ui_kit::{ButtonVariant, MessageDelivery, MessageDirection, button, message_bubble};
 use chrono::{DateTime, Local, NaiveDate, TimeZone};
 use iced::advanced::widget::{Id, Operation, operation::Outcome};
-use iced::widget::{column, container, scrollable, text};
+use iced::widget::{column, container, row, scrollable, text};
 use iced::{Element, Fill, Rectangle, Task};
-use std::collections::HashMap;
 use std::sync::Arc;
-use workspace_core::storage::HistoryWindow;
+use workspace_core::storage::{HistoryEdge, HistoryWindow, OutboxEntry};
 
 /// Маршрут истории вместе с состоянием запроса.
 pub(super) struct HistoryScreen {
-    pub(super) target: NotificationTarget, // Владелец, чат и UUID сообщения.
+    pub(super) route: ChatRoute, // Владелец, область и место открытия истории.
     pub(super) generation: SessionGeneration, // Вход, для которого открыта история.
-    pub(super) state: HistoryState,        // Загрузка, подтверждённое окно или ошибка.
-    pub(super) older_pending: bool,        // Измерение или запрос старой страницы уже выполняется.
-    pub(super) older_failed: bool,         // Последняя попытка завершилась ошибкой.
+    pub(super) state: HistoryState, // Загрузка, подтверждённое окно или ошибка.
+    pub(super) send: ConversationSend, // Редактор и доставка только этого разговора.
+    pub(super) refreshing: bool, // Свежая страница хвоста ещё загружается.
+    pub(super) refresh_failed: bool, // Свежая страница не пришла, сохранённое окно пригодно.
+    pub(super) user_scrolled: bool, // Читатель уже изменил позицию сохранённого хвоста.
+    pub(super) older_pending: bool, // Измерение или запрос старой страницы уже выполняется.
+    pub(super) older_failed: bool, // Последняя попытка завершилась ошибкой.
+    pub(super) scroll_revision: u64, // Меняется при ручном движении в любую сторону.
+    pub(super) layout: LayoutUpdate, // Подготовленная перестройка и её стадия.
+}
+
+/// Хранит самое новое состояние, пока Iced измеряет текущую разметку.
+#[derive(Default)]
+pub(super) struct LayoutUpdate {
+    pub(super) revision: u64,   // Номер измерения в открытом разговоре.
+    pub(super) measuring: bool, // Ещё не закончена пара замеров.
+    pub(super) pending: Option<HistoryPatch>, // Новая разметка ждёт применения.
+}
+
+/// Новый снимок строк истории и очереди, полученный для того же открытого окна.
+pub(super) struct HistoryPatch {
+    pub(super) window: Arc<HistoryWindow>, // Только подтверждённые данные из БД.
+    pub(super) outbox: Vec<OutboxEntry>,   // Ожидающие строки того же владельца.
+    pub(super) older_completed: bool,      // Можно добавить уже загруженную старую страницу.
 }
 
 /// Состояния, которые пользователь видит вместо каталога чатов.
@@ -28,39 +50,168 @@ pub(super) enum HistoryState {
 }
 
 impl HistoryScreen {
+    /// Начинает загрузку для выбранного маршрута, скрывая сообщения предыдущего экрана.
+    pub(super) fn loading(route: ChatRoute, generation: SessionGeneration) -> Self {
+        Self {
+            refreshing: route.entry == ChatEntry::Latest,
+            route,
+            generation,
+            state: HistoryState::Loading,
+            send: ConversationSend::default(),
+            refresh_failed: false,
+            user_scrolled: false,
+            older_pending: false,
+            older_failed: false,
+            scroll_revision: 0,
+            layout: LayoutUpdate::default(),
+        }
+    }
+
+    /// Скрывает историю и останавливает действия, относящиеся к её окну.
+    pub(super) fn fail(&mut self, error: Arc<OpenHistoryError>) {
+        if matches!(
+            *error,
+            OpenHistoryError::AccessLost
+                | OpenHistoryError::MessageMissing
+                | OpenHistoryError::InvalidTarget
+        ) {
+            self.send = ConversationSend::default();
+        }
+        self.state = HistoryState::Failed(error);
+        self.refreshing = false;
+        self.refresh_failed = false;
+        self.older_pending = false;
+        self.older_failed = false;
+        self.cancel_layout_update();
+    }
+
+    /// Отбрасывает измерения прежнего окна истории.
+    pub(super) fn cancel_layout_update(&mut self) {
+        self.layout.revision = self.layout.revision.wrapping_add(1);
+        self.layout.measuring = false;
+        self.layout.pending = None;
+    }
+
+    /// Возвращает стабильные пары виджетов и UUID для фактического измерения списка.
+    pub(super) fn layout_rows(&self, revision: u64) -> Vec<(Id, uuid::Uuid)> {
+        let HistoryState::Ready(window) = &self.state else {
+            return Vec::new();
+        };
+        let mut ids = window
+            .messages
+            .iter()
+            .map(|line| line.id)
+            .collect::<Vec<_>>();
+        let confirmed = ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        ids.extend(
+            self.send
+                .outbox
+                .iter()
+                .map(|entry| entry.snapshot.public_id)
+                .filter(|id| !confirmed.contains(id)),
+        );
+        ids.into_iter()
+            .map(|id| (row_id(revision, id), id))
+            .collect()
+    }
+
+    /// Разрешает повтор, если история не открылась или не обновилась из-за сбоя.
+    pub(super) fn can_retry(&self) -> bool {
+        self.refresh_failed
+            || matches!(&self.state, HistoryState::Failed(error) if !matches!(
+                error.as_ref(),
+                OpenHistoryError::AccessLost | OpenHistoryError::MessageMissing | OpenHistoryError::InvalidTarget
+            ))
+    }
+
     /// Рисует сообщения в порядке сервера и помечает цель для прокрутки.
-    pub(super) fn view(&self, revision: u64) -> Element<'_, Message> {
-        let heading = text("Личный чат").size(18);
+    pub(super) fn view<'a>(&'a self, revision: u64, title: &'a str) -> Element<'a, Message> {
+        let mut heading = row![text(title).size(18).wrapping(text::Wrapping::WordOrGlyph)]
+            .spacing(8)
+            .align_y(iced::Center);
+        if let HistoryState::Ready(window) = &self.state
+            && window.newer != HistoryEdge::End
+        {
+            heading = heading.push(button(
+                "К последним сообщениям",
+                ButtonVariant::Neutral,
+                Some(Message::SeeLatest(revision)),
+            ));
+        }
         let body: Element<'_, Message> = match &self.state {
             HistoryState::Loading => text("Загрузка истории…").into(),
             HistoryState::Failed(error) => text(match error.as_ref() {
+                OpenHistoryError::AccessLost if self.route.scope.topic_id.is_some() => {
+                    "Тема недоступна"
+                }
                 OpenHistoryError::AccessLost => "Чат недоступен",
                 OpenHistoryError::MessageMissing => "Сообщение недоступно",
                 _ => "Не удалось загрузить историю",
             })
             .into(),
             HistoryState::Ready(window) => {
-                let messages = history_messages(window, revision, &Local);
+                let messages = if window.messages.is_empty() && self.send.outbox.is_empty() {
+                    text("В чате пока нет сообщений").into()
+                } else {
+                    history_messages(
+                        window,
+                        &self.send.outbox,
+                        self.route.owner.user_id.parse().ok(),
+                        revision,
+                        &Local,
+                    )
+                };
                 let list = scrollable(messages)
                     .id(list_id(revision))
                     .height(Fill)
                     .into();
                 let list = Element::new(HistoryInput::new(list, revision));
-                let error = if self.older_failed {
-                    "Не удалось загрузить предыдущие сообщения. Прокрутите вверх для повтора."
-                } else {
-                    ""
-                };
-                column![text(error), list].height(Fill).into()
+                let mut body = column![].spacing(8).height(Fill);
+                if self.older_failed {
+                    body = body.push(text(
+                        "Не удалось загрузить предыдущие сообщения. Прокрутите вверх для повтора.",
+                    ));
+                }
+                if self.refresh_failed {
+                    body = body.push(text("Не удалось обновить историю"));
+                }
+                body.push(list).into()
             }
         };
-        column![heading, body].spacing(8).height(Fill).into()
+        let mut content = column![heading, body].spacing(8).height(Fill);
+        if self.can_retry() {
+            content = content.push(button(
+                "Повторить",
+                ButtonVariant::Neutral,
+                Some(Message::RetryHistory(revision)),
+            ));
+        }
+        if matches!(self.state, HistoryState::Ready(_)) && self.route.scope.topic_id.is_none() {
+            content = content.push(self.send.composer.view(
+                self.send.address.unavailable(),
+                move |action| Message::EditConversationText { revision, action },
+                Message::SendConversationText(revision),
+            ));
+            if matches!(self.send.address, Address::Unavailable(_)) {
+                content = content.push(button(
+                    "Проверить отправку",
+                    ButtonVariant::Neutral,
+                    Some(Message::RetrySendAddress(revision)),
+                ));
+            }
+        }
+        content.into()
     }
 }
 
 /// Собирает строки и подписи дней, не меняя идентификаторы сообщений.
 fn history_messages<'a, T: TimeZone>(
     window: &'a HistoryWindow,
+    outbox: &'a [OutboxEntry],
+    own_author: Option<uuid::Uuid>,
     revision: u64,
     zone: &T,
 ) -> Element<'a, Message> {
@@ -76,12 +227,30 @@ fn history_messages<'a, T: TimeZone>(
             }
             previous_day = day;
         }
-        messages = messages.push(
-            container(text(&message.text))
-                .padding(8)
-                .width(Fill)
-                .id(row_id(revision, message.id)),
-        );
+        let line = if own_author.is_some() && message.metadata.author_id == own_author {
+            container(message_bubble(
+                &message.text,
+                None,
+                "",
+                MessageDirection::Outgoing(Some(MessageDelivery::Sent)),
+            ))
+            .align_right(Fill)
+        } else {
+            container(text(&message.text).wrapping(text::Wrapping::WordOrGlyph)).width(Fill)
+        };
+        messages = messages.push(line.padding(8).id(row_id(revision, message.id)));
+    }
+    for entry in outbox {
+        let id = entry.snapshot.public_id;
+        // История может уже содержать подтверждение, пока окно ещё не перечитало очередь.
+        if !window.messages.iter().any(|message| message.id == id) {
+            messages = messages.push(
+                container(pending_bubble(entry))
+                    .align_right(Fill)
+                    .padding(8)
+                    .id(row_id(revision, id)),
+            );
+        }
     }
     messages.into()
 }
@@ -94,6 +263,75 @@ fn local_day<T: TimeZone>(
     DateTime::parse_from_rfc3339(time.as_str())
         .ok()
         .map(|value| value.with_timezone(zone).date_naive())
+}
+
+/// Различает списки разных переходов, чтобы отложенная прокрутка не задела новый экран.
+pub(super) fn list_id(revision: u64) -> Id {
+    Id::from(format!("history-list-{revision}"))
+}
+
+/// Даёт каждой строке стабильный ID внутри открытого списка.
+fn row_id(revision: u64, id: uuid::Uuid) -> Id {
+    Id::from(format!("history-row-{revision}-{id}"))
+}
+
+/// Запрашивает фактические координаты после разметки строк переменной высоты.
+pub(super) fn measure_anchor(revision: u64, id: uuid::Uuid) -> Task<Message> {
+    iced_runtime::task::widget(MeasureAnchor {
+        list: list_id(revision),
+        anchor: row_id(revision, id),
+        list_bounds: None,
+        anchor_bounds: None,
+    })
+    .map(move |offset| Message::ScrollToHistory { revision, offset })
+}
+
+/// Собирает координаты списка и строки в одном обходе разметки.
+struct MeasureAnchor {
+    list: Id,                         // Список, который нужно прокрутить.
+    anchor: Id,                       // Строка целевого сообщения.
+    list_bounds: Option<(f32, f32)>,  // Верх содержимого и высота видимой области.
+    anchor_bounds: Option<Rectangle>, // Положение и размер строки.
+}
+
+impl Operation<Option<f32>> for MeasureAnchor {
+    /// Обходит дочерние виджеты до контейнера сообщения.
+    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<Option<f32>>)) {
+        visit(self);
+    }
+
+    /// Запоминает верх строки цели.
+    fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+        if id == Some(&self.anchor) {
+            self.anchor_bounds = Some(bounds);
+        }
+    }
+
+    /// Запоминает верх всего содержимого списка.
+    fn scrollable(
+        &mut self,
+        id: Option<&Id>,
+        viewport: Rectangle,
+        content: Rectangle,
+        _: iced::Vector,
+        _: &mut dyn iced::advanced::widget::operation::Scrollable,
+    ) {
+        if id == Some(&self.list) {
+            self.list_bounds = Some((content.y, viewport.height));
+        }
+    }
+
+    /// Возвращает расстояние от начала истории до строки.
+    fn finish(&self) -> Outcome<Option<f32>> {
+        Outcome::Some(
+            self.anchor_bounds
+                .zip(self.list_bounds)
+                .map(|(anchor, (top, height))| {
+                    // Запас сверху оставляет цель видимой при округлении координат Iced.
+                    (anchor.y - top - ((height - anchor.height) / 2.0).max(0.0)).max(0.0)
+                }),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -186,7 +424,7 @@ mod day_tests {
             }
         }
         let mut ui = UserInterface::build(
-            history_messages(window, 7, zone),
+            history_messages(window, &[], None, 7, zone),
             Size::new(620.0, 500.0),
             Cache::new(),
             renderer,
@@ -194,154 +432,5 @@ mod day_tests {
         let mut observed = Observed::default();
         ui.operate(renderer, &mut observed);
         (observed.labels, observed.anchor)
-    }
-}
-
-/// Различает списки разных переходов, чтобы отложенная прокрутка не задела новый экран.
-pub(super) fn list_id(revision: u64) -> Id {
-    Id::from(format!("history-list-{revision}"))
-}
-
-/// Даёт каждой строке стабильный ID внутри открытого списка.
-fn row_id(revision: u64, id: uuid::Uuid) -> Id {
-    Id::from(format!("history-row-{revision}-{id}"))
-}
-
-/// Запрашивает фактические координаты после разметки строк переменной высоты.
-pub(super) fn measure_anchor(revision: u64, id: uuid::Uuid) -> Task<Message> {
-    iced_runtime::task::widget(MeasureAnchor {
-        list: list_id(revision),
-        anchor: row_id(revision, id),
-        list_bounds: None,
-        anchor_bounds: None,
-    })
-    .map(move |offset| Message::ScrollToHistory { revision, offset })
-}
-
-/// Видимая строка и её отступ относительно верхней границы списка.
-#[derive(Clone, Debug)]
-pub struct HistoryPosition {
-    pub(super) id: uuid::Uuid, // UUID первой видимой строки.
-    pub(super) offset: f32,    // Положение строки внутри области просмотра в пикселях.
-    pub(super) scroll: f32,    // Текущая абсолютная прокрутка в пикселях.
-}
-
-/// Измеряет текущую позицию или положение определённой строки после вставки.
-pub(super) fn measure_position(
-    revision: u64,
-    ids: Vec<uuid::Uuid>,
-    requested: Option<uuid::Uuid>,
-) -> Task<Option<HistoryPosition>> {
-    iced_runtime::task::widget(MeasurePosition {
-        list: list_id(revision),
-        rows: ids
-            .into_iter()
-            .map(|id| (row_id(revision, id), id))
-            .collect(),
-        requested,
-        viewport: None,
-        found: Vec::new(),
-    })
-}
-
-/// Собирает геометрию списка и строк из одной разметки.
-struct MeasurePosition {
-    list: Id,                            // ID открытого списка.
-    rows: HashMap<Id, uuid::Uuid>,       // ID виджетов и соответствующие UUID.
-    requested: Option<uuid::Uuid>,       // Конкретная строка после вставки или первая видимая.
-    viewport: Option<(Rectangle, f32)>,  // Область и сдвиг её содержимого.
-    found: Vec<(uuid::Uuid, Rectangle)>, // Координаты найденных строк.
-}
-
-impl Operation<Option<HistoryPosition>> for MeasurePosition {
-    /// Обходит виджеты открытого списка.
-    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<Option<HistoryPosition>>)) {
-        visit(self);
-    }
-    /// Запоминает координаты строк истории.
-    fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
-        if let Some(uuid) = id.and_then(|id| self.rows.get(id)) {
-            self.found.push((*uuid, bounds));
-        }
-    }
-    /// Запоминает видимую область и абсолютный сдвиг.
-    fn scrollable(
-        &mut self,
-        id: Option<&Id>,
-        viewport: Rectangle,
-        _: Rectangle,
-        translation: iced::Vector,
-        _: &mut dyn iced::advanced::widget::operation::Scrollable,
-    ) {
-        if id == Some(&self.list) {
-            self.viewport = Some((viewport, translation.y));
-        }
-    }
-    /// Возвращает первую видимую строку либо координаты запрошенной строки.
-    fn finish(&self) -> Outcome<Option<HistoryPosition>> {
-        Outcome::Some(self.viewport.and_then(|(viewport, scroll)| {
-            self.found
-                .iter()
-                .find(|(id, bounds)| {
-                    self.requested.map_or(
-                        bounds.y + bounds.height - scroll > viewport.y
-                            && bounds.y - scroll < viewport.y + viewport.height,
-                        |requested| *id == requested,
-                    )
-                })
-                .map(|(id, bounds)| HistoryPosition {
-                    id: *id,
-                    offset: bounds.y - scroll - viewport.y,
-                    scroll,
-                })
-        }))
-    }
-}
-
-/// Собирает координаты списка и строки в одном обходе разметки.
-struct MeasureAnchor {
-    list: Id,                         // Список, который нужно прокрутить.
-    anchor: Id,                       // Строка целевого сообщения.
-    list_bounds: Option<(f32, f32)>,  // Верх содержимого и высота видимой области.
-    anchor_bounds: Option<Rectangle>, // Положение и размер строки.
-}
-
-impl Operation<Option<f32>> for MeasureAnchor {
-    /// Обходит дочерние виджеты до контейнера сообщения.
-    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<Option<f32>>)) {
-        visit(self);
-    }
-
-    /// Запоминает верх строки цели.
-    fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
-        if id == Some(&self.anchor) {
-            self.anchor_bounds = Some(bounds);
-        }
-    }
-
-    /// Запоминает верх всего содержимого списка.
-    fn scrollable(
-        &mut self,
-        id: Option<&Id>,
-        viewport: Rectangle,
-        content: Rectangle,
-        _: iced::Vector,
-        _: &mut dyn iced::advanced::widget::operation::Scrollable,
-    ) {
-        if id == Some(&self.list) {
-            self.list_bounds = Some((content.y, viewport.height));
-        }
-    }
-
-    /// Возвращает расстояние от начала истории до строки.
-    fn finish(&self) -> Outcome<Option<f32>> {
-        Outcome::Some(
-            self.anchor_bounds
-                .zip(self.list_bounds)
-                .map(|(anchor, (top, height))| {
-                    // Запас сверху оставляет цель видимой при округлении координат Iced.
-                    (anchor.y - top - ((height - anchor.height) / 2.0).max(0.0)).max(0.0)
-                }),
-        )
     }
 }

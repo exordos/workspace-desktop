@@ -10,7 +10,7 @@ pub use history::{
     HistoryPageOutcome, HistoryPageTarget, HistoryScope, HistoryTime, HistoryWindow,
 };
 
-pub use outbox::PreparedSend;
+pub use outbox::{DeliveryStatus, OutboxEntry, PreparedSend, SendBlock};
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -83,6 +83,7 @@ pub(crate) struct AppliedEvent {
     pub outcome: ApplyOutcome,  // Была ли сохранена позиция источника.
     pub message_inserted: bool, // Появилась ли новая строка с сообщением.
     pub unread_changed: bool,   // Изменилось ли число непрочитанных.
+    pub send_confirmed: bool,   // Закрыта ли строка очереди отправки.
 }
 
 /// Причины, по которым локальная база не смогла прочитать или записать данные.
@@ -429,6 +430,7 @@ impl Storage {
                     outcome: ApplyOutcome::Duplicate,
                     message_inserted: false,
                     unread_changed: false,
+                    send_confirmed: false,
                 });
             }
         }
@@ -440,11 +442,22 @@ impl Storage {
         }
 
         let revoked = if source == crate::messenger::SOURCE_ID {
-            if let Some(HistoryChange::RemoveStream(stream)) = change.history {
-                remove_catalog_stream(&transaction, owner, stream)?;
-                true
-            } else {
-                false
+            match change.history {
+                Some(HistoryChange::RemoveStream(stream)) => {
+                    remove_catalog_stream(&transaction, owner, stream)?;
+                    outbox::reject_revoked(&transaction, owner, stream, None)?;
+                    true
+                }
+                Some(HistoryChange::RemoveTopic(address)) => {
+                    outbox::reject_revoked(
+                        &transaction,
+                        owner,
+                        &address.stream_id,
+                        Some(&address.topic_id),
+                    )?;
+                    false
+                }
+                _ => false,
             }
         } else {
             false
@@ -488,7 +501,7 @@ impl Storage {
             false
         };
         // Подтверждение очереди фиксируется вместе с сообщением и позицией события.
-        if source == crate::messenger::SOURCE_ID
+        let send_confirmed = if source == crate::messenger::SOURCE_ID
             && let (Some(message), Some(placement), Some(metadata)) =
                 (change.message, change.placement, change.metadata)
         {
@@ -499,8 +512,10 @@ impl Storage {
                 &placement.stream_id,
                 &placement.topic_id,
                 metadata.author_id,
-            )?;
-        }
+            )?
+        } else {
+            false
+        };
         // Цель уведомления доступна вместе с новым сообщением и его курсором.
         if message_inserted
             && let (Some(message), Some(conversation_id)) =
@@ -559,6 +574,7 @@ impl Storage {
             outcome: ApplyOutcome::Applied,
             message_inserted,
             unread_changed,
+            send_confirmed,
         })
     }
 }

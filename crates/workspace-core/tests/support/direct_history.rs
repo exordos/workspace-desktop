@@ -40,6 +40,9 @@ use workspace_core::{
 
 use super::Fixture;
 
+#[path = "outgoing.rs"]
+mod outgoing;
+
 const CHAT: Uuid = Uuid::from_u128(10);
 const TOPIC: Uuid = Uuid::from_u128(11);
 const OLDER: Uuid = Uuid::from_u128(12);
@@ -54,6 +57,23 @@ const CERT: &[u8] =
     include_bytes!("../../../workspace-desktop/src/shell/background_message/tls/localhost.pem");
 const KEY: &[u8] =
     include_bytes!("../../../workspace-desktop/src/shell/background_message/tls/localhost-key.pem");
+
+type HttpsSocket = BufReader<tokio_rustls::server::TlsStream<TcpStream>>;
+
+/// Согласует протокол событий и сохраняет уже считанные из сокета данные.
+async fn upgrade(mut socket: HttpsSocket, headers: &str) -> WebSocketStream<HttpsSocket> {
+    let key = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("sec-websocket-key")
+                .then(|| value.trim())
+        })
+        .unwrap();
+    let accept = derive_accept_key(key.as_bytes());
+    socket.get_mut().write_all(format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: workspace.events.v1\r\n\r\n").as_bytes()).await.unwrap();
+    WebSocketStream::from_raw_socket(socket, Role::Server, None).await
+}
 
 /// Даёт тесту управлять ответами и задержать одну страницу до выхода из аккаунта.
 #[derive(Default)]
@@ -71,6 +91,7 @@ struct HistoryApi {
     newer_pages: AtomicUsize, // Число запросов к новому краю.
     release: Notify,          // Можно вернуть задержанный ответ.
     topic_realtime: AtomicUsize, // 1 — включить отдельный сценарий событий двух тем.
+    outgoing: Option<Arc<outgoing::Api>>, // Подмена маршрутов очереди для теста отправки.
 }
 
 /// Формирует серверное сообщение с одинаковыми UUID для обоих аккаунтов.
@@ -88,6 +109,7 @@ async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
     let mut socket = BufReader::new(tls.accept(socket).await.unwrap());
     let mut line = String::new();
     socket.read_line(&mut line).await.unwrap();
+    let method = line.split_whitespace().next().unwrap().to_owned();
     let request = Url::parse(&format!(
         "https://localhost{}",
         line.split_whitespace().nth(1).unwrap()
@@ -102,19 +124,12 @@ async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
         }
         headers.push_str(&line);
     }
+    if let Some(outgoing) = &api.outgoing {
+        outgoing.reply(socket, request, &method, &headers).await;
+        return;
+    }
     if api.topic_realtime.load(Relaxed) == 1 && request.path().ends_with("/events/ws") {
-        let key = headers
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("sec-websocket-key")
-                    .then(|| value.trim())
-            })
-            .unwrap();
-        let accept = derive_accept_key(key.as_bytes());
-        socket.get_mut().write_all(format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: workspace.events.v1\r\n\r\n").as_bytes()).await.unwrap();
-        let mut socket =
-            WebSocketStream::from_raw_socket(socket.into_inner(), Role::Server, None).await;
+        let mut socket = upgrade(socket, &headers).await;
         for (version, id, created) in [
             (9, LIVE, "2026-01-01T11:30:00Z"),
             (9, LIVE, "2026-01-01T11:30:00Z"),

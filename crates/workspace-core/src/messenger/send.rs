@@ -1,13 +1,44 @@
 //! Отправляет подготовленный снимок сообщения одной попыткой и возвращает результат для сверки.
 
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::{
-    context::OwnerContext,
+    auth::{AuthError, Service},
+    context::{OwnerContext, SessionGeneration},
+    runtime::SourceError,
     storage::{HistoryMessage, PreparedSend},
+    sync::Sync,
 };
 
-use super::MessengerSource;
+use super::{MessengerSource, history::OpenHistoryError};
+
+/// Причина, по которой нельзя подготовить текст для личного разговора.
+#[derive(Debug, Error)]
+pub enum DirectSendError {
+    #[error("the direct conversation or topic is unavailable")]
+    AccessLost, // Личка или тема недоступна владельцу.
+    #[error("the server did not allow unencrypted messages")]
+    EncryptionUnavailable, // Состояние шифрования неизвестно или шифрование включено.
+    #[error("the server did not provide a valid send topic")]
+    TopicUnavailable, // Личный стрим не объявил пригодную тему для записи.
+    #[error(transparent)]
+    Auth(#[from] AuthError), // Поколение сессии изменилось или не удалось получить токен.
+    #[error(transparent)]
+    Source(#[from] SourceError), // Запрос к мессенджеру не завершился корректно.
+}
+
+impl From<OpenHistoryError> for DirectSendError {
+    /// Переиспользует результат проверки доступа, общей с открытием истории.
+    fn from(error: OpenHistoryError) -> Self {
+        match error {
+            OpenHistoryError::AccessLost => Self::AccessLost,
+            OpenHistoryError::Auth(error) => Self::Auth(error),
+            OpenHistoryError::Source(error) => Self::Source(error),
+            _ => Self::Source(SourceError::InvalidResponse),
+        }
+    }
+}
 
 /// Результат попытки, который определяет дальнейшую сверку очереди.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -21,6 +52,26 @@ pub enum SendError {
 }
 
 impl MessengerSource {
+    /// Возвращает явную тему лички из подтверждённого ответа для того же поколения.
+    pub async fn resolve_direct_send(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        stream_id: Uuid,
+    ) -> Result<Uuid, DirectSendError> {
+        let auth = sync.auth();
+        let token = auth
+            .access_token_for_generation(owner, Service::Messenger, generation)
+            .await?;
+        let topic = self
+            .rest
+            .direct_send_topic(owner, &token, stream_id, None)
+            .await;
+        auth.with_active_generation(owner, generation, || ())?;
+        topic
+    }
+
     /// Ищет подтверждение доставки по публичному UUID, не изменяя очередь.
     pub async fn lookup_prepared_message(
         &self,

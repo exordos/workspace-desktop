@@ -24,7 +24,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::{
-    sync::broadcast,
+    sync::{broadcast, oneshot},
     task::{JoinHandle, JoinSet},
 };
 use tokio_rustls::TlsAcceptor;
@@ -49,6 +49,9 @@ const ORGANIZATION: &str = "10000000-0000-4000-8000-000000000004";
 const DIRECT: &str = "10000000-0000-4000-8000-000000000005";
 const TOPIC: &str = "10000000-0000-4000-8000-000000000006";
 const CHANNEL: &str = "10000000-0000-4000-8000-000000000007";
+const CHANNEL_TOPIC: &str = "10000000-0000-4000-8000-000000000008";
+const OTHER_CHANNEL: &str = "10000000-0000-4000-8000-000000000009";
+const OTHER_TOPIC: &str = "10000000-0000-4000-8000-000000000010";
 const ALL_CHATS: &str = "00000000-0000-0000-0000-000000000000";
 const EPOCH: &str = "integration-test";
 const NEXT_EPOCH: &str = "integration-test-next";
@@ -66,6 +69,32 @@ pub(super) struct MockWorkspace {
 }
 
 impl MockWorkspace {
+    /// Подставляет отказ на проверку темы, пока она ещё показана в каталоге.
+    pub(super) fn deny_channel_topic(&self) {
+        self.journal
+            .deny_channel_topic
+            .store(true, Ordering::Relaxed);
+    }
+
+    /// Задерживает следующую страницу с хвоста, пока тест не разрешит ответ.
+    pub(super) fn pause_next_latest(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (arrived, arrival) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let previous = self
+            .journal
+            .latest_gate
+            .lock()
+            .unwrap()
+            .replace(LatestGate { arrived, released });
+        assert!(previous.is_none());
+        (arrival, release)
+    }
+
+    /// Возвращает заданную ошибку для следующей попытки загрузить хвост.
+    pub(super) fn set_latest_failure(&self, mode: u8) {
+        self.journal.latest_failure.store(mode, Ordering::Relaxed);
+    }
+
     /// Заставляет следующий запрос старой страницы вернуть сетевую ошибку.
     pub(super) fn fail_next_older_page(&self) {
         self.journal.fail_older.store(true, Ordering::Relaxed);
@@ -145,7 +174,16 @@ impl MockWorkspace {
                             if let Ok(socket) = tls.accept(socket).await {
                                 let service = service_fn(move |request| {
                                     let journal = journal.clone();
-                                    async move { Ok::<_, Infallible>(handle(request, journal)) }
+                                    async move {
+                                        if is_latest_page(&request) {
+                                            let gate = journal.latest_gate.lock().unwrap().take();
+                                            if let Some(gate) = gate {
+                                                let _ = gate.arrived.send(());
+                                                let _ = gate.released.await;
+                                            }
+                                        }
+                                        Ok::<_, Infallible>(handle(request, journal))
+                                    }
                                 });
                                 let _ = http1::Builder::new()
                                     .serve_connection(TokioIo::new(socket), service)
@@ -270,6 +308,15 @@ struct Journal {
     fail_catalog: AtomicBool,       // Нужно ли вернуть ошибку при следующей загрузке каталога A.
     fail_older: AtomicBool,         // Нужно ли отклонить следующую старую страницу.
     older_requests: AtomicUsize,    // Число запросов продолжения истории.
+    latest_gate: Mutex<Option<LatestGate>>, // Задержка следующего запроса с конца истории.
+    latest_failure: AtomicU8,       // 0 — успех, 1 — сбой, 2 — доступ отозван.
+    deny_channel_topic: AtomicBool, // Нужно ли отвечать 403 на проверку темы канала.
+}
+
+/// Позволяет тесту менять выбранный аккаунт, пока сервер ещё готовит страницу.
+struct LatestGate {
+    arrived: oneshot::Sender<()>, // Подтверждение, что запрос дошёл до сервера.
+    released: oneshot::Receiver<()>, // Разрешение продолжить обработку.
 }
 
 impl Default for Journal {
@@ -284,6 +331,9 @@ impl Default for Journal {
             fail_catalog: AtomicBool::new(false),
             fail_older: AtomicBool::new(false),
             older_requests: AtomicUsize::new(0),
+            latest_gate: Mutex::new(None),
+            latest_failure: AtomicU8::new(0),
+            deny_channel_topic: AtomicBool::new(false),
         }
     }
 }
@@ -394,6 +444,21 @@ fn handle(mut request: Request<Incoming>, journal: Arc<Journal>) -> Response<Ful
     let event_count = if user == BACKGROUND { entries.len() } else { 0 };
     let path = request.uri().path();
     let value = match path {
+        "/api/workspace/v1/messenger/messages/"
+            if query_value(request.uri(), "stream_uuid") == Some(CHANNEL) =>
+        {
+            assert_eq!(
+                query_value(request.uri(), "topic_uuid"),
+                Some(CHANNEL_TOPIC)
+            );
+            assert_eq!(query_value(request.uri(), "sort_dir"), Some("desc"));
+            json!([{
+                "uuid": "40000000-0000-4000-8000-000000000001", "stream_uuid": CHANNEL,
+                "topic_uuid": CHANNEL_TOPIC, "project_id": PROJECT, "user_uuid": user,
+                "author_uuid": FOREGROUND, "created_at": "2025-02-02T12:00:00Z",
+                "payload": {"kind": "markdown", "content": "Сообщение в теме канала"},
+            }])
+        }
         "/api/workspace/v1/messenger/messages/" if user == BACKGROUND => {
             assert_eq!(query_value(request.uri(), "stream_uuid"), Some(DIRECT));
             if query_value(request.uri(), "sort_dir") == Some("desc") {
@@ -410,16 +475,27 @@ fn handle(mut request: Request<Incoming>, journal: Arc<Journal>) -> Response<Ful
                         "payload": {"kind": "markdown", "content": format!("Предыдущее сообщение {day} {}", "длинная строка ".repeat(day * 4))},
                     })).collect::<Vec<_>>()));
                 }
-                let mut page = response(
-                    StatusCode::OK,
-                    json!((1..=20).rev().map(|day| json!({
+                match journal.latest_failure.swap(0, Ordering::Relaxed) {
+                    1 => return response(StatusCode::SERVICE_UNAVAILABLE, Value::Null),
+                    2 => return response(StatusCode::FORBIDDEN, Value::Null),
+                    _ => {}
+                }
+                let body = if journal.recovery.load(Ordering::Relaxed) == 0 {
+                    "Старое сообщение"
+                } else {
+                    "Сообщение после сброса"
+                };
+                let mut page =
+                    response(
+                        StatusCode::OK,
+                        json!((1..=20).rev().map(|day| json!({
                     "uuid": format!("20000000-0000-4000-8000-{day:012}"),
                     "stream_uuid": DIRECT, "topic_uuid": TOPIC,
                     "project_id": PROJECT, "user_uuid": user, "author_uuid": FOREGROUND,
                     "created_at": format!("2025-01-{day:02}T12:00:00Z"),
-                    "payload": {"kind": "markdown", "content": format!("Старое сообщение {day}")},
+                    "payload": {"kind": "markdown", "content": format!("{body} {day}")},
                 })).collect::<Vec<_>>()),
-                );
+                    );
                 page.headers_mut().insert(
                     "X-Pagination-Marker",
                     HeaderValue::from_static("test-older"),
@@ -466,6 +542,9 @@ fn handle(mut request: Request<Incoming>, journal: Arc<Journal>) -> Response<Ful
                 json!([{
                     "uuid": CHANNEL, "user_uuid": user, "project_id": PROJECT,
                     "name": name, "private": false, "is_archived": false,
+                }, {
+                    "uuid": OTHER_CHANNEL, "user_uuid": user, "project_id": PROJECT,
+                    "name": "Новости", "private": false, "is_archived": false,
                 }])
             } else {
                 let peer = if user == FOREGROUND {
@@ -486,8 +565,11 @@ fn handle(mut request: Request<Incoming>, journal: Arc<Journal>) -> Response<Ful
             }
         }
         "/api/workspace/v1/messenger/stream_topics/" => json!([{
-            "uuid": TOPIC, "stream_uuid": CHANNEL, "user_uuid": user, "project_id": PROJECT,
+            "uuid": CHANNEL_TOPIC, "stream_uuid": CHANNEL, "user_uuid": user, "project_id": PROJECT,
             "name": "Планы",
+        }, {
+            "uuid": OTHER_TOPIC, "stream_uuid": OTHER_CHANNEL, "user_uuid": user, "project_id": PROJECT,
+            "name": "Архив",
         }]),
         "/api/workspace/v1/users/" => json!([
             {"uuid": FOREGROUND, "username": "alice", "first_name": "Алиса"},
@@ -524,9 +606,25 @@ fn handle(mut request: Request<Incoming>, journal: Arc<Journal>) -> Response<Ful
             "uuid": TOPIC, "stream_uuid": DIRECT, "user_uuid": user, "project_id": PROJECT,
             "notification_mode": "default",
         }),
+        "/api/workspace/v1/messenger/stream_topics/10000000-0000-4000-8000-000000000008" => {
+            if journal.deny_channel_topic.load(Ordering::Relaxed) {
+                return response(StatusCode::FORBIDDEN, Value::Null);
+            }
+            json!({
+                "uuid": CHANNEL_TOPIC, "stream_uuid": CHANNEL, "user_uuid": user,
+                "project_id": PROJECT, "notification_mode": "default",
+            })
+        }
         _ => return response(StatusCode::NOT_FOUND, Value::Null),
     };
     response(StatusCode::OK, value)
+}
+
+/// Отличает запрос хвоста от страниц по маркеру и отдельного сообщения.
+fn is_latest_page(request: &Request<Incoming>) -> bool {
+    request.uri().path() == "/api/workspace/v1/messenger/messages/"
+        && query_value(request.uri(), "page_marker").is_none()
+        && query_value(request.uri(), "sort_dir") == Some("desc")
 }
 
 /// Возвращает числовую позицию, которую клиент передал в строке запроса.

@@ -3,6 +3,8 @@
 
 mod live;
 mod mock;
+mod navigation;
+mod outgoing_ui;
 
 use std::{path::Path, time::Duration};
 
@@ -17,7 +19,7 @@ use iced_runtime::user_interface::{Cache, UserInterface};
 use tokio::time::timeout;
 use uuid::Uuid;
 use workspace_core::auth::{SecretStore, StoreError};
-use workspace_core::bootstrap;
+use workspace_core::bootstrap::{self, ChatListStatus};
 use workspace_core::messenger::MessengerSource;
 use workspace_core::runtime::{Runtime, RuntimeError};
 use workspace_core::storage::Storage;
@@ -581,7 +583,13 @@ async fn background_message_scenario(workspace: &impl TestWorkspace, check_catal
             .unwrap();
         let mut messages = click_ui(&mut ui, &mut renderer, bounds.center());
         drop(ui);
-        assert!(matches!(messages.as_slice(), [Message::RetryChats]));
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::Sidebar {
+                action: SidebarAction::Retry,
+                ..
+            }]
+        ));
         let _ = shell.update(messages.remove(0));
         timeout(DEADLINE, async {
             while !shell
@@ -597,7 +605,7 @@ async fn background_message_scenario(workspace: &impl TestWorkspace, check_catal
         let loaded = RenderedText::from_shell(&shell, &mut renderer);
         assert!(loaded.contains("Канал A"));
         assert!(loaded.contains("Борис"));
-        assert!(loaded.contains("# Планы"));
+        assert!(!loaded.contains("Планы"));
         assert!(!loaded.contains("Канал B"));
         assert!(!loaded.contains("Повторить"));
     }
@@ -700,7 +708,7 @@ async fn background_message_scenario(workspace: &impl TestWorkspace, check_catal
 async fn refresh_open_history_scenario(shell: &mut Shell, renderer: &mut iced::Renderer) {
     use workspace_core::messenger::SOURCE_ID;
     use workspace_core::storage::{
-        HistoryMetadata, HistoryTime, Message as StoredMessage, MessagePlacement,
+        HistoryChange, HistoryMetadata, HistoryTime, Message as StoredMessage, MessagePlacement,
     };
     use workspace_core::sync::{ApplyOutcome, Event};
 
@@ -708,7 +716,7 @@ async fn refresh_open_history_scenario(shell: &mut Shell, renderer: &mut iced::R
     let HistoryState::Ready(window) = &screen.state else {
         panic!("ожидалось открытое окно")
     };
-    let owner = screen.target.context.clone();
+    let owner = screen.route.owner.clone();
     let generation = screen.generation;
     let stream_id = window.scope.stream_id.to_string();
     let mut cursor = shell
@@ -763,7 +771,8 @@ async fn refresh_open_history_scenario(shell: &mut Shell, renderer: &mut iced::R
         .clone();
     assert!(into_stream(shell.update(Message::Synced(wrong_owner))).is_none());
     assert!(!RenderedText::from_shell(shell, renderer).contains("Внутри участка"));
-    assert!(into_stream(shell.update(Message::Synced(update.clone()))).is_none());
+    let task = shell.update(Message::Synced(update.clone()));
+    let cache = apply_history_tasks(shell, renderer, Cache::new(), task).await;
     let HistoryState::Ready(window) = &shell.visible_history().unwrap().state else {
         panic!("после входящего сообщения история должна остаться открытой");
     };
@@ -795,6 +804,36 @@ async fn refresh_open_history_scenario(shell: &mut Shell, renderer: &mut iced::R
         updates.try_recv(),
         Err(broadcast::error::TryRecvError::Empty)
     ));
+
+    // Удаление, пришедшее до замера создания, не должно вернуть уже удалённую строку.
+    cursor.epoch_version += 1;
+    let transient = make_event(
+        cursor.clone(),
+        "2025-01-10T14:00:00Z",
+        stream_id.clone(),
+        "Удалено до разметки",
+    );
+    let Event::MessageCreated { message, .. } = &transient else {
+        unreachable!()
+    };
+    let id = message.id.clone();
+    sync.apply(&owner, generation, SOURCE_ID, transient)
+        .unwrap();
+    let task = shell.update(Message::Synced(updates.try_recv().unwrap()));
+    cursor.epoch_version += 1;
+    sync.apply(
+        &owner,
+        generation,
+        SOURCE_ID,
+        Event::HistoryChanged {
+            cursor: cursor.clone(),
+            change: HistoryChange::RemoveMessage(id),
+        },
+    )
+    .unwrap();
+    assert!(into_stream(shell.update(Message::Synced(updates.try_recv().unwrap()))).is_none());
+    apply_history_tasks(shell, renderer, cache, task).await;
+    assert!(!RenderedText::from_shell(shell, renderer).contains("Удалено до разметки"));
 
     for (timestamp, stream, label) in [
         ("2025-03-01T12:00:00Z", stream_id.clone(), "За краем"),
@@ -973,7 +1012,7 @@ async fn notification_click_scenario(
         };
         let mut ui = UserInterface::build(shell.view(), Size::new(620.0, 360.0), cache, renderer);
         ui.operate(renderer, operation.as_mut());
-        let mut layout = HistoryViewport::default();
+        let mut layout = HistoryViewport::new(shell.navigation_revision);
         ui.operate(renderer, &mut layout);
         let mut labels = RenderedText::default();
         ui.operate(renderer, &mut labels);
@@ -1082,8 +1121,9 @@ async fn notification_click_scenario(
 
     let loaded = load(shell, renderer).await;
     let _ = shell.update(Message::NotificationClicked(click.clone()));
-    assert!(into_stream(shell.update(loaded)).is_none());
-    assert!(!RenderedText::from_shell(shell, renderer).contains(body));
+    // Новый баннер ещё не прошёл проверку и не отменяет открытие текущего разговора.
+    assert!(into_stream(shell.update(loaded)).is_some());
+    assert!(RenderedText::from_shell(shell, renderer).contains(body));
 
     let mut loaded = load(shell, renderer).await;
     let _ = shell.update(loaded.clone());
@@ -1168,10 +1208,27 @@ async fn run_history_task(
     (ui.into_cache(), output)
 }
 
+/// Передаёт все замеры и коррекцию истории обычному циклу обновления Iced.
+async fn apply_history_tasks(
+    shell: &mut Shell,
+    renderer: &mut iced::Renderer,
+    mut cache: Cache,
+    mut task: Task<Message>,
+) -> Cache {
+    loop {
+        let output;
+        (cache, output) = run_history_task(shell, renderer, cache, task).await;
+        let Some(message) = output else {
+            return cache;
+        };
+        task = shell.update(message);
+    }
+}
+
 /// Посылает настоящее колесо мыши в область списка и возвращает событие оболочки.
 fn wheel_history(shell: &Shell, renderer: &mut iced::Renderer, cache: Cache) -> (Cache, Message) {
     let mut ui = UserInterface::build(shell.view(), Size::new(620.0, 360.0), cache, renderer);
-    let mut viewport = HistoryViewport::default();
+    let mut viewport = HistoryViewport::new(shell.navigation_revision);
     ui.operate(renderer, &mut viewport);
     let mut messages = Vec::new();
     ui.update(
@@ -1193,7 +1250,7 @@ fn wheel_history(shell: &Shell, renderer: &mut iced::Renderer, cache: Cache) -> 
 /// Перетаскивает полосу истории из нижнего положения к верхнему краю.
 fn drag_history(shell: &Shell, renderer: &mut iced::Renderer, cache: Cache) -> (Cache, Message) {
     let mut ui = UserInterface::build(shell.view(), Size::new(620.0, 360.0), cache, renderer);
-    let mut viewport = HistoryViewport::default();
+    let mut viewport = HistoryViewport::new(shell.navigation_revision);
     ui.operate(renderer, &mut viewport);
     let (bounds, _) = viewport.0.unwrap();
     let start = iced::Point::new(
@@ -1237,7 +1294,7 @@ fn drag_history(shell: &Shell, renderer: &mut iced::Renderer, cache: Cache) -> (
 /// Считывает положение текста первой исходной строки внутри области списка.
 fn older_anchor_offset(shell: &Shell, renderer: &mut iced::Renderer, cache: Cache) -> (Cache, f32) {
     let mut ui = UserInterface::build(shell.view(), Size::new(620.0, 360.0), cache, renderer);
-    let mut viewport = HistoryViewport::default();
+    let mut viewport = HistoryViewport::new(shell.navigation_revision);
     let mut labels = RenderedText::default();
     ui.operate(renderer, &mut viewport);
     ui.operate(renderer, &mut labels);
@@ -1324,7 +1381,7 @@ async fn load_older_scenario(
             let HistoryState::Ready(window) = &screen.state else {
                 panic!("история должна быть открыта")
             };
-            let owner = screen.target.context.clone();
+            let owner = screen.route.owner.clone();
             let generation = screen.generation;
             let stream = window.scope.stream_id;
             let sync = shell.sources.0.sync.clone();
@@ -1353,7 +1410,8 @@ async fn load_older_scenario(
                 },
             )
             .unwrap();
-            let _ = shell.update(Message::Synced(updates.try_recv().unwrap()));
+            let task = shell.update(Message::Synced(updates.try_recv().unwrap()));
+            cache = apply_history_tasks(shell, renderer, cache, task).await;
             let rendered = RenderedText::from_shell(shell, renderer);
             assert!(rendered.contains("Событие во время догрузки"));
             assert!(
@@ -1403,8 +1461,17 @@ async fn load_older_scenario(
 }
 
 /// Запоминает положение прокрутки в разметке открытой истории.
-#[derive(Default)]
-struct HistoryViewport(Option<(Rectangle, f32)>); // Область просмотра и сдвиг содержимого.
+struct HistoryViewport(
+    Option<(Rectangle, f32)>, // Область просмотра и сдвиг содержимого.
+    Id,                       // Идентификатор открытого списка истории.
+);
+
+impl HistoryViewport {
+    /// Следит только за историей, даже если рядом прокручивается каталог.
+    fn new(revision: u64) -> Self {
+        Self(None, history::list_id(revision))
+    }
+}
 
 impl Operation for HistoryViewport {
     /// Доходит до прокручиваемого списка истории.
@@ -1415,13 +1482,15 @@ impl Operation for HistoryViewport {
     /// Сохраняет размеры области и фактический сдвиг после команды Iced.
     fn scrollable(
         &mut self,
-        _: Option<&Id>,
+        id: Option<&Id>,
         bounds: Rectangle,
         _: Rectangle,
         translation: iced::Vector,
         _: &mut dyn iced::advanced::widget::operation::Scrollable,
     ) {
-        self.0 = Some((bounds, translation.y));
+        if id == Some(&self.1) {
+            self.0 = Some((bounds, translation.y));
+        }
     }
 }
 

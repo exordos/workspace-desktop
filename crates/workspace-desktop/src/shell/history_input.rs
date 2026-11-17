@@ -98,12 +98,18 @@ impl Widget<Message, iced::Theme, iced::Renderer> for HistoryInput<'_> {
         let gesture = match event {
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if over => match delta {
                 mouse::ScrollDelta::Lines { y, .. } | mouse::ScrollDelta::Pixels { y, .. } => {
+                    if *y < 0.0 {
+                        shell.publish(Message::HistoryManualScroll(self.revision));
+                    }
                     *y > 0.0
                 }
             },
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 // Полоса захватывает нажатие; обычный клик по тексту не запускает догрузку.
                 state.dragging = over && shell.is_event_captured();
+                if state.dragging {
+                    shell.publish(Message::HistoryManualScroll(self.revision));
+                }
                 false
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
