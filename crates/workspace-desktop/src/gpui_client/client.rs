@@ -11,7 +11,7 @@ use workspace_core::{auth::SessionStatus, context::AccountId};
 use super::{
     Options,
     contracts::{RuntimeEvent, RuntimeExit, ShellAction, SidebarAction},
-    conversation::Conversation,
+    conversation::{Conversation, OpenDetailsTopic},
     next_control,
     platform_window::WindowPlatform,
     previous_control,
@@ -42,16 +42,17 @@ pub(super) struct Client {
     runtime: RuntimeClient,   // Очередь команд рабочего потока этого профиля.
     sidebar: Entity<Sidebar>, // Единственный каталог; хранит поиск каждого входа.
     conversation: Option<Entity<Conversation>>, // Экран актуального адреса, если он открыт.
-    sign_in: Option<Entity<SignIn>>, // Форма нужна, пока в профиле нет доступного входа.
-    labels: HashMap<AccountId, String>, // Подписи для переключателя и баннеров.
-    top_bar: Entity<TopBar>,  // Шапка хранит локальный фокус и показывает снимок оболочки.
+    details_navigation: Option<Subscription>, // Подписка на переход из правой панели текущего экрана.
+    sign_in: Option<Entity<SignIn>>,          // Форма нужна, пока в профиле нет доступного входа.
+    labels: HashMap<AccountId, String>,       // Подписи для переключателя и баннеров.
+    top_bar: Entity<TopBar>, // Шапка хранит локальный фокус и показывает снимок оболочки.
     _top_bar_subscription: Subscription, // Передаёт выбор в оболочку.
     initial_focus: FocusHandle, // Корневая точка обхода до выбора первого элемента.
-    restore_focus: bool,      // После закрытия формы вернуть фокус в рабочую область.
-    ready: bool,              // Рабочий поток открыл профиль и подготовил подписки.
-    received_accounts: bool,  // Пришёл первый снимок аккаунтов, может быть пустым.
+    restore_focus: bool,     // После закрытия формы вернуть фокус в рабочую область.
+    ready: bool,             // Рабочий поток открыл профиль и подготовил подписки.
+    received_accounts: bool, // Пришёл первый снимок аккаунтов, может быть пустым.
     startup_error: Option<StartupError>, // Безопасная причина сбоя открытия профиля.
-    stopped: bool,            // Фоновая работа завершилась с ошибкой.
+    stopped: bool,           // Фоновая работа завершилась с ошибкой.
     _sidebar_subscription: Subscription, // Направляет команды каталога в оболочку.
     runtime_events: Option<Task<()>>, // Подписка живёт столько же, сколько окно.
 }
@@ -82,6 +83,7 @@ impl Client {
             runtime,
             sidebar,
             conversation: None,
+            details_navigation: None,
             sign_in: None,
             labels: options.labels,
             top_bar,
@@ -170,9 +172,19 @@ impl Client {
         match effect {
             Some(ShellEffect::OpenConversation(address)) => {
                 let runtime = self.runtime.clone();
-                self.conversation = Some(cx.new(|cx| Conversation::open(address, runtime, cx)));
+                let conversation = cx.new(|cx| Conversation::open(address, runtime, cx));
+                self.details_navigation = Some(cx.subscribe(
+                    &conversation,
+                    |client, _, target: &OpenDetailsTopic, cx| {
+                        client.open_details_topic(target, cx)
+                    },
+                ));
+                self.conversation = Some(conversation);
             }
-            Some(ShellEffect::CloseConversation) => self.conversation = None,
+            Some(ShellEffect::CloseConversation) => {
+                self.details_navigation = None;
+                self.conversation = None;
+            }
             Some(ShellEffect::RetryCatalog(session)) => {
                 let runtime = self.runtime.clone();
                 cx.spawn(async move |_, _| {
@@ -221,6 +233,19 @@ impl Client {
             view.update_snapshot(self.shell.selected(), catalog, conversation, cx);
         });
         cx.notify();
+    }
+
+    /// Переключает тему из открытой панели и оставляет панель на новом адресе.
+    fn open_details_topic(&mut self, target: &OpenDetailsTopic, cx: &mut Context<Self>) {
+        if let Some(effect) = self
+            .shell
+            .open_details_topic(&target.address, target.topic_id)
+        {
+            self.apply(Some(effect), cx);
+            if let Some(conversation) = &self.conversation {
+                conversation.update(cx, Conversation::restore_open_details);
+            }
+        }
     }
 
     /// Показывает вход после чтения профиля и передаёт окно первой готовой сессии после входа.

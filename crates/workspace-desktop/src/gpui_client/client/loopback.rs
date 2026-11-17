@@ -40,7 +40,7 @@ use workspace_core::{
         StoreError,
     },
     context::OwnerContext,
-    messenger::{SOURCE_ID, details::ConversationDetails},
+    messenger::{SOURCE_ID, details::SidebarDetails},
     storage::{Message as StoredMessage, Storage},
     sync::Event,
 };
@@ -60,6 +60,9 @@ const TOPIC: &str = "10000000-0000-4000-8000-000000000006";
 const CHANNEL: &str = "10000000-0000-4000-8000-000000000007";
 const CHANNEL_DEFAULT: &str = "10000000-0000-4000-8000-000000000008";
 const CHANNEL_TOPIC: &str = "10000000-0000-4000-8000-000000000009";
+const CHANNEL_BINDING: &str = "10000000-0000-4000-8000-000000000010";
+const CHANNEL_SECOND_TOPIC_ROW: &str = "details-topic-10000000-0000-4000-8000-000000000008";
+const BINDINGS: &str = "/api/workspace/v1/messenger/stream_bindings/";
 const OLD_ROW: Uuid = Uuid::from_u128(71);
 const FRESH_ROW: Uuid = Uuid::from_u128(72);
 const PEER_ROW: Uuid = Uuid::from_u128(73);
@@ -247,7 +250,9 @@ struct TopicAcceptance {
 struct DetailsFixture {
     users: Mutex<Vec<(&'static str, &'static str)>>, // Токен владельца и UUID собеседника.
     unblock: Mutex<Option<oneshot::Receiver<()>>>,   // Удерживает ровно один ответ профиля.
-    denied_topic: AtomicBool, // Возвращает 403 для темы, которую уже показывает окно.
+    live: Mutex<Option<broadcast::Sender<RecoverySignal>>>, // Кадры журнала аккаунта A.
+    notifications_muted: AtomicBool,                 // Последняя настройка канала на сервере.
+    channel_requests: AtomicUsize,                   // Число чтений тем для построения сведений.
     omit_stream_user: AtomicBool, // Имитирует старый ответ, который не подтверждает владельца.
 }
 
@@ -413,6 +418,14 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
                 live = Some((recovery.live.subscribe(), recovery.changed_epoch));
             }
         }
+        if user == USER
+            && let Some(sender) = state
+                .details
+                .as_ref()
+                .and_then(|details| details.live.lock().unwrap().clone())
+        {
+            live = Some((sender.subscribe(), false));
+        }
         let key = request.headers().get(header::SEC_WEBSOCKET_KEY).unwrap();
         let accept = derive_accept_key(key.as_bytes());
         let upgrade = hyper::upgrade::on(&mut request);
@@ -512,10 +525,10 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
             assert_eq!(request.method(), Method::GET);
             details.users.lock().unwrap().push((user, peer));
             let waiting = details.unblock.lock().unwrap().take();
-            let name = if let Some(waiting) = waiting {
+            if let Some(waiting) = waiting {
                 let _ = waiting.await;
-                "Устаревший профиль"
-            } else if peer == PEER {
+            }
+            let name = if peer == PEER {
                 "Собеседник A"
             } else {
                 "Собеседник B"
@@ -528,9 +541,32 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
                 }),
             );
         }
-        if path == format!("{TOPICS}{CHANNEL_TOPIC}") && details.denied_topic.load(Ordering::SeqCst)
-        {
-            return json_response(StatusCode::FORBIDDEN, Value::Null);
+        if path == format!("{STREAMS}{CHANNEL}/actions/notifications/invoke") {
+            assert_eq!(request.method(), Method::POST);
+            let bytes = request.into_body().collect().await.unwrap().to_bytes();
+            let data: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(data["notification_mode"], "muted");
+            details.notifications_muted.store(true, Ordering::SeqCst);
+            return json_response(StatusCode::OK, json!({}));
+        }
+        if path == BINDINGS && query_value(&request, "stream_uuid") == Some(CHANNEL) {
+            return json_response(
+                StatusCode::OK,
+                json!([{
+                    "uuid": CHANNEL_BINDING, "stream_uuid": CHANNEL, "project_id": PROJECT,
+                    "user_uuid": peer, "role": "member"
+                }]),
+            );
+        }
+        if path == TOPICS && query_value(&request, "stream_uuid") == Some(CHANNEL) {
+            details.channel_requests.fetch_add(1, Ordering::SeqCst);
+            let mut second = channel_topic(user, TopicGate::Open);
+            second["uuid"] = json!(CHANNEL_DEFAULT);
+            second["name"] = json!("Первая тема");
+            return json_response(
+                StatusCode::OK,
+                json!([channel_topic(user, TopicGate::Open), second]),
+            );
         }
     }
 
@@ -555,7 +591,11 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         MESSAGES
             if state.topic.is_some() && query_value(&request, "stream_uuid") == Some(CHANNEL) =>
         {
-            assert_eq!(query_value(&request, "topic_uuid"), Some(CHANNEL_TOPIC));
+            let requested_topic = query_value(&request, "topic_uuid").unwrap();
+            if state.details.is_some() && requested_topic == CHANNEL_DEFAULT {
+                return json_response(StatusCode::OK, json!([]));
+            }
+            assert_eq!(requested_topic, CHANNEL_TOPIC);
             let mut rows = vec![topic_message(
                 user,
                 peer,
@@ -632,7 +672,20 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         path if state.topic.is_some() && path.ends_with(CHANNEL) => {
             state.targets.fetch_add(1, Ordering::SeqCst);
             let gate = *state.topic.as_ref().unwrap().gate.lock().unwrap();
-            topic_channel(user, gate == TopicGate::Encrypted)
+            let mut channel = topic_channel(user, gate == TopicGate::Encrypted);
+            if let Some(details) = &state.details {
+                channel["owner"] = json!(user);
+                if details.notifications_muted.load(Ordering::SeqCst) {
+                    channel["notification_mode"] = json!("muted");
+                }
+            }
+            channel
+        }
+        path if state.details.is_some() && path.ends_with(CHANNEL_DEFAULT) => {
+            let mut row = channel_topic(user, TopicGate::Open);
+            row["uuid"] = json!(CHANNEL_DEFAULT);
+            row["name"] = json!("Первая тема");
+            row
         }
         path if state.topic.is_some() && path.ends_with(CHANNEL_TOPIC) => {
             let gate = *state.topic.as_ref().unwrap().gate.lock().unwrap();
@@ -1060,9 +1113,13 @@ fn wait_topic_confirmation(
 #[gpui::test]
 fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
     cx.update(bind_keys);
+    let (live, _) = broadcast::channel(8);
     let server = Server::serve(Received {
         topic: Some(TopicAcceptance::default()),
-        details: Some(DetailsFixture::default()),
+        details: Some(DetailsFixture {
+            live: Mutex::new(Some(live.clone())),
+            ..DetailsFixture::default()
+        }),
         ..Received::default()
     });
     let details = server.state.details.as_ref().unwrap();
@@ -1139,9 +1196,10 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
     );
     assert_eq!(details.users.lock().unwrap().as_slice(), &[(USER, PEER)]);
     ui.read(|app| {
-        let Some(ConversationDetails::Peer(profile)) = first.read(app).tested_details() else {
+        let Some(SidebarDetails::Peer(peer)) = first.read(app).tested_details() else {
             panic!("Ожидался профиль собеседника");
         };
+        let profile = &peer.profile;
         assert_eq!(profile.display_name, "Собеседник A");
         assert_eq!(profile.email.as_deref(), Some("peer@fixture.test"));
         assert_eq!(
@@ -1176,36 +1234,41 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
     );
     ui.read(|app| assert_eq!(composer.read(app).draft(app), MARKER));
 
-    let (release, unblock) = oneshot::channel();
-    *details.unblock.lock().unwrap() = Some(unblock);
+    let stream_reads = server.state.targets.load(Ordering::SeqCst);
     press_enter(ui);
     until(
         ui,
-        "первый профиль после открытия задержан",
+        "личка открывает сохранённую карточку",
         |ui| {
-            details.users.lock().unwrap().len() == 2
-                && ui.debug_bounds("conversation-details-loading").is_some()
+            ui.read(|app| {
+                matches!(
+                    first.read(app).tested_details(),
+                    Some(SidebarDetails::Peer(_))
+                )
+            })
         },
     );
-    ui.simulate_keystrokes("escape");
-    ui.run_until_parked();
-    press_enter(ui);
-    until(
-        ui,
-        "тот же адрес запросил профиль заново",
-        |ui| {
-            details.users.lock().unwrap().len() == 3
-                && ui.debug_bounds("conversation-details-peer").is_some()
-        },
-    );
-    let _ = release.send(());
-    ui.run_until_parked();
-    ui.read(|app| {
-        assert!(matches!(
-            first.read(app).tested_details(),
-            Some(ConversationDetails::Peer(profile)) if profile.display_name == "Собеседник A"
-        ));
+    assert_eq!(details.users.lock().unwrap().as_slice(), &[(USER, PEER)]);
+    assert_eq!(server.state.targets.load(Ordering::SeqCst), stream_reads);
+
+    let profile_updated = json!({
+        "schema_version":1, "uuid":Uuid::new_v4(), "epoch_generation":"local", "epoch_version":2,
+        "project_id":PROJECT, "user_uuid":USER, "object_type":"user", "action":"updated",
+        "payload": {"kind":"user.updated", "uuid":PEER, "username":"peer",
+                    "first_name":"Профиль после события", "status":"active"},
     });
+    assert!(live.send(RecoverySignal::Event(profile_updated)).is_ok());
+    until(
+        ui,
+        "событие обновляет открытую карточку без повторного GET",
+        |ui| {
+            ui.read(|app| matches!(
+            first.read(app).tested_details(),
+            Some(SidebarDetails::Peer(peer)) if peer.profile.display_name == "Профиль после события"
+        ))
+        },
+    );
+    assert_eq!(details.users.lock().unwrap().as_slice(), &[(USER, PEER)]);
 
     click_account(&client, ui, &b_id);
     assert!(ui.read(|app| client.read(app).conversation.is_none()));
@@ -1213,15 +1276,73 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
     until(
         ui,
         "личка B использует другой аккаунт",
-        |ui| ui.debug_bounds("workspace-composer-editor").is_some(),
+        |ui| {
+            ui.read(|app| {
+                client
+                    .read(app)
+                    .conversation
+                    .as_ref()
+                    .is_some_and(|view| view.read(app).has_access())
+            })
+        },
+    );
+    let (release, unblock) = oneshot::channel();
+    *details.unblock.lock().unwrap() = Some(unblock);
+    click(ui, DETAILS_TRIGGER);
+    until(
+        ui,
+        "сервер удерживает профиль B",
+        |_| details.users.lock().unwrap().last() == Some(&(PEER, USER)),
+    );
+    click_account(&client, ui, &a_id);
+    click(ui, CHAT_ROW);
+    until(
+        ui,
+        "личка A снова получила доступ",
+        |ui| {
+            ui.read(|app| {
+                client
+                    .read(app)
+                    .conversation
+                    .as_ref()
+                    .is_some_and(|view| view.read(app).has_access())
+            })
+        },
+    );
+    click(ui, DETAILS_TRIGGER);
+    let _ = release.send(());
+    until(
+        ui,
+        "поздний профиль B не подменяет карточку A",
+        |ui| {
+            ui.read(|app| client.read(app).conversation.as_ref().is_some_and(|view| {
+            matches!(view.read(app).tested_details(), Some(SidebarDetails::Peer(peer)) if peer.profile.display_name == "Профиль после события")
+        }))
+        },
+    );
+    click_account(&client, ui, &b_id);
+    click(ui, CHAT_ROW);
+    until(
+        ui,
+        "личка B снова получила доступ",
+        |ui| {
+            ui.read(|app| {
+                client
+                    .read(app)
+                    .conversation
+                    .as_ref()
+                    .is_some_and(|view| view.read(app).has_access())
+            })
+        },
     );
     click(ui, DETAILS_TRIGGER);
     until(
         ui,
         "токен B запросил своего собеседника",
         |ui| {
-            details.users.lock().unwrap().last() == Some(&(PEER, USER))
-                && ui.debug_bounds("conversation-details-peer").is_some()
+            ui.read(|app| client.read(app).conversation.as_ref().is_some_and(|view| {
+            matches!(view.read(app).tested_details(), Some(SidebarDetails::Peer(peer)) if peer.profile.display_name == "Собеседник B")
+        }))
         },
     );
     ui.simulate_resize(size(px(700.), px(600.)));
@@ -1254,11 +1375,22 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
         |ui| ui.debug_bounds("conversation-details-topic").is_some(),
     );
     ui.read(|app| {
-        assert!(matches!(
-            topic.read(app).tested_details(),
-            Some(ConversationDetails::Topic { channel, name, description: Some(description), done: Some(false) })
-                if channel == "Канал UI-12" && name == "Длинная тема" && description == "Описание синтетического канала"
-        ));
+        let Some(SidebarDetails::Channel(channel)) = topic.read(app).tested_details() else {
+            panic!("Ожидались сведения канала");
+        };
+        assert_eq!(channel.name, "Канал UI-12");
+        assert_eq!(
+            channel.description.as_deref(),
+            Some("Описание синтетического канала")
+        );
+        assert!(
+            channel
+                .topics
+                .iter()
+                .any(|row| row.id.to_string() == CHANNEL_TOPIC && row.name == "Длинная тема")
+        );
+        assert_eq!(channel.members.len(), 1);
+        assert!(channel.can_add_members);
     });
     assert_eq!(ui.debug_bounds("conversation-chat").unwrap(), chat_before);
     assert_eq!(
@@ -1276,19 +1408,58 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
     click(ui, "conversation-details-close");
     assert!(!ui.read(|app| topic.read(app).tested_details_is_open()));
 
-    details.denied_topic.store(true, Ordering::SeqCst);
+    let reads = details.channel_requests.load(Ordering::SeqCst);
     press_enter(ui);
     until(
         ui,
-        "запрет сервера скрывает историю и панель",
+        "канал тоже восстанавливает карточку из кэша",
         |ui| {
-            ui.debug_bounds("history-error").is_some()
-                && ui.read(|app| {
-                    let topic = topic.read(app);
-                    !topic.has_access() && !topic.tested_details_is_open()
-                })
+            ui.read(|app| {
+                matches!(
+                    topic.read(app).tested_details(),
+                    Some(SidebarDetails::Channel(_))
+                )
+            })
         },
     );
+    assert_eq!(details.channel_requests.load(Ordering::SeqCst), reads);
+
+    click(ui, "details-notification-muted");
+    until(
+        ui,
+        "настройка канала обновляется после подтверждения HTTP",
+        |ui| {
+            details.notifications_muted.load(Ordering::SeqCst) && ui.read(|app| {
+            matches!(
+                topic.read(app).tested_details(),
+                Some(SidebarDetails::Channel(channel))
+                    if channel.notification_mode == workspace_core::messenger::details::StreamNotificationMode::Muted
+            )
+        })
+        },
+    );
+    ui.simulate_resize(size(px(1440.), px(900.)));
+    ui.run_until_parked();
+    let reads = details.channel_requests.load(Ordering::SeqCst);
+    click(ui, CHANNEL_SECOND_TOPIC_ROW);
+    until(
+        ui,
+        "переход на другую тему сохраняет панель того же канала",
+        |ui| {
+            ui.read(|app| {
+                client.read(app).conversation.as_ref().is_some_and(|view| {
+                    let view = view.read(app);
+                    view.address()
+                        .route
+                        .scope
+                        .topic_id
+                        .is_some_and(|id| id.to_string() == CHANNEL_DEFAULT)
+                        && matches!(view.tested_details(), Some(SidebarDetails::Channel(_)))
+                })
+            })
+        },
+    );
+    assert_eq!(details.channel_requests.load(Ordering::SeqCst), reads);
     assert_eq!(
         futures::executor::block_on(runtime.shutdown()),
         RuntimeExit::Clean

@@ -8,8 +8,8 @@ mod viewport;
 
 use futures::channel::oneshot;
 use gpui::{
-    App, Context, Entity, FocusHandle, IntoElement, KeyDownEvent, Render, Subscription, Window,
-    div, prelude::*, px,
+    App, Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyDownEvent, Render,
+    Subscription, Window, div, prelude::*, px,
 };
 use uuid::Uuid;
 use workspace_core::{
@@ -58,6 +58,14 @@ struct Heading {
     topic: Option<String>, // Название темы, если открыт её адрес.
     direct: bool,          // В заголовке лички показываем инициалы собеседника.
 }
+
+/// Переход из правой панели, который должна подтвердить оболочка.
+pub(super) struct OpenDetailsTopic {
+    pub address: ConversationAddress, // Полный адрес панели, откуда пришло действие.
+    pub topic_id: Uuid,               // UUID выбранной темы в том же канале.
+}
+
+impl EventEmitter<OpenDetailsTopic> for Conversation {}
 
 /// История, адрес открытия и очередь сообщений одного экрана.
 pub struct Conversation {
@@ -284,6 +292,9 @@ impl Conversation {
         let scope = self.address.route.scope;
         match update.change {
             SyncChange::MessengerReset => self.restart(cx),
+            SyncChange::SidebarDetailsChanged { stream_id } if scope.stream_id == stream_id => {
+                self.refresh_open_details(cx);
+            }
             SyncChange::HistoryAccessRevoked(HistoryRevocation::Stream(stream))
                 if scope.stream_id == stream =>
             {
@@ -928,11 +939,13 @@ impl Render for Conversation {
     /// Сохраняет историю и редактор на месте при показе правой панели.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
+        self.restore_details_for_verified_history(window, cx);
+        self.restore_details_focus(window);
         let can_open = self.can_open_details();
         let chat = self.render_chat(palette, cx);
         let panel = self.details.as_ref().and_then(|panel| {
             panel.return_focus_after_clear(window, cx, &self.screen_focus, can_open);
-            panel.render(palette, window.viewport_size().width, cx)
+            panel.render(palette, window.viewport_size().width, &self.address, cx)
         });
         div()
             .id("conversation-layout")
