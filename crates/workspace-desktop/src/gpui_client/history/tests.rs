@@ -470,3 +470,10 @@ fn losing_latest_edge_does_not_move_a_history_reader(cx: &mut TestAppContext) {
         "Позиция опоры: {before} → {after}"
     );
 }
+
+impl Conversation {
+    /// Проверяет, была ли строка измерена в последнем кадре тестового окна.
+    pub(in crate::gpui_client) fn message_visible_for_test(&self, id: Uuid) -> bool {
+        self.viewport.y(id).is_some()
+    }
+}
