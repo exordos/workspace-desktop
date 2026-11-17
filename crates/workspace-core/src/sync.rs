@@ -645,17 +645,37 @@ impl Sync {
         owner: &OwnerContext,
         generation: SessionGeneration,
         stream_id: Uuid,
-        revoked: bool,
     ) -> Result<(), AuthError> {
         self.auth.with_active_generation(owner, generation, || {
             self.sidebar_cache
-                .invalidate(owner, generation, Some(stream_id), revoked);
-            let change = if revoked {
-                SyncChange::HistoryAccessRevoked(HistoryRevocation::Stream(stream_id))
-            } else {
-                SyncChange::SidebarDetailsChanged { stream_id }
-            };
-            self.publish(owner, generation, change);
+                .invalidate(owner, generation, Some(stream_id), false);
+            self.publish(
+                owner,
+                generation,
+                SyncChange::SidebarDetailsChanged { stream_id },
+            );
+        })
+    }
+
+    /// Скрывает историю сразу после выхода. Запись в базу обновит событие `stream.deleted`.
+    pub(crate) fn complete_sidebar_leave(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        stream_id: Uuid,
+        leave_grant: u64,
+    ) -> Result<(), AuthError> {
+        self.auth.with_active_generation(owner, generation, || {
+            if self
+                .sidebar_cache
+                .complete_leave(owner, generation, stream_id, leave_grant)
+            {
+                self.publish(
+                    owner,
+                    generation,
+                    SyncChange::HistoryAccessRevoked(HistoryRevocation::Stream(stream_id)),
+                );
+            }
         })
     }
 

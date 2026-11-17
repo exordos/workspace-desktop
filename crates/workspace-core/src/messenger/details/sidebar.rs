@@ -162,8 +162,9 @@ pub(crate) struct SidebarEntry {
 #[derive(Default)]
 struct CachedSidebar {
     revision: u64,                        // Меняется при принятии события или сбросе.
+    grant_revision: u64, // Меняется, когда стрим заново становится доступным или журнал сбрасывается.
     details: Option<Arc<SidebarDetails>>, // Полный снимок, пригодный для повторного открытия.
-    revoked: bool, // Сервер сообщил, что подписка текущего пользователя удалена.
+    revoked: bool,       // Сервер сообщил, что подписка текущего пользователя удалена.
     loading: Option<SidebarLoad>, // Общий результат для ожидающих экземпляров панели.
     pending: HashMap<SidebarPatchKey, SidebarChange>, // Последние снимки сущностей, принятые во время HTTP.
 }
@@ -238,12 +239,51 @@ impl SidebarCache {
                 let mut state = entry.state.lock().expect("sidebar entry");
                 state.details = None;
                 state.pending.clear();
-                if stream_id.is_none() || revoked {
-                    state.revoked = revoked;
+                if stream_id.is_none() {
+                    state.grant_revision += 1;
+                    state.revoked = false;
+                } else if revoked {
+                    state.revoked = true;
                 }
                 state.revision += 1;
             }
         }
+    }
+
+    /// Запоминает доступ к стриму до выполнения запроса выхода.
+    fn leave_grant(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        stream_id: Uuid,
+    ) -> Result<u64, DetailsError> {
+        let entry = self.entry(owner, generation, stream_id);
+        let state = entry.state.lock().expect("sidebar entry");
+        if state.revoked {
+            Err(DetailsError::AccessLost)
+        } else {
+            Ok(state.grant_revision)
+        }
+    }
+
+    /// Применяет подтверждение выхода, пока после него не выдали новый доступ к стриму.
+    pub(crate) fn complete_leave(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        stream_id: Uuid,
+        grant_revision: u64,
+    ) -> bool {
+        let entry = self.entry(owner, generation, stream_id);
+        let mut state = entry.state.lock().expect("sidebar entry");
+        if state.grant_revision != grant_revision || state.revoked {
+            return false;
+        }
+        state.details = None;
+        state.pending.clear();
+        state.revoked = true;
+        state.revision += 1;
+        true
     }
 
     /// Освобождает кэш сессии при выходе или начале нового поколения.
@@ -262,10 +302,13 @@ impl CachedSidebar {
             SidebarChange::Stream { id, .. } | SidebarChange::Membership(id) if *id != stream_id => return false,
             SidebarChange::Topic { stream_id: id, .. } | SidebarChange::RemoveTopic { stream_id: id, .. }
                 if *id != stream_id => return false,
-            SidebarChange::Stream { created: true, .. } if self.revoked => {
-                self.revoked = false;
-                self.revision += 1;
-                return true;
+            SidebarChange::Stream { created: true, .. } => {
+                self.grant_revision += 1;
+                if self.revoked {
+                    self.revoked = false;
+                    self.revision += 1;
+                    return true;
+                }
             }
             SidebarChange::MembershipBinding(binding) if self.details.as_ref().is_some_and(|details| {
                 !matches!(details.as_ref(), SidebarDetails::Channel(channel) if channel.members.iter().any(|member| member.binding_id == *binding))
@@ -540,7 +583,7 @@ impl MessengerSource {
         sync.auth()
             .with_active_generation(owner, generation, || ())?;
         result?;
-        Ok(sync.refresh_sidebar(owner, generation, stream_id, false)?)
+        Ok(sync.refresh_sidebar(owner, generation, stream_id)?)
     }
 
     /// Добавляет новых участников, если текущему пользователю доступно приглашение в стрим.
@@ -579,7 +622,7 @@ impl MessengerSource {
         sync.auth()
             .with_active_generation(owner, generation, || ())?;
         result?;
-        Ok(sync.refresh_sidebar(owner, generation, stream_id, false)?)
+        Ok(sync.refresh_sidebar(owner, generation, stream_id)?)
     }
 
     /// Снимает видимую привязку, если это сам участник или текущий пользователь владеет стримом.
@@ -602,6 +645,13 @@ impl MessengerSource {
             .iter()
             .find(|member| member.binding_id == binding_id && member.can_remove)
             .ok_or(DetailsError::ActionDenied)?;
+        let leave_grant = if member.is_self {
+            Some(sync.auth().with_active_generation(owner, generation, || {
+                sync.sidebar_cache.leave_grant(owner, generation, stream_id)
+            })??)
+        } else {
+            None
+        };
         let token = sync
             .auth()
             .access_token_for_generation(owner, Service::Messenger, generation)
@@ -613,7 +663,12 @@ impl MessengerSource {
         sync.auth()
             .with_active_generation(owner, generation, || ())?;
         result?;
-        Ok(sync.refresh_sidebar(owner, generation, stream_id, member.is_self)?)
+        if let Some(leave_grant) = leave_grant {
+            sync.complete_sidebar_leave(owner, generation, stream_id, leave_grant)?;
+        } else {
+            sync.refresh_sidebar(owner, generation, stream_id)?;
+        }
+        Ok(())
     }
 }
 
@@ -731,6 +786,13 @@ mod tests {
             assert!(state.details.is_none());
             assert_eq!(state.revision, 2);
         }
+        let old_grant = entry.state.lock().unwrap().grant_revision;
+        assert_eq!(
+            cache.apply(&owner, generation, &stream_details(id, "Канал", true)),
+            [id]
+        );
+        assert!(!cache.complete_leave(&owner, generation, id, old_grant));
+        assert!(!entry.state.lock().unwrap().revoked);
         let next = cache.entry(&owner, SessionGeneration(2), id);
         assert!(!next.state.lock().unwrap().revoked);
         assert!(!Arc::ptr_eq(&entry, &next));
