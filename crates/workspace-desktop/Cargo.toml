@@ -19,6 +19,7 @@ workspace-core = { path = "../workspace-core" }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "runtime_shaders"], optional = true }
 block2 = { version = "0.5", optional = true }
 objc2 = { version = "0.5", optional = true }
 objc2-app-kit = { version = "0.2", features = ["NSWorkspace"], optional = true }
@@ -28,7 +29,10 @@ security-framework = "3"
 
 [features]
 default = ["ui-kit"]
-ui-kit = ["dep:chrono", "dep:iced", "dep:iced_runtime", "dep:unicode-segmentation", "dep:block2", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:objc2-user-notifications"]
+ui-kit = ["dep:chrono", "dep:iced", "dep:iced_runtime", "dep:unicode-segmentation", "macos-adapters"]
+macos-adapters = ["dep:block2", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:objc2-user-notifications"]
+gpui = ["dep:gpui", "macos-adapters"]
+gpui-test = ["gpui", "gpui/test-support"]
 
 [dev-dependencies]
 http-body-util = "0.1"
@@ -49,3 +53,27 @@ required-features = ["ui-kit"]
 [[bin]]
 name = "workspace-desktop"
 required-features = ["ui-kit"]
+
+[[example]]
+name = "gpui_chat_probe"
+required-features = ["gpui"]
+
+[[example]]
+name = "gpui_history_probe"
+required-features = ["gpui"]
+
+[[example]]
+name = "gpui_editor_probe"
+required-features = ["gpui"]
+
+[[example]]
+name = "gpui_macos_window_probe"
+required-features = ["gpui"]
+
+[[example]]
+name = "gpui_gallery"
+required-features = ["gpui"]
+
+[[bin]]
+name = "workspace-desktop-gpui"
+required-features = ["gpui"]
