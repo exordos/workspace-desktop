@@ -564,24 +564,18 @@ impl Sync {
                             stream_id,
                             topic_id,
                         }) => {
-                            if self
-                                .sidebar_cache
-                                .apply(
-                                    owner,
-                                    generation,
-                                    &SidebarChange::RemoveTopic {
-                                        stream_id: *stream_id,
-                                        topic_id: *topic_id,
-                                    },
-                                )
-                                .contains(stream_id)
-                            {
+                            for stream_id in self.sidebar_cache.apply(
+                                owner,
+                                generation,
+                                &SidebarChange::RemoveTopic {
+                                    stream_id: *stream_id,
+                                    topic_id: *topic_id,
+                                },
+                            ) {
                                 self.publish(
                                     owner,
                                     generation,
-                                    SyncChange::SidebarDetailsChanged {
-                                        stream_id: *stream_id,
-                                    },
+                                    SyncChange::SidebarDetailsChanged { stream_id },
                                 );
                             }
                         }
