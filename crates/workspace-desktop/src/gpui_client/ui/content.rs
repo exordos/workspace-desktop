@@ -161,6 +161,7 @@ fn badge(palette: Palette, text: SharedString, tone: BadgeTone) -> Div {
 }
 
 /// Готовые сведения для превью последнего сообщения.
+#[derive(Clone)]
 pub struct ChatRowPreview {
     pub sender: Option<SharedString>, // Автор превью, если он нужен рядом с текстом.
     pub text: SharedString,           // Уже подготовленный короткий текст сообщения.
@@ -187,26 +188,26 @@ impl ChatRow {
         focus: Option<&FocusHandle>,
         on_activate: impl Fn(&mut Window, &mut App) + 'static,
     ) -> Stateful<Div> {
-        let badge = self
-            .unread
-            .and_then(|(count, tone)| unread_badge(palette, count, tone));
-        let preview: SharedString = self.preview.map_or_else(SharedString::default, |preview| {
-            one_line(&match preview.sender {
-                Some(sender) => format!("{sender}: {}", preview.text),
-                None => preview.text.to_string(),
-            })
-            .into()
-        });
+        self.render_with_action(palette, focus, None, on_activate)
+    }
+
+    /// Рисует строку канала с дополнительным индикатором раскрытия справа.
+    pub fn render_with_action(
+        self,
+        palette: Palette,
+        focus: Option<&FocusHandle>,
+        action: Option<Div>,
+        on_activate: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Stateful<Div> {
         let row = div()
             .id(self.id)
             .w_full()
             .min_w_0()
             .min_h(px(60.))
-            .px(px(10.))
-            .py(px(8.))
+            .px(px(9.))
+            .py(px(9.))
             .flex()
-            .items_center()
-            .gap(px(8.))
+            .gap(px(12.))
             .rounded(CONTROL_RADIUS)
             .border(CONTROL_BORDER)
             .border_color(gpui::transparent_black())
@@ -215,45 +216,21 @@ impl ChatRow {
             } else {
                 palette.card
             })
-            .child(self.avatar.render(palette))
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .child(
-                        ellipsized_label(palette, TextRole::Label, one_line(&self.title))
-                            .debug_selector(|| "chat-row-title".into()),
-                    )
-                    .child(ellipsized_label(palette, TextRole::Caption, preview)),
+                    .flex_none()
+                    .items_start()
+                    .child(self.avatar.render(palette)),
             )
-            .when(
-                self.time.is_some() || badge.is_some() || self.mention,
-                |row| {
-                    row.child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_none()
-                            .items_end()
-                            .gap(px(2.))
-                            .debug_selector(|| "chat-row-metadata".into())
-                            .children(self.time.map(|time| {
-                                label(palette, TextRole::Caption, time).whitespace_nowrap()
-                            }))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(3.))
-                                    .children(badge)
-                                    .children(self.mention.then(|| mention_badge(palette))),
-                            ),
-                    )
-                },
-            );
+            .child(Self::text(palette, self.title, self.preview))
+            .children(Self::metadata(
+                palette,
+                self.time,
+                self.unread,
+                self.mention,
+                action,
+            ));
         if self.disabled {
             row
         } else {
@@ -265,6 +242,67 @@ impl ChatRow {
                 on_activate,
             )
         }
+    }
+
+    /// Собирает сокращаемое название и превью для чата или вложенной темы.
+    pub fn text(palette: Palette, title: SharedString, preview: Option<ChatRowPreview>) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .child(
+                ellipsized_label(palette, TextRole::Label, one_line(&title))
+                    .debug_selector(|| "chat-row-title".into()),
+            )
+            .children(preview.map(|preview| {
+                let text = match preview.sender {
+                    Some(sender) => format!("{sender}: {}", preview.text),
+                    None => preview.text.to_string(),
+                };
+                ellipsized_label(palette, TextRole::Caption, one_line(&text))
+                    .debug_selector(|| "chat-row-preview".into())
+            }))
+    }
+
+    /// Размещает индикаторы над временем; ширина колонки защищена от длинных имён.
+    pub fn metadata(
+        palette: Palette,
+        time: Option<SharedString>,
+        unread: Option<(u64, BadgeTone)>,
+        mention: bool,
+        action: Option<Div>,
+    ) -> Option<Div> {
+        let badge = unread.and_then(|(count, tone)| unread_badge(palette, count, tone));
+        if time.is_none() && badge.is_none() && !mention && action.is_none() {
+            return None;
+        }
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .flex_none()
+                .min_w(px(40.))
+                .items_end()
+                .justify_between()
+                .debug_selector(|| "chat-row-metadata".into())
+                .child(
+                    div()
+                        .flex()
+                        .min_h(px(20.))
+                        .items_center()
+                        .gap(px(4.))
+                        .children(mention.then(|| mention_badge(palette)))
+                        .children(badge)
+                        .children(action),
+                )
+                .children(time.map(|time| {
+                    label(palette, TextRole::Caption, time)
+                        .whitespace_nowrap()
+                        .debug_selector(|| "chat-row-time".into())
+                })),
+        )
     }
 }
 

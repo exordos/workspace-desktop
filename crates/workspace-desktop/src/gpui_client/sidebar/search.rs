@@ -94,6 +94,16 @@ impl Search {
         &self.text
     }
 
+    /// Указывает, что стрелки пришли из поля поиска, а не из сфокусированной строки.
+    pub(super) fn is_focused(&self, window: &Window) -> bool {
+        self.focus.is_focused(window)
+    }
+
+    /// Проверяет, что система ещё редактирует незавершённый фрагмент текста.
+    pub(super) fn is_composing(&self) -> bool {
+        self.marked.is_some()
+    }
+
     /// Возвращает диапазон независимо от направления выделения.
     fn selection(&self) -> Range<usize> {
         self.anchor.min(self.caret)..self.anchor.max(self.caret)
@@ -420,9 +430,10 @@ impl Render for Search {
             .min_w_0()
             .items_center()
             .gap_2()
-            .child(Icon::Search.element(SEARCH_ICON_SIZE, palette.text_secondary))
             .child(div().flex_1().min_w_0().child(input));
-        if !self.text.is_empty() {
+        if self.text.is_empty() {
+            control = control.child(Icon::Search.element(SEARCH_ICON_SIZE, palette.icon));
+        } else {
             let mut clear = Button::new("catalog-clear", "");
             clear.appearance = ButtonAppearance::Ghost;
             clear.icon = Some(Icon::Close);
@@ -446,7 +457,7 @@ impl Search {
     fn shape(&self, bounds: Bounds<Pixels>, palette: Palette, window: &Window) -> Line {
         let placeholder = self.text.is_empty();
         let text = if placeholder {
-            "Поиск по чатам"
+            "Найти"
         } else {
             self.text.as_str()
         };

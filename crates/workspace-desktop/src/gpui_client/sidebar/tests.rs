@@ -262,6 +262,159 @@ fn opens_and_filters_only_the_catalog_of_the_selected_session(cx: &mut TestAppCo
     );
 }
 
+/// Проверяет геометрию по сценам Electron и удержание строки при смене ширины.
+#[gpui::test]
+fn fixture_catalog_keeps_metadata_inside_rows_at_both_reference_widths(cx: &mut TestAppContext) {
+    let (sidebar, ui, events) = initialize(cx);
+    let a = session("a", 11);
+    let b = session("b", 12);
+    let scenes: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/plans/roadmap/gpui-ui-parity-fixtures/scenes.json"
+    )))
+    .unwrap();
+    let direct = scenes["direct"]["title"].as_str().unwrap();
+    let channel = scenes["channel"]["title"].as_str().unwrap();
+    let topic = &scenes["channel"]["topics"][0];
+    let first = topic["title"].as_str().unwrap();
+    let second = scenes["channel"]["topics"][1]["title"].as_str().unwrap();
+    let catalog_a = catalog(
+        &a,
+        ChatListStatus::Ready,
+        vec![
+            chat(2, channel, false, &[(3, first), (4, second)]),
+            chat(1, direct, true, &[]),
+        ],
+    );
+    publish(&sidebar, ui, &a, &catalog_a);
+    let scope = HistoryScope {
+        stream_id: Uuid::from_u128(2),
+        topic_id: Some(Uuid::from_u128(3)),
+    };
+    let route = ConversationAddress {
+        route: ChatRoute {
+            owner: a.owner.clone(),
+            scope,
+            entry: ChatEntry::Latest,
+        },
+        generation: a.generation,
+        revision: Default::default(),
+    };
+    ui.update(|_, app| {
+        sidebar.update(app, |sidebar, cx| {
+            sidebar.update_snapshot(Some(&a), Some(&catalog_a), Some(&route), cx);
+            let active = sidebar.active.as_mut().unwrap();
+            active.fixture_details.insert(
+                RowKey::Topic(scope.stream_id, scope.topic_id.unwrap()),
+                RowDetails {
+                    preview: Some(ChatRowPreview {
+                        sender: Some("Вы".into()),
+                        text: topic["messages"][2]["text"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned()
+                            .into(),
+                    }),
+                    time: Some("13:13".into()),
+                    unread: Some((topic["unread"].as_u64().unwrap(), BadgeTone::Accent)),
+                    ..Default::default()
+                },
+            );
+            cx.notify();
+        });
+    });
+    ui.run_until_parked();
+
+    // 299 и 280 — внутренние ширины каталога в окнах UI‑05 1440 и 700.
+    for (window_width, catalog_width) in [(1440., 299.), (700., 280.)] {
+        ui.simulate_resize(size(px(catalog_width), px(600.)));
+        ui.run_until_parked();
+        let direct_row = ui.debug_bounds(row(1, None)).unwrap();
+        let topic_row = ui.debug_bounds(row(2, Some(3))).unwrap();
+        let accent = ui.debug_bounds("catalog-topic-bar").unwrap();
+        let preview = ui.debug_bounds("chat-row-preview").unwrap();
+        let time = ui.debug_bounds("chat-row-time").unwrap();
+        let badge = ui.debug_bounds("unread-badge").unwrap();
+        assert_eq!(direct_row.left(), px(8.));
+        assert_eq!(direct_row.size.width, px(catalog_width - 16.));
+        assert_eq!(direct_row.size.height, px(64.));
+        assert_eq!(topic_row.left(), direct_row.left());
+        assert_eq!(accent.left(), topic_row.left() + px(38.));
+        assert_eq!(accent.size.width, px(3.));
+        assert!(preview.right() < badge.left() && badge.right() <= topic_row.right());
+        assert_eq!(badge.size.height, px(20.));
+        assert!(
+            badge.bottom() <= time.top(),
+            "бейдж {badge:?} перекрывает {time:?}"
+        );
+        assert!(time.bottom() <= topic_row.bottom());
+        ui.read(|app| {
+            assert_eq!(
+                sidebar.read(app).active.as_ref().unwrap().selected,
+                Some(scope)
+            );
+        });
+        println!(
+            "fixture_window_px={window_width} catalog_px={catalog_width} chat_width_px={:?} chat_height_px={:?} topic_width_px={:?} badge_height_px={:?}",
+            direct_row.size.width, direct_row.size.height, topic_row.size.width, badge.size.height,
+        );
+    }
+    click(ui, "catalog-search");
+    ui.simulate_input("шаблон не совпадает");
+    assert!(ui.debug_bounds("catalog-empty").is_some());
+    click(ui, "catalog-clear");
+    ui.simulate_input("ПРОВЕРКА");
+    ui.simulate_keystrokes("down");
+    enter(ui);
+    assert_eq!(events.borrow().as_slice(), &[open(&a, 2, Some(3))]);
+
+    // UUID темы такой же, но её проекция и счётчик принадлежали A.
+    let catalog_b = catalog(
+        &b,
+        ChatListStatus::Ready,
+        vec![chat(2, channel, false, &[(3, first)])],
+    );
+    publish(&sidebar, ui, &b, &catalog_b);
+    click(ui, row(2, None));
+    ui.read(|app| {
+        let active = sidebar.read(app).active.as_ref().unwrap();
+        assert!(
+            active
+                .row_details(RowKey::Topic(scope.stream_id, scope.topic_id.unwrap()))
+                .unread
+                .is_none()
+        );
+        assert_ne!(active.selected, Some(scope));
+    });
+    click(ui, row(2, Some(3)));
+    assert_eq!(
+        events.borrow().as_slice(),
+        &[open(&a, 2, Some(3)), open(&b, 2, Some(3))]
+    );
+}
+
+/// Различает ожидание без списка, блокирующую ошибку с повтором и пустой ответ.
+#[gpui::test]
+fn catalog_status_follows_loading_retry_and_empty_snapshot(cx: &mut TestAppContext) {
+    let (sidebar, ui, events) = initialize(cx);
+    let a = session("a", 11);
+    ui.simulate_resize(size(px(280.), px(470.)));
+    for (status, selector) in [
+        (ChatListStatus::Loading, "catalog-loading"),
+        (ChatListStatus::Failed, "catalog-error"),
+        (ChatListStatus::Ready, "catalog-empty"),
+    ] {
+        publish(&sidebar, ui, &a, &catalog(&a, status, vec![]));
+        let bounds = ui.debug_bounds(selector).unwrap();
+        assert_eq!(bounds.left(), px(12.));
+        assert_eq!(bounds.size.width, px(256.));
+        if status == ChatListStatus::Failed {
+            click(ui, "catalog-retry");
+        }
+    }
+    assert_eq!(events.borrow().as_slice(), &[Recorded::Retry(a)]);
+}
+
 /// Проверяет повтор запроса, привязку к поколению и сброс прокрутки между входами.
 #[gpui::test]
 fn retries_exact_generation_and_resets_scroll_on_account_switch(cx: &mut TestAppContext) {
