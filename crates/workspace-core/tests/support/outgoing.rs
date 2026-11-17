@@ -109,7 +109,11 @@ impl Api {
                 "200 OK",
                 json!({"epoch_generation":"test", "epoch_version":1}),
             )
-        } else if path.ends_with("/events/") {
+        } else if path.ends_with("/events/")
+            || path.ends_with("/folders/")
+            || path.ends_with("/streams/")
+            || path.ends_with("/stream_topics/")
+        {
             ("200 OK", json!([]))
         } else if let Some((_, id)) = path.split_once("/folders/") {
             ("200 OK", json!({"uuid": id, "unread_count":0}))

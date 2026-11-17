@@ -505,6 +505,58 @@ fn temporary_failure_keeps_valid_token_but_owner_mismatch_ends_session() {
     );
 }
 
+/// Читает подтверждённый счётчик при временном сбое входа и закрывает кэш после выхода.
+#[tokio::test]
+async fn folders_keep_confirmed_cache_readable_during_temporary_auth_failure() {
+    let fixture = Fixture::new(|_, _| Err(IamError::Temporary));
+    let owner = fixture.login("a");
+    let generation = fixture.auth.snapshot()[0].generation;
+    let storage = Arc::new(Storage::in_memory().unwrap());
+    let sync = EventSync::new(fixture.auth.clone(), storage.clone());
+    let folders = workspace_core::messenger::MessengerSource::new()
+        .unwrap()
+        .folders(storage);
+    sync.apply(
+        &owner,
+        generation,
+        "messenger",
+        Event::UnreadChanged {
+            cursor: Cursor {
+                epoch_generation: "test".into(),
+                epoch_version: 2,
+            },
+            count: 9,
+        },
+    )
+    .unwrap();
+    let mut sessions = fixture.auth.subscribe();
+    fixture.clock.advance(121);
+    let current_auth = fixture.auth.clone();
+    let current_owner = owner.clone();
+    let token = tokio::spawn(async move {
+        current_auth
+            .access_token(&current_owner, Service::Messenger)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(snapshot) = sessions.next().await {
+            if snapshot[0].status == SessionStatus::TemporarilyUnavailable {
+                return;
+            }
+        }
+        panic!("подписка закрылась до временного сбоя");
+    })
+    .await
+    .expect("авторизация не сообщила о временном сбое");
+    let snapshot = folders.snapshot(&fixture.auth, &owner, generation).unwrap();
+    assert_eq!(snapshot.unread_count(uuid::Uuid::nil()), Some(9));
+    assert!(folders.retry(&fixture.auth, &owner, generation).is_err());
+
+    fixture.auth.logout(&owner.account_id).unwrap();
+    assert!(folders.snapshot(&fixture.auth, &owner, generation).is_err());
+    token.abort();
+}
+
 /// Проверяет, что медленный подписчик получает последнее состояние без секретов.
 #[test]
 fn slow_subscriber_receives_latest_snapshot_without_secrets() {

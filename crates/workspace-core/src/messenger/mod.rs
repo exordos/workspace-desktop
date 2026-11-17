@@ -3,6 +3,8 @@
 
 pub mod catalog;
 pub mod details;
+mod folder_sync;
+pub mod folders;
 pub mod history;
 pub mod message_actions;
 mod outbox;
@@ -24,6 +26,8 @@ use crate::{
     sync::{Event, Sync},
 };
 
+pub use folder_sync::{FolderRow, FolderSnapshot};
+
 use rest::RestClient;
 use socket::SocketFrame;
 
@@ -35,12 +39,18 @@ const NOTIFICATION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct MessengerSource {
     rest: Arc<RestClient>,        // Общий HTTP-клиент для чтения страниц журнала.
     connector: Option<Connector>, // Настройки TLS для сервера с частным центром сертификации.
+    catalog_refresh: Arc<catalog::RefreshGates>, // Общие запросы каталога одного владельца.
 }
 
 impl MessengerSource {
     /// Подключает каталог чатов к тому же HTTPS-клиенту, что и поток событий.
     pub fn catalog(&self, storage: Arc<crate::storage::Storage>) -> catalog::Catalog {
-        catalog::Catalog::new(self.rest.clone(), storage)
+        catalog::Catalog::new(self.rest.clone(), storage, self.catalog_refresh.clone())
+    }
+
+    /// Даёт доступ к снимкам и командам папок через общий клиент Messenger.
+    pub fn folders(&self, storage: Arc<crate::storage::Storage>) -> folders::Folders {
+        folders::Folders::new(self.rest.clone(), storage)
     }
 
     /// Получает объявленную сервером HTTPS-ссылку регистрации, доступную до входа.
@@ -53,6 +63,7 @@ impl MessengerSource {
         Ok(Self {
             rest: Arc::new(RestClient::new(None)?),
             connector: None,
+            catalog_refresh: Arc::default(),
         })
     }
 
@@ -70,6 +81,7 @@ impl MessengerSource {
         Ok(Self {
             rest: Arc::new(RestClient::new(Some(certificate_der))?),
             connector: Some(Connector::Rustls(Arc::new(tls))),
+            catalog_refresh: Arc::default(),
         })
     }
 }
@@ -98,14 +110,19 @@ impl EventSource for MessengerSource {
         })
     }
 
-    /// Обрабатывает очередь владельца рядом с потоком входящих событий.
+    /// Обрабатывает очередь и сверяет папки владельца рядом с потоком событий.
     fn run_session(
         &self,
         sync: Arc<Sync>,
         session: SessionSnapshot,
         ready: watch::Receiver<bool>,
     ) -> BoxFuture<'_, ()> {
-        Box::pin(outbox::run(self, sync, session, ready))
+        Box::pin(async move {
+            tokio::join!(
+                outbox::run(self, sync.clone(), session.clone(), ready.clone()),
+                folder_sync::run(self, sync, session, ready),
+            );
+        })
     }
 }
 

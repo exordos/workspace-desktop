@@ -40,6 +40,8 @@ use workspace_core::{
 
 use super::Fixture;
 
+#[path = "folder_runtime.rs"]
+mod folder_runtime;
 #[path = "outgoing.rs"]
 mod outgoing;
 
@@ -89,6 +91,7 @@ struct HistoryApi {
     release: Notify,          // Можно вернуть задержанный ответ.
     topic_realtime: AtomicUsize, // 1 — включить отдельный сценарий событий двух тем.
     outgoing: Option<Arc<outgoing::Api>>, // Подмена маршрутов очереди для теста отправки.
+    folders: Option<Arc<folder_runtime::Api>>, // Подмена маршрутов папок и журнала.
 }
 
 /// Формирует серверное сообщение с одинаковыми UUID для обоих аккаунтов.
@@ -123,6 +126,10 @@ async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
     }
     if let Some(outgoing) = &api.outgoing {
         outgoing.reply(socket, request, &method, &headers).await;
+        return;
+    }
+    if let Some(folders) = &api.folders {
+        folders.reply(socket, request, &method, &headers).await;
         return;
     }
     if api.topic_realtime.load(Relaxed) == 1 && request.path().ends_with("/events/ws") {

@@ -12,9 +12,10 @@ use crate::{
     context::{OwnerContext, SessionGeneration},
     notification_target::{NotificationTarget, NotificationTargetError},
     storage::{
-        Cursor, DeliveryStatus, EventWrite, HistoryChange, HistoryMessage, HistoryMetadata,
-        HistoryPageEdges, HistoryPageGuard, HistoryPageOutcome, HistoryPageTarget, HistoryScope,
-        HistoryWindow, Message, MessagePlacement, OutboxEntry, PreparedSend, Storage, StorageError,
+        Cursor, DeliveryStatus, EventWrite, FolderChange, HistoryChange, HistoryMessage,
+        HistoryMetadata, HistoryPageEdges, HistoryPageGuard, HistoryPageOutcome, HistoryPageTarget,
+        HistoryScope, HistoryWindow, Message, MessagePlacement, OutboxEntry, PreparedSend, Storage,
+        StorageError,
     },
 };
 
@@ -105,6 +106,10 @@ pub enum Event {
         cursor: Cursor, // Позиция события обновления папки в журнале.
         count: u32,     // Новый счётчик папки «Все чаты».
     },
+    FolderChanged {
+        cursor: Cursor,       // Позиция изменения в журнале.
+        change: FolderChange, // Удаление или область, которую нужно сверить.
+    },
     UnreadBaseline {
         cursor: Cursor, // Позиция сервера перед чтением счётчика. Курсор сообщений не меняется.
         count: u32,     // Счётчик, загруженный отдельным запросом при подключении.
@@ -121,6 +126,7 @@ impl Event {
             | Self::IncomingDirectMessage { cursor, .. }
             | Self::HistoryChanged { cursor, .. }
             | Self::UnreadChanged { cursor, .. }
+            | Self::FolderChanged { cursor, .. }
             | Self::UnreadBaseline { cursor, .. }
             | Self::SourceReady(cursor)
             | Self::Checkpoint(cursor) => cursor,
@@ -193,6 +199,11 @@ impl Sync {
     /// Даёт фоновой задаче доступ к авторизации и состояниям сессий.
     pub(crate) fn auth(&self) -> &Auth {
         &self.auth
+    }
+
+    /// Даёт фоновым обработчикам тот же профиль, в который пишутся события.
+    pub(crate) fn storage(&self) -> &Arc<Storage> {
+        &self.storage
     }
 
     /// Возвращает последнюю записанную позицию источника для владельца.
@@ -489,6 +500,11 @@ impl Sync {
                 Event::HistoryChanged { change, .. } => Some(change),
                 _ => None,
             };
+            let folder = match &event {
+                Event::FolderChanged { change, .. } => Some(*change),
+                Event::UnreadChanged { .. } => Some(FolderChange::Refresh(Some(Uuid::nil()))),
+                _ => None,
+            };
             let saved = self.storage.apply(
                 owner,
                 source,
@@ -500,6 +516,7 @@ impl Sync {
                     placement,
                     metadata,
                     history,
+                    folder,
                 },
             )?;
             if let Some(count) = unread.filter(|_| saved.unread_changed) {

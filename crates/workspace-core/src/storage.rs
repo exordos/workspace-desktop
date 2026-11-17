@@ -1,11 +1,13 @@
-//! Хранит сообщения, счётчики, позиции чтения, черновики и очередь отправки в SQLite.
+//! Хранит папки, сообщения, счётчики, позиции чтения, черновики и очередь отправки в SQLite.
 //! Сначала описаны данные и таблицы, затем чтение и запись.
 
 mod drafts;
+mod folders;
 mod history;
 mod outbox;
 
 pub use drafts::{DraftAccess, DraftScope, DraftWriteOutcome, PlaintextDraft};
+pub use folders::FolderChange;
 pub(crate) use history::HistoryPageGuard;
 pub use history::{
     HistoryDirection, HistoryEdge, HistoryMessage, HistoryMetadata, HistoryPageEdges,
@@ -64,6 +66,7 @@ pub(crate) struct EventWrite<'a> {
     pub unread: Option<u32>,                        // Подтверждённый счётчик.
     pub notification_conversation: Option<&'a str>, // Разговор для цели баннера.
     pub history: Option<&'a HistoryChange>,         // Правка или удаление.
+    pub folder: Option<FolderChange>,               // Сверка состава папок или удаление связей.
 }
 
 /// Число непрочитанных и позиция журнала, до которой оно уже учитывает изменения.
@@ -111,12 +114,17 @@ pub enum StorageError {
     Sqlite(#[from] rusqlite::Error), // Исходная ошибка SQLite.
     #[error("the cached chat list has an invalid format")]
     Catalog(#[from] serde_json::Error), // Не удалось прочитать или записать снимок списка чатов.
+    #[error("the cached folder snapshot has an invalid format")]
+    FolderSnapshot(#[source] serde_json::Error), // Не удалось прочитать или записать папку или её элемент.
+    #[error("the folder snapshot does not match the refresh scope")]
+    InvalidFolderSnapshot, // Ответ содержит данные вне области запроса.
 }
 
 /// Локальное хранилище сообщений, счётчиков и позиций чтения.
 pub struct Storage {
     connection: Mutex<Connection>, // Соединение с SQLite. Блокировка выдаёт его по одному запросу за раз.
-    catalog_changes: tokio::sync::watch::Sender<u64>, // Сигнал о зафиксированном отзыве доступа.
+    catalog_changes: tokio::sync::watch::Sender<u64>, // Сигнал об изменении каталога или запросе его сверки.
+    folder_changes: tokio::sync::watch::Sender<u64>, // Сигнал об изменении данных папок после записи.
 }
 
 impl Storage {
@@ -135,7 +143,7 @@ impl Storage {
         read_catalog_revision(&connection, owner)
     }
 
-    /// Даёт сигнал после каждого зафиксированного отзыва доступа.
+    /// Даёт сигнал после изменения каталога или записи запроса на его сверку.
     pub(crate) fn catalog_changes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.catalog_changes.subscribe()
     }
@@ -154,25 +162,38 @@ impl Storage {
         Ok(publish(snapshots))
     }
 
-    /// Заменяет снимок, если после начала запроса доступ к каналам не менялся.
+    /// Заменяет снимок, если после начала запроса доступ и версия каталога не менялись.
     pub(crate) fn save_chat_catalog(
         &self,
         owner: &OwnerContext,
         snapshot: &str,
         revision: i64,
     ) -> Result<(), StorageError> {
-        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
-        if read_catalog_revision(&connection, owner)? != revision {
+        let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if read_catalog_revision(&transaction, owner)? != revision {
             return Err(StorageError::StaleCatalog);
         }
-        connection.execute(
+        transaction.execute(
             "INSERT INTO messenger_catalog (account_id, server, organization_id, project_id, user_id, snapshot)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT (account_id, server, organization_id, project_id, user_id)
              DO UPDATE SET snapshot = excluded.snapshot",
             params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id, snapshot],
         )?;
+        bump_catalog_revision(&transaction, owner)?;
+        folders::finish_catalog_refresh(&transaction, owner)?;
+        transaction.commit()?;
+        drop(connection);
+        self.notify_catalog_change();
         Ok(())
+    }
+
+    /// Будит читателей каталога и папок после записи связанных данных.
+    fn notify_catalog_change(&self) {
+        self.catalog_changes
+            .send_modify(|version| *version = version.wrapping_add(1));
+        self.notify_folder_change();
     }
 
     /// Открывает базу по пути и создаёт таблицы при необходимости.
@@ -265,10 +286,12 @@ impl Storage {
         history::initialize(&transaction)?;
         outbox::initialize(&transaction)?;
         drafts::initialize(&transaction)?;
+        folders::initialize(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
             catalog_changes: tokio::sync::watch::channel(0).0,
+            folder_changes: tokio::sync::watch::channel(0).0,
         })
     }
 
@@ -373,13 +396,17 @@ impl Storage {
                 source
             ],
         )?;
-        if source == crate::messenger::SOURCE_ID {
+        let reset_messenger = source == crate::messenger::SOURCE_ID;
+        if reset_messenger {
             history::reset(&transaction, owner)?;
             drafts::invalidate_owner(&transaction, owner)?;
+            folders::reset(&transaction, owner)?;
+            bump_catalog_revision(&transaction, owner)?;
             for table in [
                 "sync_messages",
                 "messenger_notification_targets",
                 "messenger_unread",
+                "messenger_catalog",
             ] {
                 transaction.execute(
                     &format!(
@@ -391,6 +418,10 @@ impl Storage {
             }
         }
         transaction.commit()?;
+        drop(connection);
+        if reset_messenger {
+            self.notify_catalog_change();
+        }
         Ok(())
     }
 
@@ -414,6 +445,10 @@ impl Storage {
             true,
         )?;
         transaction.commit()?;
+        drop(connection);
+        if changed {
+            self.notify_folder_change();
+        }
         Ok(changed)
     }
 
@@ -451,13 +486,16 @@ impl Storage {
             apply_history(&transaction, owner, history)?;
         }
 
-        let revoked = if source == crate::messenger::SOURCE_ID {
+        let mut folder_changed = false;
+        let mut catalog_changed = false;
+        if source == crate::messenger::SOURCE_ID {
             match change.history {
                 Some(HistoryChange::RemoveStream(stream)) => {
                     remove_catalog_stream(&transaction, owner, stream)?;
+                    folders::remove_stream(&transaction, owner, stream)?;
                     outbox::reject_revoked(&transaction, owner, stream, None)?;
                     drafts::revoke(&transaction, owner, stream, None)?;
-                    true
+                    catalog_changed = true;
                 }
                 Some(HistoryChange::RemoveTopic(address)) => {
                     outbox::reject_revoked(
@@ -472,13 +510,15 @@ impl Storage {
                         &address.stream_id,
                         Some(&address.topic_id),
                     )?;
-                    false
                 }
-                _ => false,
+                _ => {}
             }
-        } else {
-            false
-        };
+            if let Some(change) = change.folder {
+                let result = folders::apply_change(&transaction, owner, change)?;
+                folder_changed = result.folders;
+                catalog_changed |= result.catalog;
+            }
+        }
 
         let message_inserted = if let Some(message) = change.message
             && history::can_create(&transaction, owner, &message.id)?
@@ -583,9 +623,11 @@ impl Storage {
             ],
         )?;
         transaction.commit()?;
-        if revoked {
-            self.catalog_changes
-                .send_modify(|version| *version = version.wrapping_add(1));
+        drop(connection);
+        if catalog_changed {
+            self.notify_catalog_change();
+        } else if folder_changed || unread_changed {
+            self.notify_folder_change();
         }
         Ok(AppliedEvent {
             outcome: ApplyOutcome::Applied,
@@ -617,7 +659,7 @@ fn read_chat_catalog(
         .optional()?)
 }
 
-/// Читает версию отзыва доступа; ноль означает отсутствие изменений.
+/// Читает ревизию каталога. Ноль означает отсутствие его записей и изменений.
 fn read_catalog_revision(
     connection: &Connection,
     owner: &OwnerContext,
@@ -662,6 +704,14 @@ fn remove_catalog_stream(
             ],
         )?;
     }
+    bump_catalog_revision(connection, owner)
+}
+
+/// Увеличивает версию, чтобы более ранний запрос каталога нельзя было сохранить.
+fn bump_catalog_revision(
+    connection: &Connection,
+    owner: &OwnerContext,
+) -> Result<(), StorageError> {
     connection.execute(
         "INSERT INTO messenger_catalog_revision VALUES (?1, ?2, ?3, ?4, ?5, 1)
          ON CONFLICT (account_id, server, organization_id, project_id, user_id)

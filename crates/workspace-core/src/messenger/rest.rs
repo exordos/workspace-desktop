@@ -1,6 +1,7 @@
 //! Работает с HTTPS API мессенджера: читает настройки, журнал и историю, отправляет сообщения.
 //! Также разбирает общий формат событий, который используют HTTP и WebSocket.
 
+mod folders;
 mod message_actions;
 pub(super) mod mutations;
 
@@ -18,8 +19,8 @@ use crate::{
     directory::ProfileRow,
     runtime::SourceError,
     storage::{
-        Cursor, HistoryChange, HistoryEdge, HistoryMessage, HistoryMetadata, HistoryScope,
-        HistoryTime, Message, MessagePlacement,
+        Cursor, FolderChange, HistoryChange, HistoryEdge, HistoryMessage, HistoryMetadata,
+        HistoryScope, HistoryTime, Message, MessagePlacement,
     },
     sync::Event,
 };
@@ -906,6 +907,9 @@ struct WirePayload {
     user_uuid: Option<String>, // Идентификатор пользователя, если сервер повторил его во вложенных данных.
     payload: Option<Value>, // Тело объекта. Для нового сообщения здесь лежат формат и содержимое.
     unread_count: Option<u32>, // Готовый счётчик в событии обновления папки.
+    is_archived: Option<bool>, // Признак архива в снимке разговора.
+    folder_uuid: Option<Uuid>, // Папка, если событие элемента называет её.
+    folder: Option<Uuid>,   // Имя того же поля в системной проекции.
     source_name: Option<String>, // Источник сообщения. Первый срез показывает баннеры Workspace.
     is_own: Option<bool>,   // Признак, что владелец сам отправил сообщение.
     read: Option<bool>,     // Признак, что владелец уже прочитал сообщение.
@@ -1154,6 +1158,63 @@ fn matches_owner(owner: &OwnerContext, project: Option<&str>, user: Option<&str>
     project.is_none_or(|id| id == owner.project_id) && user.is_none_or(|id| id == owner.user_id)
 }
 
+/// Разбирает изменения папок и видимости разговоров из журнала Messenger.
+fn folder_event(
+    wire: &WireEnvelope,
+    owner: &OwnerContext,
+    cursor: &Cursor,
+) -> Result<Option<Event>, SourceError> {
+    let resource = wire.object_type.as_str();
+    let action = wire.action.as_str();
+    let payload = &wire.payload;
+    let archived = payload
+        .is_archived
+        .or((action == "created").then_some(false));
+    if !matches!(
+        (resource, action),
+        ("folder" | "folder_item", "created" | "updated" | "deleted")
+    ) && !(resource == "stream" && matches!(action, "created" | "updated") && archived.is_some())
+    {
+        return Ok(None);
+    }
+    if payload.kind.split_once('.') != Some((resource, action))
+        || !matches_owner(
+            owner,
+            payload.project_id.as_deref(),
+            payload.user_uuid.as_deref(),
+        )
+    {
+        return Err(SourceError::InvalidResponse);
+    }
+    let id = payload
+        .uuid
+        .as_deref()
+        .and_then(parse_uuid)
+        .ok_or(SourceError::InvalidResponse)?;
+    let change = match (resource, action) {
+        ("folder", "deleted") => FolderChange::DeleteFolder(id),
+        ("folder", _) if id.is_nil() => {
+            let count = payload.unread_count.ok_or(SourceError::InvalidResponse)?;
+            return Ok(Some(Event::UnreadChanged {
+                cursor: cursor.clone(),
+                count,
+            }));
+        }
+        ("folder", _) => FolderChange::Refresh(Some(id)),
+        ("folder_item", "deleted") => FolderChange::DeleteItem(id),
+        ("folder_item", _) => FolderChange::Refresh(payload.folder_uuid.or(payload.folder)),
+        ("stream", _) => FolderChange::StreamChanged {
+            stream_id: id,
+            archived: archived.expect("проверено наличие признака архива"),
+        },
+        _ => unreachable!(),
+    };
+    Ok(Some(Event::FolderChanged {
+        cursor: cursor.clone(),
+        change,
+    }))
+}
+
 /// Разбирает серверный UUID для сравнения идентификаторов и построения URL.
 fn parse_uuid(value: &str) -> Option<Uuid> {
     Uuid::parse_str(value).ok()
@@ -1195,27 +1256,8 @@ pub(super) fn wire_event(
     if message_created != (wire.payload.kind == "message.created") {
         return Err(SourceError::InvalidResponse);
     }
-    if wire.object_type == "folder"
-        && matches!(
-            wire.payload.kind.as_str(),
-            "folder.updated" | "folder.created"
-        )
-        && wire.payload.uuid.as_deref() == Some(ALL_CHATS_FOLDER_ID)
-    {
-        if wire.payload.kind.strip_prefix("folder.") != Some(wire.action.as_str()) {
-            return Err(SourceError::InvalidResponse);
-        }
-        let folder = WireFolder {
-            uuid: wire.payload.uuid.ok_or(SourceError::InvalidResponse)?,
-            project_id: wire.payload.project_id,
-            user_uuid: wire.payload.user_uuid,
-            unread_count: wire
-                .payload
-                .unread_count
-                .ok_or(SourceError::InvalidResponse)?,
-        };
-        let count = folder.into_count(owner)?;
-        return Ok((Event::UnreadChanged { cursor, count }, None));
+    if let Some(event) = folder_event(&wire, owner, &cursor)? {
+        return Ok((event, None));
     }
     let message_updated = wire.object_type == "message" && wire.action == "updated";
     let history = match (wire.object_type.as_str(), wire.action.as_str()) {
@@ -1458,9 +1500,9 @@ mod tests {
         );
     }
 
-    /// Проверяет счётчик системной папки и исключает подмену другой папкой или аккаунтом.
+    /// Проверяет общий счётчик, обновление другой папки и подмену владельца.
     #[test]
-    fn applies_only_all_chats_folder_snapshots_for_the_current_owner() {
+    fn decodes_folder_updates_for_the_current_owner() {
         let owner = owner();
         let mut event = json!({
             "schema_version": 1,
@@ -1491,10 +1533,46 @@ mod tests {
             decode_page(vec![event.clone()], &owner, &cursor(14)),
             Err(SourceError::InvalidResponse)
         );
-        event["payload"]["uuid"] = json!("another-folder");
+        let personal = Uuid::from_u128(1);
+        event["payload"]["user_uuid"] = json!("recipient");
+        event["payload"]["uuid"] = json!(personal);
+        assert_eq!(
+            decode_page(vec![event.clone()], &owner, &cursor(14)).unwrap(),
+            [Event::FolderChanged {
+                cursor: cursor(15),
+                change: FolderChange::Refresh(Some(personal)),
+            }]
+        );
+        event["action"] = json!("deleted");
+        event["payload"] = json!({"kind":"folder.deleted", "uuid":personal});
+        assert_eq!(
+            decode_page(vec![event.clone()], &owner, &cursor(14)).unwrap(),
+            [Event::FolderChanged {
+                cursor: cursor(15),
+                change: FolderChange::DeleteFolder(personal),
+            }]
+        );
+        event["object_type"] = json!("folder_item");
+        event["payload"]["kind"] = json!("folder_item.deleted");
+        assert_eq!(
+            decode_page(vec![event.clone()], &owner, &cursor(14)).unwrap(),
+            [Event::FolderChanged {
+                cursor: cursor(15),
+                change: FolderChange::DeleteItem(personal),
+            }]
+        );
+        event["object_type"] = json!("stream");
+        event["action"] = json!("updated");
+        event["payload"] = json!({"kind":"stream.updated", "uuid":personal, "is_archived":true});
         assert_eq!(
             decode_page(vec![event], &owner, &cursor(14)).unwrap(),
-            [Event::Checkpoint(cursor(15))]
+            [Event::FolderChanged {
+                cursor: cursor(15),
+                change: FolderChange::StreamChanged {
+                    stream_id: personal,
+                    archived: true
+                },
+            }]
         );
     }
 

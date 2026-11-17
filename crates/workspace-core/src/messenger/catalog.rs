@@ -1,7 +1,10 @@
 //! Загружает каталог Messenger и хранит последний полный снимок по аккаунту и проекту.
 //! Сначала описаны данные для окна, затем загрузка и разбор ответов сервера.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, Weak},
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -47,14 +50,26 @@ pub(crate) enum CatalogError {
 
 /// Загружает чаты и темы через REST и сохраняет их в SQLite.
 pub struct Catalog {
-    rest: Arc<RestClient>, // HTTP-клиент Messenger с настройками TLS.
-    storage: Arc<Storage>, // База, в которой лежит последний полный снимок.
+    rest: Arc<RestClient>,            // HTTP-клиент Messenger с настройками TLS.
+    storage: Arc<Storage>,            // База, в которой лежит последний полный снимок.
+    refresh_gates: Arc<RefreshGates>, // Набор загрузок, общий для Bootstrap и фоновой сверки.
 }
+
+/// Слабые ссылки на блокировки загрузки для каждого владельца.
+pub(super) type RefreshGates = Mutex<HashMap<OwnerContext, Weak<tokio::sync::Mutex<()>>>>;
 
 impl Catalog {
     /// Использует HTTP-клиент мессенджера и общую базу приложения.
-    pub(super) fn new(rest: Arc<RestClient>, storage: Arc<Storage>) -> Self {
-        Self { rest, storage }
+    pub(super) fn new(
+        rest: Arc<RestClient>,
+        storage: Arc<Storage>,
+        refresh_gates: Arc<RefreshGates>,
+    ) -> Self {
+        Self {
+            rest,
+            storage,
+            refresh_gates,
+        }
     }
 
     /// Читает предыдущий снимок для показа при сетевом сбое.
@@ -91,6 +106,56 @@ impl Catalog {
 
     /// Обновляет каталог только для поколения, которое запросило загрузку.
     pub(crate) async fn refresh(
+        &self,
+        auth: &Auth,
+        session: &SessionSnapshot,
+    ) -> Result<Vec<Chat>, CatalogError> {
+        let gate = self.refresh_gate(&session.context);
+        let _loading = gate.lock().await;
+        loop {
+            match self.refresh_locked(auth, session).await {
+                // Папки или сброс журнала могли запросить новый каталог во время загрузки.
+                Err(CatalogError::Storage(StorageError::StaleCatalog))
+                    if self.storage.catalog_needs_refresh(&session.context)? => {}
+                result => return result,
+            }
+        }
+    }
+
+    /// После другой загрузки проверяет, осталась ли работа для фоновой сверки.
+    pub(super) async fn refresh_if_needed(
+        &self,
+        auth: &Auth,
+        session: &SessionSnapshot,
+    ) -> Result<bool, CatalogError> {
+        let gate = self.refresh_gate(&session.context);
+        let _loading = gate.lock().await;
+        if !self.storage.catalog_needs_refresh(&session.context)? {
+            return Ok(false);
+        }
+        match self.refresh_locked(auth, session).await {
+            Ok(_) | Err(CatalogError::Storage(StorageError::StaleCatalog)) => Ok(true),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Возвращает общую блокировку загрузки этого владельца, не удерживая чужие аккаунты.
+    fn refresh_gate(&self, owner: &OwnerContext) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self
+            .refresh_gates
+            .lock()
+            .expect("блокировки загрузки каталога");
+        gates.retain(|_, gate| gate.strong_count() != 0);
+        if let Some(gate) = gates.get(owner).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        gates.insert(owner.clone(), Arc::downgrade(&gate));
+        gate
+    }
+
+    /// Читает полный каталог и сохраняет его, пока действуют исходные сессия и ревизия.
+    async fn refresh_locked(
         &self,
         auth: &Auth,
         session: &SessionSnapshot,

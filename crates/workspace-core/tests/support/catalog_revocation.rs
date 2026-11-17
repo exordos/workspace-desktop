@@ -31,8 +31,8 @@ use workspace_core::{
 
 use super::MemoryStores;
 
-const PROJECT: &str = "00000000-0000-0000-0000-000000000001";
-const A: &str = "00000000-0000-0000-0000-000000000002";
+pub(super) const PROJECT: &str = "00000000-0000-0000-0000-000000000001";
+pub(super) const A: &str = "00000000-0000-0000-0000-000000000002";
 const B: &str = "00000000-0000-0000-0000-000000000003";
 const STREAM: &str = "00000000-0000-0000-0000-000000000004";
 const OTHER: &str = "00000000-0000-0000-0000-000000000005";
@@ -43,7 +43,7 @@ const KEY: &[u8] = include_bytes!("../../../../tests/fixtures/tls/localhost-key.
 const DEADLINE: Duration = Duration::from_secs(10);
 
 /// Выдаёт двум тестовым пользователям токены с UUID проекта.
-struct TestIam;
+pub(super) struct TestIam;
 
 /// Создаёт токен для заданного пользователя.
 fn token(user: &str, selected: bool) -> IamToken {

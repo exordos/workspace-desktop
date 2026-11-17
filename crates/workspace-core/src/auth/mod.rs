@@ -165,15 +165,50 @@ impl Auth {
         generation: SessionGeneration,
         commit: impl FnOnce() -> T,
     ) -> Result<T, AuthError> {
+        self.with_generation(
+            context,
+            generation,
+            |state| state.status == SessionStatus::Active,
+            commit,
+        )
+    }
+
+    /// Разрешает чтение кэша во время временного сбоя у уже подтверждённого входа.
+    pub(crate) fn with_confirmed_generation<T>(
+        &self,
+        context: &OwnerContext,
+        generation: SessionGeneration,
+        read: impl FnOnce() -> T,
+    ) -> Result<T, AuthError> {
+        self.with_generation(
+            context,
+            generation,
+            |state| {
+                state.status == SessionStatus::Active
+                    || (state.status == SessionStatus::TemporarilyUnavailable
+                        && state.token_version != 0)
+            },
+            read,
+        )
+    }
+
+    /// Проверяет владельца, поколение и допустимый статус под блокировкой аккаунта.
+    fn with_generation<T>(
+        &self,
+        context: &OwnerContext,
+        generation: SessionGeneration,
+        allows: impl FnOnce(&AccountState) -> bool,
+        action: impl FnOnce() -> T,
+    ) -> Result<T, AuthError> {
         let slot = self.account_slot(&context.account_id)?;
         let state = slot.lock().unwrap();
         if state.generation != generation
-            || state.status != SessionStatus::Active
             || state.record.as_ref().map(|record| &record.context) != Some(context)
+            || !allows(&state)
         {
             return Err(AuthError::SessionUnavailable);
         }
-        Ok(commit())
+        Ok(action())
     }
 
     /// Сразу отдаёт текущий список сессий, а после изменений — его свежую версию.
