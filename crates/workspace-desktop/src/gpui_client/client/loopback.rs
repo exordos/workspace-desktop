@@ -593,7 +593,23 @@ fn catalog_click_and_submission_reach_https_queue(cx: &mut TestAppContext) {
         JsonAccountStore::open(profile.path()),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
     ));
-    click(ui, CHAT_ROW);
+    // Идём от первой кнопки оболочки к меню, затем через поле поиска к строке.
+    ui.update(|window, app| window.focus(&client.read(app).initial_focus));
+    ui.simulate_keystrokes("tab tab enter");
+    ui.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("enter").unwrap(),
+    });
+    ui.run_until_parked();
+    assert!(ui.read(|app| client.read(app).top_bar.read(app).menu_is_open()));
+    ui.simulate_keystrokes("escape tab");
+    ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string("Тест".to_owned())));
+    ui.simulate_keystrokes("cmd-v");
+    ui.run_until_parked();
+    assert!(ui.debug_bounds("catalog-clear").is_some());
+    ui.simulate_keystrokes("down enter");
+    ui.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("enter").unwrap(),
+    });
     until(ui, "маршрут из каталога", |ui| {
         ui.read(|app| client.read(app).shell.conversation().is_some())
     });
@@ -605,13 +621,38 @@ fn catalog_click_and_submission_reach_https_queue(cx: &mut TestAppContext) {
                 && server.state.targets.load(Ordering::SeqCst) >= 2
         },
     );
-    click(ui, "workspace-composer-editor");
+    let row_focus = ui.update(|window, app| window.focused(app).unwrap());
+    let conversation = ui.read(|app| client.read(app).conversation.as_ref().unwrap().clone());
+    ui.simulate_keystrokes("tab");
+    ui.run_until_parked();
+    let history_focus = ui.update(|window, app| window.focused(app).unwrap());
+    assert_eq!(
+        ui.update(|window, app| conversation.read(app).keyboard_focus(window, app)),
+        Some("история")
+    );
+    assert_ne!(history_focus, row_focus);
+    ui.simulate_keystrokes("tab");
+    ui.run_until_parked();
+    let editor_focus = ui.update(|window, app| window.focused(app).unwrap());
+    assert_eq!(
+        ui.update(|window, app| conversation.read(app).keyboard_focus(window, app)),
+        Some("редактор")
+    );
+    assert_ne!(editor_focus, history_focus);
+    ui.simulate_keystrokes("shift-tab");
+    ui.run_until_parked();
+    assert!(ui.update(|window, _| history_focus.is_focused(window)));
+    ui.simulate_keystrokes("shift-tab");
+    ui.run_until_parked();
+    assert!(ui.update(|window, _| row_focus.is_focused(window)));
+    ui.simulate_keystrokes("tab tab");
+    ui.run_until_parked();
+    assert!(ui.update(|window, _| editor_focus.is_focused(window)));
     ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(MARKER.to_owned())));
     ui.simulate_keystrokes("cmd-v");
     ui.run_until_parked();
 
     // Сужаем то же окно с черновиком и убеждаемся, что отправляется тот же текст.
-    let conversation = ui.read(|app| client.read(app).conversation.as_ref().unwrap().clone());
     for (width, height, catalog_width) in [(1440., 900., 299.), (700., 600., 280.)] {
         ui.simulate_resize(size(px(width), px(height)));
         ui.run_until_parked();

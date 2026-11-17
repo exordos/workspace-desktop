@@ -46,7 +46,8 @@ pub struct Palette {
     pub text: Hsla,             // Основной текст.
     pub text_secondary: Hsla,   // Второстепенный текст.
     pub text_muted: Hsla,       // Подсказка поля и неактивная подпись.
-    pub accent: Hsla,           // Кнопка основного действия и фокус.
+    pub accent: Hsla,           // Кнопка основного действия.
+    pub focus: Hsla,            // Контрастная рамка клавиатурного фокуса.
     pub accent_soft: Hsla,      // Подложка мягкого акцента.
     pub on_accent: Hsla,        // Текст на кнопке основного действия.
     pub danger: Hsla,           // Ошибка или опасное действие.
@@ -77,12 +78,13 @@ impl Palette {
                 card_selected: rgb(0xd5e5f6).into(),
                 field: rgb(0xf0f6fc).into(),
                 text: rgb(0x1a2330).into(),
-                text_secondary: rgb(0x66758a).into(),
+                text_secondary: rgb(0x526176).into(),
                 text_muted: rgb(0x8d9bae).into(),
                 accent: rgb(0x6f90d8).into(),
+                focus: rgb(0x385fae).into(),
                 accent_soft: rgb(0xdce8fb).into(),
                 on_accent: rgb(0x101a28).into(),
-                danger: rgb(0xd92d20).into(),
+                danger: rgb(0xc4241c).into(),
                 border: rgb(0xd3dfec).into(),
                 unread: rgb(0x6f90d8).into(),
                 unread_muted: rgb(0x9ca9bb).into(),
@@ -90,7 +92,7 @@ impl Palette {
                 muted_badge_text: rgb(0x101a28).into(),
                 message: rgb(0xffffff).into(),
                 message_own: rgb(0xdbe8f8).into(),
-                message_time: rgb(0x8d9bae).into(),
+                message_time: rgb(0x526176).into(),
                 icon: rgb(0x8d9bae).into(),
                 disabled: rgb(0xb8c3d1).into(),
                 icon_hover: rgb(0x1a2330).into(),
@@ -105,12 +107,13 @@ impl Palette {
                 card_selected: rgb(0x30465d).into(),
                 field: rgb(0x232c38).into(),
                 text: rgb(0xf7fbff).into(),
-                text_secondary: rgb(0x9aa8b8).into(),
+                text_secondary: rgb(0xb4c3d4).into(),
                 text_muted: rgb(0x748396).into(),
                 accent: rgb(0x7d9ddf).into(),
+                focus: rgb(0xa6c0f4).into(),
                 accent_soft: rgb(0x2f3f66).into(),
                 on_accent: rgb(0x111823).into(),
-                danger: rgb(0xd92d20).into(),
+                danger: rgb(0xff8777).into(),
                 border: rgb(0x394a61).into(),
                 unread: rgb(0x6f8fda).into(),
                 unread_muted: rgb(0x646f7f).into(),
@@ -118,7 +121,7 @@ impl Palette {
                 muted_badge_text: rgb(0xffffff).into(),
                 message: rgb(0x323c4a).into(),
                 message_own: rgb(0x2a3a50).into(),
-                message_time: rgb(0x9aa8b8).into(),
+                message_time: rgb(0xb4c3d4).into(),
                 icon: rgb(0x748396).into(),
                 disabled: rgb(0x4b596a).into(),
                 icon_hover: rgb(0xaab9cc).into(),

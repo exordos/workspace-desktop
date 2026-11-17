@@ -80,6 +80,58 @@ fn type_burst(
     ui.run_until_parked();
 }
 
+/// Проверяет прокрутку с клавиатуры, догрузку старого края и возврат к хвосту.
+#[gpui::test]
+fn history_keys_scroll_and_load_older_page(cx: &mut TestAppContext) {
+    let (view, ui, requests) = start(cx);
+    ui.simulate_resize(size(px(340.), px(530.)));
+    let scope = ui.read(|app| view.read(app).address().route.scope);
+    publish_with_older(
+        &requests,
+        Load::Open(ChatEntry::Latest),
+        fixture_rows(scope, PAGED_ROWS + 1, LAST_ROW),
+        vec![],
+        HistoryEdge::More("older".into()),
+        ui,
+    );
+    allow(&requests, Ok(TOPIC), ui);
+    ui.update(|window, app| window.focus(&view.read(app).history_focus));
+    ui.run_until_parked();
+    assert!(ui.read(|app| view.read(app).viewport.at_tail()));
+
+    ui.simulate_keystrokes("pageup");
+    ui.run_until_parked();
+    let page = ui.read(|app| view.read(app).viewport.list().logical_scroll_top());
+    assert!(
+        page.item_ix > 0 && page.item_ix < (LAST_ROW - PAGED_ROWS) as usize,
+        "Ожидался верх страницы, получен {page:?}"
+    );
+    assert!(!ui.read(|app| view.read(app).viewport.at_tail()));
+    ui.simulate_keystrokes("down");
+    ui.run_until_parked();
+    let after = ui.read(|app| view.read(app).viewport.list().logical_scroll_top());
+    assert!(after.item_ix > page.item_ix || after.offset_in_item > page.offset_in_item);
+
+    ui.simulate_keystrokes("home");
+    ui.run_until_parked();
+    assert_eq!(
+        ui.read(|app| view.read(app).viewport.list().logical_scroll_top().item_ix),
+        0
+    );
+    ui.simulate_keystrokes("up");
+    publish(
+        &requests,
+        Load::Extend(7, HistoryDirection::Older),
+        fixture_rows(scope, 1, LAST_ROW),
+        vec![],
+        ui,
+    );
+    ui.simulate_keystrokes("end");
+    ui.run_until_parked();
+    assert!(ui.read(|app| view.read(app).viewport.at_tail()));
+    assert!(ui.update(|window, app| view.read(app).history_focus.is_focused(window)));
+}
+
 /// Проверяет чтение длинной истории во время ввода, догрузки, изменения ширины и доставки.
 #[gpui::test]
 fn long_history_keeps_reading_position_and_input(cx: &mut TestAppContext) {

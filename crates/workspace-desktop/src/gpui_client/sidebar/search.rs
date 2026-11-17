@@ -450,6 +450,13 @@ impl Render for Search {
                     .h(px(24.))
                     .min_w(px(24.))
                     .px(px(3.))
+                    .tooltip(move |_, app| {
+                        crate::gpui_client::ui::popup::tooltip(
+                            palette,
+                            "Очистить поиск".into(),
+                            app,
+                        )
+                    })
                     .debug_selector(|| "catalog-clear".into()),
             );
         }

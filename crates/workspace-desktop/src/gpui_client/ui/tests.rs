@@ -193,6 +193,33 @@ fn unread_badges_keep_text_contrast_in_both_themes() {
     }
 }
 
+/// Проверяет читаемость подписи, статуса и рамки фокуса на рабочих поверхностях.
+#[test]
+fn status_text_and_focus_keep_contrast_in_both_themes() {
+    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        let p = Palette::for_mode(mode);
+        for (name, foreground, background, minimum) in [
+            (
+                "подпись выбранной строки",
+                p.text_secondary,
+                p.card_selected,
+                4.5,
+            ),
+            ("время исходящего", p.message_time, p.message_own, 4.5),
+            ("время входящего", p.message_time, p.message, 4.5),
+            ("ошибка в редакторе", p.danger, p.surface, 4.5),
+            ("рамка поля", p.focus, p.field, 3.),
+            ("рамка выбранной строки", p.focus, p.card_selected, 3.),
+            ("рамка истории", p.focus, p.background, 3.),
+        ] {
+            let a = relative_luminance(foreground);
+            let b = relative_luminance(background);
+            let ratio = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+            assert!(ratio >= minimum, "{mode:?}, {name}: {ratio:.2}:1");
+        }
+    }
+}
+
 /// Переводит цвет sRGB в относительную яркость для проверки контраста.
 fn relative_luminance(color: gpui::Hsla) -> f32 {
     let color = color.to_rgb();

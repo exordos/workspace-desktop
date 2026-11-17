@@ -131,7 +131,7 @@ pub(super) fn activate(
             None => element.focusable(),
         })
         .tab_stop(true)
-        .focus(|style| style.border_color(palette.text))
+        .focus(|style| style.border_color(palette.focus))
         .cursor_pointer()
         .on_click(move |_, window, cx| on_activate(window, cx))
 }
@@ -150,7 +150,7 @@ pub enum FieldAppearance {
 pub fn field(palette: Palette, appearance: FieldAppearance, control: impl IntoElement) -> Div {
     let border = match appearance {
         FieldAppearance::Normal | FieldAppearance::Disabled => palette.border,
-        FieldAppearance::Focused => palette.accent,
+        FieldAppearance::Focused => palette.focus,
         FieldAppearance::Invalid => palette.danger,
     };
     div()

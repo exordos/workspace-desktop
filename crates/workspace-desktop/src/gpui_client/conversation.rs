@@ -6,7 +6,10 @@ mod source;
 mod viewport;
 
 use futures::channel::oneshot;
-use gpui::{App, Context, Entity, IntoElement, Render, Subscription, Window, div, prelude::*, px};
+use gpui::{
+    App, Context, Entity, FocusHandle, IntoElement, KeyDownEvent, Render, Subscription, Window,
+    div, prelude::*, px,
+};
 use uuid::Uuid;
 use workspace_core::{
     bootstrap::ChatList,
@@ -65,6 +68,7 @@ pub struct Conversation {
     action_error: Option<Flight>, // Запрос, который можно повторить, пока открыта история.
     outbox: Vec<OutboxEntry>, // Последний снимок очереди в области разговора.
     viewport: Viewport, // Виртуальный список и его положение.
+    history_focus: FocusHandle, // Точка клавиатурной прокрутки в открытом разговоре.
     sending: Option<Sending>, // Рабочий редактор; изолированные тесты истории могут его не подключать.
     heading: Heading,         // Отображаемые названия из текущего каталога.
 }
@@ -96,6 +100,7 @@ impl Conversation {
             action_error: None,
             outbox: Vec::new(),
             viewport: Viewport::new(),
+            history_focus: cx.focus_handle().tab_stop(true),
             sending: None,
             heading: Heading::default(),
         };
@@ -572,6 +577,82 @@ impl Conversation {
             self.restart(cx);
         }
     }
+
+    /// Прокручивает историю, когда фокус в списке, и догружает край следующим нажатием.
+    fn scroll_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.modifiers.modified() {
+            return;
+        }
+        let list = self.viewport.list();
+        let height = list.viewport_bounds().size.height;
+        let step = (height - px(40.)).max(px(40.));
+        let offset = list.logical_scroll_top();
+        let at_start = offset.item_ix == 0 && offset.offset_in_item <= px(0.);
+        let at_tail = self.viewport.at_tail();
+        let key = event.keystroke.key.as_str();
+        let distance = match key {
+            "up" => -px(40.),
+            "down" => px(40.),
+            "pageup" | "home" => -step,
+            "pagedown" => step,
+            "end" => px(0.),
+            _ => return,
+        };
+        cx.stop_propagation();
+        if key == "end" {
+            self.latest(cx);
+            return;
+        }
+        if (distance < px(0.) && at_start) || (distance > px(0.) && at_tail) {
+            if self.active.is_none() && self.action_error.is_none() {
+                let direction = if distance < px(0.) {
+                    HistoryDirection::Older
+                } else {
+                    HistoryDirection::Newer
+                };
+                self.extend(direction, cx);
+            }
+            return;
+        }
+        if key == "home" {
+            list.scroll_to(gpui::ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.),
+            });
+        } else {
+            // В режиме хвоста GPUI хранит смещение за последней строкой.
+            // Первый шаг вверх отсчитываем от верхнего края видимой области.
+            let distance = if offset.item_ix == list.item_count() {
+                distance - height
+            } else {
+                distance
+            };
+            list.scroll_by(distance);
+        }
+        cx.notify();
+    }
+
+    /// Отмечает клавиатурный фокус внутри истории, не меняя размеры списка.
+    fn history_frame(
+        &self,
+        palette: Palette,
+        viewport: impl IntoElement,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("conversation-history-focus")
+            .debug_selector(|| "conversation-history-focus".into())
+            .track_focus(&self.history_focus)
+            .flex()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .focus(|style| style.border_color(palette.focus))
+            .on_key_down(cx.listener(Self::scroll_key))
+            .child(viewport)
+    }
 }
 
 impl Conversation {
@@ -780,7 +861,14 @@ impl Render for Conversation {
                 let problem = self
                     .action_error
                     .map(|_| self.render_problem(palette, None, cx));
-                let viewport = self.viewport.render(palette, peer);
+                let viewport = if empty {
+                    label(palette, TextRole::Caption, "Сообщений пока нет")
+                        .m_auto()
+                        .debug_selector(|| "history-empty".into())
+                        .into_any_element()
+                } else {
+                    self.viewport.render(palette, peer).into_any_element()
+                };
                 root.child(
                     div()
                         .relative()
@@ -790,14 +878,7 @@ impl Render for Conversation {
                         .min_h_0()
                         .min_w_0()
                         .child(paging)
-                        .when(empty, |history| {
-                            history.child(
-                                label(palette, TextRole::Caption, "Сообщений пока нет")
-                                    .m_auto()
-                                    .debug_selector(|| "history-empty".into()),
-                            )
-                        })
-                        .when(!empty, |history| history.child(viewport))
+                        .child(self.history_frame(palette, viewport, cx))
                         .children(problem.map(|problem| {
                             div()
                                 .absolute()

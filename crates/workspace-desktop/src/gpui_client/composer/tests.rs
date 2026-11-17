@@ -28,6 +28,29 @@ const MESSAGE: Uuid = Uuid::from_u128(2001);
 const TOPIC: Uuid = Uuid::from_u128(2002);
 
 impl Conversation {
+    /// Проверяет, какой участок разговора получил фокус от клавиши Tab.
+    pub(in crate::gpui_client) fn keyboard_focus(
+        &self,
+        window: &Window,
+        app: &App,
+    ) -> Option<&'static str> {
+        if self.history_focus.is_focused(window) {
+            Some("история")
+        } else if self.sending.as_ref().is_some_and(|sending| {
+            sending
+                .view
+                .read(app)
+                .editor()
+                .read(app)
+                .focus_handle(app)
+                .is_focused(window)
+        }) {
+            Some("редактор")
+        } else {
+            None
+        }
+    }
+
     /// Подставляет отказ записи и возвращает действие для восстановления рабочего источника.
     pub(in crate::gpui_client) fn fail_queue_write(
         &mut self,
