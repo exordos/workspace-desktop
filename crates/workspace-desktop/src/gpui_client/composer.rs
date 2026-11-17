@@ -272,9 +272,10 @@ impl Render for Composer {
         };
         let target = cx.entity().downgrade();
         let retry = target.clone();
+        // Сетка сначала задаёт общую ширину поля и пояснения. От неё зависит высота переносов.
         div()
-            .flex()
-            .flex_col()
+            .grid()
+            .grid_cols(1)
             .flex_none()
             .min_w_0()
             .gap(px(4.))
@@ -292,6 +293,7 @@ impl Render for Composer {
                     .child(
                         field(palette, appearance, self.editor.clone())
                             .flex_1()
+                            .debug_selector(|| "conversation-composer-field".into())
                             .rounded(px(12.)),
                     )
                     .child(

@@ -11,7 +11,7 @@ use std::{
 };
 
 use futures::SinkExt;
-use gpui::{ClipboardItem, Modifiers, TestAppContext, VisualTestContext, px, size};
+use gpui::{ClipboardItem, Focusable, Modifiers, TestAppContext, VisualTestContext, px, size};
 use http_body_util::{BodyExt, Full};
 use hyper::{
     Method, Request, Response, StatusCode,
@@ -60,7 +60,8 @@ const TOPIC: &str = "10000000-0000-4000-8000-000000000006";
 const OLD_ROW: Uuid = Uuid::from_u128(71);
 const FRESH_ROW: Uuid = Uuid::from_u128(72);
 const PEER_ROW: Uuid = Uuid::from_u128(73);
-const MARKER: &str = "Контрольная запись";
+const MARKER: &str =
+    "Первая строка синтетического черновика.\nВторая строка для проверки роста.\nТретья строка.";
 const MESSAGES: &str = "/api/workspace/v1/messenger/messages/";
 const STREAMS: &str = "/api/workspace/v1/messenger/streams/";
 const TOPICS: &str = "/api/workspace/v1/messenger/stream_topics/";
@@ -570,7 +571,7 @@ fn start_runtime(
     .unwrap()
 }
 
-/// Открывает чат из сохранённого входа и отправляет один черновик после сужения окна.
+/// Открывает чат, проверяет редактор после сужения и сохраняет черновик при повторной попытке.
 #[gpui::test]
 fn catalog_click_and_submission_reach_https_queue(cx: &mut TestAppContext) {
     cx.update(bind_keys);
@@ -623,6 +624,49 @@ fn catalog_click_and_submission_reach_https_queue(cx: &mut TestAppContext) {
         assert!(ui.read(|app| client.read(app).conversation.as_ref() == Some(&conversation)));
         assert!(ui.debug_bounds("workspace-composer-editor").is_some());
     }
+
+    let composer = ui.update(|_, app| {
+        conversation.update(app, |conversation, _| conversation.fail_first_queue_write())
+    });
+    let before = ui.debug_bounds("workspace-composer-editor").unwrap();
+    assert!(
+        before.size.height > px(86.),
+        "В 700 px нужен черновик с несколькими переносами"
+    );
+    ui.simulate_keystrokes("enter");
+    until(ui, "пояснение сбоя записи", |ui| {
+        ui.debug_bounds("conversation-send-explanation").is_some()
+    });
+    assert!(server.state.sent.lock().unwrap().is_empty());
+    let panel = ui.debug_bounds("workspace-conversation-panel").unwrap();
+    assert_eq!(panel.bottom(), px(600.));
+    for selector in [
+        "conversation-composer",
+        "conversation-composer-field",
+        "workspace-composer-editor",
+        "conversation-send",
+        "conversation-send-explanation",
+    ] {
+        let bounds = ui.debug_bounds(selector).unwrap();
+        assert!(
+            bounds.top() >= panel.top()
+                && bounds.bottom() <= panel.bottom()
+                && bounds.left() >= panel.left()
+                && bounds.right() <= panel.right(),
+            "После ошибки {selector} выходит за границы разговора: {bounds:?}, панель {panel:?}"
+        );
+    }
+    assert_eq!(
+        ui.debug_bounds("workspace-composer-editor")
+            .unwrap()
+            .size
+            .height,
+        before.size.height
+    );
+    assert!(ui.update(|window, app| {
+        let composer = composer.read(app);
+        composer.draft(app) == MARKER && composer.editor().focus_handle(app).is_focused(window)
+    }));
 
     click(ui, "conversation-send");
     until(ui, "одна отправка по HTTPS", |_| {

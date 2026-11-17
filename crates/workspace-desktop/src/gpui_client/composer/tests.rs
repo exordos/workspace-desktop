@@ -1,7 +1,11 @@
 //! Проверяет ввод, геометрию редактора и отправку через рабочий экран разговора.
 
 use std::{
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::Duration,
 };
 
@@ -23,6 +27,28 @@ use super::*;
 
 const MESSAGE: Uuid = Uuid::from_u128(2001);
 const TOPIC: Uuid = Uuid::from_u128(2002);
+
+impl Conversation {
+    /// Отклоняет первую запись, затем снова использует рабочий источник отправки.
+    pub(in crate::gpui_client) fn fail_first_queue_write(&mut self) -> Entity<Composer> {
+        let sending = self.sending.as_mut().unwrap();
+        let save = sending.source.save.clone();
+        let first = AtomicBool::new(true);
+        sending.source.save = Arc::new(move |submission| {
+            if first.swap(false, Ordering::Relaxed) {
+                Box::pin(async move {
+                    ConversationReply {
+                        address: submission.address,
+                        value: None,
+                    }
+                })
+            } else {
+                save(submission)
+            }
+        });
+        sending.view.clone()
+    }
+}
 
 /// Запрос разговора, который тест может завершить после следующих действий пользователя.
 struct Request<T, U> {
