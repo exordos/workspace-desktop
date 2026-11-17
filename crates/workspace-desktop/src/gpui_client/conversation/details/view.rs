@@ -96,14 +96,16 @@ pub(super) struct TopicView {
     pub title: SharedString, // Отображаемое имя темы.
     pub selected: bool,      // Сейчас открыт этот разговор.
     pub muted: Option<bool>, // Действующий режим темы, если он известен.
-    pub unread: u64,         // Количество непрочитанных по данным каталога.
+    pub unread: u64,         // Активные непрочитанные или счётчик приглушённых.
+    pub unread_muted: bool,  // Счётчик относится к приглушённым непрочитанным.
     pub mentioned: bool,     // В теме есть непрочитанное личное упоминание.
 }
 
-/// Открытая тема, когда её нет среди активных.
+/// Контекст открытой темы и сведения о завершении.
 pub(super) struct SelectedTopicView {
-    pub title: SharedString, // Название открытой темы.
-    pub done: bool,          // Тема завершена.
+    pub title: SharedString,           // Название открытой темы.
+    pub done: bool,                    // Тема завершена.
+    pub summary: Option<SharedString>, // Готовый контекст из данных темы.
 }
 
 /// Строка участника с действием, разрешённым контроллером.
@@ -126,7 +128,7 @@ pub(super) struct ChannelView {
     pub member_count: usize,                       // Общее число участников.
     pub online_count: usize,                       // Число участников в сети.
     pub notifications: Option<NotificationsView>,  // Режим уведомлений, если он доступен.
-    pub selected_topic: Option<SelectedTopicView>, // Открытая тема вне активного списка.
+    pub selected_topic: Option<SelectedTopicView>, // Контекст открытой темы, если он есть.
     pub topics_expanded: bool,                     // Видимость списка тем.
     pub topics: Vec<TopicView>,                    // Темы в порядке показа.
     pub members: Vec<MemberView>,                  // Участники в порядке показа.

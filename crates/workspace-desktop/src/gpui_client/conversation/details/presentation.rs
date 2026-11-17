@@ -166,17 +166,25 @@ fn channel_content(
                         || (topic.notification_mode == TopicNotificationMode::Default
                             && channel.notification_mode == StreamNotificationMode::Muted),
                 ),
-                unread: 0,
+                unread: u64::from(if topic.active_unread_count > 0 {
+                    topic.active_unread_count
+                } else {
+                    topic.passive_unread_count
+                }),
+                unread_muted: topic.active_unread_count == 0 && topic.passive_unread_count > 0,
                 mentioned: false,
             })
             .collect(),
         selected_topic: channel
             .topics
             .iter()
-            .find(|topic| Some(topic.id) == current_topic && topic.done)
+            .find(|topic| {
+                Some(topic.id) == current_topic && (topic.done || topic.summary.is_some())
+            })
             .map(|topic| SelectedTopicView {
                 title: topic.name.clone().into(),
-                done: true,
+                done: topic.done,
+                summary: topic.summary.clone().map(Into::into),
             }),
         notifications: Some(NotificationsView {
             level: match channel.notification_mode {

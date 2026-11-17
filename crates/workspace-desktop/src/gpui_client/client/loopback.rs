@@ -61,6 +61,12 @@ const CHANNEL: &str = "10000000-0000-4000-8000-000000000007";
 const CHANNEL_DEFAULT: &str = "10000000-0000-4000-8000-000000000008";
 const CHANNEL_TOPIC: &str = "10000000-0000-4000-8000-000000000009";
 const CHANNEL_BINDING: &str = "10000000-0000-4000-8000-000000000010";
+const INVITEE: &str = "10000000-0000-4000-8000-000000000011";
+const CHANNEL_OWNER_BINDING: &str = "10000000-0000-4000-8000-000000000012";
+const INVITEE_BINDING: &str = "10000000-0000-4000-8000-000000000013";
+const PICK_INVITEE: &str = "details-member-picker-user-10000000-0000-4000-8000-000000000011";
+const REMOVE_INVITEE: &str = "details-remove-member-10000000-0000-4000-8000-000000000013";
+const LEAVE_CHANNEL: &str = "details-remove-member-10000000-0000-4000-8000-000000000010";
 const CHANNEL_SECOND_TOPIC_ROW: &str = "details-topic-10000000-0000-4000-8000-000000000008";
 const BINDINGS: &str = "/api/workspace/v1/messenger/stream_bindings/";
 const OLD_ROW: Uuid = Uuid::from_u128(71);
@@ -252,6 +258,44 @@ const AVATAR_PNG: &[u8] = &[
     16, 10, 0, 34, 234, 5, 77, 31, 20, 234, 4, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
 ];
 
+/// Моделирует владельца A, участника B и приглашение третьего пользователя.
+#[derive(Default)]
+struct ChannelMembership {
+    invited: AtomicBool, // Третий пользователь присутствует в составе канала.
+    left: AtomicBool,    // B удалил собственную привязку.
+}
+
+impl ChannelMembership {
+    /// Даёт привязки всем участникам без изменения UUID между аккаунтами.
+    fn bindings(&self) -> Value {
+        let binding = |id, user, role| {
+            json!({
+                "uuid": id, "stream_uuid": CHANNEL, "project_id": PROJECT,
+                "user_uuid": user, "role": role,
+            })
+        };
+        let mut rows = vec![binding(CHANNEL_OWNER_BINDING, USER, "owner")];
+        if !self.left.load(Ordering::SeqCst) {
+            rows.push(binding(CHANNEL_BINDING, PEER, "member"));
+        }
+        if self.invited.load(Ordering::SeqCst) {
+            rows.push(binding(INVITEE_BINDING, INVITEE, "member"));
+        }
+        Value::Array(rows)
+    }
+
+    /// Возвращает небольшие профили для списка участников и поиска.
+    fn profile(id: &str) -> Value {
+        let name = match id {
+            USER => "Владелец канала",
+            PEER => "Участник канала",
+            INVITEE => "Новый коллега",
+            _ => unreachable!(),
+        };
+        json!({"uuid":id, "username":name, "first_name":name, "status":"active"})
+    }
+}
+
 /// Управляет ответами профиля и проверяет, какого пользователя запросил каждый вход.
 #[derive(Default)]
 struct DetailsFixture {
@@ -259,6 +303,7 @@ struct DetailsFixture {
     users: Mutex<Vec<(&'static str, &'static str)>>, // Токен владельца и UUID собеседника.
     unblock: Mutex<Option<oneshot::Receiver<()>>>, // Удерживает ровно один ответ профиля.
     live: Mutex<Option<broadcast::Sender<RecoverySignal>>>, // Кадры журнала аккаунта A.
+    membership: Option<ChannelMembership>, // Сценарий приглашения, удаления и выхода.
     notifications_muted: AtomicBool, // Последняя настройка канала на сервере.
     channel_requests: AtomicUsize, // Число чтений тем для построения сведений.
     omit_stream_user: AtomicBool, // Имитирует старый ответ, который не подтверждает владельца.
@@ -560,6 +605,47 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
                 }),
             );
         }
+        if let Some(membership) = &details.membership {
+            if path == "/api/workspace/v1/users/" {
+                return json_response(
+                    StatusCode::OK,
+                    json!([
+                        ChannelMembership::profile(USER),
+                        ChannelMembership::profile(PEER),
+                        ChannelMembership::profile(INVITEE),
+                    ]),
+                );
+            }
+            if let Some(id) = path.strip_prefix("/api/workspace/v1/users/")
+                && [USER, PEER, INVITEE].contains(&id)
+            {
+                return json_response(StatusCode::OK, ChannelMembership::profile(id));
+            }
+            if path == format!("{STREAMS}{CHANNEL}/actions/add_users/invoke") {
+                assert_eq!((request.method(), user), (&Method::POST, USER));
+                let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                let data: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(data["member"], json!([INVITEE]));
+                membership.invited.store(true, Ordering::SeqCst);
+                return json_response(StatusCode::OK, json!({}));
+            }
+            if request.method() == Method::DELETE
+                && let Some(binding) = path.strip_prefix(BINDINGS)
+            {
+                match (user, binding) {
+                    (USER, INVITEE_BINDING) => membership.invited.store(false, Ordering::SeqCst),
+                    (PEER, CHANNEL_BINDING) => membership.left.store(true, Ordering::SeqCst),
+                    _ => panic!("Недопустимое удаление привязки"),
+                }
+                return json_response(StatusCode::OK, json!({}));
+            }
+            if path == format!("{STREAMS}{CHANNEL}")
+                && user == PEER
+                && membership.left.load(Ordering::SeqCst)
+            {
+                return json_response(StatusCode::FORBIDDEN, Value::Null);
+            }
+        }
         if path == format!("{STREAMS}{CHANNEL}/actions/notifications/invoke") {
             assert_eq!(request.method(), Method::POST);
             let bytes = request.into_body().collect().await.unwrap().to_bytes();
@@ -569,6 +655,9 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
             return json_response(StatusCode::OK, json!({}));
         }
         if path == BINDINGS && query_value(&request, "stream_uuid") == Some(CHANNEL) {
+            if let Some(membership) = &details.membership {
+                return json_response(StatusCode::OK, membership.bindings());
+            }
             return json_response(
                 StatusCode::OK,
                 json!([{
@@ -579,13 +668,15 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         }
         if path == TOPICS && query_value(&request, "stream_uuid") == Some(CHANNEL) {
             details.channel_requests.fetch_add(1, Ordering::SeqCst);
+            let mut selected = channel_topic(user, TopicGate::Open);
+            selected["summary"] = json!("Контекст синтетической темы");
             let mut second = channel_topic(user, TopicGate::Open);
             second["uuid"] = json!(CHANNEL_DEFAULT);
             second["name"] = json!("Первая тема");
-            return json_response(
-                StatusCode::OK,
-                json!([channel_topic(user, TopicGate::Open), second]),
-            );
+            second["unread_count"] = json!(2);
+            second["active_unread_count"] = json!(0);
+            second["passive_unread_count"] = json!(2);
+            return json_response(StatusCode::OK, json!([selected, second]));
         }
     }
 
@@ -693,7 +784,7 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
             let gate = *state.topic.as_ref().unwrap().gate.lock().unwrap();
             let mut channel = topic_channel(user, gate == TopicGate::Encrypted);
             if let Some(details) = &state.details {
-                channel["owner"] = json!(user);
+                channel["owner"] = json!(if details.membership.is_some() { USER } else { user });
                 if details.notifications_muted.load(Ordering::SeqCst) {
                     channel["notification_mode"] = json!("muted");
                 }
@@ -1424,6 +1515,14 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
         assert_eq!(channel.members.len(), 1);
         assert!(channel.can_add_members);
     });
+    assert!(
+        ui.debug_bounds("conversation-details-topic-summary")
+            .is_some()
+    );
+    assert!(
+        ui.debug_bounds("details-topic-unread-10000000-0000-4000-8000-000000000008")
+            .is_some()
+    );
     assert_eq!(ui.debug_bounds("conversation-chat").unwrap(), chat_before);
     assert_eq!(
         ui.debug_bounds("workspace-composer-editor").unwrap(),
@@ -1492,6 +1591,174 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
         },
     );
     assert_eq!(details.channel_requests.load(Ordering::SeqCst), reads);
+    assert_eq!(
+        futures::executor::block_on(runtime.shutdown()),
+        RuntimeExit::Clean
+    );
+}
+
+/// Проверяет кнопки владельца, приглашение, событие состава и выход без лишнего доступа.
+#[gpui::test]
+fn sidebar_members_offer_only_allowed_actions_and_refresh_after_changes(cx: &mut TestAppContext) {
+    use workspace_core::messenger::details::{ChannelSidebar, StreamRole};
+
+    cx.update(bind_keys);
+    let (live, _) = broadcast::channel(8);
+    let server = Server::serve(Received {
+        topic: Some(TopicAcceptance::default()),
+        details: Some(DetailsFixture {
+            live: Mutex::new(Some(live.clone())),
+            membership: Some(ChannelMembership::default()),
+            ..DetailsFixture::default()
+        }),
+        ..Received::default()
+    });
+    let membership = server
+        .state
+        .details
+        .as_ref()
+        .unwrap()
+        .membership
+        .as_ref()
+        .unwrap();
+    let profile = tempfile::tempdir().unwrap();
+    let a = saved_account(&server, USER, Uuid::nil());
+    let b = saved_account(&server, PEER, PEER.parse().unwrap());
+    let b_id = b.context.account_id.clone();
+    JsonAccountStore::open(profile.path())
+        .unwrap()
+        .save(&b)
+        .unwrap();
+    let (runtime, events) = start_runtime(profile.path(), a.clone());
+    let (client, ui) = cx.add_window_view(|_, cx| {
+        Client::new(
+            Options {
+                active: Some(a.context.account_id.clone()),
+                ..Options::default()
+            },
+            runtime.clone(),
+            cx,
+        )
+    });
+    ui.update(|_, app| {
+        let subscription = events.attach(&client, app, Client::handle_runtime);
+        client.update(app, |client, cx| client.attach(subscription, cx));
+    });
+    ui.simulate_resize(size(px(1440.), px(900.)));
+    until(ui, "сокеты A и B готовы", |ui| {
+        server.state.ready.load(Ordering::SeqCst) >= 2 && ui.debug_bounds(CHANNEL_ROW).is_some()
+    });
+    click(ui, CHANNEL_ROW);
+    ui.run_until_parked();
+    click(ui, CHANNEL_TOPIC_ROW);
+    let _ = topic_ready(&client, ui, "владелец читает тему");
+    click(ui, DETAILS_TRIGGER);
+    let channel_matches = |ui: &mut VisualTestContext,
+                           matches: &dyn Fn(&ChannelSidebar) -> bool| {
+        ui.read(|app| {
+            client.read(app).conversation.as_ref().is_some_and(|view| {
+                match view.read(app).tested_details() {
+                    Some(SidebarDetails::Channel(channel)) => matches(channel),
+                    _ => false,
+                }
+            })
+        })
+    };
+    until(
+        ui,
+        "владелец видит обе привязки и право приглашения",
+        |ui| {
+            channel_matches(ui, &|channel| {
+                channel.members.len() == 2
+                    && channel.can_add_members
+                    && channel
+                        .members
+                        .iter()
+                        .any(|member| member.role == StreamRole::Owner)
+                    && channel.members.iter().all(|member| member.can_remove)
+            })
+        },
+    );
+    click(ui, "details-add-members");
+    until(
+        ui,
+        "приглашение предлагает нового сотрудника",
+        |ui| ui.debug_bounds(PICK_INVITEE).is_some(),
+    );
+    click(ui, "details-member-picker-query");
+    ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string("коллега".into())));
+    ui.simulate_keystrokes("cmd-v");
+    ui.run_until_parked();
+    click(ui, PICK_INVITEE);
+    click(ui, "details-member-picker-submit");
+    until(
+        ui,
+        "подтверждённый POST добавляет привязку в панель",
+        |ui| {
+            membership.invited.load(Ordering::SeqCst)
+                && channel_matches(ui, &|channel| channel.members.len() == 3)
+        },
+    );
+    click(ui, REMOVE_INVITEE);
+    until(
+        ui,
+        "владелец удаляет другого участника",
+        |ui| {
+            !membership.invited.load(Ordering::SeqCst)
+                && channel_matches(ui, &|channel| channel.members.len() == 2)
+        },
+    );
+
+    membership.invited.store(true, Ordering::SeqCst);
+    let member_joined = json!({
+        "schema_version":1, "uuid":Uuid::new_v4(), "epoch_generation":"local", "epoch_version":2,
+        "project_id":PROJECT, "user_uuid":USER, "object_type":"stream_binding", "action":"created",
+        "payload": {"kind":"stream_bindings.created", "uuid":CHANNEL, "project_id":PROJECT,
+                    "items":[{"uuid":INVITEE_BINDING,"project_id":PROJECT,"stream_uuid":CHANNEL,
+                              "user_uuid":INVITEE,"role":"member"}]},
+    });
+    assert!(live.send(RecoverySignal::Event(member_joined)).is_ok());
+    until(
+        ui,
+        "событие состава обновляет открытую панель",
+        |ui| channel_matches(ui, &|channel| channel.members.len() == 3),
+    );
+
+    click_account(&client, ui, &b_id);
+    ui.run_until_parked();
+    click(ui, CHANNEL_ROW);
+    ui.run_until_parked();
+    click(ui, CHANNEL_TOPIC_ROW);
+    let _ = topic_ready(&client, ui, "участник B читает тему");
+    click(ui, DETAILS_TRIGGER);
+    until(
+        ui,
+        "участник B может снять только собственную привязку",
+        |ui| {
+            channel_matches(ui, &|channel| {
+                channel.members.len() == 3
+                    && !channel.can_add_members
+                    && channel
+                        .members
+                        .iter()
+                        .all(|member| member.can_remove == member.is_self)
+            })
+        },
+    );
+    click(ui, LEAVE_CHANNEL);
+    until(
+        ui,
+        "выход закрывает историю и панель B",
+        |ui| {
+            membership.left.load(Ordering::SeqCst)
+                && ui.read(|app| {
+                    client.read(app).conversation.as_ref().is_some_and(|view| {
+                        let view = view.read(app);
+                        !view.has_access() && !view.tested_details_is_open()
+                    })
+                })
+        },
+    );
     assert_eq!(
         futures::executor::block_on(runtime.shutdown()),
         RuntimeExit::Clean

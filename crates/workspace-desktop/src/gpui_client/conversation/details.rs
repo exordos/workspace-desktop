@@ -243,7 +243,7 @@ impl Panel {
                         .h(px(40.))
                         .mx_2()
                         .px_2()
-                        .child(label(palette, TextRole::Label, title))
+                        .child(label(palette, TextRole::Heading, title))
                         .child(
                             close
                                 .render(

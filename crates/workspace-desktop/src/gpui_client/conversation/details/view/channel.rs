@@ -4,7 +4,7 @@ use gpui::{Div, SharedString, Stateful, div, prelude::*, px};
 
 use super::{
     Availability, ChannelView, Dispatch, MemberView, NotificationLevel, NotificationsView,
-    PanelAction, TopicView,
+    PanelAction, SelectedTopicView, TopicView,
 };
 use crate::gpui_client::ui::{
     BadgeTone, Button, ButtonAppearance, Icon, Palette, TextRole, activate, ellipsized_label,
@@ -16,6 +16,7 @@ pub(super) fn render(channel: &ChannelView, palette: Palette, dispatch: &Dispatc
     let header = div()
         .flex()
         .flex_none()
+        .w_full()
         .items_center()
         .gap(px(16.))
         .px(px(8.))
@@ -28,6 +29,8 @@ pub(super) fn render(channel: &ChannelView, palette: Palette, dispatch: &Dispatc
         ))
         .child(
             div()
+                .flex()
+                .flex_col()
                 .flex_1()
                 .min_w_0()
                 .child(
@@ -73,6 +76,12 @@ pub(super) fn render(channel: &ChannelView, palette: Palette, dispatch: &Dispatc
                             palette,
                             dispatch,
                         ))
+                        .children(
+                            channel
+                                .selected_topic
+                                .iter()
+                                .map(|topic| render_topic_context(topic, palette)),
+                        )
                         .children(channel.description.iter().map(|text| {
                             div()
                                 .flex()
@@ -85,21 +94,45 @@ pub(super) fn render(channel: &ChannelView, palette: Palette, dispatch: &Dispatc
                                         .py(px(8.)),
                                 )
                         }))
-                        .children(channel.selected_topic.iter().map(|topic| {
-                            div()
-                                .px(px(8.))
-                                .child(
-                                    ellipsized_label(palette, TextRole::Label, topic.title.clone())
-                                        .debug_selector(|| "conversation-details-topic".into()),
-                                )
-                                .when(topic.done, |row| {
-                                    row.child(label(palette, TextRole::Caption, "Тема завершена"))
-                                })
-                        }))
                         .child(render_topics(channel, palette, dispatch))
                         .child(render_members(channel, palette, dispatch)),
                 ),
         )
+}
+
+/// Показывает готовый контекст из выбранной темы и состояние завершения.
+fn render_topic_context(topic: &SelectedTopicView, palette: Palette) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .when(topic.done, |section| {
+            section.child(
+                div()
+                    .px(px(8.))
+                    .child(
+                        ellipsized_label(palette, TextRole::Label, topic.title.clone())
+                            .debug_selector(|| "conversation-details-topic".into()),
+                    )
+                    .child(label(palette, TextRole::Caption, "Тема завершена")),
+            )
+        })
+        .children(topic.summary.iter().map(|summary| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .debug_selector(|| "conversation-details-topic-summary".into())
+                .child(label(palette, TextRole::Label, "Контекст темы").px(px(8.)))
+                .child(
+                    label(palette, TextRole::Body, summary.clone())
+                        .rounded_md()
+                        .border_1()
+                        .border_color(palette.border)
+                        .px(px(12.))
+                        .py(px(8.)),
+                )
+        }))
 }
 
 /// Подбирает форму счётчика участников для русского интерфейса.
@@ -272,7 +305,7 @@ fn render_topics(channel: &ChannelView, palette: Palette, dispatch: &Dispatch) -
 fn render_topic(topic: &TopicView, palette: Palette, dispatch: &Dispatch) -> Stateful<Div> {
     let id = topic.id;
     let name = ellipsized_label(palette, TextRole::Body, topic.title.clone());
-    let badge = if topic.muted == Some(true) {
+    let badge = if topic.unread_muted {
         BadgeTone::Muted
     } else {
         BadgeTone::Accent
@@ -297,7 +330,10 @@ fn render_topic(topic: &TopicView, palette: Palette, dispatch: &Dispatch) -> Sta
                 })),
         )
         .children(topic.mentioned.then(|| mention_badge(palette)))
-        .children(unread_badge(palette, topic.unread, badge))
+        .children(
+            unread_badge(palette, topic.unread, badge)
+                .map(|badge| badge.debug_selector(move || format!("details-topic-unread-{id}"))),
+        )
         .children(topic.muted.map(|muted| {
             let icon = if muted { Icon::BellOff } else { Icon::Bell };
             icon.element(px(16.), palette.icon)

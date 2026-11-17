@@ -77,10 +77,8 @@ impl Picker {
             }
             for (id, user) in filtered {
                 let chosen = self.selected.contains(id);
-                let mut button = Button::new(
-                    gpui::SharedString::from(format!("details-member-picker-user-{id}")),
-                    user.display_name.clone(),
-                );
+                let selector = gpui::SharedString::from(format!("details-member-picker-user-{id}"));
+                let mut button = Button::new(selector.clone(), user.display_name.clone());
                 button.appearance = if chosen {
                     ButtonAppearance::Primary
                 } else {
@@ -98,7 +96,8 @@ impl Picker {
                                 view.toggle_picked_member(id, cx);
                             }),
                         )
-                        .justify_start(),
+                        .justify_start()
+                        .debug_selector(move || selector.to_string()),
                 );
             }
         } else if self.request.is_some() {
@@ -145,13 +144,17 @@ impl Picker {
                             action(cx, Conversation::dismiss_details),
                         ),
                     )
-                    .child(submit.render(
-                        palette,
-                        None,
-                        action(cx, |view, _, cx| {
-                            view.submit_picked_members(cx);
-                        }),
-                    )),
+                    .child(
+                        submit
+                            .render(
+                                palette,
+                                None,
+                                action(cx, |view, _, cx| {
+                                    view.submit_picked_members(cx);
+                                }),
+                            )
+                            .debug_selector(|| "details-member-picker-submit".into()),
+                    ),
             )
     }
 }
