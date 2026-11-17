@@ -2,14 +2,17 @@
 
 use gpui::{
     App, Application, Bounds, Context, Div, Entity, Focusable, KeyBinding, SharedString,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
+    Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
+use workspace_core::context::{AccountId, OwnerContext, SessionGeneration};
 use workspace_desktop::gpui_client::{
     composer::Editor,
+    contracts::AccountSession,
     ui::{
         Avatar, AvatarPresence, AvatarSize, BadgeTone, Button, ButtonAppearance, ChatRow,
         ChatRowPreview, DeliveryMark, FieldAppearance, Icon, MessageBubble, Palette,
-        SEARCH_ICON_SIZE, TextRole, ThemeMode, WorkspaceAssets, field, label,
+        SEARCH_ICON_SIZE, TextRole, ThemeMode, TopBar, TopBarAccount, TopBarSelection,
+        WorkspaceAssets, field, label,
     },
 };
 
@@ -189,8 +192,10 @@ impl Render for Panel {
 
 /// Окно с независимыми черновиками и выбором в двух палитрах.
 struct Gallery {
-    light: Entity<Panel>, // Светлая панель.
-    dark: Entity<Panel>,  // Тёмная панель.
+    top_bar: Entity<TopBar>, // Общая шапка с четырьмя демонстрационными входами.
+    _account_selection: Subscription, // Перерисовывает выбранный вход в шапке.
+    light: Entity<Panel>,    // Светлая панель.
+    dark: Entity<Panel>,     // Тёмная панель.
 }
 
 impl Gallery {
@@ -199,7 +204,19 @@ impl Gallery {
         let light = cx.new(|cx| Panel::new(ThemeMode::Light, "light", cx));
         let dark = cx.new(|cx| Panel::new(ThemeMode::Dark, "dark", cx));
         window.focus(&light.read(cx).draft.focus_handle(cx));
-        Self { light, dark }
+        let top_bar = cx.new(TopBar::new);
+        top_bar.update(cx, |view, cx| view.set_accounts(demo_accounts("A"), cx));
+        let selection = cx.subscribe(&top_bar, |_, bar, chosen: &TopBarSelection, cx| {
+            bar.update(cx, |view, cx| {
+                view.set_accounts(demo_accounts(&chosen.0.owner.account_id.0), cx);
+            });
+        });
+        Self {
+            top_bar,
+            _account_selection: selection,
+            light,
+            dark,
+        }
     }
 }
 
@@ -209,12 +226,52 @@ impl Render for Gallery {
         div()
             .size_full()
             .flex()
-            .gap(px(1.))
+            .flex_col()
             .on_action(|_: &NextControl, window, _| window.focus_next())
             .on_action(|_: &PreviousControl, window, _| window.focus_prev())
-            .child(self.light.clone())
-            .child(self.dark.clone())
+            .child(self.top_bar.clone())
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .gap(px(1.))
+                    .child(self.light.clone())
+                    .child(self.dark.clone()),
+            )
     }
+}
+
+/// Даёт шапке обычный вход, длинную подпись и переполнение быстрых кнопок.
+fn demo_accounts(selected: &str) -> Vec<TopBarAccount> {
+    [
+        ("A", "Аккаунт A", None),
+        ("B", "Аккаунт B", Some(5)),
+        (
+            "C",
+            "Демонстрационный аккаунт с длинной подписью",
+            Some(1001),
+        ),
+        ("D", "Аккаунт D", Some(42)),
+    ]
+    .into_iter()
+    .map(|(id, label, unread)| TopBarAccount {
+        session: AccountSession {
+            owner: OwnerContext {
+                account_id: AccountId(id.into()),
+                server: "https://workspace.test".into(),
+                organization_id: "demo".into(),
+                project_id: "demo".into(),
+                user_id: id.into(),
+            },
+            generation: SessionGeneration(1),
+        },
+        label: label.into(),
+        detail: "workspace.test · demo".into(),
+        selected: id == selected,
+        unread,
+    })
+    .collect()
 }
 
 /// Готовит аватар нужного размера с выбранным состоянием присутствия.
@@ -248,6 +305,7 @@ pub fn run() {
                 KeyBinding::new("tab", NextControl, None),
                 KeyBinding::new("shift-tab", PreviousControl, None),
             ]);
+            TopBar::bind_keys(app);
             app.on_window_closed(|app| {
                 if app.windows().is_empty() {
                     app.quit();

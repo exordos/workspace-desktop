@@ -97,6 +97,7 @@ fn bind_keys(app: &mut App) {
         KeyBinding::new("tab", NextControl, None),
         KeyBinding::new("shift-tab", PreviousControl, None),
     ]);
+    ui::TopBar::bind_keys(app);
 }
 
 /// Включает общий обход интерактивных элементов на корневом контейнере.

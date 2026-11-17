@@ -1,17 +1,16 @@
 //! Направляет действия между оболочкой, рабочим потоком, экраном разговора и AppKit.
 //! Здесь также собирается основная разметка окна из готовых компонентов.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use gpui::{
-    Context, Div, Entity, FocusHandle, SharedString, Subscription, Task, Window, div, prelude::*,
-    px,
+    Context, Entity, FocusHandle, SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 use workspace_core::{auth::SessionStatus, context::AccountId};
 
 use super::{
     Options,
-    contracts::{AccountSession, RuntimeEvent, RuntimeExit, ShellAction, SidebarAction},
+    contracts::{RuntimeEvent, RuntimeExit, ShellAction, SidebarAction},
     conversation::Conversation,
     next_control,
     platform_window::WindowPlatform,
@@ -19,8 +18,22 @@ use super::{
     runtime::{RuntimeClient, StartupError},
     shell::{Shell, ShellEffect},
     sidebar::Sidebar,
-    ui::{BadgeTone, Button, ButtonAppearance, Palette, TextRole, ThemeMode, label, unread_badge},
+    ui::{Palette, TextRole, ThemeMode, TopBar, TopBarAccount, TopBarSelection, label},
 };
+
+const SIDEBAR_PREFERRED_WIDTH: f32 = 299.;
+const SIDEBAR_MIN_WIDTH: f32 = 240.;
+const SIDEBAR_MAX_WIDTH: f32 = 720.;
+const FOLDER_RAIL_SPACE: f32 = 72.;
+const PANEL_GAP: f32 = 4.;
+
+/// Ограничивает ширину каталога долей от окна, оставляя место открытому разговору.
+fn sidebar_width(width: gpui::Pixels) -> gpui::Pixels {
+    let maximum = (f32::from(width) * 0.4)
+        .round()
+        .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+    px(SIDEBAR_PREFERRED_WIDTH.min(maximum))
+}
 
 /// Корневое состояние одного окна. Долгие операции выполняет RuntimeClient.
 pub(super) struct Client {
@@ -29,12 +42,13 @@ pub(super) struct Client {
     sidebar: Entity<Sidebar>, // Единственный каталог; хранит поиск каждого входа.
     conversation: Option<Entity<Conversation>>, // Экран актуального адреса, если он открыт.
     labels: HashMap<AccountId, String>, // Подписи для переключателя и баннеров.
-    account_focus: HashMap<AccountSession, FocusHandle>, // Фокус закреплён за входом, а не индексом.
+    top_bar: Entity<TopBar>,  // Шапка хранит локальный фокус и показывает снимок оболочки.
+    _top_bar_subscription: Subscription, // Передаёт выбор в оболочку.
     initial_focus: FocusHandle, // Корневая точка обхода до выбора первого элемента.
-    ready: bool,                // Рабочий поток открыл профиль и подготовил подписки.
-    received_accounts: bool,    // Пришёл первый снимок аккаунтов, может быть пустым.
+    ready: bool,              // Рабочий поток открыл профиль и подготовил подписки.
+    received_accounts: bool,  // Пришёл первый снимок аккаунтов, может быть пустым.
     startup_error: Option<StartupError>, // Безопасная причина сбоя открытия профиля.
-    stopped: bool,              // Фоновая работа завершилась с ошибкой.
+    stopped: bool,            // Фоновая работа завершилась с ошибкой.
     _sidebar_subscription: Subscription, // Направляет команды каталога в оболочку.
     runtime_events: Option<Task<()>>, // Подписка живёт столько же, сколько окно.
 }
@@ -43,6 +57,10 @@ impl Client {
     /// Создаёт оболочку и связывает события каталога с тем же маршрутом, что у баннеров.
     pub(super) fn new(options: Options, runtime: RuntimeClient, cx: &mut Context<Self>) -> Self {
         let sidebar = cx.new(Sidebar::new);
+        let top_bar = cx.new(TopBar::new);
+        let selection = cx.subscribe(&top_bar, |client, _, selection: &TopBarSelection, cx| {
+            client.handle_action(ShellAction::SelectAccount(selection.0.clone()), cx);
+        });
         let subscription = cx.subscribe(&sidebar, |client, _, action: &SidebarAction, cx| {
             let action = match action {
                 SidebarAction::OpenChat { route, generation } => SidebarAction::OpenChat {
@@ -62,7 +80,8 @@ impl Client {
             sidebar,
             conversation: None,
             labels: options.labels,
-            account_focus: HashMap::new(),
+            top_bar,
+            _top_bar_subscription: selection,
             initial_focus: cx.focus_handle(),
             ready: false,
             received_accounts: false,
@@ -177,6 +196,9 @@ impl Client {
             }
             None => {}
         }
+        let accounts = self.top_bar_accounts();
+        self.top_bar
+            .update(cx, |view, cx| view.set_accounts(accounts, cx));
         let catalog = self.shell.selected_catalog();
         let conversation = self.shell.conversation();
         self.sidebar.update(cx, |view, cx| {
@@ -185,17 +207,10 @@ impl Client {
         cx.notify();
     }
 
-    /// Собирает переключатель аккаунтов с отдельными счётчиками и устойчивым фокусом.
-    fn header(&mut self, palette: Palette, cx: &mut Context<Self>) -> Div {
-        let accounts = self.shell.accounts();
-        let present: HashSet<_> = accounts
-            .iter()
-            .map(|account| account.session.clone())
-            .collect();
-        self.account_focus
-            .retain(|session, _| present.contains(session));
-        let target = cx.entity().downgrade();
-        let entries = accounts
+    /// Подготавливает подписи и счётчики с учётом выбранного оболочкой входа.
+    fn top_bar_accounts(&self) -> Vec<TopBarAccount> {
+        self.shell
+            .accounts()
             .iter()
             .enumerate()
             .map(|(index, account)| {
@@ -205,66 +220,22 @@ impl Client {
                     .get(&session.owner.account_id)
                     .cloned()
                     .unwrap_or_else(|| format!("Аккаунт {}", index + 1));
-                let name = match account.status {
+                let label = match account.status {
                     SessionStatus::Active => display_name,
                     SessionStatus::Restoring => format!("{display_name} · Вход…"),
                     SessionStatus::TemporarilyUnavailable => format!("{display_name} · Нет связи"),
                     _ => format!("{display_name} · Требуется вход"),
                 };
-                let mut button = Button::new(("account", index), name);
-                if self.shell.selected() == Some(session) {
-                    button.appearance = ButtonAppearance::Primary;
+                let server = session.owner.server.trim_start_matches("https://");
+                TopBarAccount {
+                    session: session.clone(),
+                    label: label.into(),
+                    detail: format!("{server} · {}", session.owner.project_id).into(),
+                    selected: self.shell.selected() == Some(session),
+                    unread: account.unread,
                 }
-                let handle = self
-                    .account_focus
-                    .entry(session.clone())
-                    .or_insert_with(|| cx.focus_handle());
-                let destination = session.clone();
-                let target = target.clone();
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        button
-                            .render(palette, Some(handle), move |_, app| {
-                                let _ = target.update(app, |client, cx| {
-                                    client.handle_action(
-                                        ShellAction::SelectAccount(destination.clone()),
-                                        cx,
-                                    );
-                                });
-                            })
-                            .max_w(px(180.))
-                            .debug_selector(move || format!("workspace-account-{index}")),
-                    )
-                    .children(account.unread.and_then(|count| {
-                        unread_badge(palette, u64::from(count), BadgeTone::Accent)
-                    }))
             })
-            .collect::<Vec<_>>();
-        div()
-            .w_full()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_3()
-            .p_3()
-            .bg(palette.surface)
-            .border_b_1()
-            .border_color(palette.border)
-            .child(label(palette, TextRole::Heading, "Workspace").flex_none())
-            .child(
-                div()
-                    .id("workspace-accounts")
-                    .flex()
-                    .items_center()
-                    .min_w_0()
-                    .gap_2()
-                    .overflow_x_scroll()
-                    .children(entries),
-            )
+            .collect()
     }
 
     /// Сообщает о начальном состоянии или ошибке только безопасным текстом.
@@ -322,18 +293,24 @@ impl Render for Client {
                 .min_h_0()
                 .min_w_0()
                 .overflow_hidden()
+                .gap(px(PANEL_GAP))
+                // Папки появятся отдельным сценарием. Сохраняем ширину рабочей области.
+                .pl(px(FOLDER_RAIL_SPACE + PANEL_GAP))
                 .child(
                     div()
-                        .w(px(264.))
-                        .max_w(gpui::relative(0.44))
+                        .id("workspace-sidebar-panel")
+                        .debug_selector(|| "workspace-sidebar-panel".into())
+                        .w(sidebar_width(window.viewport_size().width))
                         .h_full()
                         .flex_none()
-                        .border_r_1()
-                        .border_color(palette.border)
+                        .rounded(px(6.))
+                        .overflow_hidden()
                         .child(self.sidebar.clone()),
                 )
                 .child(
                     div()
+                        .id("workspace-conversation-panel")
+                        .debug_selector(|| "workspace-conversation-panel".into())
                         .flex_1()
                         .h_full()
                         .min_w_0()
@@ -354,13 +331,21 @@ impl Render for Client {
             .track_focus(&self.initial_focus)
             .on_action(next_control)
             .on_action(previous_control)
-            .child(self.header(palette, cx))
+            .child(self.top_bar.clone())
             .children(issue.map(|message| {
                 label(palette, TextRole::Body, message)
                     .p_2()
                     .text_color(palette.danger)
             }))
-            .child(div().flex().flex_1().min_h_0().min_w_0().child(content))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .pt(px(PANEL_GAP))
+                    .child(content),
+            )
     }
 }
 
@@ -377,7 +362,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::gpui_client::{bind_keys, contracts::AccountSnapshot};
+    use crate::gpui_client::{
+        bind_keys,
+        contracts::{AccountSession, AccountSnapshot},
+    };
 
     /// Готовит один временный вход, который показывается в новом окне.
     fn account(name: &str) -> AccountSnapshot {
@@ -465,6 +453,149 @@ mod tests {
                 .map(|rows| rows[0].id)),
             Some(Uuid::from_u128(12))
         );
+        assert_eq!(
+            futures::executor::block_on(runtime.shutdown()),
+            RuntimeExit::Clean
+        );
+    }
+
+    /// Открывает полное меню, показывает непрочитанное и проверяет модальное поведение.
+    #[gpui::test]
+    fn top_bar_exposes_overflow_accounts_without_passing_through_outside_clicks(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(bind_keys);
+        let profile = tempfile::tempdir().unwrap();
+        let (runtime, _events) = RuntimeClient::start_in(profile.path().into()).unwrap();
+        let mut accounts = vec![account("A"), account("B"), account("C"), account("D")];
+        accounts[1].unread = Some(7);
+        accounts[3].unread = Some(1001);
+        let (client, ui) = cx.add_window_view(|_, cx| {
+            Client::new(
+                Options {
+                    active: Some(accounts[0].session.owner.account_id.clone()),
+                    labels: HashMap::new(),
+                },
+                runtime.clone(),
+                cx,
+            )
+        });
+        ui.simulate_resize(size(px(620.), px(360.)));
+        ui.update(|_, app| {
+            client.update(app, |view, cx| {
+                view.ready = true;
+                view.handle_runtime(RuntimeEvent::Accounts(accounts.clone()), cx);
+            });
+        });
+        ui.run_until_parked();
+
+        let bar = ui.debug_bounds("workspace-top-bar").unwrap();
+        let chats = ui.debug_bounds("workspace-top-bar-chats").unwrap();
+        assert_eq!(bar.center().x, chats.center().x);
+        assert!(ui.debug_bounds("workspace-account-dot-1").is_some());
+        assert!(ui.debug_bounds("workspace-account-3").is_none());
+        assert!(ui.debug_bounds("workspace-account-overflow").is_some());
+        let trigger = ui.debug_bounds("workspace-account-menu-trigger").unwrap();
+        let b = ui.debug_bounds("workspace-account-1").unwrap();
+
+        ui.simulate_click(trigger.center(), Modifiers::none());
+        ui.run_until_parked();
+        assert!(ui.debug_bounds("workspace-account-menu").is_some());
+        assert!(ui.debug_bounds("workspace-account-count-3").is_some());
+
+        ui.simulate_click(b.center(), Modifiers::none());
+        ui.run_until_parked();
+        assert!(!ui.read(|app| client.read(app).top_bar.read(app).menu_is_open()));
+        assert_eq!(
+            ui.read(|app| client.read(app).shell.selected().cloned()),
+            Some(accounts[0].session.clone())
+        );
+
+        press_key(ui, "enter");
+        assert!(ui.read(|app| client.read(app).top_bar.read(app).menu_is_open()));
+        ui.simulate_keystrokes("tab shift-tab end");
+        assert!(ui.update(|window, app| client.read(app).top_bar.read(app).menu_has_focus(window)));
+        press_key(ui, "space");
+        assert!(!ui.read(|app| client.read(app).top_bar.read(app).menu_is_open()));
+        assert_eq!(
+            ui.read(|app| client.read(app).shell.selected().cloned()),
+            Some(accounts[3].session.clone())
+        );
+
+        press_key(ui, "space");
+        assert!(ui.read(|app| client.read(app).top_bar.read(app).menu_is_open()));
+        ui.simulate_keystrokes("escape");
+        ui.run_until_parked();
+        assert!(!ui.read(|app| client.read(app).top_bar.read(app).menu_is_open()));
+        assert_eq!(
+            ui.read(|app| client.read(app).shell.selected().cloned()),
+            Some(accounts[3].session.clone())
+        );
+        assert_eq!(
+            futures::executor::block_on(runtime.shutdown()),
+            RuntimeExit::Clean
+        );
+    }
+
+    /// Передаёт обе фазы нативной клавиши активации GPUI.
+    fn press_key(ui: &mut gpui::VisualTestContext, key: &str) {
+        ui.simulate_keystrokes(key);
+        ui.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse(key).unwrap(),
+        });
+        ui.run_until_parked();
+    }
+
+    /// Отпускание указателя после замены сессий не выбирает аккаунт на старой позиции.
+    #[gpui::test]
+    fn top_bar_discards_a_press_when_the_account_list_changes(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        let profile = tempfile::tempdir().unwrap();
+        let (runtime, _events) = RuntimeClient::start_in(profile.path().into()).unwrap();
+        let a = account("A");
+        let b = account("B");
+        let c = account("C");
+        let (client, ui) = cx.add_window_view(|_, cx| {
+            Client::new(
+                Options {
+                    active: Some(a.session.owner.account_id.clone()),
+                    labels: HashMap::new(),
+                },
+                runtime.clone(),
+                cx,
+            )
+        });
+        ui.simulate_resize(size(px(620.), px(360.)));
+        let show_accounts = |accounts: Vec<AccountSnapshot>, ui: &mut gpui::VisualTestContext| {
+            ui.update(|_, app| {
+                client.update(app, |view, cx| {
+                    view.ready = true;
+                    view.handle_runtime(RuntimeEvent::Accounts(accounts), cx);
+                });
+            });
+            ui.run_until_parked();
+        };
+
+        for use_menu in [false, true] {
+            show_accounts(vec![a.clone(), b.clone(), c.clone()], ui);
+            let selector = if use_menu {
+                let trigger = ui.debug_bounds("workspace-account-menu-trigger").unwrap();
+                ui.simulate_click(trigger.center(), Modifiers::none());
+                ui.run_until_parked();
+                "workspace-account-menu-row-1"
+            } else {
+                "workspace-account-1"
+            };
+            let position = ui.debug_bounds(selector).unwrap().center();
+            ui.simulate_mouse_down(position, gpui::MouseButton::Left, Modifiers::none());
+            show_accounts(vec![a.clone(), c.clone(), b.clone()], ui);
+            ui.simulate_mouse_up(position, gpui::MouseButton::Left, Modifiers::none());
+            ui.run_until_parked();
+            assert_eq!(
+                ui.read(|app| client.read(app).shell.selected().cloned()),
+                Some(a.session.clone())
+            );
+        }
         assert_eq!(
             futures::executor::block_on(runtime.shutdown()),
             RuntimeExit::Clean

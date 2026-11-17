@@ -570,7 +570,7 @@ fn start_runtime(
     .unwrap()
 }
 
-/// Сохранённый вход загружает каталог; мышь и ввод в рабочем окне приводят к одному POST.
+/// Открывает чат из сохранённого входа и отправляет один черновик после сужения окна.
 #[gpui::test]
 fn catalog_click_and_submission_reach_https_queue(cx: &mut TestAppContext) {
     cx.update(bind_keys);
@@ -584,7 +584,7 @@ fn catalog_click_and_submission_reach_https_queue(cx: &mut TestAppContext) {
         let subscription = events.attach(&client, app, Client::handle_runtime);
         client.update(app, |client, cx| client.attach(subscription, cx));
     });
-    ui.simulate_resize(size(px(780.), px(560.)));
+    ui.simulate_resize(size(px(1440.), px(900.)));
     until(ui, "каталог и готовый WSS", |ui| {
         ui.debug_bounds(CHAT_ROW).is_some() && server.state.ready.load(Ordering::SeqCst) > 0
     });
@@ -608,6 +608,22 @@ fn catalog_click_and_submission_reach_https_queue(cx: &mut TestAppContext) {
     ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(MARKER.to_owned())));
     ui.simulate_keystrokes("cmd-v");
     ui.run_until_parked();
+
+    // Сужаем то же окно с черновиком и убеждаемся, что отправляется тот же текст.
+    let conversation = ui.read(|app| client.read(app).conversation.as_ref().unwrap().clone());
+    for (width, height, catalog_width) in [(1440., 900., 299.), (700., 600., 280.)] {
+        ui.simulate_resize(size(px(width), px(height)));
+        ui.run_until_parked();
+        let catalog = ui.debug_bounds("workspace-sidebar-panel").unwrap();
+        let history = ui.debug_bounds("workspace-conversation-panel").unwrap();
+        assert_eq!(catalog.left(), px(76.));
+        assert_eq!(catalog.size.width, px(catalog_width));
+        assert_eq!(history.left(), catalog.right() + px(4.));
+        assert_eq!(history.right(), px(width));
+        assert!(ui.read(|app| client.read(app).conversation.as_ref() == Some(&conversation)));
+        assert!(ui.debug_bounds("workspace-composer-editor").is_some());
+    }
+
     click(ui, "conversation-send");
     until(ui, "одна отправка по HTTPS", |_| {
         !server.state.sent.lock().unwrap().is_empty()

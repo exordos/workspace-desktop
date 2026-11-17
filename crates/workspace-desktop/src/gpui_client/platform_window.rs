@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use futures::{StreamExt, channel::mpsc};
 use gpui::{
     AnyWindowHandle, App, AppContext, Entity, Global, KeyBinding, Menu, MenuItem, Subscription,
-    Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions,
+    Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, px, size,
 };
 use workspace_core::context::AccountId;
 
@@ -49,6 +49,10 @@ impl WindowPlatform {
     /// Восстанавливает размер области содержимого из существующего профиля.
     pub fn window_options(profile: &Path, app: &App) -> WindowOptions {
         WindowOptions {
+            window_min_size: Some(size(
+                px(window_size::MIN_WIDTH),
+                px(window_size::MIN_HEIGHT),
+            )),
             window_bounds: Some(WindowBounds::centered(window_size::load(profile), app)),
             titlebar: Some(TitlebarOptions {
                 title: Some("Workspace Desktop".into()),

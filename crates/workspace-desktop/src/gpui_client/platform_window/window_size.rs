@@ -12,7 +12,9 @@ use tokio::sync::watch;
 use super::macos::NativeWindow;
 
 const FILE_NAME: &str = "window-size.json";
-const DEFAULT_SIZE: [f32; 2] = [620., 360.];
+const DEFAULT_SIZE: [f32; 2] = [MIN_WIDTH, MIN_HEIGHT];
+pub(super) const MIN_WIDTH: f32 = 700.;
+pub(super) const MIN_HEIGHT: f32 = 600.;
 
 /// Последний обычный размер и сигнал завершения его фоновой записи.
 #[derive(Clone, Copy, Default)]
@@ -116,7 +118,8 @@ pub(super) fn record(
 /// Возвращает обычный размер из профиля или размер первого запуска.
 pub(super) fn load(profile: &Path) -> Size<Pixels> {
     let [width, height] = read(&profile.join(FILE_NAME)).unwrap_or(DEFAULT_SIZE);
-    size(px(width), px(height))
+    // Старые профили могут хранить размер меньше нового минимума окна.
+    size(px(width.max(MIN_WIDTH)), px(height.max(MIN_HEIGHT)))
 }
 
 /// Читает и проверяет обе координаты в формате существующего профиля.
@@ -176,9 +179,9 @@ mod tests {
         let profile = tempfile::tempdir().unwrap();
         let path = profile.path().join(FILE_NAME);
         std::fs::write(&path, b"[880.5,490]").unwrap();
-        assert_eq!(load(profile.path()), size(px(880.5), px(490.0)));
+        assert_eq!(load(profile.path()), size(px(880.5), px(600.0)));
         std::fs::write(&path, b"[800,0]").unwrap();
-        assert_eq!(load(profile.path()), size(px(620.0), px(360.0)));
+        assert_eq!(load(profile.path()), size(px(700.0), px(600.0)));
     }
 
     /// Сохраняет новый размер даже при закрытии до первой фоновой записи.
@@ -187,10 +190,10 @@ mod tests {
         let profile = tempfile::tempdir().unwrap();
         let path = profile.path().join(FILE_NAME);
         let (changes, receiver) = watch::channel(SizeUpdate::default());
-        changes.send_modify(|update| update.size = Some([650., 410.]));
-        changes.send_modify(|update| update.size = Some([880.5, 540.]));
+        changes.send_modify(|update| update.size = Some([750., 610.]));
+        changes.send_modify(|update| update.size = Some([880.5, 640.]));
         changes.send_modify(|update| update.closing = true);
         write_updates(path, receiver).await;
-        assert_eq!(load(profile.path()), size(px(880.5), px(540.)));
+        assert_eq!(load(profile.path()), size(px(880.5), px(640.)));
     }
 }

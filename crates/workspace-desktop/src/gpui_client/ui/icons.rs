@@ -9,6 +9,9 @@ pub(super) const BUTTON_ICON_SIZE: Pixels = px(16.);
 /// Слот лупы в поле поиска каталога.
 pub const SEARCH_ICON_SIZE: Pixels = px(18.);
 
+/// Путь к многоцветному логотипу, доступному через ресурсы GPUI.
+pub(super) const ORGANIZATION_LOGO: &str = "organization-fallback.svg";
+
 // Одно имя ресурса используется и при отрисовке, и при поиске в AssetSource.
 macro_rules! workspace_icons {
     ($($variant:ident => ($filename:literal, $description:literal)),+ $(,)?) => {
@@ -37,6 +40,7 @@ macro_rules! workspace_icons {
             fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
                 let found: Option<&'static [u8]> = match path {
                     $(p if p == Icon::$variant.path() => Some(include_bytes!(concat!("../../../assets/icons/", $filename))),)+
+                    ORGANIZATION_LOGO => Some(include_bytes!("../../../assets/organization-fallback.svg")),
                     _ => None,
                 };
                 Ok(found.map(Cow::Borrowed))
@@ -45,7 +49,7 @@ macro_rules! workspace_icons {
             /// Перечисляет встроенные SVG под запрошенным путём.
             fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
                 let prefix = path.trim_end_matches('/');
-                let paths = [$(Icon::$variant.path()),+];
+                let paths = [ORGANIZATION_LOGO, $(Icon::$variant.path()),+];
                 Ok(paths.into_iter().filter(|file| {
                     prefix.is_empty() || *file == prefix || file.strip_prefix(prefix).is_some_and(|suffix| suffix.starts_with('/'))
                 }).map(Into::into).collect())

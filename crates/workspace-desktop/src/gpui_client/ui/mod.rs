@@ -5,6 +5,7 @@ mod content;
 mod controls;
 mod icons;
 mod theme;
+mod top_bar;
 
 #[cfg(all(test, feature = "gpui-test"))]
 mod tests;
@@ -16,3 +17,4 @@ pub use content::{
 pub use controls::{Button, ButtonAppearance, FieldAppearance, field};
 pub use icons::{Icon, SEARCH_ICON_SIZE, WorkspaceAssets};
 pub use theme::{Palette, TextRole, ThemeMode, label};
+pub use top_bar::{TopBar, TopBarAccount, TopBarSelection};
