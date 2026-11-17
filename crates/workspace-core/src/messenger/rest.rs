@@ -1,6 +1,9 @@
 //! Работает с HTTPS API мессенджера: читает журнал и историю, отправляет подготовленные сообщения.
 //! Также разбирает общий формат событий, который используют HTTP и WebSocket.
 
+mod message_actions;
+pub(super) mod mutations;
+
 use std::{collections::HashSet, time::Duration};
 
 use reqwest::{
@@ -346,7 +349,7 @@ impl RestClient {
             .stream_access(owner, token, scope.stream_id)
             .await
             .map_err(details_access_error)?;
-        check_details_owner(
+        check_explicit_owner(
             owner,
             stream.project_id.as_deref(),
             stream.user_uuid.as_deref(),
@@ -359,7 +362,7 @@ impl RestClient {
                 .topic_access(owner, token, scope.stream_id, topic_id)
                 .await
                 .map_err(details_access_error)?;
-            check_details_owner(
+            check_explicit_owner(
                 owner,
                 topic.project_id.as_deref(),
                 topic.user_uuid.as_deref(),
@@ -738,8 +741,8 @@ fn details_access_error(error: OpenHistoryError) -> DetailsError {
     }
 }
 
-/// Требует проект и пользователя в ответе, прежде чем показывать данные панели.
-fn check_details_owner(
+/// Требует явно указанные проект и пользователя в ответе API владельца.
+fn check_explicit_owner(
     owner: &OwnerContext,
     project: Option<&str>,
     user: Option<&str>,
@@ -884,15 +887,16 @@ pub(super) struct HistoryPage {
 /// Поля ответа ресурса messages, используемые для записи истории.
 #[derive(Deserialize)]
 struct WireHistoryMessage {
-    uuid: Uuid,                 // Публичный идентификатор сообщения.
-    stream_uuid: Uuid,          // Разговор сообщения.
-    topic_uuid: Uuid,           // Тема внутри разговора.
-    project_id: Option<String>, // Проект из ответа.
-    user_uuid: Option<String>,  // Владелец проекции из ответа.
-    author_uuid: Uuid,          // Автор сообщения.
-    created_at: String,         // Серверное время создания.
-    updated_at: Option<String>, // Серверное время последней правки.
-    payload: WireMessageBody,   // Формат и содержимое сообщения.
+    uuid: Uuid,                  // Публичный идентификатор сообщения.
+    stream_uuid: Uuid,           // Разговор сообщения.
+    topic_uuid: Uuid,            // Тема внутри разговора.
+    project_id: Option<String>,  // Проект из ответа.
+    user_uuid: Option<String>,   // Владелец проекции из ответа.
+    author_uuid: Uuid,           // Автор сообщения.
+    created_at: String,          // Серверное время создания.
+    updated_at: Option<String>,  // Серверное время последней правки.
+    source_name: Option<String>, // Серверный носитель сообщения, если он известен.
+    payload: WireMessageBody,    // Формат и содержимое сообщения.
 }
 
 impl WireHistoryMessage {
@@ -1018,6 +1022,7 @@ struct WireStream {
     uuid: String,                // Идентификатор запрошенного разговора.
     project_id: Option<String>,  // Проект, если он есть в ответе.
     user_uuid: Option<String>,   // Пользователь, если он есть в ответе.
+    source_name: Option<String>, // Нативный стрим или внешний провайдер, если сервер указал.
     private: bool,               // Признак личного разговора.
     is_archived: bool,           // Признак архивного разговора.
     direct_user_uuid: Option<String>, // Идентификатор собеседника для личного разговора.

@@ -4,6 +4,7 @@
 pub mod catalog;
 pub mod details;
 pub mod history;
+pub mod message_actions;
 mod outbox;
 pub mod read;
 mod rest;

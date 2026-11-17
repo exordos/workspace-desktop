@@ -29,6 +29,8 @@ mod background_baseline;
 mod catalog_revocation;
 #[path = "support/direct_history.rs"]
 mod direct_history;
+#[path = "support/message_actions.rs"]
+mod message_actions;
 #[path = "support/read_boundary.rs"]
 mod read_boundary;
 
