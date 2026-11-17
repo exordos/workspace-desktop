@@ -472,7 +472,9 @@ mod tests {
         cx.update(bind_keys);
         let profile = tempfile::tempdir().unwrap();
         let (runtime, _events) = RuntimeClient::start_in(profile.path().into()).unwrap();
-        let mut accounts = vec![account("A"), account("B"), account("C"), account("D")];
+        let mut accounts = (0..20)
+            .map(|index| account(&format!("Аккаунт {index}")))
+            .collect::<Vec<_>>();
         accounts[1].unread = Some(7);
         accounts[3].unread = Some(1001);
         let (client, ui) = cx.add_window_view(|_, cx| {
@@ -505,7 +507,8 @@ mod tests {
 
         ui.simulate_click(trigger.center(), Modifiers::none());
         ui.run_until_parked();
-        assert!(ui.debug_bounds("workspace-account-menu").is_some());
+        let menu = ui.debug_bounds("workspace-account-menu").unwrap();
+        assert!(menu.right() <= px(616.) && menu.bottom() <= px(356.));
         assert!(ui.debug_bounds("workspace-account-count-3").is_some());
 
         ui.simulate_click(b.center(), Modifiers::none());
@@ -519,12 +522,18 @@ mod tests {
         press_key(ui, "enter");
         assert!(ui.read(|app| client.read(app).top_bar.read(app).menu_is_open()));
         ui.simulate_keystrokes("tab shift-tab end");
+        ui.run_until_parked();
+        let last = ui.debug_bounds("workspace-account-menu-row-19").unwrap();
+        assert!(
+            last.top() >= menu.top() && last.bottom() <= menu.bottom(),
+            "{last:?} / {menu:?}"
+        );
         assert!(ui.update(|window, app| client.read(app).top_bar.read(app).menu_has_focus(window)));
         press_key(ui, "space");
         assert!(!ui.read(|app| client.read(app).top_bar.read(app).menu_is_open()));
         assert_eq!(
             ui.read(|app| client.read(app).shell.selected().cloned()),
-            Some(accounts[3].session.clone())
+            Some(accounts[19].session.clone())
         );
 
         press_key(ui, "space");
@@ -534,7 +543,7 @@ mod tests {
         assert!(!ui.read(|app| client.read(app).top_bar.read(app).menu_is_open()));
         assert_eq!(
             ui.read(|app| client.read(app).shell.selected().cloned()),
-            Some(accounts[3].session.clone())
+            Some(accounts[19].session.clone())
         );
         assert_eq!(
             futures::executor::block_on(runtime.shutdown()),

@@ -99,6 +99,11 @@ impl Search {
         self.focus.is_focused(window)
     }
 
+    /// Возвращает ввод в поиск, если строка каталога исчезла или недоступна.
+    pub(super) fn focus(&self, window: &mut Window) {
+        window.focus(&self.focus);
+    }
+
     /// Проверяет, что система ещё редактирует незавершённый фрагмент текста.
     pub(super) fn is_composing(&self) -> bool {
         self.marked.is_some()

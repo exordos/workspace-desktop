@@ -4,6 +4,7 @@
 mod content;
 mod controls;
 mod icons;
+pub(super) mod popup;
 mod theme;
 mod top_bar;
 

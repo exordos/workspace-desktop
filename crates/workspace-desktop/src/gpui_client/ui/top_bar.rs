@@ -2,13 +2,18 @@
 //! Подсветка, фокус и прокрутка принадлежат меню. Выбранный вход сообщает оболочка.
 
 use gpui::{
-    App, Context, Div, EventEmitter, FocusHandle, ImageSource, KeyBinding, Resource, ScrollHandle,
-    SharedString, Stateful, Window, actions, anchored, deferred, div, img, point, prelude::*, px,
+    App, Context, Div, EventEmitter, FocusHandle, ImageSource, Resource, ScrollHandle,
+    SharedString, Stateful, Window, div, img, point, prelude::*, px,
 };
 
 use super::{
     Avatar, AvatarSize, BadgeTone, Button, ButtonAppearance, Icon, Palette, TextRole, ThemeMode,
-    controls::activate, icons::ORGANIZATION_LOGO, label, theme::ellipsized_label, unread_badge,
+    controls::activate,
+    icons::ORGANIZATION_LOGO,
+    label,
+    popup::{MenuInput, bind_menu_keys, menu_layer, menu_navigation, menu_surface, tooltip},
+    theme::ellipsized_label,
+    unread_badge,
 };
 use crate::gpui_client::contracts::AccountSession;
 
@@ -20,11 +25,6 @@ const GAP: f32 = 6.;
 const OVERFLOW_SIZE: f32 = 34.;
 const START_INSET: f32 = 28.;
 const END_INSET: f32 = 12.;
-
-actions!(
-    workspace_account_menu,
-    [Previous, Next, First, Last, Close, KeepFocus]
-);
 
 /// Строка аккаунта, подготовленная оболочкой для отображения.
 pub struct TopBarAccount {
@@ -65,16 +65,7 @@ impl TopBar {
 
     /// Ограничивает обработку клавиш открытым списком, не меняя обход остальных полей окна.
     pub fn bind_keys(app: &mut App) {
-        let context = Some("WorkspaceAccountMenu");
-        app.bind_keys([
-            KeyBinding::new("up", Previous, context),
-            KeyBinding::new("down", Next, context),
-            KeyBinding::new("home", First, context),
-            KeyBinding::new("end", Last, context),
-            KeyBinding::new("escape", Close, context),
-            KeyBinding::new("tab", KeepFocus, context),
-            KeyBinding::new("shift-tab", KeepFocus, context),
-        ]);
+        bind_menu_keys(app);
     }
 
     /// Сохраняет фокус и подсветку у того же входа при обновлении непрочитанного.
@@ -185,7 +176,7 @@ impl TopBar {
     ) -> Stateful<Div> {
         let session = account.session.clone();
         let target = cx.entity().downgrade();
-        let tooltip = account.label.clone();
+        let description = account.label.clone();
         let focus = self
             .quick_focus
             .iter()
@@ -227,7 +218,7 @@ impl TopBar {
             },
         )
         .debug_selector(move || format!("workspace-account-{index}"))
-        .tooltip(move |_, app| app.new(|_| AccountTooltip(palette, tooltip.clone())).into())
+        .tooltip(move |_, app| tooltip(palette, description.clone(), app))
     }
 
     /// Рисует кликабельную строку меню и числовой счётчик поверх логотипа.
@@ -240,7 +231,7 @@ impl TopBar {
     ) -> Stateful<Div> {
         let session = account.session.clone();
         let highlighted = self.highlight.as_ref() == Some(&session);
-        let tooltip: SharedString = format!("{} · {}", account.label, account.detail).into();
+        let description: SharedString = format!("{} · {}", account.label, account.detail).into();
         div()
             .id(account_element_id("menu", &session))
             .debug_selector(move || format!("workspace-account-menu-row-{index}"))
@@ -264,7 +255,7 @@ impl TopBar {
             .hover(|row| row.bg(palette.card_hover))
             .cursor_pointer()
             .on_click(cx.listener(move |view, _, window, cx| view.choose(&session, window, cx)))
-            .tooltip(move |_, app| app.new(|_| AccountTooltip(palette, tooltip.clone())).into())
+            .tooltip(move |_, app| tooltip(palette, description.clone(), app))
             .child(
                 div()
                     .relative()
@@ -306,72 +297,58 @@ impl TopBar {
         viewport: gpui::Size<gpui::Pixels>,
         cx: &Context<Self>,
     ) -> Stateful<Div> {
-        div()
-            .id("workspace-account-menu")
-            .debug_selector(|| "workspace-account-menu".to_owned())
-            .w(px(320.).min((viewport.width - px(8.)).max(px(0.))))
-            .max_h(px(320.).min((viewport.height - px(HEIGHT + 4.)).max(px(32.))))
-            .p_1()
-            .flex()
-            .flex_col()
-            .rounded(px(12.))
-            .border_1()
-            .border_color(palette.border)
-            .bg(palette.surface)
-            .shadow_md()
-            .occlude()
-            .on_mouse_down_out(cx.listener(|view, _, window, cx| {
-                cx.stop_propagation();
-                view.dismiss_menu(window, cx);
-            }))
-            .child(
-                div()
-                    .id("workspace-account-menu-scroll")
-                    .min_h_0()
-                    .flex()
-                    .flex_col()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.menu_scroll)
-                    .children(
-                        self.accounts
-                            .iter()
-                            .enumerate()
-                            .map(|(index, account)| self.menu_row(index, account, palette, cx)),
-                    ),
-            )
+        let height = px(320.).min((viewport.height - px(HEIGHT + 4.)).max(px(32.)));
+        menu_surface(
+            "workspace-account-menu",
+            palette,
+            viewport,
+            px(320.),
+            height,
+        )
+        .debug_selector(|| "workspace-account-menu".to_owned())
+        .on_mouse_down_out(cx.listener(|view, _, window, cx| {
+            cx.stop_propagation();
+            view.dismiss_menu(window, cx);
+        }))
+        .child(
+            div()
+                .id("workspace-account-menu-scroll")
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .overflow_y_scroll()
+                .track_scroll(&self.menu_scroll)
+                .children(
+                    self.accounts
+                        .iter()
+                        .enumerate()
+                        .map(|(index, account)| self.menu_row(index, account, palette, cx)),
+                ),
+        )
     }
 
-    /// Держит клавиатурный маршрут в обычном дереве окна, пока меню нарисовано поверх него.
-    fn menu_keys(&self, bar: Stateful<Div>, cx: &Context<Self>) -> Stateful<Div> {
-        bar.track_focus(&self.menu_focus)
-            .key_context("WorkspaceAccountMenu")
-            .on_action(cx.listener(|view, _: &Previous, _, cx| {
-                if let Some(index) = view.highlight_index() {
-                    view.highlight_at(index.saturating_sub(1), cx);
+    /// Перемещает подсветку списка или выполняет действие текущего входа.
+    fn menu_input(&mut self, input: MenuInput, window: &mut Window, cx: &mut Context<Self>) {
+        match input {
+            MenuInput::Previous => {
+                if let Some(index) = self.highlight_index() {
+                    self.highlight_at(index.saturating_sub(1), cx);
                 }
-            }))
-            .on_action(cx.listener(|view, _: &Next, _, cx| {
-                if let Some(index) = view.highlight_index() {
-                    view.highlight_at((index + 1).min(view.accounts.len() - 1), cx);
+            }
+            MenuInput::Next => {
+                if let Some(index) = self.highlight_index() {
+                    self.highlight_at((index + 1).min(self.accounts.len() - 1), cx);
                 }
-            }))
-            .on_action(cx.listener(|view, _: &First, _, cx| view.highlight_at(0, cx)))
-            .on_action(cx.listener(|view, _: &Last, _, cx| {
-                view.highlight_at(view.accounts.len().saturating_sub(1), cx);
-            }))
-            .on_key_up(cx.listener(|view, event: &gpui::KeyUpEvent, window, cx| {
-                if matches!(event.keystroke.key.as_str(), "enter" | "space")
-                    && !event.keystroke.modifiers.modified()
-                    && let Some(session) = view.highlight.clone()
-                {
-                    // Подтверждаем на отпускании, как кнопка-стрелка. Одна клавиша —
-                    // одно действие, даже когда фокус возвращается на стрелку.
-                    cx.stop_propagation();
-                    view.choose(&session, window, cx);
+            }
+            MenuInput::First => self.highlight_at(0, cx),
+            MenuInput::Last => self.highlight_at(self.accounts.len().saturating_sub(1), cx),
+            MenuInput::Select => {
+                if let Some(session) = self.highlight.clone() {
+                    self.choose(&session, window, cx);
                 }
-            }))
-            .on_action(cx.listener(|view, _: &Close, window, cx| view.dismiss_menu(window, cx)))
-            .on_action(|_: &KeepFocus, _, cx| cx.stop_propagation())
+            }
+            MenuInput::Close => self.dismiss_menu(window, cx),
+        }
     }
 }
 
@@ -444,8 +421,7 @@ impl Render for TopBar {
                                 })
                                 .debug_selector(|| "workspace-account-menu-trigger".to_owned())
                                 .tooltip(move |_, app| {
-                                    app.new(|_| AccountTooltip(palette, "Выбрать аккаунт".into()))
-                                        .into()
+                                    tooltip(palette, "Выбрать аккаунт".into(), app)
                                 }),
                         )
                     }),
@@ -466,9 +442,7 @@ impl Render for TopBar {
                     .border_color(palette.border)
                     .bg(palette.card_selected)
                     .child(Icon::Chat.element(px(chat.min(24.)), palette.text))
-                    .tooltip(move |_, app| {
-                        app.new(|_| AccountTooltip(palette, "Чаты".into())).into()
-                    }),
+                    .tooltip(move |_, app| tooltip(palette, "Чаты".into(), app)),
             )
             .children(
                 self.accounts
@@ -477,28 +451,12 @@ impl Render for TopBar {
                     .map(|account| active_identity(account, px(side), palette)),
             )
             .when(self.highlight.is_some(), |bar| {
-                // Слой перекрывает прокрутку и другие действия окна, пока меню открыто.
-                let backdrop = div()
-                    .id("workspace-account-menu-backdrop")
-                    .w(viewport.width)
-                    .h(viewport.height)
-                    .occlude();
-                self.menu_keys(bar, cx)
-                    .child(
-                        deferred(anchored().position(point(px(0.), px(0.))).child(backdrop))
-                            .with_priority(1),
-                    )
-                    .child(
-                        deferred(
-                            anchored()
-                                .position(point(
-                                    px(trigger_x),
-                                    px((HEIGHT + TRIGGER_SIZE) / 2. + 6.),
-                                ))
-                                .child(self.menu(palette, viewport, cx)),
-                        )
-                        .with_priority(2),
-                    )
+                let origin = point(px(trigger_x), px((HEIGHT + TRIGGER_SIZE) / 2. + 6.));
+                menu_navigation(bar, &self.menu_focus, cx, Self::menu_input).children(menu_layer(
+                    viewport,
+                    origin,
+                    self.menu(palette, viewport, cx),
+                ))
             })
     }
 }
@@ -584,21 +542,4 @@ fn organization_logo(palette: Palette, selected: bool, size: f32) -> Div {
             )))
             .size(px(size - 4.)),
         )
-}
-
-/// Подсказка с именем входа или подписью иконки раздела.
-struct AccountTooltip(Palette, SharedString); // Палитра окна и текст подсказки.
-
-impl Render for AccountTooltip {
-    /// Показывает подпись на общем фоне всплывающей панели.
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        label(self.0, TextRole::Caption, self.1.clone())
-            .max_w(px(320.))
-            .px_2()
-            .py_1()
-            .rounded(px(6.))
-            .border_1()
-            .border_color(self.0.border)
-            .bg(self.0.surface)
-    }
 }

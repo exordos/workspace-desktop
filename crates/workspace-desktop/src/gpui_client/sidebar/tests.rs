@@ -85,6 +85,7 @@ fn initialize(cx: &mut TestAppContext) -> Harness<'_> {
     cx.update(|app| {
         Sidebar::bind_keys(app);
         app.bind_keys([KeyBinding::new("tab", NextFocus, None)]);
+        crate::gpui_client::ui::TopBar::bind_keys(app);
     });
     let (root, ui) = cx.add_window_view(|_, cx| TestRoot {
         sidebar: cx.new(Sidebar::new),
@@ -506,4 +507,83 @@ fn keeps_keyed_focus_on_catalog_updates_but_not_after_sign_in(cx: &mut TestAppCo
     publish(&sidebar, ui, &again, &new_snapshot);
     enter(ui);
     assert_eq!(events.borrow().len(), 2);
+}
+
+/// Проверяет правый клик, Shift+F10, границы, недоступное действие и смену входа.
+#[gpui::test]
+fn row_menu_uses_navigation_and_ignores_click_through(cx: &mut TestAppContext) {
+    let (sidebar, ui, events) = initialize(cx);
+    let a = session("a", 11);
+    let b = session("b", 12);
+    let a_catalog = catalog(
+        &a,
+        ChatListStatus::Ready,
+        (1..=9)
+            .map(|id| chat(id, "Разговор", id != 9, &[]))
+            .collect(),
+    );
+    ui.simulate_resize(size(px(700.), px(600.)));
+    publish(&sidebar, ui, &a, &a_catalog);
+    let direct = ui.debug_bounds(row(1, None)).unwrap().center();
+    ui.simulate_mouse_down(direct, MouseButton::Right, Modifiers::none());
+    ui.simulate_mouse_up(direct, MouseButton::Right, Modifiers::none());
+    ui.run_until_parked();
+    assert!(ui.debug_bounds("catalog-menu").is_some());
+    assert!(events.borrow().is_empty());
+
+    // Снаружи меню находится та же рабочая строка. Щелчок только закрывает список.
+    ui.simulate_click(point(direct.x - px(24.), direct.y), Modifiers::none());
+    assert!(events.borrow().is_empty());
+    ui.update(|window, app| {
+        let active = sidebar.read(app).active.as_ref().unwrap();
+        assert!(active.menu.is_none());
+        assert!(active.focus[&RowKey::Chat(Uuid::from_u128(1))].is_focused(window));
+    });
+
+    ui.simulate_keystrokes("shift-f10");
+    ui.run_until_parked();
+    ui.read(|app| {
+        assert!(
+            sidebar.read(app).active.as_ref().unwrap().menu.is_some(),
+            "Shift+F10"
+        )
+    });
+    ui.simulate_keystrokes("tab");
+    ui.update(|window, app| assert!(sidebar.read(app).menu_focus.is_focused(window)));
+    ui.simulate_keystrokes("escape");
+    ui.simulate_keystrokes("shift-f10");
+    enter(ui);
+    assert_eq!(events.borrow().as_slice(), &[open(&a, 1, None)]);
+
+    let last_row = ui
+        .debug_bounds("catalog-chat-00000000-0000-0000-0000-000000000009")
+        .unwrap();
+    let edge = point(last_row.right() - px(3.), px(599.));
+    assert!(last_row.contains(&edge), "{last_row:?}");
+    ui.simulate_mouse_down(edge, MouseButton::Right, Modifiers::none());
+    ui.simulate_mouse_up(edge, MouseButton::Right, Modifiers::none());
+    ui.run_until_parked();
+    let popup = ui.debug_bounds("catalog-menu").unwrap();
+    assert!(
+        popup.right() <= px(696.) && popup.bottom() <= px(596.),
+        "{popup:?}"
+    );
+    click(ui, "catalog-menu-action");
+    enter(ui);
+    assert_eq!(events.borrow().as_slice(), &[open(&a, 1, None)]);
+    ui.update(|window, app| assert!(sidebar.read(app).menu_focus.is_focused(window)));
+
+    let b_catalog = catalog(
+        &b,
+        ChatListStatus::Ready,
+        vec![chat(9, "Другой разговор", true, &[])],
+    );
+    publish(&sidebar, ui, &b, &b_catalog);
+    ui.update(|window, app| {
+        let active = sidebar.read(app).active.as_ref().unwrap();
+        assert!(active.menu.is_none());
+        assert!(active.search.read(app).is_focused(window));
+    });
+    enter(ui);
+    assert_eq!(events.borrow().as_slice(), &[open(&a, 1, None)]);
 }

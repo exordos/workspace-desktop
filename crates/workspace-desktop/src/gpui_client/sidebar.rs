@@ -4,8 +4,9 @@
 use std::collections::{HashMap, HashSet};
 
 use gpui::{
-    App, Context, Div, ElementId, Entity, EventEmitter, FocusHandle, KeyBinding, Render,
-    ScrollHandle, SharedString, Window, div, prelude::*, px,
+    App, Context, Div, ElementId, Entity, EventEmitter, FocusHandle, KeyBinding, MouseButton,
+    Pixels, Point, Render, ScrollHandle, SharedString, Size, Stateful, Window, div, point,
+    prelude::*, px,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
@@ -20,6 +21,7 @@ use super::{
     ui::{
         Avatar, AvatarPresence, BadgeTone, Button, ButtonAppearance, ChatRow, ChatRowPreview, Icon,
         Palette, TextRole, ThemeMode, label,
+        popup::{MenuInput, menu_layer, menu_navigation, menu_surface, tooltip},
     },
 };
 use search::{QueryChanged, Search};
@@ -29,12 +31,13 @@ mod search;
 #[cfg(all(test, feature = "gpui-test"))]
 mod tests;
 
-gpui::actions!(catalog_results, [PreviousResult, NextResult]);
+gpui::actions!(catalog_results, [PreviousResult, NextResult, OpenRowMenu]);
 
 /// Состояние каталога в окне. Оболочка передаёт выбранный вход и актуальный снимок.
 pub struct Sidebar {
     active: Option<Active>, // Показанный каталог или ожидание выбора входа.
     saved: HashMap<AccountSession, Preferences>, // Поиск и раскрытые каналы других входов.
+    menu_focus: FocusHandle, // Удерживает клавиатурный ввод внутри открытого меню.
 }
 
 /// Состояние, которое можно вернуть при повторном выборе того же входа.
@@ -54,6 +57,7 @@ struct Active {
     expanded: HashSet<Uuid>,              // Каналы, раскрытые вне режима поиска.
     scroll: ScrollHandle,                 // Позиция прокрутки только текущего показа.
     focus: HashMap<RowKey, FocusHandle>,  // Фокус строки остаётся у UUID при перестановке.
+    menu: Option<RowMenu>,                // Открытая строка и место раскрытия в окне.
     #[cfg(all(test, feature = "gpui-test"))]
     fixture_details: HashMap<RowKey, RowDetails>, // Синтетические метаданные этого показа.
 }
@@ -63,6 +67,13 @@ struct Active {
 enum RowKey {
     Chat(Uuid),        // UUID личного чата или канала.
     Topic(Uuid, Uuid), // UUID канала и его темы.
+}
+
+/// Меню привязано к строке текущего входа, даже если каталог переставит строки.
+#[derive(Clone, Copy)]
+struct RowMenu {
+    key: RowKey,           // Цель действия в текущем каталоге.
+    anchor: Point<Pixels>, // Координаты раскрытия относительно окна.
 }
 
 /// Готовые визуальные сведения строки. Каталог core пока передаёт только имя и темы.
@@ -76,6 +87,31 @@ struct RowDetails {
 }
 
 impl Active {
+    /// Определяет подпись и доступность уже существующего действия каталога.
+    fn menu_action(&self, key: RowKey, app: &App) -> Option<(&'static str, bool)> {
+        let stream = match key {
+            RowKey::Chat(stream) | RowKey::Topic(stream, _) => stream,
+        };
+        let chats = self.catalog.as_ref()?.chats.as_deref()?;
+        let chat = chats.iter().find(|chat| chat.id == stream)?;
+        match key {
+            RowKey::Chat(_) if chat.direct => Some(("Открыть чат", true)),
+            RowKey::Chat(_) => Some((
+                if self.expanded.contains(&stream) {
+                    "Свернуть темы"
+                } else {
+                    "Развернуть темы"
+                },
+                !chat.topics.is_empty() && self.search.read(app).text().trim().is_empty(),
+            )),
+            RowKey::Topic(_, topic) => chat
+                .topics
+                .iter()
+                .any(|entry| entry.id == topic)
+                .then_some(("Открыть тему", true)),
+        }
+    }
+
     /// Берёт метаданные только для текущего владельца. Без источника поля остаются пустыми.
     fn row_details(&self, _key: RowKey) -> RowDetails {
         #[cfg(all(test, feature = "gpui-test"))]
@@ -128,10 +164,11 @@ impl Active {
 
 impl Sidebar {
     /// Создаёт каталог без выбранного входа.
-    pub fn new(_: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             active: None,
             saved: HashMap::new(),
+            menu_focus: cx.focus_handle(),
         }
     }
 
@@ -141,6 +178,7 @@ impl Sidebar {
         app.bind_keys([
             KeyBinding::new("up", PreviousResult, Some("CatalogResults")),
             KeyBinding::new("down", NextResult, Some("CatalogResults")),
+            KeyBinding::new("shift-f10", OpenRowMenu, Some("CatalogRow")),
         ]);
     }
 
@@ -172,8 +210,9 @@ impl Sidebar {
                 let preferences = self.saved.remove(session).unwrap_or_default();
                 let search = cx.new(|cx| Search::new(preferences.query, cx));
                 let observer = cx.subscribe(&search, |this, _, _: &QueryChanged, cx| {
-                    if let Some(active) = &this.active {
+                    if let Some(active) = &mut this.active {
                         active.scroll.set_offset(gpui::point(px(0.), px(0.)));
+                        active.menu = None;
                     }
                     cx.notify();
                 });
@@ -186,6 +225,7 @@ impl Sidebar {
                     expanded: preferences.expanded,
                     scroll: ScrollHandle::new(),
                     focus: HashMap::new(),
+                    menu: None,
                     #[cfg(all(test, feature = "gpui-test"))]
                     fixture_details: HashMap::new(),
                 });
@@ -223,10 +263,140 @@ impl Sidebar {
                     .collect::<HashSet<_>>();
                 active.focus.retain(|key, _| keys.contains(key));
             }
+            if let Some(menu) = active.menu
+                && active.menu_action(menu.key, cx).is_none()
+            {
+                active.menu = None;
+            }
             cx.notify();
         } else if switched {
             cx.notify();
         }
+    }
+
+    /// Открывает меню из указателя или клавиатурного фокуса на строке.
+    fn open_row_menu(
+        &mut self,
+        origin: &AccountSession,
+        menu: RowMenu,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(active) = &mut self.active
+            && &active.session == origin
+            && active.menu_action(menu.key, cx).is_some()
+        {
+            active.menu = Some(menu);
+            window.focus(&self.menu_focus);
+            cx.notify();
+        }
+    }
+
+    /// Закрывает меню перед действием и возвращает фокус строке каталога.
+    fn menu_input(&mut self, input: MenuInput, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(input, MenuInput::Select | MenuInput::Close) {
+            return;
+        }
+        let Some(active) = &mut self.active else {
+            return;
+        };
+        let Some(menu) = active.menu else {
+            return;
+        };
+        let selected = matches!(input, MenuInput::Select);
+        let enabled = active
+            .menu_action(menu.key, cx)
+            .is_some_and(|(_, enabled)| enabled);
+        if selected && !enabled {
+            return;
+        }
+        active.menu = None;
+        if let Some(focus) = active.focus.get(&menu.key).filter(|_| enabled) {
+            window.focus(focus);
+        } else {
+            active.search.read(cx).focus(window);
+        }
+        let session = active.session.clone();
+        cx.notify();
+        if selected {
+            self.activate(&session, menu.key, cx);
+        }
+    }
+
+    /// Добавляет правую кнопку мыши, Shift+F10 и подсказку полного названия.
+    fn context_trigger(
+        row: Stateful<Div>,
+        active: &Active,
+        key: RowKey,
+        index: usize,
+        title: SharedString,
+        palette: Palette,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let origin = active.session.clone();
+        let keyboard_origin = origin.clone();
+        row.key_context("CatalogRow")
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |view, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    let menu = RowMenu {
+                        key,
+                        anchor: event.position,
+                    };
+                    view.open_row_menu(&origin, menu, window, cx);
+                }),
+            )
+            .on_action(cx.listener(move |view, _: &OpenRowMenu, window, cx| {
+                let Some(bounds) = view
+                    .active
+                    .as_ref()
+                    .filter(|active| active.session == keyboard_origin)
+                    .and_then(|active| active.scroll.bounds_for_item(index))
+                else {
+                    return;
+                };
+                let menu = RowMenu {
+                    key,
+                    anchor: point(bounds.left(), bounds.bottom()),
+                };
+                view.open_row_menu(&keyboard_origin, menu, window, cx);
+            }))
+            .tooltip(move |_, app| tooltip(palette, title.clone(), app))
+    }
+
+    /// Рисует только действие, которое уже умеет выполнять каталог.
+    fn row_menu(
+        action: (&'static str, bool),
+        viewport: Size<Pixels>,
+        palette: Palette,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let (title, enabled) = action;
+        let mut button = Button::new("catalog-menu-action", title);
+        button.appearance = ButtonAppearance::Ghost;
+        button.disabled = !enabled;
+        let target = cx.entity().downgrade();
+        menu_surface("catalog-menu", palette, viewport, px(224.), px(320.))
+            .debug_selector(|| "catalog-menu".into())
+            .on_mouse_down_out(cx.listener(|view, _, window, cx| {
+                cx.stop_propagation();
+                view.menu_input(MenuInput::Close, window, cx);
+            }))
+            .child(
+                button
+                    .render(palette, None, move |window, app| {
+                        let _ = target.update(app, |view, cx| {
+                            view.menu_input(MenuInput::Select, window, cx)
+                        });
+                    })
+                    .w_full()
+                    .min_w_0()
+                    .justify_start()
+                    .flex_none()
+                    .when(enabled, |row| row.bg(palette.card_selected))
+                    .debug_selector(|| "catalog-menu-action".into()),
+            )
     }
 
     /// Принимает активацию только от строки, которая ещё видна в том же входе.
@@ -314,6 +484,7 @@ impl Sidebar {
         chat: &Chat,
         opened: bool,
         expandable: bool,
+        index: usize,
         palette: Palette,
         cx: &mut Context<Self>,
     ) -> Div {
@@ -364,6 +535,15 @@ impl Sidebar {
         })
         .min_h(px(64.))
         .debug_selector(move || format!("catalog-chat-{id}"));
+        let row = Self::context_trigger(
+            row,
+            active,
+            key,
+            index,
+            chat.name.clone().into(),
+            palette,
+            cx,
+        );
         div().w_full().min_w_0().child(row)
     }
 
@@ -372,6 +552,7 @@ impl Sidebar {
         active: &mut Active,
         stream_id: Uuid,
         topic: &Topic,
+        index: usize,
         palette: Palette,
         cx: &mut Context<Self>,
     ) -> Div {
@@ -428,6 +609,15 @@ impl Sidebar {
                 None,
             ))
             .debug_selector(move || id);
+        let row = Self::context_trigger(
+            row,
+            active,
+            key,
+            index,
+            topic.name.clone().into(),
+            palette,
+            cx,
+        );
         div().w_full().min_w_0().child(row)
     }
 
@@ -495,8 +685,14 @@ impl Render for Sidebar {
             .bg(palette.surface);
 
         let Some(active) = &mut self.active else {
+            if self.menu_focus.is_focused(window) {
+                window.blur();
+            }
             return panel.child(catalog_status(palette, "Выберите аккаунт", None));
         };
+        if active.menu.is_none() && self.menu_focus.is_focused(window) {
+            active.search.read(cx).focus(window);
+        }
         panel = panel.child(
             div()
                 .px(px(12.))
@@ -553,6 +749,7 @@ impl Render for Sidebar {
                     chat,
                     opened,
                     !searching && !chat.topics.is_empty(),
+                    row_index,
                     palette,
                     cx,
                 ));
@@ -562,7 +759,9 @@ impl Render for Sidebar {
                 row_index += 1;
                 if opened {
                     for topic in visible_topics {
-                        rows = rows.child(Self::topic_row(active, chat.id, topic, palette, cx));
+                        rows = rows.child(Self::topic_row(
+                            active, chat.id, topic, row_index, palette, cx,
+                        ));
                         if searching {
                             results.push((
                                 row_index,
@@ -603,7 +802,21 @@ impl Render for Sidebar {
                     }
                 }));
         }
-        panel.child(rows)
+        panel.child(rows).when_some(
+            active.menu.and_then(|menu| {
+                active
+                    .menu_action(menu.key, cx)
+                    .map(|action| (menu, action))
+            }),
+            |panel, (menu, action)| {
+                let viewport = window.viewport_size();
+                menu_navigation(panel, &self.menu_focus, cx, Self::menu_input).children(menu_layer(
+                    viewport,
+                    menu.anchor,
+                    Self::row_menu(action, viewport, palette, cx),
+                ))
+            },
+        )
     }
 }
 
