@@ -33,6 +33,18 @@ cargo run --locked -p workspace-desktop --bin workspace-desktop
 cargo test --locked --workspace --no-default-features
 ```
 
+## Открыть галерею компонентов
+
+В графической сессии macOS запустите галерею из корня репозитория.
+
+```sh
+cargo run --locked -p workspace-desktop --no-default-features --features gpui --example gpui_gallery
+```
+
+Светлая и тёмная палитры показаны рядом. Выберите строку каталога мышью
+или клавишами Tab и Enter. В нижней части каждой панели можно вводить
+многострочный черновик.
+
 ## Воспроизвести скачок истории при догрузке сверху
 
 Из корня проекта в графической сессии macOS выполните:

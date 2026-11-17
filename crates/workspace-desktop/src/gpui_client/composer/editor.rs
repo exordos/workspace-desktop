@@ -70,8 +70,8 @@ impl Editor {
         }
     }
 
-    /// Создаёт поле разговора внутри общей рамки Workspace.
-    pub(super) fn for_conversation(cx: &mut Context<Self>) -> Self {
+    /// Создаёт поле для общей рамки Workspace в разговоре и галерее.
+    pub fn for_conversation(cx: &mut Context<Self>) -> Self {
         Self {
             framed_probe: false,
             ..Self::new(cx)
