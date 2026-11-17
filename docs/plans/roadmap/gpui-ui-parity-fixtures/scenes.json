@@ -1,0 +1,148 @@
+{
+  "commit": "af0999886daaffefc2a7be33f8dcf3f484a0e9c1",
+  "clock": "2026-07-16T12:30:00.000Z",
+  "timezone": "Europe/Moscow",
+  "language": "ru",
+  "palette": "blue-mist",
+  "deviceScaleFactor": 1,
+  "profiles": [
+    { "id": "a", "firstName": "Лина", "lastName": "Тестовая", "avatar": null },
+    {
+      "id": "b",
+      "firstName": "Александра",
+      "lastName": "Тестовая-Сопровождение-Городских-Проектов",
+      "avatar": null
+    }
+  ],
+  "direct": {
+    "title": "Александра Тестовая-Сопровождение-Городских-Проектов",
+    "messages": [
+      { "author": "b", "minute": 0, "text": "Черновик готов." },
+      {
+        "author": "a",
+        "minute": 3,
+        "text": "Сверю размеры окна и поля редактора.\n\nЕсли название не помещается, зафиксируем точку обрезки в узком окне."
+      },
+      {
+        "author": "b",
+        "minute": 5,
+        "text": "Проверь две темы:\n\n- дневной режим;\n- ночной режим;\n- узкое окно с тем же текстом."
+      },
+      { "author": "a", "minute": 7, "text": "Готово к сравнению." }
+    ],
+    "outgoing": "Синтетическая проверка статуса отправки."
+  },
+  "channel": {
+    "title": "International Design Review and Customer Experience Workshop",
+    "topics": [
+      {
+        "title": "Проверка компоновки и переноса длинных заголовков",
+        "unread": 3,
+        "messages": [
+          { "author": "b", "minute": 10, "text": "Layout reviewed." },
+          {
+            "author": "b",
+            "minute": 11,
+            "text": "Compare the conversation title and the channel title.\n\nKeep the sidebar open in every frame."
+          },
+          { "author": "a", "minute": 13, "text": "Окно подготовлено." }
+        ]
+      },
+      {
+        "title": "Empty topic for loading and retry",
+        "unread": 0,
+        "messages": []
+      }
+    ]
+  },
+  "scenes": [
+    {
+      "id": "dm-ready-light",
+      "route": "direct",
+      "state": "ready",
+      "width": 1440,
+      "height": 900,
+      "theme": "light"
+    },
+    {
+      "id": "dm-ready-dark",
+      "route": "direct",
+      "state": "ready",
+      "width": 1440,
+      "height": 900,
+      "theme": "dark"
+    },
+    {
+      "id": "dm-narrow-light",
+      "route": "direct",
+      "state": "ready",
+      "width": 700,
+      "height": 600,
+      "theme": "light"
+    },
+    {
+      "id": "topic-ready-light",
+      "route": "topic",
+      "state": "ready",
+      "width": 1440,
+      "height": 900,
+      "theme": "light"
+    },
+    {
+      "id": "topic-narrow-light",
+      "route": "topic",
+      "state": "ready",
+      "width": 700,
+      "height": 600,
+      "theme": "light"
+    },
+    {
+      "id": "dm-sending-light",
+      "route": "direct-topic",
+      "state": "sending",
+      "width": 1440,
+      "height": 900,
+      "theme": "light"
+    },
+    {
+      "id": "dm-failed-light",
+      "route": "direct-topic",
+      "state": "failed",
+      "width": 1440,
+      "height": 900,
+      "theme": "light"
+    },
+    {
+      "id": "dm-confirmed-light",
+      "route": "direct-topic",
+      "state": "confirmed",
+      "width": 1440,
+      "height": 900,
+      "theme": "light"
+    },
+    {
+      "id": "topic-error-light",
+      "route": "empty-topic",
+      "state": "error",
+      "width": 1440,
+      "height": 900,
+      "theme": "light"
+    },
+    {
+      "id": "topic-loading-light",
+      "route": "empty-topic",
+      "state": "loading",
+      "width": 1440,
+      "height": 900,
+      "theme": "light"
+    },
+    {
+      "id": "topic-empty-light",
+      "route": "empty-topic",
+      "state": "empty",
+      "width": 1440,
+      "height": 900,
+      "theme": "light"
+    }
+  ]
+}
