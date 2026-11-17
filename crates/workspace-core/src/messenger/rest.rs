@@ -3,6 +3,7 @@
 
 mod message_actions;
 pub(super) mod mutations;
+pub(super) mod sidebar;
 
 use std::{collections::HashSet, time::Duration};
 
@@ -24,7 +25,9 @@ use crate::{
     sync::Event,
 };
 
-use super::details::{ConversationDetails, DetailsError};
+use super::details::{
+    ConversationDetails, DetailsError, StreamNotificationMode, TopicNotificationMode,
+};
 use super::history::OpenHistoryError;
 use super::read::ReadError;
 use super::send::{DirectSendError, SendError};
@@ -256,13 +259,25 @@ impl RestClient {
         token: &str,
         path: &str,
     ) -> Result<Vec<T>, SourceError> {
+        self.filtered_collection(owner, token, path, &[]).await
+    }
+
+    /// Сохраняет заданный фильтр при переходе ко всем страницам ресурса.
+    async fn filtered_collection<T: DeserializeOwned>(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        path: &str,
+        filters: &[(&str, &str)],
+    ) -> Result<Vec<T>, SourceError> {
         let mut rows = Vec::new();
         let mut seen = HashSet::new();
         let mut marker: Option<String> = None;
         loop {
             let mut request = self
                 .request(owner, token, path)?
-                .query(&[("page_limit", PAGE_LIMIT)]);
+                .query(&[("page_limit", PAGE_LIMIT)])
+                .query(filters);
             if let Some(marker) = &marker {
                 request = request.query(&[("page_marker", marker)]);
             }
@@ -1057,6 +1072,9 @@ impl WireFolder {
 struct WireStream {
     name: Option<String>,        // Название, которое нужно только панели сведений.
     description: Option<String>, // Описание канала, если оно заполнено.
+    color: Option<u32>,          // Цвет значка стрима.
+    owner: Option<String>,       // UUID владельца стрима.
+    invite_only: Option<bool>,   // Доступ по приглашению.
     uuid: String,                // Идентификатор запрошенного разговора.
     project_id: Option<String>,  // Проект, если он есть в ответе.
     user_uuid: Option<String>,   // Пользователь, если он есть в ответе.
@@ -1119,25 +1137,6 @@ impl WireTopic {
     }
 }
 
-/// Настройка уведомлений отдельного разговора на сервере.
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum StreamNotificationMode {
-    AllMessages,  // Включены уведомления о сообщениях.
-    MentionsOnly, // Настройка канала. В личном разговоре сообщения уведомляют.
-    Muted,        // Уведомления отключены, если тема не переопределяет настройку.
-}
-
-/// Настройка уведомлений отдельной темы на сервере.
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum TopicNotificationMode {
-    Default, // Использовать настройку разговора.
-    Mute,    // Отключить уведомления темы.
-    Unmute,  // Включить уведомления темы.
-    Follow,  // Следить за темой и получать её уведомления.
-}
-
 impl TopicNotificationMode {
     /// Решает, разрешают ли настройки уведомление о входящем личном сообщении.
     fn allows(self, stream: StreamNotificationMode) -> bool {
@@ -1166,7 +1165,7 @@ pub(super) fn wire_event(
     epoch: &str,
 ) -> Result<(Event, Option<IncomingMessage>), SourceError> {
     let wire: WireEnvelope =
-        serde_json::from_value(value).map_err(|_| SourceError::InvalidResponse)?;
+        WireEnvelope::deserialize(&value).map_err(|_| SourceError::InvalidResponse)?;
     let cursor = Cursor {
         epoch_generation: epoch.to_owned(),
         epoch_version: wire.epoch_version,
@@ -1259,7 +1258,14 @@ pub(super) fn wire_event(
         return Ok((Event::HistoryChanged { cursor, change }, None));
     }
     if !message_created && !message_updated {
-        return Ok((Event::Checkpoint(cursor), None));
+        let event = sidebar::wire_sidebar_change(&wire, &value["payload"], owner).map_or_else(
+            || Event::Checkpoint(cursor.clone()),
+            |change| Event::SidebarChanged {
+                cursor: cursor.clone(),
+                change,
+            },
+        );
+        return Ok((event, None));
     }
     if message_updated && wire.payload.kind != "message.updated" {
         return Err(SourceError::InvalidResponse);
@@ -1364,7 +1370,7 @@ mod tests {
 
     /// Удаление привязки для оставшегося участника не означает отзыв канала.
     #[test]
-    fn stream_binding_deletion_only_advances_cursor() {
+    fn legacy_stream_binding_deletion_identifies_binding_without_revoking_history() {
         let event = json!({
             "schema_version": 1, "uuid": "event", "epoch_version": 1,
             "project_id": "project", "user_uuid": "recipient",
@@ -1373,7 +1379,8 @@ mod tests {
         });
         assert!(matches!(
             wire_event(event, &owner(), "epoch").unwrap().0,
-            Event::Checkpoint(_)
+            Event::SidebarChanged { change: crate::messenger::details::SidebarChange::MembershipBinding(id), .. }
+                if id == Uuid::from_u128(4)
         ));
     }
 

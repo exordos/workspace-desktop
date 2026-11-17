@@ -228,6 +228,13 @@ impl Runtime {
             .collect();
         for (key, task) in tasks.iter_mut() {
             let current = desired.get(&key.context);
+            if key.source == crate::messenger::SOURCE_ID
+                && current.is_none_or(|session| session.generation != task.generation)
+            {
+                self.sync
+                    .sidebar_cache
+                    .clear_session(&key.context, task.generation);
+            }
             if current.is_none_or(|session| {
                 session.generation != task.generation || session.token_version != task.token_version
             }) {

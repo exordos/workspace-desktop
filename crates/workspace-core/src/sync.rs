@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::{
     auth::{Auth, AuthError},
     context::{OwnerContext, SessionGeneration},
+    messenger::details::{SidebarCache, SidebarChange},
     notification_target::{NotificationTarget, NotificationTargetError},
     storage::{
         Cursor, DeliveryStatus, EventWrite, HistoryChange, HistoryMessage, HistoryMetadata,
@@ -62,6 +63,9 @@ pub enum SyncChange {
         message_id: Uuid, // UUID исправленной или удалённой строки.
     },
     HistoryAccessRevoked(HistoryRevocation), // Область, которую больше нельзя показывать.
+    SidebarDetailsChanged {
+        stream_id: Uuid, // Стрим, чья открытая панель должна получить обновление.
+    },
     OutboxChanged {
         scope: HistoryScope, // Исходная тема, очередь которой нужно перечитать.
     },
@@ -101,6 +105,10 @@ pub enum Event {
         cursor: Cursor,        // Позиция изменения в журнале.
         change: HistoryChange, // Правка, удаление или отзыв доступа.
     },
+    SidebarChanged {
+        cursor: Cursor,        // Позиция в общем журнале Workspace.
+        change: SidebarChange, // Изменение профиля, стрима, темы или состава.
+    },
     UnreadChanged {
         cursor: Cursor, // Позиция события обновления папки в журнале.
         count: u32,     // Новый счётчик папки «Все чаты».
@@ -120,6 +128,7 @@ impl Event {
             Self::MessageCreated { cursor, .. }
             | Self::IncomingDirectMessage { cursor, .. }
             | Self::HistoryChanged { cursor, .. }
+            | Self::SidebarChanged { cursor, .. }
             | Self::UnreadChanged { cursor, .. }
             | Self::UnreadBaseline { cursor, .. }
             | Self::SourceReady(cursor)
@@ -175,6 +184,7 @@ pub enum PrepareSendError {
 
 /// Проверяет право сессии на запись и передаёт события в хранилище.
 pub struct Sync {
+    pub(crate) sidebar_cache: SidebarCache, // Временные снимки панелей на время сессии.
     auth: Auth,            // Авторизация для проверки владельца и поколения сессии.
     storage: Arc<Storage>, // Общая локальная база сообщений, позиций и счётчиков.
     updates: broadcast::Sender<SyncUpdate>, // Канал изменений. Оформление окна получает их после записи.
@@ -186,6 +196,7 @@ impl Sync {
         Self {
             auth,
             storage,
+            sidebar_cache: SidebarCache::default(),
             updates: broadcast::channel(128).0,
         }
     }
@@ -215,6 +226,8 @@ impl Sync {
         self.auth.with_active_generation(owner, generation, || {
             self.storage.reset_source(owner, source)?;
             if source == crate::messenger::SOURCE_ID {
+                self.sidebar_cache
+                    .invalidate(owner, generation, None, false);
                 self.publish(owner, generation, SyncChange::MessengerReset);
             }
             Ok(())
@@ -529,11 +542,51 @@ impl Sync {
                     self.publish(owner, generation, SyncChange::OutboxChanged { scope });
                 }
             }
-            if saved.outcome == ApplyOutcome::Applied
-                && source == crate::messenger::SOURCE_ID
-                && let Some(change) = history.and_then(history_update)
-            {
-                self.publish(owner, generation, change);
+            if saved.outcome == ApplyOutcome::Applied && source == crate::messenger::SOURCE_ID {
+                if let Event::SidebarChanged { change, .. } = &event {
+                    for stream_id in self.sidebar_cache.apply(owner, generation, change) {
+                        self.publish(
+                            owner,
+                            generation,
+                            SyncChange::SidebarDetailsChanged { stream_id },
+                        );
+                    }
+                }
+                if let Some(change) = history.and_then(history_update) {
+                    match &change {
+                        SyncChange::HistoryAccessRevoked(HistoryRevocation::Stream(id)) => {
+                            self.sidebar_cache
+                                .invalidate(owner, generation, Some(*id), true);
+                        }
+                        SyncChange::HistoryAccessRevoked(HistoryRevocation::Topic {
+                            stream_id,
+                            topic_id,
+                        }) => {
+                            if self
+                                .sidebar_cache
+                                .apply(
+                                    owner,
+                                    generation,
+                                    &SidebarChange::RemoveTopic {
+                                        stream_id: *stream_id,
+                                        topic_id: *topic_id,
+                                    },
+                                )
+                                .contains(stream_id)
+                            {
+                                self.publish(
+                                    owner,
+                                    generation,
+                                    SyncChange::SidebarDetailsChanged {
+                                        stream_id: *stream_id,
+                                    },
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.publish(owner, generation, change);
+                }
             }
             if saved.message_inserted
                 && let Event::IncomingDirectMessage {
@@ -572,6 +625,26 @@ impl Sync {
                 },
             },
         );
+    }
+
+    /// Перечитывает панель после подтверждённого действия текущего пользователя.
+    pub(crate) fn refresh_sidebar(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        stream_id: Uuid,
+        revoked: bool,
+    ) -> Result<(), AuthError> {
+        self.auth.with_active_generation(owner, generation, || {
+            self.sidebar_cache
+                .invalidate(owner, generation, Some(stream_id), revoked);
+            let change = if revoked {
+                SyncChange::HistoryAccessRevoked(HistoryRevocation::Stream(stream_id))
+            } else {
+                SyncChange::SidebarDetailsChanged { stream_id }
+            };
+            self.publish(owner, generation, change);
+        })
     }
 
     /// Публикует изменение под блокировкой действующей сессии после записи в базу.
