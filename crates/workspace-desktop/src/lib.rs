@@ -1,4 +1,7 @@
-//! Открывает системные адаптеры, оболочку Iced и общие виджеты приложения.
+//! Открывает системные адаптеры и точки входа клиентов Iced и GPUI.
+
+#[cfg(all(feature = "gpui", target_os = "macos"))]
+pub mod gpui_client;
 
 pub mod platform;
 
