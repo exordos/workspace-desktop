@@ -1,11 +1,14 @@
-//! Проверяет отправку через кнопки разговора с управляемыми ответами истории и очереди.
+//! Проверяет ввод, геометрию редактора и отправку через рабочий экран разговора.
 
 use std::{
     sync::{Arc, mpsc},
     time::Duration,
 };
 
-use gpui::{ClipboardItem, Modifiers, TestAppContext, VisualTestContext, px, size};
+use gpui::{
+    ClipboardItem, EntityInputHandler, Focusable, KeyDownEvent, Keystroke, ListOffset, Modifiers,
+    TestAppContext, VisualTestContext, px, size,
+};
 use workspace_core::{
     context::{AccountId, OwnerContext, SessionGeneration},
     storage::{DeliveryStatus, HistoryMessage, HistoryMetadata, HistoryTime, PreparedSend},
@@ -218,7 +221,7 @@ fn accepts_only_valid_text_and_one_click_while_saving(cx: &mut TestAppContext) {
     publish(&requests, Load::Open(ChatEntry::Latest), vec![], vec![], ui);
     allow(&requests, Err(DestinationError::EncryptionUnavailable), ui);
     paste(ui, "Обычный текст");
-    click(ui, "conversation-send");
+    ui.simulate_keystrokes("enter");
     assert!(
         requests.save.try_recv().is_err(),
         "Запрещённая тема не допускает запись"
@@ -232,6 +235,11 @@ fn accepts_only_valid_text_and_one_click_while_saving(cx: &mut TestAppContext) {
         requests.save.try_recv().is_err(),
         "Пробелы не считаются сообщением"
     );
+
+    paste(ui, &"Ж".repeat(40_001));
+    ui.simulate_keystrokes("enter");
+    assert!(requests.save.try_recv().is_err());
+    assert!(ui.debug_bounds("conversation-send-explanation").is_some());
 
     paste(ui, "Обычный текст");
     click(ui, "conversation-send");
@@ -258,6 +266,171 @@ fn accepts_only_valid_text_and_one_click_while_saving(cx: &mut TestAppContext) {
         "Успешно записанная версия должна очиститься"
     );
     publish(&requests, Load::Read(7), vec![], vec![], ui);
+}
+
+/// Рабочий редактор передаёт Enter один раз, а AppKit подтверждает композицию отдельно.
+#[gpui::test]
+fn editor_keyboard_and_ime_share_the_same_send_path(cx: &mut TestAppContext) {
+    let (view, ui, requests) = start(cx);
+    publish(&requests, Load::Open(ChatEntry::Latest), vec![], vec![], ui);
+    allow(&requests, Ok(TOPIC), ui);
+    paste(ui, "Строка 🧪");
+    ui.simulate_keystrokes("right shift-enter");
+    assert_eq!(draft(&view, ui), "Строка 🧪\n");
+    assert!(requests.save.try_recv().is_err());
+
+    let editor = ui.read(|app| {
+        view.read(app)
+            .sending
+            .as_ref()
+            .unwrap()
+            .view
+            .read(app)
+            .editor()
+    });
+    ui.update(|window, app| {
+        editor.update(app, |field, cx| {
+            field.replace_and_mark_text_in_range(None, "仮", Some(0..1), window, cx);
+        });
+    });
+    ui.run_until_parked();
+    ui.simulate_keystrokes("enter");
+    assert!(requests.save.try_recv().is_err());
+    assert_eq!(draft(&view, ui), "Строка 🧪\n仮");
+
+    ui.update(|window, app| {
+        editor.update(app, |field, cx| {
+            field.replace_text_in_range(None, "確定", window, cx);
+        });
+    });
+    ui.run_until_parked();
+    ui.simulate_keystrokes("enter");
+    let submission = next(&requests.save, "Enter после подтверждения IME");
+    assert_eq!(submission.input.markdown, "Строка 🧪\n確定");
+    saved(submission, None, ui);
+    assert_eq!(draft(&view, ui), "Строка 🧪\n確定");
+
+    ui.simulate_event(KeyDownEvent {
+        keystroke: Keystroke::parse("enter").unwrap(),
+        is_held: true,
+    });
+    ui.run_until_parked();
+    assert!(
+        requests.save.try_recv().is_err(),
+        "Удержание Enter не повторяет сбой"
+    );
+    assert!(ui.update(|window, app| editor.focus_handle(app).is_focused(window)));
+
+    click(ui, "conversation-send");
+    saved(next(&requests.save, "Повтор кнопкой"), Some(MESSAGE), ui);
+    assert!(draft(&view, ui).is_empty());
+    assert!(ui.update(|window, app| editor.focus_handle(app).is_focused(window)));
+    publish(&requests, Load::Read(7), vec![], vec![], ui);
+}
+
+/// Перенос и рост редактора оставляют опору читателя на месте и сохраняют нижнюю привязку.
+#[gpui::test]
+fn editor_growth_preserves_reading_anchor_and_tail(cx: &mut TestAppContext) {
+    let (view, ui, requests) = start(cx);
+    let stream_id = ui.read(|app| view.read(app).address().route.scope.stream_id);
+    let messages = (1..=60)
+        .map(|index| HistoryMessage {
+            id: Uuid::from_u128(index),
+            stream_id,
+            topic_id: TOPIC,
+            text: "Синтетическая строка".into(),
+            metadata: HistoryMetadata {
+                author_id: Some(Uuid::from_u128(900)),
+                created_at: HistoryTime::parse("2026-11-17T07:10:30Z").unwrap(),
+                updated_at: None,
+            },
+        })
+        .collect();
+    publish(
+        &requests,
+        Load::Open(ChatEntry::Latest),
+        messages,
+        vec![],
+        ui,
+    );
+    allow(&requests, Ok(TOPIC), ui);
+
+    let empty = ui.debug_bounds("workspace-composer-editor").unwrap();
+    assert_eq!(empty.size.height, px(38.));
+    let send = ui.debug_bounds("conversation-send").unwrap();
+    assert_eq!(send.size, size(px(40.), px(40.)));
+    assert_eq!(send.bottom(), empty.bottom() + px(1.));
+
+    // Измеряем верх последней строки от нижнего края списка. Её высота и текст не меняются.
+    let tail_inset = |ui: &VisualTestContext| {
+        ui.read(|app| {
+            let viewport = &view.read(app).viewport;
+            viewport.list().viewport_bounds().size.height
+                - px(viewport.y(Uuid::from_u128(60)).unwrap())
+        })
+    };
+    let inset_before = tail_inset(ui);
+    paste(
+        ui,
+        "Длинная строка, которая переносится в узком окне. "
+            .repeat(3)
+            .as_str(),
+    );
+    let wide = ui
+        .debug_bounds("workspace-composer-editor")
+        .unwrap()
+        .size
+        .height;
+    assert!(wide > empty.size.height);
+    assert_eq!(tail_inset(ui), inset_before);
+
+    ui.simulate_resize(size(px(340.), px(530.)));
+    ui.run_until_parked();
+    let narrow = ui
+        .debug_bounds("workspace-composer-editor")
+        .unwrap()
+        .size
+        .height;
+    assert!(
+        narrow > wide,
+        "Перенос должен увеличить высоту поля: {wide:?} → {narrow:?}"
+    );
+    assert_eq!(tail_inset(ui), inset_before);
+
+    ui.update(|_, app| {
+        view.update(app, |view, cx| {
+            view.viewport.list().scroll_to(ListOffset {
+                item_ix: 8,
+                offset_in_item: px(11.),
+            });
+            cx.notify();
+        })
+    });
+    ui.run_until_parked();
+    let anchor = Uuid::from_u128(9);
+    let anchor_y =
+        |ui: &VisualTestContext| ui.read(|app| view.read(app).viewport.y(anchor).unwrap());
+    let before = anchor_y(ui);
+    let long_text = "Длинный черновик 🧪\r\n".repeat(50);
+    paste(ui, &long_text);
+    assert_eq!(draft(&view, ui), long_text.replace("\r\n", "\n"));
+    assert_eq!(
+        ui.debug_bounds("workspace-composer-editor")
+            .unwrap()
+            .size
+            .height,
+        px(126.)
+    );
+    assert_eq!(anchor_y(ui), before);
+    paste(ui, "");
+    assert_eq!(
+        ui.debug_bounds("workspace-composer-editor")
+            .unwrap()
+            .size
+            .height,
+        empty.size.height
+    );
+    assert_eq!(anchor_y(ui), before);
 }
 
 /// Новая версия того же ввода и другой открытый разговор переживают поздний итог сохранения.

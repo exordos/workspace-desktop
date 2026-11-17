@@ -5,12 +5,13 @@ mod editor;
 mod source;
 
 use gpui::{
-    App, Context, Entity, EventEmitter, Focusable, IntoElement, Render, Subscription, Window, div,
-    prelude::*,
+    App, Context, Entity, EventEmitter, Focusable, IntoElement, Render, SharedString, Subscription,
+    Window, div, prelude::*, px,
 };
 use uuid::Uuid;
 
 pub use self::editor::Editor;
+use self::editor::SubmitRequested;
 pub(super) use self::source::{DestinationError, SendSource};
 use super::{
     contracts::{ConversationAddress, ConversationReply},
@@ -59,13 +60,17 @@ pub(super) struct Composer {
     writing: Option<Attempt>,     // Текущая запись; None позволяет начать следующую.
     error_version: Option<u64>,   // Версия текста, для которой запись не удалась.
     _editor_observer: Subscription, // Обновляет доступность кнопки после редактирования.
+    _editor_submit: Subscription, // Связывает Enter с тем же действием, что и кнопку отправки.
 }
 
 impl Composer {
     /// Создаёт редактор привязанного к открытому разговору черновика.
     pub fn new(address: ConversationAddress, cx: &mut Context<Self>) -> Self {
-        let editor = cx.new(Editor::for_conversation);
+        let editor = cx.new(Editor::for_composer);
         let observer = cx.observe(&editor, |_, _, cx| cx.notify());
+        let submit = cx.subscribe(&editor, |composer, _, _: &SubmitRequested, cx| {
+            composer.submit(cx);
+        });
         Self {
             address,
             editor,
@@ -73,6 +78,7 @@ impl Composer {
             writing: None,
             error_version: None,
             _editor_observer: observer,
+            _editor_submit: submit,
         }
     }
 
@@ -80,6 +86,12 @@ impl Composer {
     #[cfg(all(test, feature = "gpui-test"))]
     pub fn draft<'a>(&self, app: &'a App) -> &'a str {
         self.editor.read(app).text()
+    }
+
+    /// Даёт тесту доступ к системному обработчику ввода рабочего поля.
+    #[cfg(all(test, feature = "gpui-test"))]
+    pub fn editor(&self) -> Entity<Editor> {
+        self.editor.clone()
     }
 
     /// Убирает разрешение на отправку, пока история проходит повторную проверку.
@@ -244,63 +256,121 @@ impl Render for Composer {
         } else {
             FieldAppearance::Normal
         };
-        let mut send = Button::new(
-            "conversation-send",
-            if self.writing.is_some() {
-                "Сохраняем…"
-            } else {
-                "Отправить"
-            },
-        );
-        send.icon = Some(Icon::Send);
+        let saving = self.writing.is_some();
+        let mut send = Button::new("conversation-send", "");
         send.appearance = ButtonAppearance::Primary;
         send.disabled = !self.can_send(cx);
+        let send_icon = if saving {
+            Icon::Pending.element(px(20.), palette.text_secondary)
+        } else {
+            let color = if send.disabled {
+                palette.disabled
+            } else {
+                palette.on_accent
+            };
+            Icon::Send.element(px(24.), color)
+        };
         let target = cx.entity().downgrade();
         let retry = target.clone();
         div()
             .flex()
             .flex_col()
             .flex_none()
-            .gap_2()
+            .min_w_0()
+            .gap(px(4.))
             .p_2()
+            .border_t_1()
+            .border_color(palette.border)
             .bg(palette.surface)
-            .child(field(palette, appearance, self.editor.clone()).w_full())
-            .when_some(explanation, |view, (text, error)| {
-                view.child(
-                    label(palette, TextRole::Caption, text)
-                        .when(error, |label| label.text_color(palette.danger))
-                        .debug_selector(|| "conversation-send-explanation".into()),
-                )
-            })
+            .debug_selector(|| "conversation-composer".into())
             .child(
                 div()
                     .flex()
-                    .flex_wrap()
-                    .justify_end()
-                    .gap_2()
-                    .when(
-                        matches!(self.destination, Destination::Unavailable(_)),
-                        |row| {
-                            row.child(
-                                Button::new("conversation-send-retry", "Проверить отправку")
-                                    .render(palette, None, move |_, app| {
-                                        let _ = retry.update(app, |view, cx| {
-                                            cx.emit(ComposerEvent::RetryDestination(
-                                                view.address.clone(),
-                                            ));
-                                        });
-                                    })
-                                    .debug_selector(|| "conversation-send-retry".into()),
-                            )
-                        },
+                    .min_w_0()
+                    .items_end()
+                    .gap(px(12.))
+                    .child(
+                        field(palette, appearance, self.editor.clone())
+                            .flex_1()
+                            .rounded(px(12.)),
                     )
                     .child(
-                        send.render(palette, None, move |_, app| {
-                            let _ = target.update(app, Composer::submit);
+                        send.render(palette, None, move |window, app| {
+                            let _ = target.update(app, |composer, cx| {
+                                window.focus(&composer.editor.focus_handle(cx));
+                                composer.submit(cx);
+                            });
+                        })
+                        .size(px(40.))
+                        .flex_none()
+                        .p(px(0.))
+                        .rounded(px(12.))
+                        .when(saving, |button| button.bg(palette.accent_soft))
+                        .child(send_icon)
+                        .tooltip(move |_, app| {
+                            app.new(|_| SendTooltip {
+                                palette,
+                                text: if saving {
+                                    "Сохраняем сообщение…"
+                                } else {
+                                    "Отправить (Enter)"
+                                }
+                                .into(),
+                            })
+                            .into()
                         })
                         .debug_selector(|| "conversation-send".into()),
                     ),
             )
+            .when_some(explanation, |view, (text, error)| {
+                view.child(
+                    label(palette, TextRole::Caption, text)
+                        .text_color(if error {
+                            palette.danger
+                        } else {
+                            palette.text_secondary
+                        })
+                        .debug_selector(|| "conversation-send-explanation".into()),
+                )
+            })
+            .when(
+                matches!(self.destination, Destination::Unavailable(_)),
+                |view| {
+                    view.child(
+                        div().flex().justify_end().child(
+                            Button::new("conversation-send-retry", "Проверить отправку")
+                                .render(palette, None, move |_, app| {
+                                    let _ = retry.update(app, |view, cx| {
+                                        cx.emit(ComposerEvent::RetryDestination(
+                                            view.address.clone(),
+                                        ));
+                                    });
+                                })
+                                .debug_selector(|| "conversation-send-retry".into()),
+                        ),
+                    )
+                },
+            )
+    }
+}
+
+/// Подпись компактной кнопки отправки, видимая при наведении.
+struct SendTooltip {
+    palette: Palette,   // Цвета текущей темы окна.
+    text: SharedString, // Действие с клавишей или состояние текущей записи.
+}
+
+impl Render for SendTooltip {
+    /// Рисует подсказку теми же цветами и размером текста, что и редактор.
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        label(self.palette, TextRole::Caption, self.text.clone())
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(self.palette.surface)
+            .border_1()
+            .border_color(self.palette.border)
+            .shadow_md()
     }
 }
 

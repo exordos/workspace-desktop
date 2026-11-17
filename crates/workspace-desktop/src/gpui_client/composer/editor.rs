@@ -1,15 +1,16 @@
 //! Многострочное текстовое поле GPUI. Сначала состояние и действия, затем связь с системным вводом и разметка.
 
-use std::ops::Range;
+use std::{cell::RefCell, ops::Range, rc::Rc};
 
 use crate::gpui_client::ui::{Palette, ThemeMode};
 
 use gpui::{
-    App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Element, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId,
-    InspectorElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels,
-    Point, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine, div,
-    fill, point, prelude::*, px, relative, rgb, rgba, size,
+    App, AvailableSpace, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Element,
+    ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
+    Focusable, GlobalElementId, InspectorElementId, KeyBinding, KeyDownEvent, LayoutId,
+    MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, Style, TextAlign, TextRun,
+    TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine, div, fill, point, prelude::*,
+    px, relative, rgb, rgba, size,
 };
 
 /// Действия клавиатуры внутри редактора. Печатные символы передаёт система ввода macOS.
@@ -36,21 +37,30 @@ mod keys {
     );
 }
 
-const LINE_HEIGHT: Pixels = px(22.);
-const VIEWPORT_HEIGHT: Pixels = px(110.);
+const PROBE_LINE_HEIGHT: Pixels = px(22.);
+const PROBE_HEIGHT: Pixels = px(110.);
+const LINE_HEIGHT: Pixels = px(24.);
+const MAX_TEXT_HEIGHT: Pixels = px(112.); // Вся рамка поля ограничена 128 px.
+const FONT_SIZE: Pixels = px(16.);
+
+/// Нажатие Enter в рабочем редакторе. Доступность отправки определяет Composer.
+pub(super) struct SubmitRequested;
+
+impl EventEmitter<SubmitRequested> for Editor {}
 
 /// Черновик разговора и локальное состояние выделения. Индексы считаются в байтах UTF-8.
 pub struct Editor {
-    version: u64,       // Меняется при каждом изменении текста, даже если его восстановили.
-    framed_probe: bool, // Демонстрационные окна сохраняют нейтральную рамку прототипа.
-    text: String,       // Текст с системными переводами строк, приведёнными к LF.
-    anchor: usize,      // Неподвижный конец выделения.
-    caret: usize,       // Положение курсора или подвижный конец выделения.
+    version: u64,        // Меняется при каждом изменении текста, даже если его восстановили.
+    framed_probe: bool,  // Демонстрационные окна сохраняют нейтральную рамку прототипа.
+    send_on_enter: bool, // В рабочем поле Enter передаёт намерение отправки.
+    text: String,        // Текст с системными переводами строк, приведёнными к LF.
+    anchor: usize,       // Неподвижный конец выделения.
+    caret: usize,        // Положение курсора или подвижный конец выделения.
     marked: Option<Range<usize>>, // Незавершённая композиция IME.
-    focus: FocusHandle, // Связь состояния редактора с фокусом GPUI.
+    focus: FocusHandle,  // Связь состояния редактора с фокусом GPUI.
     layout: Option<TextLayout>, // Последняя нарисованная геометрия для мыши и IME.
     layout_current: bool, // Геометрия относится к текущей версии текста.
-    dragging: bool,     // Зажата кнопка мыши при выделении текста.
+    dragging: bool,      // Зажата кнопка мыши при выделении текста.
 }
 
 impl Editor {
@@ -59,6 +69,7 @@ impl Editor {
         Self {
             version: 0,
             framed_probe: true,
+            send_on_enter: false,
             text: String::new(),
             anchor: 0,
             caret: 0,
@@ -75,6 +86,14 @@ impl Editor {
         Self {
             framed_probe: false,
             ..Self::new(cx)
+        }
+    }
+
+    /// Создаёт рабочее поле, в котором Enter запрашивает отправку.
+    pub(super) fn for_composer(cx: &mut Context<Self>) -> Self {
+        Self {
+            send_on_enter: true,
+            ..Self::for_conversation(cx)
         }
     }
 
@@ -102,7 +121,11 @@ impl Editor {
                 Some("WorkspaceComposerEditor"),
             ),
             KeyBinding::new("delete", keys::Delete, Some("WorkspaceComposerEditor")),
-            KeyBinding::new("enter", keys::Newline, Some("WorkspaceComposerEditor")),
+            KeyBinding::new(
+                "enter",
+                keys::Newline,
+                Some("WorkspaceComposerEditor && !ComposerSends"),
+            ),
             KeyBinding::new(
                 "shift-enter",
                 keys::Newline,
@@ -174,7 +197,8 @@ impl Editor {
         let Some(mut position) = layout.position(self.caret) else {
             return;
         };
-        position.y += if down { LINE_HEIGHT } else { -LINE_HEIGHT } + px(1.);
+        let line_height = layout.line_height;
+        position.y += if down { line_height } else { -line_height } + px(1.);
         self.move_to(layout.index_at(position), false, cx);
     }
 
@@ -246,6 +270,17 @@ impl Editor {
             && let Some(layout) = self.current_layout()
         {
             self.move_to(layout.index_at(event.position), true, cx);
+        }
+    }
+
+    /// Передаёт обычный Enter один раз. AppKit первым получает клавиши незавершённого IME.
+    fn handle_enter(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key != "enter" || event.keystroke.modifiers.modified() {
+            return;
+        }
+        cx.stop_propagation();
+        if !event.is_held && !self.composing() {
+            cx.emit(SubmitRequested);
         }
     }
 }
@@ -393,7 +428,7 @@ impl EntityInputHandler for Editor {
         };
         Some(Bounds::new(
             start,
-            size((right - start.x).max(px(1.)), LINE_HEIGHT),
+            size((right - start.x).max(px(1.)), layout.line_height),
         ))
     }
 
@@ -424,7 +459,7 @@ impl Render for Editor {
             .debug_selector(|| "workspace-composer-editor".into())
             .w_full()
             .min_w_0()
-            .py_2()
+            .py(if self.framed_probe { px(8.) } else { px(7.) })
             .when(self.framed_probe, |field| {
                 field
                     .px_2()
@@ -434,10 +469,17 @@ impl Render for Editor {
                     .bg(rgb(0x24272d))
                     .text_color(rgb(0xf1f2f5))
             })
-            .text_size(px(16.))
-            .key_context("WorkspaceComposerEditor")
+            .text_size(FONT_SIZE)
+            .key_context(if self.send_on_enter {
+                "WorkspaceComposerEditor ComposerSends"
+            } else {
+                "WorkspaceComposerEditor"
+            })
             .track_focus(&self.focus)
             .cursor(CursorStyle::IBeam)
+            .when(self.send_on_enter, |field| {
+                field.on_key_down(cx.listener(Self::handle_enter))
+            })
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_up(
@@ -495,6 +537,7 @@ struct TextLayout {
     lines: Vec<TextLine>,   // Строки с переносами и исходным смещением.
     scroll: Pixels,         // Вертикальная прокрутка текста до курсора.
     text_len: usize,        // Длина черновика в байтах без подсказки.
+    line_height: Pixels,    // Высота визуальной строки для курсора, мыши и AppKit.
 }
 
 impl TextLayout {
@@ -505,7 +548,7 @@ impl TextLayout {
         }
         self.lines.iter().find_map(|line| {
             let local = index.checked_sub(line.start)?;
-            let offset = line.shape.position_for_index(local, LINE_HEIGHT)?;
+            let offset = line.shape.position_for_index(local, self.line_height)?;
             Some(self.line_origin(line) + offset)
         })
     }
@@ -525,11 +568,11 @@ impl TextLayout {
         }
         for line in &self.lines {
             let local = position - self.line_origin(line);
-            if local.y < line.shape.size(LINE_HEIGHT).height {
+            if local.y < line.shape.size(self.line_height).height {
                 return (line.start
                     + line
                         .shape
-                        .closest_index_for_position(local, LINE_HEIGHT)
+                        .closest_index_for_position(local, self.line_height)
                         .unwrap_or_else(|edge| edge))
                 .min(self.text_len);
             }
@@ -550,8 +593,100 @@ impl IntoElement for EditorSurface {
     }
 }
 
+/// Текст, измеренный для одной ширины. Переносы нужны разметке и курсору.
+struct SurfaceMeasurement {
+    width: Pixels,        // Ширина, при которой посчитаны переносы.
+    height: Pixels,       // Полная высота текста до ограничения редактора.
+    lines: Vec<TextLine>, // Готовые строки с оформлением выделения и IME.
+}
+
+/// Сохраняет результат разметки для отрисовки на той же ширине.
+type LayoutMeasurement = Rc<RefCell<Option<SurfaceMeasurement>>>;
+
+/// Накладывает оформление и разбивает текст по ширине видимой поверхности.
+fn measure_text(
+    editor: &Editor,
+    style: &TextStyle,
+    palette: Palette,
+    width: Pixels,
+    line_height: Pixels,
+    window: &Window,
+) -> SurfaceMeasurement {
+    let placeholder = editor.text.is_empty();
+    let text = if !placeholder {
+        editor.text()
+    } else if editor.framed_probe {
+        "Сообщение…"
+    } else {
+        "Написать сообщение…"
+    };
+    let selection = editor.selection();
+    let mut boundaries = vec![0, text.len(), selection.start, selection.end];
+    if let Some(marked) = &editor.marked {
+        boundaries.extend([marked.start, marked.end]);
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    let runs = boundaries
+        .windows(2)
+        .map(|pair| TextRun {
+            len: pair[1] - pair[0],
+            font: style.font(),
+            color: if placeholder {
+                if editor.framed_probe {
+                    rgb(0x9a9da8).into()
+                } else {
+                    palette.text_muted
+                }
+            } else {
+                style.color
+            },
+            background_color: selection
+                .contains(&pair[0])
+                .then(|| rgba(0x508eff70).into()),
+            underline: editor
+                .marked
+                .as_ref()
+                .filter(|range| range.contains(&pair[0]))
+                .map(|_| UnderlineStyle {
+                    color: Some(style.color),
+                    thickness: px(1.),
+                    wavy: false,
+                }),
+            strikethrough: None,
+        })
+        .collect::<Vec<_>>();
+    let mut top = px(0.);
+    let mut start = 0;
+    let lines = window
+        .text_system()
+        .shape_text(
+            text.to_string().into(),
+            FONT_SIZE,
+            &runs,
+            Some(width.max(px(1.))),
+            None,
+        )
+        .expect("Не удалось разложить текст редактора")
+        .into_iter()
+        .map(|shape| {
+            let next_top = top + shape.size(line_height).height;
+            let next_start = start + shape.text.len() + 1;
+            let line = TextLine { shape, start, top };
+            top = next_top;
+            start = next_start;
+            line
+        })
+        .collect();
+    SurfaceMeasurement {
+        width,
+        height: top,
+        lines,
+    }
+}
+
 impl Element for EditorSurface {
-    type RequestLayoutState = ();
+    type RequestLayoutState = LayoutMeasurement;
     type PrepaintState = TextLayout;
 
     /// Оставляет идентификатор за внешним контейнером.
@@ -564,102 +699,88 @@ impl Element for EditorSurface {
         None
     }
 
-    /// Запрашивает ширину поля и место для пяти видимых строк.
+    /// Выбирает высоту видимых строк по текущей ширине, сохраняя исходный viewport пробы.
     fn request_layout(
         &mut self,
         _: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
         window: &mut Window,
         cx: &mut App,
-    ) -> (LayoutId, ()) {
+    ) -> (LayoutId, LayoutMeasurement) {
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = VIEWPORT_HEIGHT.into();
-        (window.request_layout(style, [], cx), ())
+        let measurement: LayoutMeasurement = Rc::default();
+        if self.0.read(cx).framed_probe {
+            style.size.height = PROBE_HEIGHT.into();
+            return (window.request_layout(style, [], cx), measurement);
+        }
+
+        let editor = self.0.clone();
+        let text_style = window.text_style();
+        let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
+        let cache = measurement.clone();
+        let id = window.request_measured_layout(style, move |known, available, window, cx| {
+            let width = match (known.width, available.width) {
+                (Some(width), _) | (None, AvailableSpace::Definite(width)) => width,
+                _ => return size(px(0.), LINE_HEIGHT),
+            };
+            let mut cache = cache.borrow_mut();
+            let measured = cache
+                .take()
+                .filter(|previous| previous.width == width)
+                .unwrap_or_else(|| {
+                    measure_text(
+                        editor.read(cx),
+                        &text_style,
+                        palette,
+                        width,
+                        LINE_HEIGHT,
+                        window,
+                    )
+                });
+            let height = measured.height.clamp(LINE_HEIGHT, MAX_TEXT_HEIGHT);
+            *cache = Some(measured);
+            size(width, height)
+        });
+        (id, measurement)
     }
 
-    /// Раскладывает текст с переносами и подбирает прокрутку для видимого курсора.
+    /// Находит видимую область курсора и использует переносы, рассчитанные при измерении.
     fn prepaint(
         &mut self,
         _: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _: &mut (),
+        measurement: &mut LayoutMeasurement,
         window: &mut Window,
         cx: &mut App,
     ) -> TextLayout {
         let editor = self.0.read(cx);
-        let style = window.text_style();
-        let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
-        let placeholder = editor.text.is_empty();
-        let text = if placeholder {
-            "Сообщение…"
+        let line_height = if editor.framed_probe {
+            PROBE_LINE_HEIGHT
         } else {
-            editor.text()
+            LINE_HEIGHT
         };
-        let selection = editor.selection();
-        let mut boundaries = vec![0, text.len(), selection.start, selection.end];
-        if let Some(marked) = &editor.marked {
-            boundaries.extend([marked.start, marked.end]);
-        }
-        boundaries.sort_unstable();
-        boundaries.dedup();
-        let runs = boundaries
-            .windows(2)
-            .map(|pair| TextRun {
-                len: pair[1] - pair[0],
-                font: style.font(),
-                color: if placeholder {
-                    if editor.framed_probe {
-                        rgb(0x9a9da8).into()
-                    } else {
-                        palette.text_muted
-                    }
-                } else {
-                    style.color
-                },
-                background_color: selection
-                    .contains(&pair[0])
-                    .then(|| rgba(0x508eff70).into()),
-                underline: editor
-                    .marked
-                    .as_ref()
-                    .filter(|range| range.contains(&pair[0]))
-                    .map(|_| UnderlineStyle {
-                        color: Some(style.color),
-                        thickness: px(1.),
-                        wavy: false,
-                    }),
-                strikethrough: None,
-            })
-            .collect::<Vec<_>>();
-        let mut top = px(0.);
-        let mut start = 0;
-        let lines = window
-            .text_system()
-            .shape_text(
-                text.to_string().into(),
-                px(16.),
-                &runs,
-                Some(bounds.size.width.max(px(1.))),
-                None,
-            )
-            .expect("Не удалось разложить текст редактора")
-            .into_iter()
-            .map(|shape| {
-                let next_top = top + shape.size(LINE_HEIGHT).height;
-                let next_start = start + shape.text.len() + 1;
-                let line = TextLine { shape, start, top };
-                top = next_top;
-                start = next_start;
-                line
-            })
-            .collect();
+        let SurfaceMeasurement { lines, height, .. } = measurement
+            .borrow_mut()
+            .take()
+            .filter(|previous| previous.width == bounds.size.width)
+            .unwrap_or_else(|| {
+                measure_text(
+                    editor,
+                    &window.text_style(),
+                    Palette::for_mode(ThemeMode::from(window.appearance())),
+                    bounds.size.width,
+                    line_height,
+                    window,
+                )
+            });
         let mut layout = TextLayout {
             bounds,
             lines,
             scroll: px(0.),
             text_len: editor.text.len(),
+            line_height,
         };
         let caret_y = layout
             .position(editor.caret)
@@ -670,10 +791,10 @@ impl Element for EditorSurface {
             .map_or(px(0.), |layout| layout.scroll);
         layout.scroll = previous
             .clamp(
-                (caret_y + LINE_HEIGHT - bounds.size.height).max(px(0.)),
+                (caret_y + line_height - bounds.size.height).max(px(0.)),
                 caret_y.max(px(0.)),
             )
-            .min((top - bounds.size.height).max(px(0.)));
+            .min((height - bounds.size.height).max(px(0.)));
         layout
     }
 
@@ -683,7 +804,7 @@ impl Element for EditorSurface {
         _: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _: &mut (),
+        _: &mut LayoutMeasurement,
         layout: &mut TextLayout,
         window: &mut Window,
         cx: &mut App,
@@ -706,20 +827,34 @@ impl Element for EditorSurface {
             for line in &layout.lines {
                 let origin = layout.line_origin(line);
                 if origin.y >= bounds.bottom()
-                    || origin.y + line.shape.size(LINE_HEIGHT).height <= bounds.top()
+                    || origin.y + line.shape.size(layout.line_height).height <= bounds.top()
                 {
                     continue;
                 }
                 line.shape
-                    .paint_background(origin, LINE_HEIGHT, TextAlign::Left, None, window, cx)
+                    .paint_background(
+                        origin,
+                        layout.line_height,
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    )
                     .expect("Не удалось нарисовать выделение");
                 line.shape
-                    .paint(origin, LINE_HEIGHT, TextAlign::Left, None, window, cx)
+                    .paint(
+                        origin,
+                        layout.line_height,
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    )
                     .expect("Не удалось нарисовать строку");
             }
             if focused && let Some(caret) = caret {
                 window.paint_quad(fill(
-                    Bounds::new(caret, size(px(1.5), LINE_HEIGHT)),
+                    Bounds::new(caret, size(px(1.5), layout.line_height)),
                     caret_color,
                 ));
             }
@@ -731,6 +866,7 @@ impl Element for EditorSurface {
                 lines: std::mem::take(&mut layout.lines),
                 scroll: layout.scroll,
                 text_len: layout.text_len,
+                line_height: layout.line_height,
             });
         });
     }
