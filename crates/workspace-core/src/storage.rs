@@ -1,9 +1,11 @@
-//! Хранит сообщения, счётчики, позиции чтения и очередь отправки в SQLite.
+//! Хранит сообщения, счётчики, позиции чтения, черновики и очередь отправки в SQLite.
 //! Сначала описаны данные и таблицы, затем чтение и запись.
 
+mod drafts;
 mod history;
 mod outbox;
 
+pub use drafts::{DraftAccess, DraftScope, DraftWriteOutcome, PlaintextDraft};
 pub(crate) use history::HistoryPageGuard;
 pub use history::{
     HistoryDirection, HistoryEdge, HistoryMessage, HistoryMetadata, HistoryPageEdges,
@@ -99,6 +101,12 @@ pub enum StorageError {
     InvalidHistoryPage, // Страница не подходит по области, направлению или формату.
     #[error("the catalog changed while the request was in flight")]
     StaleCatalog, // После начала запроса доступ к каналу изменился.
+    #[error("the local draft version must be a positive SQLite integer")]
+    InvalidDraftVersion, // Версия черновика вышла за диапазон.
+    #[error("invalid messenger draft record")]
+    InvalidDraftRecord, // Хранилище вернуло повреждённый UUID или версию.
+    #[error("the draft access scope changed")]
+    StaleDraftAccess, // Доступ отозван или журнал сброшен после захвата области.
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error), // Исходная ошибка SQLite.
     #[error("the cached chat list has an invalid format")]
@@ -256,6 +264,7 @@ impl Storage {
             ON sync_messages (account_id, server, organization_id, project_id, user_id, stream_id, topic_id)")?;
         history::initialize(&transaction)?;
         outbox::initialize(&transaction)?;
+        drafts::initialize(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -366,6 +375,7 @@ impl Storage {
         )?;
         if source == crate::messenger::SOURCE_ID {
             history::reset(&transaction, owner)?;
+            drafts::invalidate_owner(&transaction, owner)?;
             for table in [
                 "sync_messages",
                 "messenger_notification_targets",
@@ -446,10 +456,17 @@ impl Storage {
                 Some(HistoryChange::RemoveStream(stream)) => {
                     remove_catalog_stream(&transaction, owner, stream)?;
                     outbox::reject_revoked(&transaction, owner, stream, None)?;
+                    drafts::revoke(&transaction, owner, stream, None)?;
                     true
                 }
                 Some(HistoryChange::RemoveTopic(address)) => {
                     outbox::reject_revoked(
+                        &transaction,
+                        owner,
+                        &address.stream_id,
+                        Some(&address.topic_id),
+                    )?;
+                    drafts::revoke(
                         &transaction,
                         owner,
                         &address.stream_id,
