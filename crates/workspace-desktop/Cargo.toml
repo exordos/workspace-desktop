@@ -63,3 +63,11 @@ required-features = ["gpui"]
 [[example]]
 name = "gpui_macos_window_probe"
 required-features = ["gpui"]
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+raw-window-handle = "0.6"
+
+[[example]]
+name = "ui_scene"
+required-features = ["gpui"]
