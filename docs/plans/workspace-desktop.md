@@ -1,6 +1,6 @@
 # Workspace Desktop
 
-Разрабатываем нативный десктопный клиент Workspace на **Rust + Iced**.
+Разрабатываем нативный десктопный клиент Workspace на Rust. Текущая сборка использует Iced. Новый UI делаем на GPUI по [плану перехода](workspace-desktop-roadmap.md#предлагаемый-переход-на-gpui).
 
 Референс — [текущий клиент Workspace на React и Electron](https://github.com/exordos/workspace_ui). При переносе функций сверяем с ним интерфейс, поведение и работу с Workspace API. Локальная копия — `../workspace_ui`.
 
@@ -40,7 +40,7 @@ cargo test -p workspace-desktop --lib live_workspace_background_message_updates_
 
 ## Фундамент архитектуры
 
-[Проектирование на Rust + Iced](workspace-desktop-architecture.md) — модули, жизненный цикл сессий и маршрутизация событий.
+[Архитектура Workspace Desktop](workspace-desktop-architecture.md) — модули, жизненный цикл сессий и маршрутизация событий.
 
 ### Авторизация и аккаунты
 
