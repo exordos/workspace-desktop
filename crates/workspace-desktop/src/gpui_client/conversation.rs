@@ -81,9 +81,7 @@ impl Conversation {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut view = Self::with_source(address, runtime_source(runtime.clone()), cx);
-        if view.address.route.scope.topic_id.is_none() {
-            view.attach_composer(SendSource::runtime(runtime), cx);
-        }
+        view.attach_composer(SendSource::runtime(runtime), cx);
         view
     }
 
@@ -900,23 +898,6 @@ impl Render for Conversation {
                         }),
                 )
                 .children(self.sending.as_ref().map(|sending| sending.view.clone()))
-                .when(
-                    self.sending.is_none() && self.address.route.scope.topic_id.is_some(),
-                    |view| {
-                        view.child(
-                            label(
-                                palette,
-                                TextRole::Caption,
-                                "Отправка в теме пока недоступна",
-                            )
-                            .px_3()
-                            .py_2()
-                            .rounded_md()
-                            .bg(palette.surface)
-                            .debug_selector(|| "topic-send-unavailable".into()),
-                        )
-                    },
-                )
             }
         }
     }

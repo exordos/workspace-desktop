@@ -28,6 +28,11 @@ const MESSAGE: Uuid = Uuid::from_u128(2001);
 const TOPIC: Uuid = Uuid::from_u128(2002);
 
 impl Conversation {
+    /// Передаёт сквозному тесту редактор разговора после проверки истории.
+    pub(in crate::gpui_client) fn tested_composer(&self) -> Option<&Entity<Composer>> {
+        self.sending.as_ref().map(|sending| &sending.view)
+    }
+
     /// Проверяет, какой участок разговора получил фокус от клавиши Tab.
     pub(in crate::gpui_client) fn keyboard_focus(
         &self,

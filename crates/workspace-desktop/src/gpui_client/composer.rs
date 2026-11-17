@@ -88,6 +88,19 @@ impl Composer {
         self.editor.read(app).text()
     }
 
+    /// Возвращает разрешённую тему и признак отказа для текущего текста в сквозном тесте.
+    #[cfg(all(test, feature = "gpui-test"))]
+    pub fn tested_send_state(&self, app: &App) -> (Option<Uuid>, bool) {
+        let topic = match self.destination {
+            Destination::Ready(topic) => Some(topic),
+            _ => None,
+        };
+        (
+            topic,
+            self.error_version == Some(self.editor.read(app).version()),
+        )
+    }
+
     /// Даёт тесту доступ к системному обработчику ввода рабочего поля.
     #[cfg(all(test, feature = "gpui-test"))]
     pub fn editor(&self) -> Entity<Editor> {

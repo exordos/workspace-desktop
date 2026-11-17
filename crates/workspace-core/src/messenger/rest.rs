@@ -308,6 +308,20 @@ impl RestClient {
         token: &str,
         stream: Uuid,
     ) -> Result<WireStream, OpenHistoryError> {
+        let row = self.stream_access(owner, token, stream).await?;
+        if !row.is_direct() {
+            return Err(OpenHistoryError::AccessLost);
+        }
+        Ok(row)
+    }
+
+    /// Читает сведения о стриме и сверяет его UUID и владельца.
+    async fn stream_access(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        stream: Uuid,
+    ) -> Result<WireStream, OpenHistoryError> {
         let row: WireStream = self
             .access_row(owner, token, &format!("{STREAMS_PATH}/{stream}"))
             .await?;
@@ -316,46 +330,63 @@ impl RestClient {
         {
             return Err(SourceError::InvalidResponse.into());
         }
-        if !row.private
-            || row
-                .direct_user_uuid
-                .as_deref()
-                .and_then(parse_uuid)
-                .is_none()
-        {
-            return Err(OpenHistoryError::AccessLost);
-        }
         Ok(row)
     }
 
-    /// Разрешает обычный текст в текущей теме или проверяет сохранённую тему очереди.
+    /// Разрешает обычный текст в теме лички по умолчанию.
     pub(super) async fn direct_send_topic(
         &self,
         owner: &OwnerContext,
         token: &str,
         stream: Uuid,
-        saved_topic: Option<Uuid>,
     ) -> Result<Uuid, DirectSendError> {
-        if let Some(topic) = saved_topic {
-            self.check_topic_access(owner, token, stream, topic).await?;
-        }
-        // Проверяем флаг последним, прямо перед разрешением первой попытки.
         let row = self.direct_stream(owner, token, stream).await?;
-        if row.is_archived {
-            return Err(DirectSendError::AccessLost);
-        }
-        if !matches!(row.encryption, Some(Value::Bool(false))) {
-            return Err(DirectSendError::EncryptionUnavailable);
-        }
-        if let Some(topic) = saved_topic {
-            return Ok(topic);
-        }
+        row.check_plain_send()?;
         row.default_topic_uuid
             .as_ref()
             .and_then(Value::as_str)
             .and_then(parse_uuid)
             .filter(|topic| !topic.is_nil())
             .ok_or(DirectSendError::TopicUnavailable)
+    }
+
+    /// Проверяет явную тему канала или сохранённую цель отправки.
+    pub(super) async fn check_send_topic(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        stream: Uuid,
+        topic: Uuid,
+        queued: bool,
+    ) -> Result<(), DirectSendError> {
+        if topic.is_nil() {
+            return Err(DirectSendError::TopicUnavailable);
+        }
+        let topic = self.topic_access(owner, token, stream, topic).await?;
+        // Проверяем шифрование после чтения темы, прямо перед записью или отправкой.
+        let row = self.stream_access(owner, token, stream).await?;
+        if row.is_direct() {
+            // Сохранённую тему лички перепроверяем без пересчёта темы по умолчанию.
+            return if queued {
+                row.check_plain_send()
+            } else {
+                Err(DirectSendError::AccessLost)
+            };
+        }
+        if row.direct_user_uuid.is_some()
+            || row.project_id.as_deref() != Some(owner.project_id.as_str())
+            || row.user_uuid.as_deref() != Some(owner.user_id.as_str())
+            || topic.project_id.as_deref() != Some(owner.project_id.as_str())
+            || topic.user_uuid.as_deref() != Some(owner.user_id.as_str())
+        {
+            return Err(SourceError::InvalidResponse.into());
+        }
+        row.check_plain_send()?;
+        match topic.is_done {
+            Some(false) => Ok(()),
+            Some(true) => Err(DirectSendError::TopicClosed),
+            None => Err(SourceError::InvalidResponse.into()),
+        }
     }
 
     /// Подтверждает, что тема нужного стрима видна владельцу токена.
@@ -366,13 +397,25 @@ impl RestClient {
         stream: Uuid,
         topic: Uuid,
     ) -> Result<(), OpenHistoryError> {
+        self.topic_access(owner, token, stream, topic).await?;
+        Ok(())
+    }
+
+    /// Читает тему и сверяет её адрес с контекстом запроса.
+    async fn topic_access(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        stream: Uuid,
+        topic: Uuid,
+    ) -> Result<WireTopic, OpenHistoryError> {
         let row: WireTopic = self
             .access_row(owner, token, &format!("{TOPICS_PATH}/{topic}"))
             .await?;
         if !row.matches(owner, stream, topic) {
             return Err(SourceError::InvalidResponse.into());
         }
-        Ok(())
+        Ok(row)
     }
 
     /// Читает отдельную запись и отличает потерю доступа от других ошибок REST.
@@ -893,6 +936,27 @@ struct WireStream {
 }
 
 impl WireStream {
+    /// Определяет личку по признаку приватности и подтверждённому UUID собеседника.
+    fn is_direct(&self) -> bool {
+        self.private
+            && self
+                .direct_user_uuid
+                .as_deref()
+                .and_then(parse_uuid)
+                .is_some()
+    }
+
+    /// Разрешает открытый текст только в рабочем стриме с явным отключением шифрования.
+    fn check_plain_send(&self) -> Result<(), DirectSendError> {
+        if self.is_archived {
+            return Err(DirectSendError::AccessLost);
+        }
+        if !matches!(self.encryption, Some(Value::Bool(false))) {
+            return Err(DirectSendError::EncryptionUnavailable);
+        }
+        Ok(())
+    }
+
     /// Проверяет идентификатор разговора и владельца данных.
     fn matches(&self, owner: &OwnerContext, incoming: &IncomingMessage) -> bool {
         parse_uuid(&self.uuid) == Some(incoming.stream)
@@ -907,6 +971,7 @@ struct WireTopic {
     stream_uuid: String,                      // Идентификатор разговора, которому принадлежит тема.
     project_id: Option<String>,               // Проект, если он есть в ответе.
     user_uuid: Option<String>,                // Пользователь, если он есть в ответе.
+    is_done: Option<bool>,                    // Закрытие темы, неизвестно у старых ответов.
     notification_mode: TopicNotificationMode, // Настройка уведомлений темы.
 }
 

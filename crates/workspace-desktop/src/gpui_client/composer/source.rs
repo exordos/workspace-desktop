@@ -18,6 +18,7 @@ pub(in crate::gpui_client) enum DestinationError {
     AccessLost,            // Стрим или тема недоступны исходному входу.
     EncryptionUnavailable, // Сервер не разрешил отправку открытого текста.
     TopicUnavailable,      // Сервер не предоставил пригодный UUID темы.
+    TopicClosed,           // Отправку ограничивает завершённая тема канала.
     Unavailable,           // Проверка цели временно не завершилась.
 }
 
@@ -28,6 +29,7 @@ impl DestinationError {
             Self::AccessLost => "Чат или тема для отправки недоступны",
             Self::EncryptionUnavailable => "Отправка открытого текста недоступна",
             Self::TopicUnavailable => "Сервер не указал тему для отправки",
+            Self::TopicClosed => "Тема закрыта для отправки",
             Self::Unavailable => "Не удалось проверить возможность отправки",
         }
     }
@@ -40,6 +42,7 @@ impl From<DirectSendError> for DestinationError {
             DirectSendError::AccessLost => Self::AccessLost,
             DirectSendError::EncryptionUnavailable => Self::EncryptionUnavailable,
             DirectSendError::TopicUnavailable => Self::TopicUnavailable,
+            DirectSendError::TopicClosed => Self::TopicClosed,
             DirectSendError::Auth(_) | DirectSendError::Source(_) => Self::Unavailable,
         }
     }
@@ -73,16 +76,30 @@ impl SendSource {
                     let reply = worker
                         .conversation(address, move |services, address| async move {
                             log::debug!("gpui_send op_id={op_id} event=destination_worker_started");
-                            services
-                                .messenger
-                                .resolve_direct_send(
-                                    &services.sync,
-                                    &address.route.owner,
-                                    address.generation,
-                                    address.route.scope.stream_id,
-                                )
-                                .await
-                                .map_err(DestinationError::from)
+                            let result = if let Some(topic) = address.route.scope.topic_id {
+                                services
+                                    .messenger
+                                    .check_topic_send(
+                                        &services.sync,
+                                        &address.route.owner,
+                                        address.generation,
+                                        address.route.scope.stream_id,
+                                        topic,
+                                    )
+                                    .await
+                                    .map(|()| topic)
+                            } else {
+                                services
+                                    .messenger
+                                    .resolve_direct_send(
+                                        &services.sync,
+                                        &address.route.owner,
+                                        address.generation,
+                                        address.route.scope.stream_id,
+                                    )
+                                    .await
+                            };
+                            result.map_err(DestinationError::from)
                         })
                         .await;
                     ConversationReply {
@@ -98,6 +115,23 @@ impl SendSource {
                     let reply = worker
                         .conversation(submission.address, move |services, address| async move {
                             log::debug!("gpui_send op_id={op_id} event=queue_write_started");
+                            // Тема могла закрыться, пока пользователь редактировал черновик.
+                            if let Some(topic) = address.route.scope.topic_id
+                                && (topic != submission.topic
+                                    || services
+                                        .messenger
+                                        .check_topic_send(
+                                            &services.sync,
+                                            &address.route.owner,
+                                            address.generation,
+                                            address.route.scope.stream_id,
+                                            topic,
+                                        )
+                                        .await
+                                        .is_err())
+                            {
+                                return None;
+                            }
                             services
                                 .sync
                                 .prepare_send(

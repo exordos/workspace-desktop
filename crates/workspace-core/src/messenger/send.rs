@@ -13,15 +13,17 @@ use crate::{
 
 use super::{MessengerSource, history::OpenHistoryError};
 
-/// Причина, по которой нельзя подготовить текст для личного разговора.
+/// Причина, по которой нельзя подготовить открытый текст для разговора.
 #[derive(Debug, Error)]
 pub enum DirectSendError {
-    #[error("the direct conversation or topic is unavailable")]
+    #[error("the conversation or topic is unavailable")]
     AccessLost, // Личка или тема недоступна владельцу.
     #[error("the server did not allow unencrypted messages")]
     EncryptionUnavailable, // Состояние шифрования неизвестно или шифрование включено.
     #[error("the server did not provide a valid send topic")]
     TopicUnavailable, // Личный стрим не объявил пригодную тему для записи.
+    #[error("the topic is closed for sending")]
+    TopicClosed, // Тема канала завершена.
     #[error(transparent)]
     Auth(#[from] AuthError), // Поколение сессии изменилось или не удалось получить токен.
     #[error(transparent)]
@@ -64,12 +66,30 @@ impl MessengerSource {
         let token = auth
             .access_token_for_generation(owner, Service::Messenger, generation)
             .await?;
-        let topic = self
-            .rest
-            .direct_send_topic(owner, &token, stream_id, None)
-            .await;
+        let topic = self.rest.direct_send_topic(owner, &token, stream_id).await;
         auth.with_active_generation(owner, generation, || ())?;
         topic
+    }
+
+    /// Подтверждает явную тему канала для открытия редактора или записи сообщения в очередь.
+    pub async fn check_topic_send(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        stream_id: Uuid,
+        topic_id: Uuid,
+    ) -> Result<(), DirectSendError> {
+        let auth = sync.auth();
+        let token = auth
+            .access_token_for_generation(owner, Service::Messenger, generation)
+            .await?;
+        let result = self
+            .rest
+            .check_send_topic(owner, &token, stream_id, topic_id, false)
+            .await;
+        auth.with_active_generation(owner, generation, || ())?;
+        result
     }
 
     /// Ищет подтверждение доставки по публичному UUID, не изменяя очередь.

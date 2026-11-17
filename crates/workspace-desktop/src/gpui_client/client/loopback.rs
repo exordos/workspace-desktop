@@ -47,7 +47,7 @@ use workspace_core::{
 
 use super::*;
 use crate::{
-    gpui_client::{bind_keys, runtime::RuntimeEvents},
+    gpui_client::{bind_keys, contracts::ConversationAddress, runtime::RuntimeEvents},
     platform::JsonAccountStore,
 };
 
@@ -57,6 +57,9 @@ const PROJECT: &str = "10000000-0000-4000-8000-000000000003";
 const ORGANIZATION: &str = "10000000-0000-4000-8000-000000000004";
 const STREAM: &str = "10000000-0000-4000-8000-000000000005";
 const TOPIC: &str = "10000000-0000-4000-8000-000000000006";
+const CHANNEL: &str = "10000000-0000-4000-8000-000000000007";
+const CHANNEL_DEFAULT: &str = "10000000-0000-4000-8000-000000000008";
+const CHANNEL_TOPIC: &str = "10000000-0000-4000-8000-000000000009";
 const OLD_ROW: Uuid = Uuid::from_u128(71);
 const FRESH_ROW: Uuid = Uuid::from_u128(72);
 const PEER_ROW: Uuid = Uuid::from_u128(73);
@@ -66,6 +69,10 @@ const MESSAGES: &str = "/api/workspace/v1/messenger/messages/";
 const STREAMS: &str = "/api/workspace/v1/messenger/streams/";
 const TOPICS: &str = "/api/workspace/v1/messenger/stream_topics/";
 const CHAT_ROW: &str = "catalog-chat-10000000-0000-4000-8000-000000000005";
+const CHANNEL_ROW: &str = "catalog-chat-10000000-0000-4000-8000-000000000007";
+const CHANNEL_TOPIC_ROW: &str =
+    "catalog-topic-10000000-0000-4000-8000-000000000007-10000000-0000-4000-8000-000000000009";
+const CHANNEL_HISTORY: Uuid = Uuid::from_u128(84);
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Восстанавливает синтетическую сессию без системных токенов.
@@ -206,6 +213,31 @@ impl Recovery {
     }
 }
 
+/// Подтверждённый HTTP POST в тему с привязкой к тестовому аккаунту.
+struct TopicPost {
+    author: &'static str, // Вход из токена запроса.
+    id: Uuid,             // Публичный UUID из канонического UUID и явной темы.
+}
+
+/// Состояние темы, управляемое тестом перед проверкой редактора или очереди.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum TopicGate {
+    #[default]
+    Open, // Канал допускает обычный текст, тема открыта.
+    Closed,      // Тема закрылась.
+    Encrypted,   // Канал требует защищённые сообщения.
+    WrongStream, // Тема в ответе принадлежит другому стриму.
+    Unknown,     // В ответе отсутствует признак is_done.
+}
+
+/// Наблюдения за попытками записи в явную тему канала.
+#[derive(Default)]
+struct TopicAcceptance {
+    gate: Mutex<TopicGate>,      // Текущее состояние на локальном сервере.
+    attempts: AtomicUsize,       // Все попытки POST, даже с неверным адресом.
+    sent: Mutex<Vec<TopicPost>>, // Подтверждённые POST в тему.
+}
+
 /// Записывает наблюдения сервера о готовности подключений и принятой отправке.
 #[derive(Default)]
 struct Received {
@@ -214,6 +246,7 @@ struct Received {
     targets: AtomicUsize,   // Сколько проверок доступа к стриму вернул HTTPS.
     delayed: Option<DelayedHistory>, // Сценарий позднего ответа, если тест его включил.
     recovery: Option<Recovery>, // Сценарий сброса курсора, если тест его включил.
+    topic: Option<TopicAcceptance>, // Канал с явной темой для UI-12.
 }
 
 /// Держит локальный сервер, пока существует сценарий.
@@ -228,6 +261,14 @@ impl Server {
     /// Открывает только loopback и запускает обычный HTTPS/WS на отдельном потоке.
     fn start() -> Self {
         Self::serve(Received::default())
+    }
+
+    /// Запускает два сохранённых входа с доступом к тестовому каналу.
+    fn start_with_topic() -> Self {
+        Self::serve(Received {
+            topic: Some(TopicAcceptance::default()),
+            ..Received::default()
+        })
     }
 
     /// Запускает сервер с отдельным сигналом выдачи первого ответа A.
@@ -332,7 +373,8 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         let protocol = request.headers()[header::SEC_WEBSOCKET_PROTOCOL]
             .to_str()
             .unwrap();
-        let two_accounts = state.delayed.is_some() || state.recovery.is_some();
+        let two_accounts =
+            state.delayed.is_some() || state.recovery.is_some() || state.topic.is_some();
         let user = match protocol {
             "workspace.events.v1, bearer.local-user" => USER,
             "workspace.events.v1, bearer.local-peer" if two_accounts => PEER,
@@ -405,12 +447,36 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
 
     let (user, peer) = match request.headers()[header::AUTHORIZATION].to_str().unwrap() {
         "Bearer local-user" => (USER, PEER),
-        "Bearer local-peer" if state.delayed.is_some() || state.recovery.is_some() => (PEER, USER),
+        "Bearer local-peer"
+            if state.delayed.is_some() || state.recovery.is_some() || state.topic.is_some() =>
+        {
+            (PEER, USER)
+        }
         _ => panic!("HTTPS должен использовать тестовый вход открытого профиля"),
     };
     if path == MESSAGES && request.method() == Method::POST {
         let bytes = request.into_body().collect().await.unwrap().to_bytes();
         let post: Value = serde_json::from_slice(&bytes).unwrap();
+        if let Some(acceptance) = &state.topic {
+            acceptance.attempts.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(post["stream_uuid"], CHANNEL);
+            assert_eq!(post["topic_uuid"], CHANNEL_TOPIC);
+            assert_eq!(post["payload"]["content"], MARKER);
+            let canonical = post["uuid"].as_str().unwrap();
+            let id = Uuid::new_v5(
+                &Uuid::parse_str(CHANNEL_TOPIC).unwrap(),
+                canonical.as_bytes(),
+            );
+            acceptance
+                .sent
+                .lock()
+                .unwrap()
+                .push(TopicPost { author: user, id });
+            return json_response(
+                StatusCode::CREATED,
+                topic_message(user, user, id, "2026-11-17T10:01:00Z", MARKER),
+            );
+        }
         assert_eq!(post["stream_uuid"], STREAM);
         assert_eq!(post["topic_uuid"], TOPIC);
         assert_eq!(post["payload"]["content"], MARKER);
@@ -437,7 +503,34 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         .as_ref()
         .map_or(("local", 1, 0), |r| r.baseline(user));
     let result = match path {
+        STREAMS if state.topic.is_some() => json!([stream, topic_channel(user, false)]),
         STREAMS => json!([stream]),
+        TOPICS if state.topic.is_some() => json!([channel_topic(user, TopicGate::Open)]),
+        MESSAGES
+            if state.topic.is_some() && query_value(&request, "stream_uuid") == Some(CHANNEL) =>
+        {
+            assert_eq!(query_value(&request, "topic_uuid"), Some(CHANNEL_TOPIC));
+            let mut rows = vec![topic_message(
+                user,
+                peer,
+                CHANNEL_HISTORY,
+                "2026-11-17T10:00:00Z",
+                "Строка синтетической темы",
+            )];
+            rows.extend(
+                state
+                    .topic
+                    .as_ref()
+                    .unwrap()
+                    .sent
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|post| post.author == user)
+                    .map(|post| topic_message(user, user, post.id, "2026-11-17T10:01:00Z", MARKER)),
+            );
+            json!(rows)
+        }
         MESSAGES if state.delayed.is_some() => {
             let delayed = state.delayed.as_ref().unwrap();
             let id = if user == USER {
@@ -476,6 +569,15 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         }
         TOPICS | "/api/workspace/v1/events/" | "/api/workspace/v1/users/" => json!([]),
         "/api/workspace/v1/epoch/" => json!({"epoch_generation":epoch,"epoch_version":base}),
+        path if state.topic.is_some() && path.ends_with(CHANNEL) => {
+            state.targets.fetch_add(1, Ordering::SeqCst);
+            let gate = *state.topic.as_ref().unwrap().gate.lock().unwrap();
+            topic_channel(user, gate == TopicGate::Encrypted)
+        }
+        path if state.topic.is_some() && path.ends_with(CHANNEL_TOPIC) => {
+            let gate = *state.topic.as_ref().unwrap().gate.lock().unwrap();
+            channel_topic(user, gate)
+        }
         path if path.ends_with(STREAM) => {
             state.targets.fetch_add(1, Ordering::SeqCst);
             stream
@@ -490,6 +592,41 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         _ => return json_response(StatusCode::NOT_FOUND, Value::Null),
     };
     json_response(StatusCode::OK, result)
+}
+
+/// Возвращает открытую конфигурацию канала с отдельной темой по умолчанию.
+fn topic_channel(user: &str, encrypted: bool) -> Value {
+    json!({
+        "uuid": CHANNEL, "project_id": PROJECT, "user_uuid": user, "name": "Канал UI-12",
+        "private": false, "is_archived": false, "default_topic_uuid": CHANNEL_DEFAULT,
+        "encryption": encrypted, "notification_mode": "all_messages",
+    })
+}
+
+/// Возвращает метаданные явной темы для чтения и повторной проверки перед отправкой.
+fn channel_topic(user: &str, gate: TopicGate) -> Value {
+    let stream = if gate == TopicGate::WrongStream {
+        STREAM
+    } else {
+        CHANNEL
+    };
+    let mut row = json!({
+        "uuid": CHANNEL_TOPIC, "stream_uuid": stream, "project_id": PROJECT,
+        "user_uuid": user, "name": "Длинная тема", "notification_mode": "default",
+    });
+    if gate != TopicGate::Unknown {
+        row["is_done"] = json!(gate == TopicGate::Closed);
+    }
+    row
+}
+
+/// Формирует подтверждённую строку истории явной темы.
+fn topic_message(user: &str, author: &str, id: Uuid, created: &str, content: &str) -> Value {
+    json!({
+        "uuid": id, "stream_uuid": CHANNEL, "topic_uuid": CHANNEL_TOPIC,
+        "user_uuid": user, "project_id": PROJECT, "author_uuid": author,
+        "created_at": created, "payload": {"kind": "markdown", "content": content},
+    })
 }
 
 /// Возвращает значение параметра курсора из запроса локального клиента.
@@ -773,6 +910,334 @@ fn click_account(client: &Entity<Client>, ui: &mut VisualTestContext, account: &
                     && shell.selected_catalog().is_some()
             }) && ui.debug_bounds(CHAT_ROW).is_some()
         },
+    );
+}
+
+/// Передаёт нажатие и отпускание Enter. Кнопки подтверждают действие на отпускании.
+fn press_enter(ui: &mut VisualTestContext) {
+    ui.simulate_keystrokes("enter");
+    ui.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("enter").unwrap(),
+    });
+    ui.run_until_parked();
+}
+
+/// Проверяет чтение явной темы и открытие редактора с доступной отправкой.
+fn topic_ready(
+    client: &Entity<Client>,
+    ui: &mut VisualTestContext,
+    step: &str,
+) -> ConversationAddress {
+    let topic = CHANNEL_TOPIC.parse().unwrap();
+    until(ui, step, |ui| {
+        ui.read(|app| {
+            client
+                .read(app)
+                .conversation
+                .as_ref()
+                .is_some_and(|screen| {
+                    let screen = screen.read(app);
+                    screen.has_access()
+                        && screen.tested_composer().is_some_and(|view| {
+                            view.read(app).tested_send_state(app) == (Some(topic), false)
+                        })
+                })
+        }) && ui
+            .debug_bounds("history-message-00000000-0000-0000-0000-000000000054")
+            .is_some()
+            && ui.debug_bounds("workspace-composer-editor").is_some()
+    });
+    let address = ui.read(|app| client.read(app).shell.conversation().unwrap().clone());
+    assert_eq!(address.route.scope.stream_id.to_string(), CHANNEL);
+    assert_eq!(address.route.scope.topic_id, Some(topic));
+    address
+}
+
+/// Ждёт ровно одну закреплённую строку по публичному UUID и пустую очередь.
+fn wait_topic_confirmation(
+    runtime: &RuntimeClient,
+    ui: &mut VisualTestContext,
+    address: &ConversationAddress,
+    id: Uuid,
+) {
+    until(
+        ui,
+        "одно сообщение в истории и пустая очередь",
+        |_| {
+            let address = address.clone();
+            futures::executor::block_on(runtime.request(move |services| async move {
+                let owner = &address.route.owner;
+                let generation = address.generation;
+                let scope = address.route.scope;
+                let pending = services.sync.outbox(owner, generation, scope)?;
+                let windows = services.sync.history_windows(owner, generation, scope)?;
+                let occurrences = windows
+                    .iter()
+                    .flat_map(|window| &window.messages)
+                    .filter(|row| row.id == id)
+                    .count();
+                Ok::<_, workspace_core::sync::SyncError>(pending.is_empty() && occurrences == 1)
+            }))
+            .is_ok_and(|result| result.unwrap_or(false))
+        },
+    );
+}
+
+/// Проходит мышью и клавиатурой два входа, читает тему и проверяет доставку без дублей.
+#[gpui::test]
+fn explicit_topic_accepts_mouse_and_keyboard_in_each_account(cx: &mut TestAppContext) {
+    cx.update(bind_keys);
+    let server = Server::start_with_topic();
+    let acceptance = server.state.topic.as_ref().unwrap();
+    let profile = tempfile::tempdir().unwrap();
+    let a = saved_account(&server, USER, Uuid::nil());
+    let b = saved_account(&server, PEER, PEER.parse().unwrap());
+    JsonAccountStore::open(profile.path())
+        .unwrap()
+        .save(&b)
+        .unwrap();
+    let a_id = a.context.account_id.clone();
+    let b_id = b.context.account_id.clone();
+    let (runtime, events) = start_runtime(profile.path(), a);
+    let (client, ui) = cx.add_window_view(|_, cx| {
+        Client::new(
+            Options {
+                active: Some(a_id.clone()),
+                ..Options::default()
+            },
+            runtime.clone(),
+            cx,
+        )
+    });
+    ui.update(|_, app| {
+        let subscription = events.attach(&client, app, Client::handle_runtime);
+        client.update(app, |client, cx| client.attach(subscription, cx));
+    });
+    ui.simulate_resize(size(px(1440.), px(900.)));
+    until(ui, "готовы два WSS и каталог", |ui| {
+        server.state.ready.load(Ordering::SeqCst) >= 2 && ui.debug_bounds(CHANNEL_ROW).is_some()
+    });
+
+    click_account(&client, ui, &b_id);
+    click(ui, CHANNEL_ROW);
+    ui.run_until_parked();
+    click(ui, CHANNEL_TOPIC_ROW);
+    let mouse_address = topic_ready(&client, ui, "мышь открыла историю темы и редактор B");
+    assert_eq!(mouse_address.route.owner.account_id, b_id);
+    assert_eq!(
+        ui.debug_bounds("workspace-conversation-panel")
+            .unwrap()
+            .right(),
+        px(1440.)
+    );
+    click(ui, "workspace-composer-editor");
+    ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(MARKER.to_owned())));
+    ui.simulate_keystrokes("cmd-v");
+    ui.run_until_parked();
+    click(ui, "conversation-send");
+    until(ui, "единственный POST от B", |_| {
+        !acceptance.sent.lock().unwrap().is_empty()
+    });
+    let mouse_id = {
+        let posts = acceptance.sent.lock().unwrap();
+        assert_eq!(posts[0].author, PEER);
+        posts[0].id
+    };
+    wait_topic_confirmation(&runtime, ui, &mouse_address, mouse_id);
+
+    ui.simulate_resize(size(px(700.), px(600.)));
+    ui.update(|window, app| window.focus(&client.read(app).initial_focus));
+    ui.simulate_keystrokes("tab tab tab");
+    press_enter(ui);
+    assert!(ui.read(|app| client.read(app).top_bar.read(app).menu_is_open()));
+    let target_first = ui.read(|app| {
+        client.read(app).shell.accounts()[0]
+            .session
+            .owner
+            .account_id
+            == a_id
+    });
+    ui.simulate_keystrokes(if target_first { "up" } else { "down" });
+    press_enter(ui);
+    until(ui, "клавиатура переключила A", |ui| {
+        ui.read(|app| {
+            client
+                .read(app)
+                .shell
+                .selected()
+                .is_some_and(|s| s.owner.account_id == a_id)
+        }) && ui.debug_bounds(CHANNEL_ROW).is_some()
+    });
+    ui.simulate_keystrokes("tab");
+    ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string("Длинная тема".into())));
+    ui.simulate_keystrokes("cmd-v");
+    ui.run_until_parked();
+    assert!(ui.debug_bounds("catalog-clear").is_some());
+    assert!(ui.debug_bounds(CHANNEL_TOPIC_ROW).is_some());
+    ui.simulate_keystrokes("down");
+    ui.run_until_parked();
+    press_enter(ui);
+    until(
+        ui,
+        "Enter открыл маршрут явной темы A",
+        |ui| {
+            ui.read(|app| {
+                client
+                    .read(app)
+                    .shell
+                    .conversation()
+                    .is_some_and(|address| {
+                        address.route.owner.account_id == a_id
+                            && address.route.scope.topic_id == Some(CHANNEL_TOPIC.parse().unwrap())
+                    })
+            })
+        },
+    );
+    let key_address = topic_ready(&client, ui, "клавиатура открыла историю темы и редактор A");
+    assert_eq!(key_address.route.owner.account_id, a_id);
+    assert_eq!(
+        ui.debug_bounds("workspace-conversation-panel")
+            .unwrap()
+            .right(),
+        px(700.)
+    );
+    ui.simulate_keystrokes("tab");
+    let conversation = ui.read(|app| client.read(app).conversation.as_ref().unwrap().clone());
+    assert_eq!(
+        ui.update(|window, app| conversation.read(app).keyboard_focus(window, app)),
+        Some("история")
+    );
+    ui.simulate_keystrokes("tab");
+    assert_eq!(
+        ui.update(|window, app| conversation.read(app).keyboard_focus(window, app)),
+        Some("редактор")
+    );
+    ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(MARKER.to_owned())));
+    ui.simulate_keystrokes("cmd-v");
+    press_enter(ui);
+    until(ui, "единственный POST от A", |_| {
+        acceptance.sent.lock().unwrap().len() >= 2
+    });
+    let key_id = {
+        let posts = acceptance.sent.lock().unwrap();
+        assert_eq!(posts[1].author, USER);
+        posts[1].id
+    };
+    assert_ne!(mouse_id, key_id);
+    wait_topic_confirmation(&runtime, ui, &key_address, key_id);
+    assert_eq!(acceptance.attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        futures::executor::block_on(runtime.shutdown()),
+        RuntimeExit::Clean
+    );
+}
+
+/// Закрывает тему после открытия редактора и проверяет также отказ для сохранённых записей.
+#[gpui::test]
+fn explicit_topic_is_rechecked_before_queue_and_before_post(cx: &mut TestAppContext) {
+    use workspace_core::storage::{DeliveryStatus, SendBlock};
+
+    cx.update(bind_keys);
+    let server = Server::start_with_topic();
+    let acceptance = server.state.topic.as_ref().unwrap();
+    let profile = tempfile::tempdir().unwrap();
+    let (runtime, events) =
+        start_runtime(profile.path(), saved_account(&server, USER, Uuid::nil()));
+    let (client, ui) =
+        cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
+    ui.update(|_, app| {
+        let subscription = events.attach(&client, app, Client::handle_runtime);
+        client.update(app, |client, cx| client.attach(subscription, cx));
+    });
+    ui.simulate_resize(size(px(700.), px(600.)));
+    until(ui, "WSS и каталог", |ui| {
+        server.state.ready.load(Ordering::SeqCst) > 0 && ui.debug_bounds(CHANNEL_ROW).is_some()
+    });
+    click(ui, CHANNEL_ROW);
+    ui.run_until_parked();
+    click(ui, CHANNEL_TOPIC_ROW);
+    let address = topic_ready(&client, ui, "до закрытия видны история темы и редактор");
+    *acceptance.gate.lock().unwrap() = TopicGate::Closed;
+    click(ui, "workspace-composer-editor");
+    ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(MARKER.to_owned())));
+    ui.simulate_keystrokes("cmd-v");
+    press_enter(ui);
+    until(
+        ui,
+        "пояснение отказа перед записью",
+        |ui| {
+            ui.read(|app| {
+                let screen = client.read(app).conversation.as_ref().unwrap().read(app);
+                let composer = screen.tested_composer().unwrap().read(app);
+                composer.tested_send_state(app).1 && composer.draft(app) == MARKER
+            }) && ui.debug_bounds("conversation-send-explanation").is_some()
+        },
+    );
+    let route = address.clone();
+    let entries = futures::executor::block_on(runtime.request(move |services| async move {
+        services
+            .sync
+            .outbox(&route.route.owner, route.generation, route.route.scope)
+    }))
+    .unwrap()
+    .unwrap();
+    assert!(entries.is_empty());
+    assert_eq!(acceptance.attempts.load(Ordering::SeqCst), 0);
+
+    // Имитируем запись, созданную, когда контекст ещё разрешал отправку.
+    for (gate, expected) in [
+        (
+            TopicGate::Closed,
+            DeliveryStatus::Blocked(SendBlock::AccessLost),
+        ),
+        (
+            TopicGate::Encrypted,
+            DeliveryStatus::Blocked(SendBlock::EncryptionUnavailable),
+        ),
+        (TopicGate::WrongStream, DeliveryStatus::Rejected(None)),
+        (TopicGate::Unknown, DeliveryStatus::Rejected(None)),
+    ] {
+        *acceptance.gate.lock().unwrap() = gate;
+        let route = address.clone();
+        let id = futures::executor::block_on(runtime.request(move |services| async move {
+            services
+                .sync
+                .prepare_send(
+                    &route.route.owner,
+                    route.generation,
+                    route.route.scope.stream_id,
+                    route.route.scope.topic_id.unwrap(),
+                    MARKER.to_owned(),
+                )
+                .map(|record| record.public_id)
+        }))
+        .unwrap()
+        .unwrap();
+        until(
+            ui,
+            "очередь подтверждает отказ по этому UUID",
+            |_| {
+                let route = address.clone();
+                futures::executor::block_on(runtime.request(move |services| async move {
+                    let entries = services.sync.outbox(
+                        &route.route.owner,
+                        route.generation,
+                        route.route.scope,
+                    )?;
+                    Ok::<_, workspace_core::sync::SyncError>(
+                        entries.iter().any(|entry| {
+                            entry.snapshot.public_id == id && entry.status == expected
+                        }),
+                    )
+                }))
+                .is_ok_and(|result| result.unwrap_or(false))
+            },
+        );
+        assert_eq!(acceptance.attempts.load(Ordering::SeqCst), 0);
+    }
+    assert_eq!(
+        futures::executor::block_on(runtime.shutdown()),
+        RuntimeExit::Clean
     );
 }
 

@@ -194,10 +194,10 @@ impl OutboxWorker<'_> {
         let preflight = self
             .source
             .rest
-            .direct_send_topic(owner, &token, snapshot.stream_id, Some(snapshot.topic_id))
+            .check_send_topic(owner, &token, snapshot.stream_id, snapshot.topic_id, true)
             .await;
         let blocked = match preflight {
-            Ok(_) => None,
+            Ok(()) => None,
             Err(DirectSendError::Source(SourceError::Unauthorized)) => {
                 self.sync
                     .auth()
@@ -207,9 +207,11 @@ impl OutboxWorker<'_> {
             Err(DirectSendError::Source(SourceError::Temporary) | DirectSendError::Auth(_)) => {
                 return Ok(false);
             }
-            Err(DirectSendError::AccessLost | DirectSendError::TopicUnavailable) => {
-                Some(DeliveryStatus::Blocked(SendBlock::AccessLost))
-            }
+            Err(
+                DirectSendError::AccessLost
+                | DirectSendError::TopicUnavailable
+                | DirectSendError::TopicClosed,
+            ) => Some(DeliveryStatus::Blocked(SendBlock::AccessLost)),
             Err(DirectSendError::EncryptionUnavailable) => {
                 Some(DeliveryStatus::Blocked(SendBlock::EncryptionUnavailable))
             }
