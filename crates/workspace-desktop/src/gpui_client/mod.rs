@@ -47,7 +47,8 @@ pub fn run(options: Options) -> io::Result<()> {
     application.run(move |app| {
         bind_keys(app);
         let window_options = WindowPlatform::window_options(&profile, app);
-        let window = app.open_window(window_options, |_, app| {
+        let window = app.open_window(window_options, |window, app| {
+            refresh_on_appearance(window);
             app.new(|cx| Client::new(options, runtime.clone(), cx))
         });
         let Ok(window) = window else {
@@ -87,6 +88,14 @@ pub fn run(options: Options) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// Перерисовывает всё дерево окна после смены системной темы.
+fn refresh_on_appearance(window: &Window) {
+    // GPUI 0.2.2 обновляет Window::appearance, но дочерние виды ждут перерисовки.
+    window
+        .observe_window_appearance(|window, _| window.refresh())
+        .detach();
 }
 
 /// Регистрирует системный ввод и общий порядок фокуса для всех частей окна.
