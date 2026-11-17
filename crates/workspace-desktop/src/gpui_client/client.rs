@@ -18,6 +18,7 @@ use super::{
     runtime::{RuntimeClient, StartupError},
     shell::{Shell, ShellEffect},
     sidebar::Sidebar,
+    sign_in::SignIn,
     ui::{Palette, TextRole, ThemeMode, TopBar, TopBarAccount, TopBarSelection, label},
 };
 
@@ -41,10 +42,12 @@ pub(super) struct Client {
     runtime: RuntimeClient,   // Очередь команд рабочего потока этого профиля.
     sidebar: Entity<Sidebar>, // Единственный каталог; хранит поиск каждого входа.
     conversation: Option<Entity<Conversation>>, // Экран актуального адреса, если он открыт.
+    sign_in: Option<Entity<SignIn>>, // Форма нужна, пока в профиле нет доступного входа.
     labels: HashMap<AccountId, String>, // Подписи для переключателя и баннеров.
     top_bar: Entity<TopBar>,  // Шапка хранит локальный фокус и показывает снимок оболочки.
     _top_bar_subscription: Subscription, // Передаёт выбор в оболочку.
     initial_focus: FocusHandle, // Корневая точка обхода до выбора первого элемента.
+    restore_focus: bool,      // После закрытия формы вернуть фокус в рабочую область.
     ready: bool,              // Рабочий поток открыл профиль и подготовил подписки.
     received_accounts: bool,  // Пришёл первый снимок аккаунтов, может быть пустым.
     startup_error: Option<StartupError>, // Безопасная причина сбоя открытия профиля.
@@ -79,10 +82,12 @@ impl Client {
             runtime,
             sidebar,
             conversation: None,
+            sign_in: None,
             labels: options.labels,
             top_bar,
             _top_bar_subscription: selection,
             initial_focus: cx.focus_handle(),
+            restore_focus: false,
             ready: false,
             received_accounts: false,
             startup_error: None,
@@ -99,20 +104,25 @@ impl Client {
         cx.spawn(async move |client, cx| {
             let ready = runtime.ready().await;
             let _ = client.update(cx, |client, cx| {
-                match ready {
-                    Ok(()) => {
-                        client.ready = true;
-                        log::debug!("event=workspace_profile_ready");
-                    }
-                    Err(error) => {
-                        log::warn!("event=workspace_start_failed reason={error:?}");
-                        client.startup_error = Some(error);
-                    }
-                }
-                cx.notify();
+                client.handle_ready(ready, cx);
             });
         })
         .detach();
+    }
+
+    /// Сохраняет результат чтения профиля и обновляет маршрут окна.
+    fn handle_ready(&mut self, ready: Result<(), StartupError>, cx: &mut Context<Self>) {
+        match ready {
+            Ok(()) => {
+                self.ready = true;
+                log::debug!("event=workspace_profile_ready");
+            }
+            Err(error) => {
+                log::warn!("event=workspace_start_failed reason={error:?}");
+                self.startup_error = Some(error);
+            }
+        }
+        self.apply(None, cx);
     }
 
     /// Применяет действие каталога, переключателя или системного окна.
@@ -156,6 +166,7 @@ impl Client {
 
     /// Выполняет команду оболочки и обновляет связанные части того же окна.
     fn apply(&mut self, effect: Option<ShellEffect>, cx: &mut Context<Self>) {
+        let effect = self.reconcile_sign_in(cx).or(effect);
         match effect {
             Some(ShellEffect::OpenConversation(address)) => {
                 let runtime = self.runtime.clone();
@@ -212,6 +223,35 @@ impl Client {
         cx.notify();
     }
 
+    /// Показывает вход после чтения профиля и передаёт окно первой готовой сессии после входа.
+    fn reconcile_sign_in(&mut self, cx: &mut Context<Self>) -> Option<ShellEffect> {
+        let accounts = self.shell.accounts();
+        let show = self.status().is_none()
+            && accounts
+                .iter()
+                .all(|account| account.status == SessionStatus::ReauthenticationRequired);
+        if show {
+            if self.sign_in.is_none() {
+                let server = match accounts {
+                    [account] => Some(account.session.owner.server.as_str()),
+                    _ => None,
+                };
+                self.sign_in = Some(cx.new(|cx| SignIn::new(self.runtime.clone(), server, cx)));
+            }
+            return None;
+        }
+
+        self.sign_in.take()?;
+        self.restore_focus = true;
+        let session = accounts
+            .iter()
+            .find(|account| account.status == SessionStatus::Active)?
+            .session
+            .clone();
+        self.shell
+            .handle_action(ShellAction::SelectAccount(session))
+    }
+
     /// Подготавливает подписи и счётчики с учётом выбранного оболочкой входа.
     fn top_bar_accounts(&self) -> Vec<TopBarAccount> {
         self.shell
@@ -254,25 +294,35 @@ impl Client {
         if !self.ready || !self.received_accounts {
             return Some("Загружаем аккаунты…".into());
         }
-        if self.shell.accounts().is_empty() {
-            return Some("Нет сохранённых аккаунтов. Войдите через workspace-auth login.".into());
-        }
         None
     }
 
     /// Устанавливает фокус внутри окна, чтобы Tab работал до первого клика.
-    fn focus_first_time(&self, window: &mut Window, cx: &Context<Self>) {
-        if window.focused(cx).is_none() {
+    fn focus_workspace(&mut self, window: &mut Window, cx: &Context<Self>) {
+        if std::mem::take(&mut self.restore_focus) || window.focused(cx).is_none() {
             window.focus(&self.initial_focus);
         }
     }
 }
 
 impl Render for Client {
-    /// Показывает аккаунты, каталог и актуальный разговор с редактором.
+    /// Показывает форму входа или рабочую область с выбранным аккаунтом.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.focus_first_time(window, cx);
+        self.focus_workspace(window, cx);
         let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
+        let root = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(palette.background)
+            .text_color(palette.text)
+            .track_focus(&self.initial_focus)
+            .on_action(next_control)
+            .on_action(previous_control);
+        if let Some(sign_in) = &self.sign_in {
+            return root.child(div().flex().flex_1().min_h_0().child(sign_in.clone()));
+        }
+
         let issue = self.shell.route_error().or_else(|| {
             WindowPlatform::notification_error(cx).map(|_| "Системные уведомления недоступны")
         });
@@ -327,16 +377,7 @@ impl Render for Client {
                 )
         };
 
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(palette.background)
-            .text_color(palette.text)
-            .track_focus(&self.initial_focus)
-            .on_action(next_control)
-            .on_action(previous_control)
-            .child(self.top_bar.clone())
+        root.child(self.top_bar.clone())
             .children(issue.map(|message| {
                 label(palette, TextRole::Body, message)
                     .p_2()
@@ -388,6 +429,71 @@ mod tests {
             status: SessionStatus::Active,
             unread: None,
         }
+    }
+
+    /// Проверяет, что форма ждёт готовности профиля и отдаёт окно активному входу.
+    #[gpui::test]
+    fn sign_in_routes_only_after_profile_ready_and_session_changes(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        let profile = tempfile::tempdir().unwrap();
+        let (runtime, _events) = RuntimeClient::start_in(profile.path().into()).unwrap();
+        let mut saved = account("Сохранённый аккаунт");
+        let signed_in = account("Новый аккаунт");
+        let (client, ui) =
+            cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
+        ui.simulate_resize(size(px(700.), px(600.)));
+        let send_accounts = |accounts, ui: &mut gpui::VisualTestContext| {
+            ui.update(|_, app| {
+                client.update(app, |view, cx| {
+                    view.handle_runtime(RuntimeEvent::Accounts(accounts), cx);
+                });
+            });
+            ui.run_until_parked();
+        };
+
+        send_accounts(vec![], ui);
+        assert!(ui.debug_bounds("workspace-sign-in").is_none());
+        ui.update(|_, app| {
+            client.update(app, |view, cx| view.handle_ready(Ok(()), cx));
+        });
+        ui.run_until_parked();
+        assert!(ui.debug_bounds("workspace-sign-in").is_some());
+        let has_form =
+            |ui: &mut gpui::VisualTestContext| ui.read(|app| client.read(app).sign_in.is_some());
+
+        saved.status = SessionStatus::Restoring;
+        send_accounts(vec![saved.clone()], ui);
+        assert!(!has_form(ui));
+        saved.status = SessionStatus::TemporarilyUnavailable;
+        send_accounts(vec![saved.clone()], ui);
+        assert!(!has_form(ui));
+
+        saved.status = SessionStatus::ReauthenticationRequired;
+        send_accounts(vec![saved.clone()], ui);
+        assert!(has_form(ui));
+
+        send_accounts(vec![saved.clone(), signed_in.clone()], ui);
+        assert!(!has_form(ui));
+        assert!(ui.debug_bounds("workspace-top-bar").is_some());
+        assert!(ui.debug_bounds("workspace-sidebar-panel").is_some());
+        assert!(ui.update(|window, app| client.read(app).initial_focus.is_focused(window)));
+        assert_eq!(
+            ui.read(|app| client.read(app).shell.selected().cloned()),
+            Some(signed_in.session),
+        );
+
+        send_accounts(vec![], ui);
+        assert!(has_form(ui));
+        assert!(ui.debug_bounds("sign-in-server").is_some());
+        // Ввод сразу попадает в адрес, без клика или перезапуска окна.
+        ui.simulate_input("https://127.0.0.1:1");
+        ui.simulate_keystrokes("enter");
+        ui.run_until_parked();
+        assert!(ui.debug_bounds("sign-in-login").is_some());
+        assert_eq!(
+            futures::executor::block_on(runtime.shutdown()),
+            RuntimeExit::Clean,
+        );
     }
 
     /// Вход меняется от кнопки корня, а каталог того же окна следует за новым владельцем.

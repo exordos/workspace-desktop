@@ -43,6 +43,11 @@ impl MessengerSource {
         catalog::Catalog::new(self.rest.clone(), storage)
     }
 
+    /// Получает объявленную сервером HTTPS-ссылку регистрации, доступную до входа.
+    pub async fn registration_url(&self, server: &str) -> Result<Option<String>, SourceError> {
+        self.rest.registration_url(server).await
+    }
+
     /// Создаёт источник и подготавливает HTTP-клиент.
     pub fn new() -> Result<Self, SourceError> {
         Ok(Self {

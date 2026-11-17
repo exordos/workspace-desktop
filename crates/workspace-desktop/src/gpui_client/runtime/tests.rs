@@ -1,5 +1,7 @@
 //! Проверяет запуск, восстановление после пропуска и остановку диспетчера без графической сессии.
 
+mod login;
+
 use std::{
     sync::{
         Mutex,
@@ -87,14 +89,14 @@ impl SecretStore for TestSecrets {
             .map(|(_, marker)| marker.clone()))
     }
 
-    /// Имитирует запись замены токена и подтверждает её тесту.
+    /// Имитирует запись нового секрета или замену существующего и подтверждает её тесту.
     fn save(&self, key: &str, value: &str) -> Result<(), StoreError> {
         let mut values = self.values.lock().unwrap();
-        let (_, stored) = values
-            .iter_mut()
-            .find(|(stored, _)| stored == key)
-            .ok_or(StoreError)?;
-        *stored = value.to_owned();
+        if let Some((_, stored)) = values.iter_mut().find(|(stored, _)| stored == key) {
+            *stored = value.to_owned();
+        } else {
+            values.push((key.to_owned(), value.to_owned()));
+        }
         self.writes.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -223,10 +225,13 @@ async fn bootstrap_delivers_independent_sessions_and_recovers_lag() {
         RuntimeClient::start_using(move || Ok(test_parts(directory, hold_a, Arc::default())))
             .unwrap();
     assert_eq!(client.ready().await, Ok(()));
-    assert!(matches!(
-        events.recv().await,
-        Some(RuntimeEvent::Accounts(_))
-    ));
+    let Some(RuntimeEvent::Accounts(first_accounts)) = events.recv().await else {
+        panic!("первый снимок с сохранёнными аккаунтами не получен");
+    };
+    assert_eq!(first_accounts.len(), 2);
+    assert!(first_accounts.iter().any(|account| {
+        account.session.owner.user_id == "a" && account.status == SessionStatus::Restoring
+    }));
     assert!(matches!(
         events.recv().await,
         Some(RuntimeEvent::Catalog(_))

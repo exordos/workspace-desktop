@@ -9,6 +9,7 @@ pub mod platform_window;
 pub mod runtime;
 pub mod shell;
 pub mod sidebar;
+mod sign_in;
 pub mod ui;
 
 use std::{cell::Cell, collections::HashMap, io, rc::Rc};
@@ -23,6 +24,7 @@ use contracts::ShellAction;
 use platform_window::WindowPlatform;
 use runtime::{RuntimeClient, StartupError};
 use sidebar::Sidebar;
+use sign_in::SignIn;
 use ui::WorkspaceAssets;
 
 actions!(workspace_focus, [NextControl, PreviousControl]);
@@ -100,8 +102,10 @@ fn refresh_on_appearance(window: &Window) {
 
 /// Регистрирует системный ввод и общий порядок фокуса для всех частей окна.
 fn bind_keys(app: &mut App) {
+    ui::TextInput::bind_keys(app);
     Sidebar::bind_keys(app);
     Editor::bind_keys(app);
+    SignIn::bind_keys(app);
     conversation::Conversation::bind_details_keys(app);
     app.bind_keys([
         KeyBinding::new("tab", NextControl, None),

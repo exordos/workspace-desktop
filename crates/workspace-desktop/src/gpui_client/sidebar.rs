@@ -20,11 +20,10 @@ use super::{
     contracts::{AccountSession, ChatEntry, ChatRoute, ConversationAddress, SidebarAction},
     ui::{
         Avatar, AvatarPresence, BadgeTone, Button, ButtonAppearance, ChatRow, ChatRowPreview, Icon,
-        Palette, TextRole, ThemeMode, label,
+        Palette, TextInput, TextInputChanged, TextRole, ThemeMode, label,
         popup::{MenuInput, menu_layer, menu_navigation, menu_surface, tooltip},
     },
 };
-use search::{QueryChanged, Search};
 
 mod search;
 
@@ -52,7 +51,7 @@ struct Active {
     session: AccountSession,              // Владелец данных и поколение входа.
     catalog: Option<ChatList>,            // Нет снимка до начала или завершения первого чтения.
     selected: Option<HistoryScope>,       // Разговор, который сейчас открыт в окне.
-    search: Entity<Search>,               // Поле системного ввода, живущее до смены входа.
+    search: Entity<TextInput>,            // Поле системного ввода, живущее до смены входа.
     _search_observer: gpui::Subscription, // Подписка на изменение поискового запроса.
     expanded: HashSet<Uuid>,              // Каналы, раскрытые вне режима поиска.
     scroll: ScrollHandle,                 // Позиция прокрутки только текущего показа.
@@ -174,7 +173,7 @@ impl Sidebar {
 
     /// Регистрирует команды редактирования поиска один раз при запуске GPUI.
     pub fn bind_keys(app: &mut App) {
-        Search::bind_keys(app);
+        search::bind_keys(app);
         app.bind_keys([
             KeyBinding::new("up", PreviousResult, Some("CatalogResults")),
             KeyBinding::new("down", NextResult, Some("CatalogResults")),
@@ -208,8 +207,8 @@ impl Sidebar {
                     key.owner != session.owner || key.generation == session.generation
                 });
                 let preferences = self.saved.remove(session).unwrap_or_default();
-                let search = cx.new(|cx| Search::new(preferences.query, cx));
-                let observer = cx.subscribe(&search, |this, _, _: &QueryChanged, cx| {
+                let search = cx.new(|cx| TextInput::for_search(preferences.query, cx));
+                let observer = cx.subscribe(&search, |this, _, _: &TextInputChanged, cx| {
                     if let Some(active) = &mut this.active {
                         active.scroll.set_offset(gpui::point(px(0.), px(0.)));
                         active.menu = None;
@@ -699,7 +698,7 @@ impl Render for Sidebar {
                 .pt(px(16.))
                 .pb(px(12.))
                 .flex_none()
-                .child(active.search.clone()),
+                .child(search::render(&active.search, palette, window, cx)),
         );
         let catalog = active.catalog.clone();
         let chats = catalog.as_ref().and_then(|list| list.chats.as_deref());

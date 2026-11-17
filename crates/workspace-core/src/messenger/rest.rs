@@ -1,4 +1,4 @@
-//! Работает с HTTPS API мессенджера: читает журнал и историю, отправляет подготовленные сообщения.
+//! Работает с HTTPS API мессенджера: читает настройки, журнал и историю, отправляет сообщения.
 //! Также разбирает общий формат событий, который используют HTTP и WebSocket.
 
 mod message_actions;
@@ -34,6 +34,7 @@ const MESSAGES_PATH: &str = "/api/workspace/v1/messenger/messages/";
 const WINDOW_LIMIT: &str = "50";
 const EPOCH_PATH: &str = "/api/workspace/v1/epoch/";
 const EVENTS_PATH: &str = "/api/workspace/v1/events/";
+const SERVER_SETTINGS_PATH: &str = "/api/workspace/v1/messenger/server_settings";
 const ALL_CHATS_FOLDER_ID: &str = "00000000-0000-0000-0000-000000000000";
 const ALL_CHATS_PATH: &str =
     "/api/workspace/v1/messenger/folders/00000000-0000-0000-0000-000000000000";
@@ -210,6 +211,21 @@ impl RestClient {
         }
         let client = builder.build().map_err(|_| SourceError::Temporary)?;
         Ok(client)
+    }
+
+    /// Читает ссылку регистрации из публичных настроек, доступных до входа.
+    pub(super) async fn registration_url(
+        &self,
+        server: &str,
+    ) -> Result<Option<String>, SourceError> {
+        let mut url = https_origin(server)?;
+        url.set_path(SERVER_SETTINGS_PATH);
+        let settings: Value =
+            get_json(self.read.get(url).header(ACCEPT, "application/json")).await?;
+        Ok(settings
+            .get("registration_url")
+            .and_then(Value::as_str)
+            .and_then(registration_target))
     }
 
     /// Получает текущую позицию журнала, с которой начинается первый запуск.
@@ -763,7 +779,12 @@ fn required_title(value: Option<String>) -> Result<String, SourceError> {
 
 /// Проверяет, что адрес владельца содержит базовый HTTPS-адрес сервера.
 pub(super) fn workspace_origin(owner: &OwnerContext) -> Result<Url, SourceError> {
-    let url = Url::parse(&owner.server).map_err(|_| SourceError::InvalidResponse)?;
+    https_origin(&owner.server)
+}
+
+/// Проверяет базовый адрес Workspace, который можно использовать для загрузки данных.
+fn https_origin(server: &str) -> Result<Url, SourceError> {
+    let url = Url::parse(server).map_err(|_| SourceError::InvalidResponse)?;
     if url.scheme() != "https"
         || url.host().is_none()
         || !url.username().is_empty()
@@ -775,6 +796,23 @@ pub(super) fn workspace_origin(owner: &OwnerContext) -> Result<Url, SourceError>
         return Err(SourceError::InvalidResponse);
     }
     Ok(url)
+}
+
+/// Возвращает абсолютную HTTPS-ссылку без учётных данных для системного браузера.
+fn registration_target(value: &str) -> Option<String> {
+    let value = value.trim();
+    let (scheme, address) = value.split_once("://")?;
+    let authority = address.split(['/', '?', '#']).next()?;
+    // Разбор URL может удалить пустую запись о пользователе и преобразовать обратную косую черту.
+    if !scheme.eq_ignore_ascii_case("https")
+        || authority.is_empty()
+        || authority.contains('@')
+        || value.contains(|ch: char| ch.is_control() || ch == '\\')
+    {
+        return None;
+    }
+    let url = Url::parse(value).ok()?;
+    url.host().is_some().then(|| url.into())
 }
 
 /// Выполняет запрос, проверяет HTTP-статус и разбирает JSON.

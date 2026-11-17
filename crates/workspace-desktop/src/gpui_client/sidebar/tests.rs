@@ -261,6 +261,11 @@ fn opens_and_filters_only_the_catalog_of_the_selected_session(cx: &mut TestAppCo
         ui.debug_bounds("catalog-empty").is_some(),
         "очистка не вернула фокус или нет пустого результата"
     );
+    ui.simulate_keystrokes("escape");
+    ui.read(|app| {
+        let active = sidebar.read(app).active.as_ref().expect("аккаунт A");
+        assert!(active.search.read(app).text().is_empty());
+    });
 }
 
 /// Проверяет геометрию по сценам Electron и удержание строки при смене ширины.

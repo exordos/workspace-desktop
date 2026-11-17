@@ -432,7 +432,8 @@ impl Auth {
     }
 
     /// Один раз читает и проверяет записи аккаунтов, затем публикует их состояния.
-    fn load_accounts(&self) -> Result<(), AuthError> {
+    /// Окно может вызвать этот шаг до первого снимка. Сетевое восстановление выполняет `restore`.
+    pub fn load_accounts(&self) -> Result<(), AuthError> {
         let mut loaded = self.inner.loaded.lock().unwrap();
         if !*loaded {
             let records = self.inner.accounts.load()?;

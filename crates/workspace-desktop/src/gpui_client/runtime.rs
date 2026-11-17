@@ -1,6 +1,10 @@
 //! Запускает Bootstrap вне потока GPUI и связывает его с окном.
 //! Сначала описаны команды и подписка окна, затем настройка профиля и фоновый цикл.
 
+mod login;
+
+pub use login::{LoginAttempt, LoginError};
+
 use std::{fmt, future::Future, io, path::PathBuf, pin::Pin, sync::Arc, thread};
 
 use futures::{Stream, StreamExt, stream::FuturesUnordered};
@@ -132,7 +136,9 @@ impl RuntimeClient {
                         .build()
                         .map_err(|_| StartupError::Worker)?;
                     let (parts, profile_released) = setup()?;
-                    // Явно освобождаем Tokio и его блокирующие задачи до публикации итога.
+                    // Поздние ответы ещё должны уметь отменить попытку, пока Tokio ждёт
+                    // окончания начатых блокирующих запросов.
+                    let login_auth = Arc::clone(&parts.services.auth);
                     let exit = executor.block_on(parts.run(
                         publish_start.clone(),
                         requests,
@@ -141,6 +147,7 @@ impl RuntimeClient {
                         stopping,
                     ));
                     drop(executor);
+                    drop(login_auth);
                     // Auth продлевает токены в отдельных потоках. Пока такой поток держит
                     // профиль и может писать в Keychain, выход ещё не подтверждён.
                     let _ = profile_released.blocking_recv();
@@ -331,10 +338,12 @@ impl RuntimeEvents {
 /// Службы одного профиля, которые запрос получает на выделенном потоке.
 #[derive(Clone)]
 pub struct WorkerServices {
-    pub auth: Auth,                      // Сессии и проверка поколения.
-    pub sync: Arc<Sync>,                 // История, счётчики, проверка целей и запись отправок.
+    pub auth: Arc<Auth>, // Сессии и проверка поколения; окно держит только слабую ссылку для отмены входа.
+    pub sync: Arc<Sync>, // История, счётчики, проверка целей и запись отправок.
     pub messenger: Arc<MessengerSource>, // Сетевые запросы к истории и разрешение адреса отправки.
-    pub catalog: Arc<ChatCatalog>,       // Снимки и повторы загрузки каталога.
+    pub catalog: Arc<ChatCatalog>, // Снимки и повторы загрузки каталога.
+    #[cfg(all(test, feature = "gpui-test"))]
+    registration_url_for_test: Option<fn(&str) -> Option<String>>, // Подмена публичных настроек для формы.
 }
 
 /// Настроенные зависимости одного запуска Bootstrap.
@@ -418,9 +427,11 @@ impl WorkerParts {
         let (catalog, startup) = bootstrap::chat_catalog(messenger.catalog(storage.clone()));
         let services = WorkerServices {
             sync: Arc::new(Sync::new(auth.clone(), storage)),
-            auth,
+            auth: Arc::new(auth),
             messenger,
             catalog: Arc::new(catalog),
+            #[cfg(all(test, feature = "gpui-test"))]
+            registration_url_for_test: None,
         };
         let runtime = runtime(&services).map_err(|_| StartupError::Worker)?;
         Ok(Self {
@@ -442,6 +453,12 @@ impl WorkerParts {
         // Если окно исчезло ещё при открытии профиля, не начинаем восстановление по сети.
         if *stopping.borrow_and_update() || events.is_closed() || requests.is_closed() {
             return RuntimeExit::Clean;
+        }
+        // Пустой снимок открывает форму входа. Сначала читаем локальные записи, чтобы
+        // окно могло отличить пустой профиль от ещё не начавшегося восстановления.
+        if self.services.auth.load_accounts().is_err() {
+            started.send_replace(Some(Err(StartupError::Profile)));
+            return RuntimeExit::Failed;
         }
         let sessions = self.services.auth.subscribe();
         let catalog_updates = self.services.catalog.subscribe();

@@ -5,6 +5,7 @@ mod content;
 mod controls;
 mod icons;
 pub(super) mod popup;
+mod text_input;
 mod theme;
 mod top_bar;
 
@@ -17,5 +18,6 @@ pub use content::{
 };
 pub use controls::{Button, ButtonAppearance, FieldAppearance, field};
 pub use icons::{Icon, SEARCH_ICON_SIZE, WorkspaceAssets};
+pub(crate) use text_input::{TextInput, TextInputChanged, TextInputSubmitted};
 pub use theme::{Palette, TextRole, ThemeMode, label};
 pub use top_bar::{TopBar, TopBarAccount, TopBarSelection};
