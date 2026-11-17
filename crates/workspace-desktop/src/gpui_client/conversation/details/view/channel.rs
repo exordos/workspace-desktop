@@ -1,6 +1,6 @@
 //! Панель канала: заголовок и прокручиваемые блоки настроек, тем и участников.
 
-use gpui::{Div, ElementId, Stateful, div, prelude::*, px};
+use gpui::{Div, SharedString, Stateful, div, prelude::*, px};
 
 use super::{
     Availability, ChannelView, Dispatch, MemberView, NotificationLevel, NotificationsView,
@@ -278,7 +278,8 @@ fn render_topic(topic: &TopicView, palette: Palette, dispatch: &Dispatch) -> Sta
         BadgeTone::Accent
     };
     let row = div()
-        .id(ElementId::Name(format!("details-topic-{id}").into()))
+        .id(SharedString::from(format!("details-topic-{id}")))
+        .debug_selector(move || format!("details-topic-{id}"))
         .h(px(36.))
         .px(px(12.))
         .flex()
@@ -318,7 +319,7 @@ fn render_members(channel: &ChannelView, palette: Palette, dispatch: &Dispatch) 
         .child(label(palette, TextRole::Label, "Участники"))
         .when(channel.add_members != Availability::Hidden, |title| {
             title.child(icon_button(
-                "details-add-members",
+                "details-add-members".into(),
                 Icon::PersonAdd,
                 "Добавить участников",
                 channel.add_members,
@@ -404,7 +405,7 @@ fn render_member(member: &MemberView, palette: Palette, dispatch: &Dispatch) -> 
         .when(member.remove != Availability::Hidden, |row| {
             row.child(
                 icon_button(
-                    ElementId::Name(format!("details-remove-{}", member.id).into()),
+                    format!("details-remove-member-{}", member.id).into(),
                     Icon::Close,
                     "Удалить участника",
                     member.remove,
@@ -421,7 +422,7 @@ fn render_member(member: &MemberView, palette: Palette, dispatch: &Dispatch) -> 
 
 /// Использует кнопку UI-кита для действий над участниками.
 fn icon_button(
-    id: impl Into<ElementId>,
+    id: SharedString,
     icon: Icon,
     description: &'static str,
     availability: Availability,
@@ -429,7 +430,7 @@ fn icon_button(
     palette: Palette,
     dispatch: &Dispatch,
 ) -> Stateful<Div> {
-    let mut button = Button::new(id, "");
+    let mut button = Button::new(id.clone(), "");
     button.icon = Some(icon);
     button.appearance = ButtonAppearance::Ghost;
     button.disabled = availability != Availability::Enabled;
@@ -439,5 +440,6 @@ fn icon_button(
             dispatch(action.clone(), window, app);
         })
         .flex_none()
+        .debug_selector(move || id.to_string())
         .tooltip(move |_, app| tooltip(palette, description.into(), app))
 }
