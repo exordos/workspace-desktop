@@ -31,7 +31,7 @@ security-framework = "3"
 default = ["ui-kit"]
 ui-kit = ["dep:chrono", "dep:iced", "dep:iced_runtime", "dep:unicode-segmentation", "macos-adapters"]
 macos-adapters = ["dep:block2", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:objc2-user-notifications"]
-gpui = ["dep:gpui", "macos-adapters"]
+gpui = ["dep:gpui", "dep:unicode-segmentation", "macos-adapters"]
 gpui-test = ["gpui", "gpui/test-support"]
 
 [dev-dependencies]
