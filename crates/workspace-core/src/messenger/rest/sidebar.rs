@@ -7,6 +7,7 @@ use reqwest::{Method, StatusCode};
 use serde::Serialize;
 
 use super::*;
+use crate::directory::ProfileRow;
 use crate::messenger::details::{
     ChannelSidebar, DirectSidebar, SidebarAvatar, SidebarAvatarFormat, SidebarChange,
     SidebarDetails, SidebarMember, SidebarStreamKind, SidebarStreamMetadata, SidebarTopic,

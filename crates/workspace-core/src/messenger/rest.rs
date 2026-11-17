@@ -16,7 +16,6 @@ use uuid::Uuid;
 
 use crate::{
     context::OwnerContext,
-    directory::ProfileRow,
     runtime::SourceError,
     storage::{
         Cursor, HistoryChange, HistoryEdge, HistoryMessage, HistoryMetadata, HistoryScope,
@@ -25,9 +24,7 @@ use crate::{
     sync::Event,
 };
 
-use super::details::{
-    ConversationDetails, DetailsError, StreamNotificationMode, TopicNotificationMode,
-};
+use super::details::{DetailsError, StreamNotificationMode, TopicNotificationMode};
 use super::history::OpenHistoryError;
 use super::read::ReadError;
 use super::send::{DirectSendError, SendError};
@@ -367,64 +364,6 @@ impl RestClient {
             return Err(SourceError::InvalidResponse.into());
         }
         Ok(row)
-    }
-
-    /// Загружает сведения для точного адреса. Профиль запрашивается только после проверки стрима.
-    pub(super) async fn conversation_details(
-        &self,
-        owner: &OwnerContext,
-        token: &str,
-        scope: HistoryScope,
-    ) -> Result<ConversationDetails, DetailsError> {
-        let stream = self
-            .stream_access(owner, token, scope.stream_id)
-            .await
-            .map_err(details_access_error)?;
-        check_explicit_owner(
-            owner,
-            stream.project_id.as_deref(),
-            stream.user_uuid.as_deref(),
-        )?;
-        if let Some(topic_id) = scope.topic_id {
-            if stream.private || stream.direct_user_uuid.is_some() {
-                return Err(DetailsError::Unsupported);
-            }
-            let topic = self
-                .topic_access(owner, token, scope.stream_id, topic_id)
-                .await
-                .map_err(details_access_error)?;
-            check_explicit_owner(
-                owner,
-                topic.project_id.as_deref(),
-                topic.user_uuid.as_deref(),
-            )?;
-            return Ok(ConversationDetails::Topic {
-                channel: required_title(stream.name)?,
-                name: required_title(topic.name)?,
-                description: stream.description.filter(|value| !value.trim().is_empty()),
-                done: topic.is_done,
-            });
-        }
-
-        if !stream.private || !matches!(stream.encryption, Some(Value::Bool(false))) {
-            return Err(DetailsError::Unsupported);
-        }
-        let peer = stream
-            .direct_user_uuid
-            .as_deref()
-            .and_then(parse_uuid)
-            .ok_or(SourceError::InvalidResponse)?;
-        let profile: ProfileRow = self
-            .access_row(owner, token, &format!("/api/workspace/v1/users/{peer}"))
-            .await
-            .map_err(|error| match error {
-                OpenHistoryError::AccessLost => DetailsError::ProfileUnavailable,
-                other => details_access_error(other),
-            })?;
-        let profile = profile
-            .into_profile(peer)
-            .ok_or(SourceError::InvalidResponse)?;
-        Ok(ConversationDetails::Peer(profile))
     }
 
     /// Разрешает обычный текст в теме лички по умолчанию.
