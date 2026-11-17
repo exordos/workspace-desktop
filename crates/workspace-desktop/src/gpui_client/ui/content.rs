@@ -96,10 +96,12 @@ impl Avatar {
                 ))
             })
             .children(self.image.map(|image| {
+                // В GPUI границу картинки скругляет сама картинка.
                 img(image)
                     .absolute()
                     .inset_0()
                     .size_full()
+                    .rounded_full()
                     .object_fit(ObjectFit::Cover)
             }))
             // Обводка поверх фотографии совпадает с контуром аватара без фото.
