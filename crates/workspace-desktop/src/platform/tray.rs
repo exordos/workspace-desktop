@@ -35,13 +35,13 @@ declare_class!(
     unsafe impl NSObjectProtocol for MenuTarget {}
 
     unsafe impl MenuTarget {
-        /// Просит Iced вернуть существующее окно.
+        /// Просит оболочку вернуть существующее окно.
         #[method(workspaceShow:)]
         fn show(&self, _sender: &NSObject) {
             let _ = self.ivars().unbounded_send(Command::Show);
         }
 
-        /// Просит Iced завершить приложение.
+        /// Просит оболочку завершить приложение.
         #[method(workspaceQuit:)]
         fn quit(&self, _sender: &NSObject) {
             let _ = self.ivars().unbounded_send(Command::Quit);

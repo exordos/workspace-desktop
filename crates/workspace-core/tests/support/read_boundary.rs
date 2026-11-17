@@ -25,12 +25,9 @@ use workspace_core::{
 
 use super::Fixture;
 
-const CA: &[u8] =
-    include_bytes!("../../../workspace-desktop/src/shell/background_message/tls/ca.pem");
-const CERT: &[u8] =
-    include_bytes!("../../../workspace-desktop/src/shell/background_message/tls/localhost.pem");
-const KEY: &[u8] =
-    include_bytes!("../../../workspace-desktop/src/shell/background_message/tls/localhost-key.pem");
+const CA: &[u8] = include_bytes!("../../../../tests/fixtures/tls/ca.pem");
+const CERT: &[u8] = include_bytes!("../../../../tests/fixtures/tls/localhost.pem");
+const KEY: &[u8] = include_bytes!("../../../../tests/fixtures/tls/localhost-key.pem");
 
 /// Проверяет ответ, ошибки, отсутствие повтора и отказ старому поколению.
 #[tokio::test]

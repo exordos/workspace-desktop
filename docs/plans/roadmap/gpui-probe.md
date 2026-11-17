@@ -5,7 +5,7 @@
 `workspace-desktop` использует точную версию GPUI `0.2.2` из crates.io.
 Для сборки на macOS нужны Xcode с macOS SDK и Clang: GPUI генерирует
 привязки к системным заголовкам. Feature `font-kit` включает системный
-движок текста macOS. Прототип использует Metal и компилирует
+движок текста macOS. Оконный клиент и прототип используют Metal и компилирует
 шейдеры при открытии окна через `runtime_shaders`. Отдельный компилятор
 `xcrun metal` для этого режима не нужен. Среда проверки: arm64,
 macOS 27.0.1, Xcode 26.4.1 (macOS SDK 26.4), Rust 1.100.0.
@@ -13,23 +13,18 @@ macOS 27.0.1, Xcode 26.4.1 (macOS SDK 26.4), Rust 1.100.0.
 Из корня репозитория в графической сессии:
 
 ```sh
-cargo run --locked -p workspace-desktop --no-default-features --features gpui --example gpui_chat_probe
+cargo run --locked -p workspace-desktop --example gpui_chat_probe
 ```
 
 Откроется **Workspace GPUI Chat Probe** с тестовой историей и редактором.
 Закрытие окна завершает пример. Пример не читает профиль и не
 подключается к Workspace.
 
-Feature `gpui` включает GPUI и общие адаптеры macOS. Тесты с
-`#[gpui::test]` могут включить `gpui-test` для доступа к тестовому контексту
-GPUI. Точка входа `workspace-desktop-gpui` и отдельные примеры `gpui_history_probe`,
-`gpui_editor_probe`, `gpui_macos_window_probe`, `gpui_gallery` требуют
-`gpui`.
-
-Прежний клиент Iced остаётся в обычной сборке:
+Feature `gpui` включена по умолчанию для штатного окна и примеров. Feature `gpui-test` включает тестовый контекст `#[gpui::test]`.
 
 ```sh
 cargo run --locked -p workspace-desktop --bin workspace-desktop
+cargo build --locked -p workspace-desktop --no-default-features --bin workspace-auth
 cargo test --locked --workspace --no-default-features
 ```
 
@@ -38,7 +33,7 @@ cargo test --locked --workspace --no-default-features
 В графической сессии macOS запустите галерею из корня репозитория.
 
 ```sh
-cargo run --locked -p workspace-desktop --no-default-features --features gpui --example gpui_gallery
+cargo run --locked -p workspace-desktop --example ui_gallery
 ```
 
 Светлая и тёмная палитры показаны рядом. Выберите строку каталога мышью
@@ -50,7 +45,7 @@ cargo run --locked -p workspace-desktop --no-default-features --features gpui --
 Из корня проекта в графической сессии macOS выполните:
 
 ```sh
-cargo run --locked -p workspace-desktop --no-default-features --features gpui --example gpui_chat_probe -- --reproduce-scroll-jump 2>&1 | tee /tmp/gpui-scroll-jump.log
+cargo run --locked -p workspace-desktop --example gpui_chat_probe -- --reproduce-scroll-jump 2>&1 | tee /tmp/gpui-scroll-jump.log
 ```
 
 Откроется **Workspace GPUI Chat Probe**. Сценарий сам переходит к известному UUID и подаёт
@@ -108,5 +103,5 @@ fi
 координату опоры и новое сообщение у нижнего края:
 
 ```sh
-cargo test --locked -p workspace-desktop --no-default-features --features gpui-test --example gpui_chat_probe
+cargo test --locked -p workspace-desktop --features gpui-test --example gpui_chat_probe
 ```

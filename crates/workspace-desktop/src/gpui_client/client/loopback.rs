@@ -23,11 +23,15 @@ use hyper::{
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use serde_json::{Value, json};
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{
     WebSocketStream,
-    tungstenite::{Message, handshake::derive_accept_key, protocol::Role},
+    tungstenite::{
+        Message,
+        handshake::derive_accept_key,
+        protocol::{CloseFrame, Role, frame::coding::CloseCode},
+    },
 };
 use uuid::Uuid;
 use workspace_core::{
@@ -36,6 +40,9 @@ use workspace_core::{
         StoreError,
     },
     context::OwnerContext,
+    messenger::SOURCE_ID,
+    storage::{Message as StoredMessage, Storage},
+    sync::Event,
 };
 
 use super::*;
@@ -132,6 +139,72 @@ struct DelayedHistory {
     requested: AtomicBool,                         // Сервер принял запрос первой истории A.
 }
 
+/// Переключает только журнал B на новую позицию или эпоху и доставляет живые события.
+struct Recovery {
+    changed_epoch: bool,  // True меняет эпоху, false обрезает прежнюю.
+    rejected: AtomicBool, // После сброса REST отдаёт новую позицию и счётчик B.
+    live: broadcast::Sender<RecoverySignal>, // Кадры для сокета B в порядке отправки.
+}
+
+/// Определяет, какой кадр должен получить уже подключённый B.
+#[derive(Clone)]
+enum RecoverySignal {
+    RejectCursor, // Сервер больше не принимает прежнюю позицию.
+    Event(Value), // Обычное событие журнала, переданное B.
+}
+
+impl Recovery {
+    /// Даёт текущую начальную позицию и счётчик одного аккаунта.
+    fn baseline(&self, user: &str) -> (&'static str, u64, u32) {
+        if user == USER {
+            return ("local", 1, 4);
+        }
+        if !self.rejected.load(Ordering::SeqCst) {
+            return ("local", 1, 6);
+        }
+        if self.changed_epoch {
+            ("next", 1, 7)
+        } else {
+            ("local", 50, 7)
+        }
+    }
+
+    /// Сдвигает журнал B и просит его старый сокет отклонить курсор.
+    fn reject(&self) {
+        self.rejected.store(true, Ordering::SeqCst);
+        assert!(self.live.send(RecoverySignal::RejectCursor).is_ok());
+    }
+
+    /// Передаёт B одно штатное событие текущей эпохи.
+    fn event(&self, offset: u64, object: &str, action: &str, payload: Value) {
+        let (epoch, base, _) = self.baseline(PEER);
+        let event = json!({
+            "schema_version":1, "uuid":Uuid::new_v4(),
+            "epoch_generation":epoch, "epoch_version":base + offset,
+            "project_id":PROJECT, "user_uuid":PEER,
+            "object_type":object, "action":action, "payload":payload,
+        });
+        assert!(self.live.send(RecoverySignal::Event(event)).is_ok());
+    }
+
+    /// Передаёт B сообщение и следующий за ним новый счётчик непрочитанного.
+    fn incoming(&self, id: Uuid, unread: u32) {
+        self.event(1, "message", "created", json!({
+            "kind":"message.created", "uuid":id, "source_name":"native",
+            "is_own":false, "read":false, "author_uuid":USER, "stream_uuid":STREAM, "topic_uuid":TOPIC,
+            "payload":{"kind":"markdown", "content":"Строка локального сценария"},
+        }));
+        self.event(
+            2,
+            "folder",
+            "updated",
+            json!({
+                "kind":"folder.updated","uuid":Uuid::nil(),"unread_count":unread,
+            }),
+        );
+    }
+}
+
 /// Записывает наблюдения сервера о готовности подключений и принятой отправке.
 #[derive(Default)]
 struct Received {
@@ -139,6 +212,7 @@ struct Received {
     ready: AtomicUsize,     // Сколько подключений подтвердили готовность через WSS.
     targets: AtomicUsize,   // Сколько проверок доступа к стриму вернул HTTPS.
     delayed: Option<DelayedHistory>, // Сценарий позднего ответа, если тест его включил.
+    recovery: Option<Recovery>, // Сценарий сброса курсора, если тест его включил.
 }
 
 /// Держит локальный сервер, пока существует сценарий.
@@ -168,6 +242,18 @@ impl Server {
         (server, release)
     }
 
+    /// Запускает сервер с управляемым сбросом журнала B.
+    fn start_with_recovery(changed_epoch: bool) -> Self {
+        Self::serve(Received {
+            recovery: Some(Recovery {
+                changed_epoch,
+                rejected: AtomicBool::new(false),
+                live: broadcast::channel(16).0,
+            }),
+            ..Received::default()
+        })
+    }
+
     /// Подключает сценарий к обычным HTTPS/WSS-сокетам клиента.
     fn serve(state: Received) -> Self {
         let socket = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -176,13 +262,13 @@ impl Server {
         let (stop, mut stopping) = oneshot::channel();
         let state = Arc::new(state);
         let received = state.clone();
-        // Эти сертификаты уже используются локальным сценарием Desktop.
+        // Тестовые сертификаты доверены только клиенту локального сценария.
         let cert = CertificateDer::from_pem_slice(include_bytes!(
-            "../../shell/background_message/tls/localhost.pem"
+            "../../../../../tests/fixtures/tls/localhost.pem"
         ))
         .unwrap();
         let key = PrivateKeyDer::from_pem_slice(include_bytes!(
-            "../../shell/background_message/tls/localhost-key.pem"
+            "../../../../../tests/fixtures/tls/localhost-key.pem"
         ))
         .unwrap();
         let config = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -245,11 +331,31 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         let protocol = request.headers()[header::SEC_WEBSOCKET_PROTOCOL]
             .to_str()
             .unwrap();
-        assert!(
-            protocol == "workspace.events.v1, bearer.local-user"
-                || state.delayed.is_some() && protocol == "workspace.events.v1, bearer.local-peer",
-            "WSS должен использовать тестовый вход открытого профиля"
-        );
+        let two_accounts = state.delayed.is_some() || state.recovery.is_some();
+        let user = match protocol {
+            "workspace.events.v1, bearer.local-user" => USER,
+            "workspace.events.v1, bearer.local-peer" if two_accounts => PEER,
+            _ => panic!("WSS должен использовать тестовый вход открытого профиля"),
+        };
+        let (epoch, base, _) = state
+            .recovery
+            .as_ref()
+            .map_or(("local", 1, 0), |r| r.baseline(user));
+        let mut live = None;
+        let mut after = base;
+        if let Some(recovery) = state.recovery.as_ref() {
+            let cursor =
+                query_value(&request, "last_epoch_version").and_then(|v| v.parse::<u64>().ok());
+            if query_value(&request, "epoch_generation") != Some(epoch)
+                || cursor.is_none_or(|version| version < base)
+            {
+                return json_response(StatusCode::GONE, json!({"error":"epoch_pruned"}));
+            }
+            after = cursor.unwrap();
+            if user == PEER {
+                live = Some((recovery.live.subscribe(), recovery.changed_epoch));
+            }
+        }
         let key = request.headers().get(header::SEC_WEBSOCKET_KEY).unwrap();
         let accept = derive_accept_key(key.as_bytes());
         let upgrade = hyper::upgrade::on(&mut request);
@@ -257,11 +363,34 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
             let socket = upgrade.await.unwrap();
             let mut ws =
                 WebSocketStream::from_raw_socket(TokioIo::new(socket), Role::Server, None).await;
-            let ready = json!({"type":"ready","epoch_generation":"local","epoch_version":1});
+            let ready = json!({"type":"ready","epoch_generation":epoch,"epoch_version":after});
             ws.send(Message::text(ready.to_string())).await.unwrap();
             state.ready.fetch_add(1, Ordering::SeqCst);
-            futures::future::pending::<()>().await;
-            drop(ws);
+            if let Some((mut live, changes_epoch)) = live {
+                while let Ok(signal) = live.recv().await {
+                    match signal {
+                        RecoverySignal::RejectCursor => {
+                            if changes_epoch {
+                                let frame = json!({"error":"epoch_pruned","reason":"epoch_generation_changed","epoch_generation":"next"});
+                                let _ = ws.send(Message::text(frame.to_string())).await;
+                            } else {
+                                let _ = ws
+                                    .close(Some(CloseFrame {
+                                        code: CloseCode::from(4410),
+                                        reason: "epoch_pruned".into(),
+                                    }))
+                                    .await;
+                            }
+                            return;
+                        }
+                        RecoverySignal::Event(frame) => {
+                            ws.send(Message::text(frame.to_string())).await.unwrap()
+                        }
+                    }
+                }
+            } else {
+                futures::future::pending::<()>().await;
+            }
         });
         return Response::builder()
             .status(StatusCode::SWITCHING_PROTOCOLS)
@@ -275,7 +404,7 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
 
     let (user, peer) = match request.headers()[header::AUTHORIZATION].to_str().unwrap() {
         "Bearer local-user" => (USER, PEER),
-        "Bearer local-peer" if state.delayed.is_some() => (PEER, USER),
+        "Bearer local-peer" if state.delayed.is_some() || state.recovery.is_some() => (PEER, USER),
         _ => panic!("HTTPS должен использовать тестовый вход открытого профиля"),
     };
     if path == MESSAGES && request.method() == Method::POST {
@@ -302,6 +431,10 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         "private": true, "direct_user_uuid": peer, "is_archived": false,
         "default_topic_uuid": TOPIC, "encryption": false, "notification_mode":"all_messages",
     });
+    let (epoch, base, unread) = state
+        .recovery
+        .as_ref()
+        .map_or(("local", 1, 0), |r| r.baseline(user));
     let result = match path {
         STREAMS => json!([stream]),
         MESSAGES if state.delayed.is_some() => {
@@ -330,8 +463,18 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
             "project_id": PROJECT, "author_uuid": USER, "created_at": "2026-11-17T10:00:00Z",
             "payload": {"kind": "markdown", "content": MARKER},
         })).collect::<Vec<_>>()),
+        "/api/workspace/v1/events/" if state.recovery.is_some() => {
+            let cursor =
+                query_value(&request, "epoch_version%3E").and_then(|v| v.parse::<u64>().ok());
+            if query_value(&request, "epoch_generation") != Some(epoch)
+                || cursor.is_none_or(|version| version < base)
+            {
+                return json_response(StatusCode::GONE, json!({"error":"epoch_pruned"}));
+            }
+            json!([])
+        }
         TOPICS | "/api/workspace/v1/events/" | "/api/workspace/v1/users/" => json!([]),
-        "/api/workspace/v1/epoch/" => json!({"epoch_generation":"local","epoch_version":1}),
+        "/api/workspace/v1/epoch/" => json!({"epoch_generation":epoch,"epoch_version":base}),
         path if path.ends_with(STREAM) => {
             state.targets.fetch_add(1, Ordering::SeqCst);
             stream
@@ -341,11 +484,19 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         }
         path if path.contains("/folders/") => json!({
             "uuid":"00000000-0000-0000-0000-000000000000", "user_uuid":user,
-            "project_id":PROJECT, "unread_count":0,
+            "project_id":PROJECT, "unread_count":unread,
         }),
         _ => return json_response(StatusCode::NOT_FOUND, Value::Null),
     };
     json_response(StatusCode::OK, result)
+}
+
+/// Возвращает значение параметра курсора из запроса локального клиента.
+fn query_value<'a>(request: &'a Request<Incoming>, name: &str) -> Option<&'a str> {
+    request.uri().query()?.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == name).then_some(value)
+    })
 }
 
 /// Возвращает REST-ответ с таким же типом результата, как у рабочего сервера.
@@ -407,7 +558,7 @@ fn start_runtime(
     account: AccountRecord,
 ) -> (RuntimeClient, RuntimeEvents) {
     let ca =
-        CertificateDer::from_pem_slice(include_bytes!["../../shell/background_message/tls/ca.pem"])
+        CertificateDer::from_pem_slice(include_bytes!["../../../../../tests/fixtures/tls/ca.pem"])
             .unwrap();
     RuntimeClient::start_for_test(
         profile.into(),
@@ -666,4 +817,194 @@ fn late_history_keeps_the_reopened_account_conversation(cx: &mut TestAppContext)
         RuntimeExit::Clean,
         "останавливаем фон после обоих ответов"
     );
+}
+
+/// Ждёт наблюдаемое состояние хранилища через штатную фоновую работу.
+async fn wait_storage(step: &str, mut ready: impl FnMut() -> bool) {
+    tokio::time::timeout(TIMEOUT, async {
+        while !ready() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("Не дождались шага: {step}"));
+}
+
+/// Проверяет реальный отказ по WSS, новый курсор и продолжение без потери данных A.
+#[tokio::test]
+async fn local_wss_recovers_pruned_cursor_and_changed_epoch() {
+    for changed_epoch in [false, true] {
+        let server = Server::start_with_recovery(changed_epoch);
+        let recovery = server.state.recovery.as_ref().unwrap();
+        let profile = tempfile::tempdir().unwrap();
+        let a = saved_account(&server, USER, Uuid::nil());
+        let b = saved_account(&server, PEER, PEER.parse().unwrap());
+        let owner_a = a.context.clone();
+        let owner_b = b.context.clone();
+        JsonAccountStore::open(profile.path())
+            .unwrap()
+            .save(&b)
+            .unwrap();
+        let (runtime, _events) = start_runtime(profile.path(), a);
+        runtime.ready().await.unwrap();
+        let storage = Storage::open(profile.path().join("messenger.sqlite3")).unwrap();
+        wait_storage("оба исходных WSS и счётчики", || {
+            server.state.ready.load(Ordering::SeqCst) == 2
+                && storage.unread(&owner_a).unwrap() == Some(4)
+                && storage.unread(&owner_b).unwrap() == Some(6)
+        })
+        .await;
+        let original_a = owner_a.clone();
+        runtime
+            .request(move |services| async move {
+                let generation = services
+                    .auth
+                    .snapshot()
+                    .into_iter()
+                    .find(|s| s.context == original_a)
+                    .unwrap()
+                    .generation;
+                let mut cursor = services
+                    .sync
+                    .cursor(&original_a, SOURCE_ID)
+                    .unwrap()
+                    .unwrap();
+                cursor.epoch_version += 1;
+                services
+                    .sync
+                    .apply(
+                        &original_a,
+                        generation,
+                        SOURCE_ID,
+                        Event::MessageCreated {
+                            cursor,
+                            message: StoredMessage {
+                                id: PEER_ROW.to_string(),
+                                text: "Данные A".into(),
+                            },
+                            placement: None,
+                            metadata: None,
+                        },
+                    )
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+        let cursor_a = storage.cursor(&owner_a, SOURCE_ID).unwrap();
+        recovery.incoming(OLD_ROW, 7);
+        wait_storage("сообщение B до сброса", || {
+            storage
+                .message(&owner_b, &OLD_ROW.to_string())
+                .unwrap()
+                .is_some()
+                && storage.unread(&owner_b).unwrap() == Some(7)
+        })
+        .await;
+
+        recovery.reject();
+        let (epoch, base, _) = recovery.baseline(PEER);
+        wait_storage(
+            "B получил новую позицию и переподключился",
+            || {
+                server.state.ready.load(Ordering::SeqCst) >= 3
+                    && storage
+                        .cursor(&owner_b, SOURCE_ID)
+                        .unwrap()
+                        .is_some_and(|c| c.epoch_generation == epoch && c.epoch_version == base)
+                    && storage
+                        .message(&owner_b, &OLD_ROW.to_string())
+                        .unwrap()
+                        .is_none()
+                    && storage.unread(&owner_b).unwrap() == Some(7)
+            },
+        )
+        .await;
+
+        recovery.incoming(FRESH_ROW, 8);
+        wait_storage(
+            "новое сообщение B записано после восстановления",
+            || {
+                storage
+                    .message(&owner_b, &FRESH_ROW.to_string())
+                    .unwrap()
+                    .is_some()
+                    && storage.unread(&owner_b).unwrap() == Some(8)
+            },
+        )
+        .await;
+        if changed_epoch {
+            recovery.event(
+                3,
+                "message",
+                "updated",
+                json!({
+                    "kind":"message.updated","uuid":FRESH_ROW,
+                    "payload":{"kind":"markdown","content":"Обновлённая строка"},
+                }),
+            );
+            wait_storage("правка B после смены эпохи", || {
+                storage
+                    .message(&owner_b, &FRESH_ROW.to_string())
+                    .unwrap()
+                    .is_some_and(|row| row.text == "Обновлённая строка")
+            })
+            .await;
+            recovery.event(
+                4,
+                "message",
+                "deleted",
+                json!({"kind":"message.deleted","uuid":FRESH_ROW}),
+            );
+            wait_storage(
+                "удаление B после смены эпохи",
+                || {
+                    storage
+                        .message(&owner_b, &FRESH_ROW.to_string())
+                        .unwrap()
+                        .is_none()
+                },
+            )
+            .await;
+            recovery.event(5, "message", "created", json!({
+                "kind":"message.created","uuid":OLD_ROW,"source_name":"native",
+                "is_own":false,"read":false,"author_uuid":USER,"stream_uuid":STREAM,"topic_uuid":TOPIC,
+                "payload":{"kind":"markdown","content":"Другая строка"},
+            }));
+            wait_storage(
+                "другая строка B перед отзывом",
+                || {
+                    storage
+                        .message(&owner_b, &OLD_ROW.to_string())
+                        .unwrap()
+                        .is_some()
+                },
+            )
+            .await;
+            recovery.event(
+                6,
+                "stream",
+                "deleted",
+                json!({"kind":"stream.deleted","uuid":STREAM}),
+            );
+            wait_storage(
+                "отзыв доступа очищает историю B",
+                || {
+                    storage
+                        .message(&owner_b, &OLD_ROW.to_string())
+                        .unwrap()
+                        .is_none()
+                },
+            )
+            .await;
+        }
+        assert_eq!(storage.cursor(&owner_a, SOURCE_ID).unwrap(), cursor_a);
+        assert_eq!(storage.unread(&owner_a).unwrap(), Some(4));
+        assert!(
+            storage
+                .message(&owner_a, &PEER_ROW.to_string())
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(runtime.shutdown().await, RuntimeExit::Clean);
+    }
 }

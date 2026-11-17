@@ -37,7 +37,7 @@ pub(in crate::gpui_client) fn disable_state_restoration() {
 
 /// Удостоверяет главный поток перед вызовами AppKit.
 pub(super) fn main_thread() -> Option<MainThreadMarker> {
-    // В сборке GPUI без Iced типизированный API NSThread не включён.
+    // Типизированный API NSThread не включён в зависимостях клиента.
     let is_main: Bool = unsafe { msg_send![class!(NSThread), isMainThread] };
     if !is_main.as_bool() {
         return None;

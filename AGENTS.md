@@ -1,7 +1,7 @@
 # Workspace Desktop
 
 - `crates/workspace-core` содержит контекст Workspace, авторизацию и тесты жизненного цикла сессии.
-- `crates/workspace-desktop` подключает системные адаптеры и содержит UI-компоненты Iced.
+- `crates/workspace-desktop` подключает системные адаптеры и содержит окно и компоненты GPUI.
 - [Архитектура](docs/plans/workspace-desktop-architecture.md) и [контракт авторизации](docs/plans/modules/auth.md) описывают границы модулей.
 - [Дорожная карта](docs/plans/workspace-desktop-roadmap.md) ведёт от текущего блока к сценариям, контрактам и карточкам задач.
 
@@ -15,7 +15,7 @@
 
 ## Запуск приложения
 
-Окно и команда `workspace-auth sync` запускают фоновую работу через `workspace_core::bootstrap::run`. Порядок начальной загрузки описывай в [Bootstrap](docs/plans/workspace-desktop-architecture.md#bootstrap), а запросы, обработку и хранение данных оставляй в модуле, который ими владеет.
+Окно и команда `workspace-auth sync` используют общий запуск `workspace_core::bootstrap`. Порядок начальной загрузки описывай в [Bootstrap](docs/plans/workspace-desktop-architecture.md#bootstrap), а запросы, обработку и хранение данных оставляй в модуле, который ими владеет.
 
 ## Комментарии к коду
 
@@ -28,7 +28,7 @@
 
 ## Работа с UI
 
-- Новые экраны и компоненты реализуй на **GPUI**. Начинай со среза, предусмотренного [планом перехода](docs/plans/workspace-desktop-roadmap.md#предлагаемый-переход-на-gpui). Текущий код на Iced используй как референс поведения или меняй по задаче, которая явно относится к действующему клиенту.
+- Новые экраны и компоненты реализуй на **GPUI**. Границы рабочего клиента описаны в [архитектуре](docs/plans/workspace-desktop-architecture.md).
 - Для проектирования, реализации или ревью компонентов и экранов используй [Workspace Desktop UI](skills/workspace-desktop-ui/SKILL.md).
 - Когда для задачи нужен актуальный макет, используй [Workspace Desktop Figma Bridge](skills/workspace-desktop-figma-bridge/SKILL.md), даже если Figma не упомянута.
 
@@ -55,6 +55,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo test --workspace --no-default-features
+cargo test -p workspace-desktop --features gpui-test --all-targets
 ```
 
-[Запуск авторизации без окна](docs/plans/modules/auth.md#запуск-без-окна) описывает проверку на тестовом стенде. Галерея Iced запускается командой `cargo run -p workspace-desktop --example ui_gallery`.
+[Запуск авторизации без окна](docs/plans/modules/auth.md#запуск-без-окна) описывает проверку на тестовом стенде. На macOS окно запускается командой `cargo run -p workspace-desktop --bin workspace-desktop`, галерея — `cargo run -p workspace-desktop --example ui_gallery`.
