@@ -21,6 +21,9 @@ use crate::gpui_client::{
 
 use super::*;
 
+#[path = "../history/stability.rs"]
+mod stability;
+
 const MESSAGE: Uuid = Uuid::from_u128(2001);
 const TOPIC: Uuid = Uuid::from_u128(2002);
 
@@ -151,6 +154,18 @@ fn publish(
     outbox: Vec<OutboxEntry>,
     ui: &mut VisualTestContext,
 ) {
+    publish_with_older(requests, expected, messages, outbox, HistoryEdge::End, ui);
+}
+
+/// Публикует окно истории, сохраняя возможность открыть страницу сверху.
+fn publish_with_older(
+    requests: &Requests,
+    expected: Load,
+    messages: Vec<HistoryMessage>,
+    outbox: Vec<OutboxEntry>,
+    older: HistoryEdge,
+    ui: &mut VisualTestContext,
+) {
     let Request {
         input: (address, load),
         reply,
@@ -165,7 +180,7 @@ fn publish(
                     window: HistoryWindow {
                         id: 7,
                         scope,
-                        older: HistoryEdge::End,
+                        older,
                         newer: HistoryEdge::End,
                         needs_refresh: false,
                         messages
