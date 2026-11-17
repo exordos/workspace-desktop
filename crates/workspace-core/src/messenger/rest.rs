@@ -1065,6 +1065,10 @@ struct WireTopic {
     user_uuid: Option<String>,  // Пользователь, если он есть в ответе.
     is_done: Option<bool>,      // Закрытие темы, неизвестно у старых ответов.
     notification_mode: TopicNotificationMode, // Настройка уведомлений темы.
+    unread_count: Option<u32>,  // Общий счётчик, может отсутствовать в старом ответе.
+    active_unread_count: Option<u32>, // Счётчик сообщений с уведомлениями.
+    passive_unread_count: Option<u32>, // Счётчик остальных непрочитанных.
+    summary: Option<String>,    // Текст последней серверной сводки.
 }
 
 impl WireTopic {

@@ -319,6 +319,18 @@ impl WireTopic {
                 name: required_title(self.name)?,
                 done: self.is_done.unwrap_or_default(),
                 notification_mode: self.notification_mode,
+                unread_count: self.unread_count.unwrap_or_default(),
+                active_unread_count: self
+                    .active_unread_count
+                    .or(self.unread_count)
+                    .unwrap_or_default(),
+                passive_unread_count: self.passive_unread_count.unwrap_or_default(),
+                summary: self
+                    .summary
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned),
             },
         ))
     }
@@ -473,6 +485,71 @@ fn avatar_signature_matches(format: SidebarAvatarFormat, bytes: &[u8]) -> bool {
         SidebarAvatarFormat::Gif => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
         SidebarAvatarFormat::Webp => {
             bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP")
+        }
+    }
+}
+
+#[cfg(test)]
+mod topic_tests {
+    use super::*;
+
+    /// Входящее сообщение и чтение меняют счётчики в журнале и сохраняют серверную сводку.
+    #[test]
+    fn topic_snapshots_include_recipient_counters_and_summary() {
+        let owner = OwnerContext {
+            account_id: crate::context::AccountId("account".into()),
+            server: "https://workspace.test".into(),
+            organization_id: "organization".into(),
+            project_id: "project".into(),
+            user_id: "recipient".into(),
+        };
+        let stream_id = Uuid::new_v4();
+        let topic_id = Uuid::new_v4();
+        for (action, raw, active, passive, summary) in [
+            ("updated", 4, 1, 3, Some("  Серверная сводка  ")),
+            ("read", 0, 0, 0, Some("  Серверная сводка  ")),
+            ("updated", 0, 0, 0, None),
+        ] {
+            let event = serde_json::json!({
+                "schema_version": 1,
+                "uuid": Uuid::new_v4(),
+                "epoch_version": 7,
+                "project_id": owner.project_id,
+                "user_uuid": owner.user_id,
+                "object_type": "topic",
+                "action": action,
+                "payload": {
+                    "kind": format!("topic.{action}"),
+                    "uuid": topic_id,
+                    "project_id": owner.project_id,
+                    "user_uuid": owner.user_id,
+                    "stream_uuid": stream_id,
+                    "name": "Тема",
+                    "notification_mode": "default",
+                    "unread_count": raw,
+                    "active_unread_count": active,
+                    "passive_unread_count": passive,
+                    "summary": summary,
+                },
+            });
+            let (event, _) = wire_event(event, &owner, "generation").unwrap();
+            let Event::SidebarChanged {
+                change:
+                    SidebarChange::Topic {
+                        stream_id: actual_stream,
+                        topic,
+                    },
+                ..
+            } = event
+            else {
+                panic!("expected a topic snapshot");
+            };
+            assert_eq!(actual_stream, stream_id);
+            assert_eq!(topic.id, topic_id);
+            assert_eq!(topic.unread_count, raw);
+            assert_eq!(topic.active_unread_count, active);
+            assert_eq!(topic.passive_unread_count, passive);
+            assert_eq!(topic.summary.as_deref(), summary.map(str::trim));
         }
     }
 }
