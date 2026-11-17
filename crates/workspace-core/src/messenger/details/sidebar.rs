@@ -127,12 +127,21 @@ pub enum SidebarChange {
 /// Часть снимка стрима, которую можно обновить из обычного события.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SidebarStreamMetadata {
-    pub(in crate::messenger) name: String, // Название стрима.
+    pub(in crate::messenger) kind: SidebarStreamKind, // Тип стрима для проверки пригодности старого снимка.
+    pub(in crate::messenger) name: String,            // Название стрима.
     pub(in crate::messenger) description: Option<String>, // Заполненное описание стрима.
-    pub(in crate::messenger) color: Option<u32>, // Цвет значка RGB.
-    pub(in crate::messenger) invite_only: bool, // Признак доступа по приглашению.
+    pub(in crate::messenger) color: Option<u32>,      // Цвет значка RGB.
+    pub(in crate::messenger) invite_only: bool,       // Признак доступа по приглашению.
     pub(in crate::messenger) notification_mode: StreamNotificationMode, // Настройка подписчика.
-    pub(in crate::messenger) can_add_members: bool, // Текущий пользователь владеет стримом.
+    pub(in crate::messenger) can_add_members: bool,   // Текущий пользователь владеет стримом.
+}
+
+/// Тип карточки, выведенный из подтверждённых полей стрима.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::messenger) enum SidebarStreamKind {
+    Peer(Uuid),  // Личка с подтверждённым UUID собеседника.
+    Channel,     // Стрим с темами и участниками.
+    Unsupported, // Стрим другого типа или с включённым шифрованием.
 }
 
 type SidebarKey = (OwnerContext, SessionGeneration, Uuid);
@@ -156,6 +165,15 @@ struct CachedSidebar {
     details: Option<Arc<SidebarDetails>>, // Полный снимок, пригодный для повторного открытия.
     revoked: bool, // Сервер сообщил, что подписка текущего пользователя удалена.
     loading: Option<SidebarLoad>, // Общий результат для ожидающих экземпляров панели.
+    pending: HashMap<SidebarPatchKey, SidebarChange>, // Последние снимки сущностей, принятые во время HTTP.
+}
+
+/// Позволяет сохранить одно последнее изменение каждой сущности во время чтения REST.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SidebarPatchKey {
+    Stream,        // Метаданные родительского стрима.
+    Topic(Uuid),   // UUID изменённой или удалённой темы.
+    Profile(Uuid), // UUID изменённого профиля.
 }
 
 type SidebarResult = Result<Arc<SidebarDetails>, DetailsError>;
@@ -219,6 +237,7 @@ impl SidebarCache {
             {
                 let mut state = entry.state.lock().expect("sidebar entry");
                 state.details = None;
+                state.pending.clear();
                 if stream_id.is_none() || revoked {
                     state.revoked = revoked;
                 }
@@ -253,15 +272,32 @@ impl CachedSidebar {
             }) => return false,
             _ => {}
         }
-        // При загрузке ещё неизвестен состав, поэтому защищаем и ответ справочника.
         let Some(details) = &self.details else {
-            if !self.revoked {
-                self.revision += 1;
+            if self.revoked || self.loading.is_none() {
+                return false;
             }
+            let key = match change {
+                SidebarChange::Stream { .. } => SidebarPatchKey::Stream,
+                SidebarChange::Topic { topic, .. } => SidebarPatchKey::Topic(topic.id),
+                SidebarChange::RemoveTopic { topic_id, .. } => SidebarPatchKey::Topic(*topic_id),
+                SidebarChange::Profile { user_id, .. } => SidebarPatchKey::Profile(*user_id),
+                SidebarChange::Membership(_) | SidebarChange::MembershipBinding(_) => {
+                    // Привязки могут меняться между страницами. Тогда читаем весь состав заново.
+                    self.revision += 1;
+                    return false;
+                }
+            };
+            self.pending.insert(key, change.clone());
             return false;
         };
         let updated = match change {
             SidebarChange::Membership(_) | SidebarChange::MembershipBinding(_) => None,
+            SidebarChange::Stream { metadata, .. } if details.kind() != metadata.kind => None,
+            SidebarChange::Profile { user_id, profile }
+                if !details.needs_profile(*user_id, profile) =>
+            {
+                return false;
+            }
             _ => {
                 let mut next = (**details).clone();
                 next.apply(change);
@@ -278,6 +314,24 @@ impl CachedSidebar {
 }
 
 impl SidebarDetails {
+    /// Сверяет тип готового снимка с обновлённым описанием стрима.
+    fn kind(&self) -> SidebarStreamKind {
+        match self {
+            Self::Peer(peer) => SidebarStreamKind::Peer(peer.user_id),
+            Self::Channel(_) => SidebarStreamKind::Channel,
+        }
+    }
+
+    /// Проверяет, повлияет ли обновление профиля на хотя бы одну строку панели.
+    fn needs_profile(&self, user_id: Uuid, profile: &UserProfile) -> bool {
+        match self {
+            Self::Peer(peer) => peer.user_id == user_id && &peer.profile != profile,
+            Self::Channel(channel) => channel.members.iter().any(|member| {
+                member.user_id == user_id && member.profile.as_ref() != Some(profile)
+            }),
+        }
+    }
+
     /// Переносит поля из полного события в готовую карточку.
     fn apply(&mut self, change: &SidebarChange) {
         match (self, change) {
@@ -363,7 +417,9 @@ impl MessengerSource {
             tokio::spawn(async move {
                 let result =
                     load_sidebar(&rest, &auth, &owner, generation, stream_id, &entry).await;
-                entry.state.lock().expect("sidebar entry").loading = None;
+                let mut state = entry.state.lock().expect("sidebar entry");
+                state.loading = None;
+                state.pending.clear();
                 send.send_replace(Some(result));
             });
             SidebarRead::Loading(receive)
@@ -401,7 +457,8 @@ async fn load_sidebar(
 ) -> SidebarResult {
     for _ in 0..3 {
         let revision = auth.with_active_generation(owner, generation, || {
-            let state = entry.state.lock().expect("sidebar entry");
+            let mut state = entry.state.lock().expect("sidebar entry");
+            state.pending.clear();
             if state.revoked {
                 Err(DetailsError::AccessLost)
             } else {
@@ -420,7 +477,17 @@ async fn load_sidebar(
             if state.revision != revision {
                 return None;
             }
-            Some(result.map(|details| {
+            let pending = std::mem::take(&mut state.pending);
+            if let (Ok(details), Some(SidebarChange::Stream { metadata, .. })) =
+                (&result, pending.get(&SidebarPatchKey::Stream))
+                && details.kind() != metadata.kind
+            {
+                return None;
+            }
+            Some(result.map(|mut details| {
+                for change in pending.values() {
+                    details.apply(change);
+                }
                 let details = Arc::new(details);
                 state.details = Some(details.clone());
                 details
@@ -555,4 +622,117 @@ pub fn sidebar_profile_link(owner: &OwnerContext, user_id: Uuid) -> Result<Strin
     let mut url = super::super::rest::workspace_origin(owner)?;
     url.set_fragment(Some(&format!("user/{user_id}")));
     Ok(url.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::AccountId;
+
+    /// Готовит два разделённых контекста с одинаковым ID канала.
+    fn owner(login: &str) -> OwnerContext {
+        OwnerContext {
+            account_id: AccountId(login.into()),
+            server: "https://workspace.test".into(),
+            organization_id: "test".into(),
+            project_id: "project".into(),
+            user_id: login.into(),
+        }
+    }
+
+    /// Даёт снимок канала, который сервер присылает после смены счётчика или названия.
+    fn stream_details(id: Uuid, name: &str, created: bool) -> SidebarChange {
+        SidebarChange::Stream {
+            id,
+            created,
+            metadata: SidebarStreamMetadata {
+                kind: SidebarStreamKind::Channel,
+                name: name.into(),
+                description: None,
+                color: None,
+                invite_only: false,
+                notification_mode: StreamNotificationMode::AllMessages,
+                can_add_members: false,
+            },
+        }
+    }
+
+    /// Заполняет кэш полученным снимком, чтобы проверить обновления без повторного HTTP.
+    fn fill_channel(entry: &SidebarEntry) {
+        entry.state.lock().unwrap().details =
+            Some(Arc::new(SidebarDetails::Channel(ChannelSidebar {
+                name: "Канал".into(),
+                description: None,
+                color: None,
+                invite_only: false,
+                notification_mode: StreamNotificationMode::AllMessages,
+                can_add_members: false,
+                topics: Vec::new(),
+                members: Vec::new(),
+            })));
+    }
+
+    /// Смена счётчика сохраняет тот же снимок, а переименование обновляет только свой аккаунт.
+    #[test]
+    fn applies_metadata_without_refetching_or_crossing_accounts() {
+        let cache = SidebarCache::default();
+        let first = owner("first");
+        let second = owner("second");
+        let id = Uuid::new_v4();
+        let generation = SessionGeneration(1);
+        let first_entry = cache.entry(&first, generation, id);
+        let second_entry = cache.entry(&second, generation, id);
+        fill_channel(&first_entry);
+        fill_channel(&second_entry);
+        assert!(
+            cache
+                .apply(&first, generation, &stream_details(id, "Канал", false))
+                .is_empty()
+        );
+        assert_eq!(
+            cache.apply(&first, generation, &stream_details(id, "Другое имя", false)),
+            [id]
+        );
+        let right_name = |entry: &SidebarEntry, name: &str| {
+            matches!(
+                entry.state.lock().unwrap().details.as_deref(),
+                Some(SidebarDetails::Channel(channel)) if channel.name == name,
+            )
+        };
+        assert!(right_name(&first_entry, "Другое имя"));
+        assert!(right_name(&second_entry, "Канал"));
+        assert_eq!(
+            cache.apply(&first, generation, &SidebarChange::Membership(id)),
+            [id]
+        );
+        assert!(first_entry.state.lock().unwrap().details.is_none());
+        assert!(right_name(&second_entry, "Канал"));
+    }
+
+    /// Отзыв доступа перебивает ожидающий ответ и поздний успех команды.
+    #[test]
+    fn revoke_survives_refresh_until_server_grants_stream_again() {
+        let cache = SidebarCache::default();
+        let owner = owner("first");
+        let id = Uuid::new_v4();
+        let generation = SessionGeneration(1);
+        let entry = cache.entry(&owner, generation, id);
+        fill_channel(&entry);
+        cache.invalidate(&owner, generation, Some(id), true);
+        cache.invalidate(&owner, generation, Some(id), false);
+        assert!(
+            cache
+                .apply(&owner, generation, &stream_details(id, "Канал", false))
+                .is_empty()
+        );
+        {
+            let state = entry.state.lock().unwrap();
+            assert!(state.revoked);
+            assert!(state.details.is_none());
+            assert_eq!(state.revision, 2);
+        }
+        let next = cache.entry(&owner, SessionGeneration(2), id);
+        assert!(!next.state.lock().unwrap().revoked);
+        assert!(!Arc::ptr_eq(&entry, &next));
+    }
 }

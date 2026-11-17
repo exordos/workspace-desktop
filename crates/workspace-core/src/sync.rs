@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::{
     auth::{Auth, AuthError},
     context::{OwnerContext, SessionGeneration},
-    messenger::details::{SidebarCache, SidebarChange},
+    messenger::details::{AvatarCache, SidebarCache, SidebarChange},
     notification_target::{NotificationTarget, NotificationTargetError},
     storage::{
         Cursor, DeliveryStatus, EventWrite, HistoryChange, HistoryMessage, HistoryMetadata,
@@ -184,9 +184,10 @@ pub enum PrepareSendError {
 
 /// Проверяет право сессии на запись и передаёт события в хранилище.
 pub struct Sync {
+    pub(crate) avatar_cache: AvatarCache, // Временные файлы аватаров по владельцу и сессии.
     pub(crate) sidebar_cache: SidebarCache, // Временные снимки панелей на время сессии.
-    auth: Auth,            // Авторизация для проверки владельца и поколения сессии.
-    storage: Arc<Storage>, // Общая локальная база сообщений, позиций и счётчиков.
+    auth: Auth,                           // Авторизация для проверки владельца и поколения сессии.
+    storage: Arc<Storage>,                // Общая локальная база сообщений, позиций и счётчиков.
     updates: broadcast::Sender<SyncUpdate>, // Канал изменений. Оформление окна получает их после записи.
 }
 
@@ -197,6 +198,7 @@ impl Sync {
             auth,
             storage,
             sidebar_cache: SidebarCache::default(),
+            avatar_cache: AvatarCache::default(),
             updates: broadcast::channel(128).0,
         }
     }
@@ -625,6 +627,16 @@ impl Sync {
                 },
             },
         );
+    }
+
+    /// Освобождает сведения и изображения после завершения сессии.
+    pub(crate) fn clear_sidebar_session(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+    ) {
+        self.sidebar_cache.clear_session(owner, generation);
+        self.avatar_cache.clear_session(owner, generation);
     }
 
     /// Перечитывает панель после подтверждённого действия текущего пользователя.

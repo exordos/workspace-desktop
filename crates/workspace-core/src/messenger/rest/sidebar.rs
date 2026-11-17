@@ -8,8 +8,9 @@ use serde::Serialize;
 
 use super::*;
 use crate::messenger::details::{
-    ChannelSidebar, DirectSidebar, SidebarChange, SidebarDetails, SidebarMember,
-    SidebarStreamMetadata, SidebarTopic, StreamRole,
+    ChannelSidebar, DirectSidebar, SidebarAvatar, SidebarAvatarFormat, SidebarChange,
+    SidebarDetails, SidebarMember, SidebarStreamKind, SidebarStreamMetadata, SidebarTopic,
+    StreamRole,
 };
 
 const BINDINGS_PATH: &str = "/api/workspace/v1/messenger/stream_bindings/";
@@ -56,29 +57,21 @@ impl RestClient {
             stream.user_uuid.as_deref(),
         )?;
         let current_user = parse_uuid(&owner.user_id).ok_or(SourceError::InvalidResponse)?;
-        if !matches!(stream.encryption, Some(Value::Bool(false))) {
-            return Err(DetailsError::Unsupported);
-        }
-
-        if stream.private {
-            let user_id = stream
-                .direct_user_uuid
-                .as_deref()
-                .and_then(parse_uuid)
-                .ok_or(DetailsError::Unsupported)?;
-            let profile = self
-                .sidebar_profile(owner, token, user_id)
-                .await?
-                .ok_or(DetailsError::ProfileUnavailable)?;
-            return Ok(SidebarDetails::Peer(DirectSidebar {
-                user_id,
-                profile,
-                is_self: user_id == current_user,
-                notification_mode: stream.notification_mode,
-            }));
-        }
-        if stream.direct_user_uuid.is_some() {
-            return Err(DetailsError::Unsupported);
+        match stream.sidebar_kind() {
+            SidebarStreamKind::Peer(user_id) => {
+                let profile = self
+                    .sidebar_profile(owner, token, user_id)
+                    .await?
+                    .ok_or(DetailsError::ProfileUnavailable)?;
+                return Ok(SidebarDetails::Peer(DirectSidebar {
+                    user_id,
+                    profile,
+                    is_self: user_id == current_user,
+                    notification_mode: stream.notification_mode,
+                }));
+            }
+            SidebarStreamKind::Channel => {}
+            SidebarStreamKind::Unsupported => return Err(DetailsError::Unsupported),
         }
 
         let metadata = stream.sidebar_metadata(owner)?;
@@ -273,9 +266,24 @@ impl RestClient {
 }
 
 impl WireStream {
+    /// Проверяет тип стрима и доступность данных обычного разговора.
+    fn sidebar_kind(&self) -> SidebarStreamKind {
+        if !matches!(self.encryption, Some(Value::Bool(false))) {
+            return SidebarStreamKind::Unsupported;
+        }
+        match (self.private, self.direct_user_uuid.as_deref()) {
+            (true, Some(peer)) => parse_uuid(peer)
+                .filter(|id| !id.is_nil())
+                .map_or(SidebarStreamKind::Unsupported, SidebarStreamKind::Peer),
+            (_, None) => SidebarStreamKind::Channel,
+            _ => SidebarStreamKind::Unsupported,
+        }
+    }
+
     /// Оставляет только поля, важные для панели, без счётчиков и UUID последнего сообщения.
     fn sidebar_metadata(&self, owner: &OwnerContext) -> Result<SidebarStreamMetadata, SourceError> {
         Ok(SidebarStreamMetadata {
+            kind: self.sidebar_kind(),
             name: required_title(self.name.clone())?,
             description: self
                 .description
@@ -378,5 +386,110 @@ pub(super) fn wire_sidebar_change(
             })
         }
         _ => None,
+    }
+}
+
+const AVATAR_BYTE_LIMIT: usize = 25 * 1024 * 1024;
+
+impl RestClient {
+    /// Читает изображение только с текущего HTTPS-сервера, ограничивает тело и проверяет формат.
+    pub(in crate::messenger) async fn sidebar_avatar(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        file_id: Uuid,
+    ) -> Result<SidebarAvatar, DetailsError> {
+        if file_id.is_nil() {
+            return Err(SourceError::InvalidResponse.into());
+        }
+        let mut url = workspace_origin(owner)?;
+        url.set_path(&format!(
+            "/api/workspace/v1/messenger/files/{file_id}/actions/download"
+        ));
+        let mut response = self
+            .read
+            .get(url)
+            .bearer_auth(token)
+            .header(ACCEPT, "image/png, image/jpeg, image/gif, image/webp")
+            .send()
+            .await
+            .map_err(request_error)?;
+        if matches!(
+            response.status(),
+            StatusCode::NOT_FOUND | StatusCode::FORBIDDEN
+        ) {
+            return Err(DetailsError::ProfileUnavailable);
+        }
+        check_status(response.status())?;
+        let format = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|header| header.to_str().ok())
+            .and_then(avatar_format)
+            .ok_or(SourceError::InvalidResponse)?;
+        if response
+            .content_length()
+            .is_some_and(|size| size > AVATAR_BYTE_LIMIT as u64)
+        {
+            return Err(SourceError::InvalidResponse.into());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(request_error)? {
+            if chunk.len() > AVATAR_BYTE_LIMIT - bytes.len() {
+                return Err(SourceError::InvalidResponse.into());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if !avatar_signature_matches(format, &bytes) {
+            return Err(SourceError::InvalidResponse.into());
+        }
+        Ok(SidebarAvatar { format, bytes })
+    }
+}
+
+/// Принимает MIME только из набора, разрешённого для аватаров сервером.
+fn avatar_format(content_type: &str) -> Option<SidebarAvatarFormat> {
+    match content_type
+        .split(';')
+        .next()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/png" => Some(SidebarAvatarFormat::Png),
+        "image/jpeg" | "image/jpg" => Some(SidebarAvatarFormat::Jpeg),
+        "image/gif" => Some(SidebarAvatarFormat::Gif),
+        "image/webp" => Some(SidebarAvatarFormat::Webp),
+        _ => None,
+    }
+}
+
+/// Сверяет начальные байты файла с MIME, прежде чем передать их графическому декодеру.
+fn avatar_signature_matches(format: SidebarAvatarFormat, bytes: &[u8]) -> bool {
+    match format {
+        SidebarAvatarFormat::Png => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        SidebarAvatarFormat::Jpeg => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        SidebarAvatarFormat::Gif => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        SidebarAvatarFormat::Webp => {
+            bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP")
+        }
+    }
+}
+
+#[cfg(test)]
+mod avatar_tests {
+    use super::*;
+
+    /// Пропускает только согласованный MIME и подпись форматов, разрешённых Workspace.
+    #[test]
+    fn validates_avatar_formats() {
+        let png = avatar_format("image/png; charset=binary").unwrap();
+        assert!(avatar_signature_matches(png, b"\x89PNG\r\n\x1a\n"));
+        assert!(!avatar_signature_matches(png, b"GIF89a"));
+        assert_eq!(avatar_format("image/svg+xml"), None);
+        assert!(!avatar_signature_matches(
+            SidebarAvatarFormat::Webp,
+            b"RIFF"
+        ));
     }
 }

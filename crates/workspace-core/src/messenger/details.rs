@@ -59,5 +59,7 @@ impl MessengerSource {
     }
 }
 
+mod avatars;
 mod sidebar;
+pub use avatars::*;
 pub use sidebar::*;

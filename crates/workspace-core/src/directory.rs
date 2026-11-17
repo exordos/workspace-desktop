@@ -15,6 +15,17 @@ pub struct UserProfile {
     pub created_at: Option<String>,        // Время появления в каталоге, в формате API.
 }
 
+impl UserProfile {
+    /// Возвращает UUID файла, если аватар хранится внутри Workspace.
+    pub fn avatar_file_id(&self) -> Option<Uuid> {
+        self.avatar
+            .as_deref()?
+            .strip_prefix("urn:image:")
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .filter(|id| !id.is_nil())
+    }
+}
+
 /// Известные значения присутствия из Workspace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProfilePresence {

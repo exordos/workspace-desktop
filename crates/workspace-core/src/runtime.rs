@@ -232,8 +232,7 @@ impl Runtime {
                 && current.is_none_or(|session| session.generation != task.generation)
             {
                 self.sync
-                    .sidebar_cache
-                    .clear_session(&key.context, task.generation);
+                    .clear_sidebar_session(&key.context, task.generation);
             }
             if current.is_none_or(|session| {
                 session.generation != task.generation || session.token_version != task.token_version
