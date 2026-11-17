@@ -1,11 +1,7 @@
 //! Проверяет ввод, геометрию редактора и отправку через рабочий экран разговора.
 
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::{Arc, mpsc},
     time::Duration,
 };
 
@@ -29,24 +25,26 @@ const MESSAGE: Uuid = Uuid::from_u128(2001);
 const TOPIC: Uuid = Uuid::from_u128(2002);
 
 impl Conversation {
-    /// Отклоняет первую запись, затем снова использует рабочий источник отправки.
-    pub(in crate::gpui_client) fn fail_first_queue_write(&mut self) -> Entity<Composer> {
+    /// Подставляет отказ записи и возвращает действие для восстановления рабочего источника.
+    pub(in crate::gpui_client) fn fail_queue_write(
+        &mut self,
+    ) -> (Entity<Composer>, impl FnOnce(&mut Self) + use<>) {
         let sending = self.sending.as_mut().unwrap();
-        let save = sending.source.save.clone();
-        let first = AtomicBool::new(true);
-        sending.source.save = Arc::new(move |submission| {
-            if first.swap(false, Ordering::Relaxed) {
+        let previous = std::mem::replace(
+            &mut sending.source.save,
+            Arc::new(|submission| {
                 Box::pin(async move {
                     ConversationReply {
                         address: submission.address,
                         value: None,
                     }
                 })
-            } else {
-                save(submission)
-            }
-        });
-        sending.view.clone()
+            }),
+        );
+        let restore = move |conversation: &mut Self| {
+            conversation.sending.as_mut().unwrap().source.save = previous;
+        };
+        (sending.view.clone(), restore)
     }
 }
 

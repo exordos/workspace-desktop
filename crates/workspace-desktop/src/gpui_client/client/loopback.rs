@@ -625,8 +625,8 @@ fn catalog_click_and_submission_reach_https_queue(cx: &mut TestAppContext) {
         assert!(ui.debug_bounds("workspace-composer-editor").is_some());
     }
 
-    let composer = ui.update(|_, app| {
-        conversation.update(app, |conversation, _| conversation.fail_first_queue_write())
+    let (composer, restore_save) = ui.update(|_, app| {
+        conversation.update(app, |conversation, _| conversation.fail_queue_write())
     });
     let before = ui.debug_bounds("workspace-composer-editor").unwrap();
     assert!(
@@ -668,6 +668,7 @@ fn catalog_click_and_submission_reach_https_queue(cx: &mut TestAppContext) {
         composer.draft(app) == MARKER && composer.editor().focus_handle(app).is_focused(window)
     }));
 
+    ui.update(|_, app| conversation.update(app, |conversation, _| restore_save(conversation)));
     click(ui, "conversation-send");
     until(ui, "одна отправка по HTTPS", |_| {
         !server.state.sent.lock().unwrap().is_empty()
