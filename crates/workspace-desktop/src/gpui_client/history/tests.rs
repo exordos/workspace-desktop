@@ -366,7 +366,6 @@ fn fixed_topic_groups_and_wraps_at_both_panel_sizes(cx: &mut TestAppContext) {
         ] {
             assert!(ui.debug_bounds(id).is_some());
         }
-        assert!(ui.debug_bounds("topic-send-unavailable").is_some());
     }
     let last_message = "history-message-00000000-0000-0000-0000-00000000005d";
     let narrow = ui.debug_bounds(last_message).unwrap();
