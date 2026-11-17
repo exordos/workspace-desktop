@@ -55,7 +55,16 @@ impl Avatar {
             AvatarSize::Small => 32.,
             AvatarSize::Medium => 40.,
         };
-        let size = px(diameter);
+        self.render_at(palette, px(diameter), palette.background)
+    }
+
+    /// Рисует аватар указанного размера и цвета для карточки профиля или канала.
+    pub(in crate::gpui_client) fn render_at(
+        self,
+        palette: Palette,
+        size: gpui::Pixels,
+        background: gpui::Hsla,
+    ) -> Div {
         let presence = match self.presence {
             AvatarPresence::Hidden => None,
             AvatarPresence::Online => Some(palette.presence_online),
@@ -71,12 +80,20 @@ impl Avatar {
             .justify_center()
             .rounded_full()
             .overflow_hidden()
-            .bg(palette.background)
+            .bg(background)
             .when(initials.trim().is_empty(), |avatar| {
                 avatar.child(Icon::Account.element(px(20.), palette.text_secondary))
             })
             .when(!initials.trim().is_empty(), |avatar| {
-                avatar.child(label(palette, TextRole::Initials, initials))
+                avatar.child(label(
+                    palette,
+                    if size >= px(48.) {
+                        TextRole::ProfileHeading
+                    } else {
+                        TextRole::Initials
+                    },
+                    initials,
+                ))
             })
             .children(self.image.map(|image| {
                 img(image)
@@ -102,7 +119,7 @@ impl Avatar {
             .child(avatar)
             .children(presence.map(|color| {
                 // Центр метки лежит на окружности под углом 45°, как в Electron.
-                let inset = px(diameter * 0.1465 - 6.);
+                let inset = size * 0.1465 - px(6.);
                 div()
                     .absolute()
                     .right(inset)

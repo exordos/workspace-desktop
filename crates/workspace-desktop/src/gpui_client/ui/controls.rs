@@ -118,7 +118,7 @@ impl Button {
 }
 
 /// Подключает одинаковые события мыши и клавиатуры у кнопок и строк.
-pub(super) fn activate(
+pub(in crate::gpui_client) fn activate(
     element: Stateful<Div>,
     focus: Option<&FocusHandle>,
     palette: Palette,
