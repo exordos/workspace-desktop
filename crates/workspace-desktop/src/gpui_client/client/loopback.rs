@@ -51,6 +51,8 @@ use crate::{
     platform::JsonAccountStore,
 };
 
+use crate::gpui_client::right_panel::{PanelKey, Scope};
+
 const USER: &str = "10000000-0000-4000-8000-000000000001";
 const PEER: &str = "10000000-0000-4000-8000-000000000002";
 const PROJECT: &str = "10000000-0000-4000-8000-000000000003";
@@ -937,7 +939,7 @@ fn catalog_click_and_submission_reach_https_queue(cx: &mut TestAppContext) {
     ui.simulate_keystrokes("tab");
     ui.run_until_parked();
     assert_eq!(
-        ui.update(|window, app| conversation.read(app).tested_details_focus(window)),
+        ui.update(|window, app| conversation.read(app).tested_details_focus(window, app)),
         Some("сведения")
     );
     ui.simulate_keystrokes("tab");
@@ -962,7 +964,7 @@ fn catalog_click_and_submission_reach_https_queue(cx: &mut TestAppContext) {
     ui.simulate_keystrokes("shift-tab");
     ui.run_until_parked();
     assert_eq!(
-        ui.update(|window, app| conversation.read(app).tested_details_focus(window)),
+        ui.update(|window, app| conversation.read(app).tested_details_focus(window, app)),
         Some("сведения")
     );
     ui.simulate_keystrokes("shift-tab");
@@ -1169,6 +1171,41 @@ fn wait_topic_confirmation(
     );
 }
 
+/// Содержимое тестовой панели уровня аккаунта.
+struct AccountPanelFixture(&'static str); // Селектор видимого экрана.
+
+impl gpui::Render for AccountPanelFixture {
+    /// Помечает видимую панель в тестовом окне.
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+        let id = self.0;
+        div().id(id).debug_selector(move || id.into())
+    }
+}
+
+/// Открывает панель уровня аккаунта через тот же API, что и рабочие панели.
+fn open_account_panel(client: &Entity<Client>, ui: &mut VisualTestContext, id: &'static str) {
+    ui.update(|window, app| {
+        let client = client.read(app);
+        let key = PanelKey {
+            scope: Scope::Account(client.shell.selected().unwrap().clone()),
+            id: id.into(),
+        };
+        let opener = client.initial_focus.clone();
+        let panel = client.right_panel.clone();
+        panel.update(app, |panel, cx| {
+            panel.open(
+                key,
+                "Тестовая панель",
+                opener,
+                |cx| cx.new(|_| AccountPanelFixture(id)),
+                window,
+                cx,
+            );
+        });
+    });
+    ui.run_until_parked();
+}
+
 /// Проверяет доступ к профилю, точную тему, закрытие и фокус через обычный Client.
 #[gpui::test]
 fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
@@ -1252,15 +1289,17 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
     );
     assert_eq!(details.users.lock().unwrap().as_slice(), &[(USER, PEER)]);
     ui.read(|app| {
-        let Some(ConversationDetails::Peer(profile)) = first.read(app).tested_details() else {
-            panic!("Ожидался профиль собеседника");
-        };
-        assert_eq!(profile.display_name, "Собеседник A");
-        assert_eq!(profile.email.as_deref(), Some("peer@fixture.test"));
-        assert_eq!(
-            profile.presence,
-            Some(workspace_core::directory::ProfilePresence::Idle)
-        );
+        first.read(app).tested_details(app, |details| {
+            let Some(ConversationDetails::Peer(profile)) = details else {
+                panic!("Ожидался профиль собеседника");
+            };
+            assert_eq!(profile.display_name, "Собеседник A");
+            assert_eq!(profile.email.as_deref(), Some("peer@fixture.test"));
+            assert_eq!(
+                profile.presence,
+                Some(workspace_core::directory::ProfilePresence::Idle)
+            );
+        })
     });
     ui.read(|app| {
         let y = first
@@ -1276,15 +1315,27 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
     assert_eq!(panel.size.width, px(315.));
     assert!(ui.debug_bounds("conversation-chat").unwrap().right() < panel.left());
     assert_eq!(
-        ui.update(|window, app| first.read(app).tested_details_focus(window)),
+        ui.update(|window, app| first.read(app).tested_details_focus(window, app)),
+        Some("закрыть")
+    );
+    open_account_panel(&client, ui, "test-account-main");
+    open_account_panel(&client, ui, "test-account-settings");
+    assert!(ui.debug_bounds("test-account-settings").is_some());
+    assert!(!ui.read(|app| first.read(app).tested_details_is_open(app)));
+    click(ui, "right-panel-back");
+    click(ui, "right-panel-close");
+    assert!(ui.read(|app| first.read(app).tested_details_is_open(app)));
+    assert_eq!(details.users.lock().unwrap().as_slice(), &[(USER, PEER)]);
+    assert_eq!(
+        ui.update(|window, app| first.read(app).tested_details_focus(window, app)),
         Some("закрыть")
     );
     ui.simulate_keystrokes("escape");
     until(ui, "Escape закрыл панель", |ui| {
-        !ui.read(|app| first.read(app).tested_details_is_open())
+        !ui.read(|app| first.read(app).tested_details_is_open(app))
     });
     assert_eq!(
-        ui.update(|window, app| first.read(app).tested_details_focus(window)),
+        ui.update(|window, app| first.read(app).tested_details_focus(window, app)),
         Some("сведения")
     );
     ui.read(|app| assert_eq!(composer.read(app).draft(app), MARKER));
@@ -1314,14 +1365,31 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
     let _ = release.send(());
     ui.run_until_parked();
     ui.read(|app| {
-        assert!(matches!(
-            first.read(app).tested_details(),
-            Some(ConversationDetails::Peer(profile)) if profile.display_name == "Собеседник A"
-        ));
+        first.read(app).tested_details(app, |details| {
+            assert!(matches!(
+                details,
+                Some(ConversationDetails::Peer(profile)) if profile.display_name == "Собеседник A"
+            ));
+        });
     });
 
+    open_account_panel(&client, ui, "test-account-main");
+    open_account_panel(&client, ui, "test-account-settings");
+    click(ui, "right-panel-close-all");
+    ui.read(|app| {
+        assert!(!first.read(app).tested_details_is_open(app));
+        first
+            .read(app)
+            .tested_details(app, |details| assert!(details.is_none()));
+    });
+    assert_eq!(
+        ui.update(|window, app| first.read(app).tested_details_focus(window, app)),
+        Some("сведения")
+    );
+    open_account_panel(&client, ui, "test-account-main");
     click_account(&client, ui, &b_id);
     assert!(ui.read(|app| client.read(app).conversation.is_none()));
+    ui.read(|app| assert!(client.read(app).right_panel.read(app).is_empty()));
     click(ui, CHAT_ROW);
     until(
         ui,
@@ -1337,6 +1405,7 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
                 && ui.debug_bounds("conversation-details-peer").is_some()
         },
     );
+    open_account_panel(&client, ui, "test-account-main");
     ui.simulate_resize(size(px(700.), px(600.)));
     ui.run_until_parked();
     click(ui, CHANNEL_ROW);
@@ -1344,20 +1413,36 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
     click(ui, CHANNEL_TOPIC_ROW);
     let _ = topic_ready(&client, ui, "в B открылась выбранная тема, панель закрыта");
     let topic = ui.read(|app| client.read(app).conversation.as_ref().unwrap().clone());
-    assert!(!ui.read(|app| topic.read(app).tested_details_is_open()));
+    ui.read(|app| {
+        let client = client.read(app);
+        let key = PanelKey {
+            scope: Scope::Account(client.shell.selected().unwrap().clone()),
+            id: "test-account-main".into(),
+        };
+        assert!(client.right_panel.read(app).is_active(&key));
+    });
+    let route_focus = ui.update(|window, app| window.focused(app));
+    click(ui, "right-panel-close");
+    ui.update(|window, _| {
+        if let Some(focus) = route_focus {
+            window.focus(&focus);
+        }
+    });
+    ui.read(|app| assert!(client.read(app).right_panel.read(app).is_empty()));
+    assert!(!ui.read(|app| topic.read(app).tested_details_is_open(app)));
     let chat_before = ui.debug_bounds("conversation-chat").unwrap();
     let composer_before = ui.debug_bounds("workspace-composer-editor").unwrap();
     for _ in 0..8 {
         ui.simulate_keystrokes("tab");
         if ui
-            .update(|window, app| topic.read(app).tested_details_focus(window))
+            .update(|window, app| topic.read(app).tested_details_focus(window, app))
             .is_some()
         {
             break;
         }
     }
     assert_eq!(
-        ui.update(|window, app| topic.read(app).tested_details_focus(window)),
+        ui.update(|window, app| topic.read(app).tested_details_focus(window, app)),
         Some("сведения")
     );
     press_enter(ui);
@@ -1367,11 +1452,13 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
         |ui| ui.debug_bounds("conversation-details-topic").is_some(),
     );
     ui.read(|app| {
-        assert!(matches!(
-            topic.read(app).tested_details(),
-            Some(ConversationDetails::Topic { channel, name, description: Some(description), done: Some(false) })
-                if channel == "Канал UI-12" && name == "Длинная тема" && description == "Описание синтетического канала"
-        ));
+        topic.read(app).tested_details(app, |details| {
+            assert!(matches!(
+                details,
+                Some(ConversationDetails::Topic { channel, name, description: Some(description), done: Some(false) })
+                    if channel == "Канал UI-12" && name == "Длинная тема" && description == "Описание синтетического канала"
+            ));
+        });
     });
     assert_eq!(ui.debug_bounds("conversation-chat").unwrap(), chat_before);
     assert_eq!(
@@ -1383,11 +1470,11 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
     assert!(panel.left() >= chat_before.left());
     ui.simulate_keystrokes("tab shift-tab");
     assert_eq!(
-        ui.update(|window, app| topic.read(app).tested_details_focus(window)),
+        ui.update(|window, app| topic.read(app).tested_details_focus(window, app)),
         Some("закрыть"),
     );
     click(ui, "conversation-details-close");
-    assert!(!ui.read(|app| topic.read(app).tested_details_is_open()));
+    assert!(!ui.read(|app| topic.read(app).tested_details_is_open(app)));
 
     details.denied_topic.store(true, Ordering::SeqCst);
     press_enter(ui);
@@ -1398,7 +1485,7 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
             ui.debug_bounds("history-error").is_some()
                 && ui.read(|app| {
                     let topic = topic.read(app);
-                    !topic.has_access() && !topic.tested_details_is_open()
+                    !topic.has_access() && !topic.tested_details_is_open(app)
                 })
         },
     );
@@ -1529,7 +1616,7 @@ fn explicit_topic_accepts_mouse_and_keyboard_in_each_account(cx: &mut TestAppCon
     ui.simulate_keystrokes("tab");
     let conversation = ui.read(|app| client.read(app).conversation.as_ref().unwrap().clone());
     assert_eq!(
-        ui.update(|window, app| conversation.read(app).tested_details_focus(window)),
+        ui.update(|window, app| conversation.read(app).tested_details_focus(window, app)),
         Some("сведения")
     );
     ui.simulate_keystrokes("tab");

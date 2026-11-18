@@ -26,6 +26,7 @@ use self::{
 use super::{
     composer::{Composer, ComposerEvent, SendSource, Submission},
     contracts::{AccountSession, ChatEntry, ConversationAddress},
+    right_panel::RightPanel,
     runtime::RuntimeClient,
     ui::{Avatar, Button, ButtonAppearance, Icon, Palette, TextRole, ThemeMode, label},
 };
@@ -79,14 +80,15 @@ pub struct Conversation {
 
 impl Conversation {
     /// Создаёт экран и сразу запрашивает историю в адресе, переданном оболочкой.
-    pub fn open(
+    pub(super) fn open(
         address: ConversationAddress,
         runtime: RuntimeClient,
+        right_panel: Entity<RightPanel>,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut view = Self::with_source(address, runtime_source(runtime.clone()), cx);
         view.attach_composer(SendSource::runtime(runtime.clone()), cx);
-        view.details = Some(Panel::new(runtime, cx));
+        view.details = Some(Panel::new(right_panel, view.address.clone(), runtime, cx));
         view
     }
 
@@ -315,8 +317,8 @@ impl Conversation {
 
     /// Очищает недействительные данные и начинает проверку прежней цели заново.
     fn restart(&mut self, cx: &mut Context<Self>) {
-        if let Some(details) = &mut self.details {
-            details.clear();
+        if let Some(details) = &self.details {
+            details.clear(&self.address, None, cx);
         }
         self.invalidate_send_destination(cx);
         self.state = State::Opening;
@@ -330,8 +332,9 @@ impl Conversation {
 
     /// Скрывает историю и делает любые запоздавшие ответы неприменимыми.
     fn fail(&mut self, error: Failure, cx: &mut Context<Self>) {
-        if let Some(details) = &mut self.details {
-            details.clear();
+        if let Some(details) = &self.details {
+            let fallback = matches!(error, Failure::AccessLost).then_some(&self.screen_focus);
+            details.clear(&self.address, fallback, cx);
         }
         self.invalidate_send_destination(cx);
         self.state = State::Failed(error);
@@ -925,15 +928,9 @@ impl Conversation {
 }
 
 impl Render for Conversation {
-    /// Сохраняет историю и редактор на месте при показе правой панели.
+    /// Рисует историю и редактор в рабочей области разговора.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
-        let can_open = self.can_open_details();
-        let chat = self.render_chat(palette, cx);
-        let panel = self.details.as_ref().and_then(|panel| {
-            panel.return_focus_after_clear(window, cx, &self.screen_focus, can_open);
-            panel.render(palette, window.viewport_size().width, cx)
-        });
         div()
             .id("conversation-layout")
             .relative()
@@ -942,8 +939,7 @@ impl Render for Conversation {
             .min_h_0()
             .min_w_0()
             .track_focus(&self.screen_focus)
-            .child(chat)
-            .children(panel)
+            .child(self.render_chat(palette, cx))
     }
 }
 

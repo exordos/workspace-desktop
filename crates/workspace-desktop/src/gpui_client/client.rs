@@ -15,6 +15,7 @@ use super::{
     next_control,
     platform_window::WindowPlatform,
     previous_control,
+    right_panel::{Back, CloseAll, RightPanel},
     runtime::{RuntimeClient, StartupError},
     shell::{Shell, ShellEffect},
     sidebar::{FolderIntent, Sidebar},
@@ -41,6 +42,7 @@ pub(super) struct Client {
     runtime: RuntimeClient,   // Очередь команд рабочего потока этого профиля.
     sidebar: Entity<Sidebar>, // Единственный каталог; хранит поиск каждого входа.
     conversation: Option<Entity<Conversation>>, // Экран актуального адреса, если он открыт.
+    right_panel: Entity<RightPanel>, // Общая история правых панелей рабочего окна.
     sign_in: Option<Entity<SignIn>>, // Форма нужна, пока в профиле нет доступного входа.
     labels: HashMap<AccountId, String>, // Подписи для переключателя и баннеров.
     top_bar: Entity<TopBar>,  // Шапка хранит локальный фокус и показывает снимок оболочки.
@@ -65,6 +67,9 @@ impl Client {
         })
         .detach();
         let top_bar = cx.new(TopBar::new);
+        let initial_focus = cx.focus_handle();
+        let right_panel = cx.new(|cx| RightPanel::new(initial_focus.clone(), cx));
+        cx.observe(&right_panel, |_, _, cx| cx.notify()).detach();
         let selection = cx.subscribe(&top_bar, |client, _, selection: &TopBarSelection, cx| {
             client.handle_action(ShellAction::SelectAccount(selection.0.clone()), cx);
         });
@@ -86,11 +91,12 @@ impl Client {
             runtime,
             sidebar,
             conversation: None,
+            right_panel,
             sign_in: None,
             labels: options.labels,
             top_bar,
             _top_bar_subscription: selection,
-            initial_focus: cx.focus_handle(),
+            initial_focus,
             restore_focus: false,
             ready: false,
             received_accounts: false,
@@ -229,10 +235,21 @@ impl Client {
     /// Выполняет команду оболочки и обновляет связанные части того же окна.
     fn apply(&mut self, effect: Option<ShellEffect>, cx: &mut Context<Self>) {
         let effect = self.reconcile_sign_in(cx).or(effect);
+        let account = self
+            .status()
+            .is_none()
+            .then(|| self.shell.selected())
+            .flatten();
+        let conversation = self.shell.conversation();
+        self.right_panel.update(cx, |panel, cx| {
+            panel.set_context(account, conversation, cx);
+        });
         match effect {
             Some(ShellEffect::OpenConversation(address)) => {
                 let runtime = self.runtime.clone();
-                self.conversation = Some(cx.new(|cx| Conversation::open(address, runtime, cx)));
+                let panel = self.right_panel.clone();
+                self.conversation =
+                    Some(cx.new(|cx| Conversation::open(address, runtime, panel, cx)));
             }
             Some(ShellEffect::CloseConversation) => self.conversation = None,
             Some(ShellEffect::RetryCatalog(session)) => {
@@ -380,6 +397,7 @@ impl Render for Client {
     /// Показывает форму входа или рабочую область с выбранным аккаунтом.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.focus_workspace(window, cx);
+        RightPanel::restore_focus(&self.right_panel, window, cx);
         let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
         let root = div()
             .size_full()
@@ -389,7 +407,17 @@ impl Render for Client {
             .text_color(palette.text)
             .track_focus(&self.initial_focus)
             .on_action(next_control)
-            .on_action(previous_control);
+            .on_action(previous_control)
+            .on_action(cx.listener(|client, _: &Back, window, cx| {
+                client
+                    .right_panel
+                    .update(cx, |panel, cx| panel.back(window, cx));
+            }))
+            .on_action(cx.listener(|client, _: &CloseAll, window, cx| {
+                client
+                    .right_panel
+                    .update(cx, |panel, cx| panel.close_all(window, cx));
+            }));
         if let Some(sign_in) = &self.sign_in {
             return root.child(div().flex().flex_1().min_h_0().child(sign_in.clone()));
         }
@@ -434,14 +462,23 @@ impl Render for Client {
                     div()
                         .id("workspace-conversation-panel")
                         .debug_selector(|| "workspace-conversation-panel".into())
+                        .relative()
+                        .flex()
                         .flex_1()
                         .h_full()
                         .min_w_0()
                         .overflow_hidden()
                         .map(|view| match &self.conversation {
-                            Some(conversation) => view.child(conversation.clone()),
-                            None => view.child(empty),
-                        }),
+                            Some(conversation) => view.child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .child(conversation.clone()),
+                            ),
+                            None => view.child(empty.flex_1().min_w_0()),
+                        })
+                        .children(RightPanel::frame(&self.right_panel, palette, window, cx)),
                 )
         };
 

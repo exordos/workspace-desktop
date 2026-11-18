@@ -6,6 +6,7 @@ pub mod composer;
 pub mod contracts;
 pub mod conversation;
 pub mod platform_window;
+mod right_panel;
 pub mod runtime;
 pub mod shell;
 pub mod sidebar;
@@ -106,7 +107,7 @@ fn bind_keys(app: &mut App) {
     Sidebar::bind_keys(app);
     Editor::bind_keys(app);
     SignIn::bind_keys(app);
-    conversation::Conversation::bind_details_keys(app);
+    right_panel::RightPanel::bind_keys(app);
     app.bind_keys([
         KeyBinding::new("tab", NextControl, None),
         KeyBinding::new("shift-tab", PreviousControl, None),

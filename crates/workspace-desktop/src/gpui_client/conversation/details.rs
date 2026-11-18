@@ -1,256 +1,185 @@
-//! Правая панель разговора. Хранит запрос текущего открытия и рисует его результат.
+//! Показывает сведения о разговоре и загружает их для одного открытия правой панели.
 
 mod source;
 
+#[cfg(all(test, feature = "gpui-test"))]
+use gpui::App;
 use gpui::{
-    App, Context, Div, FocusHandle, KeyBinding, Pixels, Stateful, Task, Window, actions, div,
-    prelude::*, px,
+    Context, Div, Entity, FocusHandle, IntoElement, Render, ScrollHandle, Stateful, Task,
+    WeakEntity, Window, div, prelude::*,
 };
 use uuid::Uuid;
 use workspace_core::{directory::ProfilePresence, messenger::details::ConversationDetails};
 
 use super::{Conversation, Failure};
 use crate::gpui_client::{
-    NextControl, PreviousControl,
+    contracts::ConversationAddress,
+    right_panel::{PanelKey, RightPanel, Scope},
     runtime::RuntimeClient,
-    ui::{Avatar, Button, ButtonAppearance, Icon, Palette, TextRole, label},
+    ui::{Avatar, Button, Palette, TextRole, ThemeMode, label},
 };
 use source::Problem;
 
-const WIDTH: Pixels = px(315.);
-const SPLIT_FROM: Pixels = px(1050.);
-const PANEL_GAP: Pixels = px(4.);
-const KEY_CONTEXT: &str = "WorkspaceConversationDetails";
-
-actions!(conversation_details, [Dismiss]);
-
-/// Сведения видны только между открытием панели и закрытием.
+/// Запрос или результат, который показывает открытый экран сведений.
 enum State {
     Loading {
-        op_id: Uuid,        // Номер запроса, который принимается этим открытием панели.
-        _request: Task<()>, // Закрытие панели отменяет ожидание ответа.
+        op_id: Uuid,        // Номер запроса, ответ которого ждёт экран.
+        _request: Task<()>, // Закрытие экрана отменяет ожидание ответа.
     },
     Ready(ConversationDetails), // Подтверждённый профиль или сведения темы.
     Failed(Problem),            // Сбой и допустимый следующий шаг.
 }
 
-/// Хранит состояние и фокус панели одного экземпляра экрана.
+/// Содержимое экрана сведений. Стек держит его живым под другими панелями.
+struct DetailsView {
+    runtime: RuntimeClient,                 // Рабочий поток для запроса сведений.
+    address: ConversationAddress,           // Адрес, зафиксированный при открытии.
+    host: WeakEntity<RightPanel>,           // Проверяет, что экран всё ещё находится в стеке.
+    conversation: WeakEntity<Conversation>, // Экран для доставки отзыва доступа.
+    state: State,                           // Запрос или его результат.
+    scroll: ScrollHandle, // Положение прокрутки, пока экран прикрыт другой панелью.
+    retry: FocusHandle,   // Кнопка повтора после временного сбоя.
+}
+
+/// Связывает шапку разговора со стеком окна.
 pub(super) struct Panel {
-    runtime: RuntimeClient, // Тот же рабочий поток, что читает историю.
-    state: Option<State>,   // None, пока панель закрыта.
-    region: FocusHandle,    // Проверяет, был ли фокус внутри перед вынужденным закрытием.
-    trigger: FocusHandle,   // Кнопка сведений в шапке разговора.
-    close: FocusHandle,     // Первый фокус после открытия панели.
-    retry: FocusHandle,     // Кнопка повтора после временного сбоя.
+    host: Entity<RightPanel>,          // Общий стек этого окна.
+    key: PanelKey,                     // Сведения текущего открытия разговора.
+    runtime: RuntimeClient,            // Рабочий поток для новых открытий.
+    trigger: FocusHandle,              // Кнопка сведений в шапке разговора.
+    _subscription: gpui::Subscription, // Обновляет подпись кнопки при навигации по стеку.
 }
 
 impl Panel {
-    /// Готовит закрытую панель без сетевого запроса.
-    pub(super) fn new(runtime: RuntimeClient, cx: &mut Context<Conversation>) -> Self {
+    /// Подключает шапку к стеку без сетевого запроса.
+    pub(super) fn new(
+        host: Entity<RightPanel>,
+        address: ConversationAddress,
+        runtime: RuntimeClient,
+        cx: &mut Context<Conversation>,
+    ) -> Self {
+        let subscription = cx.observe(&host, |_, _, cx| cx.notify());
         Self {
+            host,
+            key: PanelKey {
+                scope: Scope::Conversation(address),
+                id: "conversation-details".into(),
+            },
             runtime,
-            state: None,
-            region: cx.focus_handle(),
             trigger: cx.focus_handle(),
-            close: cx.focus_handle(),
-            retry: cx.focus_handle(),
+            _subscription: subscription,
         }
     }
 
-    /// Закрывает панель и отменяет ожидающий запрос.
-    pub(super) fn clear(&mut self) {
-        if let Some(State::Loading { op_id, .. }) = self.state.as_ref() {
-            log::debug!("gpui_details op_id={op_id} event=cancelled");
-        }
-        self.state = None;
+    /// Убирает из стека контекстные экраны при сбросе или отзыве доступа.
+    pub(super) fn clear(
+        &self,
+        address: &ConversationAddress,
+        fallback: Option<&FocusHandle>,
+        cx: &mut Context<Conversation>,
+    ) {
+        self.host.update(cx, |host, cx| {
+            host.invalidate_conversation(address, fallback.unwrap_or(&self.trigger).clone(), cx)
+        });
     }
 
     /// Рисует действие из шапки для мыши, Enter и пробела.
     pub(super) fn trigger(&self, palette: Palette, cx: &Context<Conversation>) -> Stateful<Div> {
-        let button = Button::new(
-            "conversation-details-trigger",
-            if self.state.is_some() {
-                "Скрыть"
-            } else {
-                "Сведения"
-            },
-        );
-        button
-            .render(
-                palette,
-                Some(&self.trigger),
-                action(cx, Conversation::toggle_details),
-            )
+        let title = if self.host.read(cx).is_active(&self.key) {
+            "Скрыть"
+        } else {
+            "Сведения"
+        };
+        let target = cx.entity().downgrade();
+        Button::new("conversation-details-trigger", title)
+            .render(palette, Some(&self.trigger), move |window, app| {
+                let _ = target.update(app, |view, cx| view.toggle_details(window, cx));
+            })
             .flex_none()
             .debug_selector(|| "conversation-details-trigger".into())
-    }
-
-    /// Сохраняет клавиатуру в текущем разговоре, если панель исчезла при отзыве или сбросе.
-    pub(super) fn return_focus_after_clear(
-        &self,
-        window: &mut Window,
-        cx: &Context<Conversation>,
-        fallback: &FocusHandle,
-        can_open: bool,
-    ) {
-        if self.state.is_none() && self.region.contains_focused(window, cx) {
-            window.focus(if can_open { &self.trigger } else { fallback });
-        }
-    }
-
-    /// Добавляет панель справа. В узком окне она перекрывает историю и редактор.
-    pub(super) fn render(
-        &self,
-        palette: Palette,
-        width: Pixels,
-        cx: &Context<Conversation>,
-    ) -> Option<Stateful<Div>> {
-        let state = self.state.as_ref()?;
-        let overlay = width < SPLIT_FROM;
-        let mut close = Button::new("conversation-details-close", "Закрыть");
-        close.icon = Some(Icon::Close);
-        close.appearance = ButtonAppearance::Ghost;
-        let content = match state {
-            State::Loading { .. } => label(palette, TextRole::Body, "Загружаем сведения…")
-                .debug_selector(|| "conversation-details-loading".into()),
-            State::Ready(details) => render_details(details, palette)
-                .debug_selector(|| "conversation-details-ready".into()),
-            State::Failed(problem) => self
-                .render_problem(*problem, palette, cx)
-                .debug_selector(|| "conversation-details-error".into()),
-        };
-        Some(
-            div()
-                .id("conversation-details-panel")
-                .debug_selector(|| "conversation-details-panel".into())
-                .track_focus(&self.region)
-                .key_context(KEY_CONTEXT)
-                .on_action(cx.listener(|view, _: &Dismiss, window, cx| {
-                    view.close_details(window, cx);
-                }))
-                .flex()
-                .flex_col()
-                .w(WIDTH)
-                .min_h_0()
-                .flex_none()
-                .rounded_md()
-                .border_1()
-                .border_color(palette.border)
-                .bg(palette.surface)
-                .when(overlay, |panel| {
-                    panel
-                        .absolute()
-                        .top_0()
-                        .bottom_0()
-                        .right_0()
-                        .max_w_full()
-                        .shadow_md()
-                        .occlude()
-                        .on_action(cx.listener(|view, _: &NextControl, window, cx| {
-                            view.focus_next_detail(window, cx);
-                        }))
-                        .on_action(cx.listener(|view, _: &PreviousControl, window, cx| {
-                            view.focus_next_detail(window, cx);
-                        }))
-                })
-                .when(!overlay, |panel| panel.h_full().ml(PANEL_GAP))
-                .child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .justify_between()
-                        .items_center()
-                        .gap_3()
-                        .p_3()
-                        .child(label(palette, TextRole::Label, "Сведения"))
-                        .child(
-                            close
-                                .render(
-                                    palette,
-                                    Some(&self.close),
-                                    action(cx, Conversation::close_details),
-                                )
-                                .debug_selector(|| "conversation-details-close".into()),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("conversation-details-content")
-                        .min_h_0()
-                        .min_w_0()
-                        .overflow_x_hidden()
-                        .overflow_y_scroll()
-                        .p_3()
-                        .child(content),
-                ),
-        )
-    }
-
-    /// Показывает повтор только для временной ошибки.
-    fn render_problem(
-        &self,
-        problem: Problem,
-        palette: Palette,
-        cx: &Context<Conversation>,
-    ) -> Div {
-        let message = match problem {
-            Problem::AccessLost => "Разговор недоступен",
-            Problem::Unsupported => "Сведения для этого разговора недоступны",
-            Problem::ProfileUnavailable => "Профиль недоступен",
-            Problem::Unavailable => "Не удалось загрузить сведения",
-        };
-        div()
-            .flex()
-            .flex_col()
-            .items_start()
-            .gap_3()
-            .child(label(palette, TextRole::Body, message))
-            .when(matches!(problem, Problem::Unavailable), |content| {
-                content.child(
-                    Button::new("conversation-details-retry", "Повторить")
-                        .render(
-                            palette,
-                            Some(&self.retry),
-                            action(cx, Conversation::load_details),
-                        )
-                        .debug_selector(|| "conversation-details-retry".into()),
-                )
-            })
     }
 }
 
 impl Conversation {
-    /// Открывает или закрывает панель, пока её шапка относится к рабочему разговору.
-    fn toggle_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.details.as_ref().map(|panel| panel.state.is_some()) {
-            Some(true) => self.close_details(window, cx),
-            Some(false) if self.can_open_details() => self.load_details(window, cx),
-            _ => {}
-        }
-    }
-
-    /// Показывает действие в процессе загрузки и после неё, если доступ не был отозван.
+    /// Показывает действие в процессе загрузки и после неё, пока доступ не отозван.
     pub(super) fn can_open_details(&self) -> bool {
         !matches!(self.state, super::State::Failed(Failure::AccessLost))
     }
 
-    /// Открывает панель и начинает новый запрос даже после возврата к тому же адресу.
-    fn load_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(panel) = &mut self.details else {
+    /// Открывает сведения через стек или снимает их, если они уже сверху.
+    fn toggle_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_open_details() {
+            return;
+        }
+        let Some(panel) = &self.details else {
             return;
         };
-        let op_id = Uuid::new_v4();
-        let runtime = panel.runtime.clone();
+        let conversation = cx.entity().downgrade();
         let address = self.address.clone();
-        window.focus(&panel.close);
+        panel.host.update(cx, |host, cx| {
+            if host.is_active(&panel.key) {
+                host.back(window, cx);
+            } else {
+                host.open(
+                    panel.key.clone(),
+                    "Сведения",
+                    panel.trigger.clone(),
+                    |cx| {
+                        let host = cx.weak_entity();
+                        cx.new(|cx| {
+                            DetailsView::new(panel.runtime.clone(), address, conversation, host, cx)
+                        })
+                    },
+                    window,
+                    cx,
+                );
+            }
+        });
+    }
+}
+
+impl DetailsView {
+    /// Запускает запрос для нового экрана сведений.
+    fn new(
+        runtime: RuntimeClient,
+        address: ConversationAddress,
+        conversation: WeakEntity<Conversation>,
+        host: WeakEntity<RightPanel>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let state = Self::request(runtime.clone(), address.clone(), cx);
+        Self {
+            runtime,
+            address,
+            conversation,
+            host,
+            state,
+            scroll: ScrollHandle::new(),
+            retry: cx.focus_handle(),
+        }
+    }
+
+    /// Принимает ответ только для живого экрана и его последнего запроса.
+    fn request(
+        runtime: RuntimeClient,
+        address: ConversationAddress,
+        cx: &mut Context<Self>,
+    ) -> State {
+        let op_id = Uuid::new_v4();
         log::debug!("gpui_details op_id={op_id} event=request_started");
         let task = cx.spawn(async move |view, cx| {
             let reply = source::load(runtime, address).await;
             let _ = view.update(cx, |view, cx| {
-                let Some(panel) = &mut view.details else {
+                if !view
+                    .host
+                    .upgrade()
+                    .is_some_and(|host| host.read(cx).contains_view(cx.entity_id()))
+                {
+                    log::debug!("gpui_details op_id={op_id} event=closed_screen");
                     return;
-                };
-                if !matches!(panel.state, Some(State::Loading { op_id: current, .. }) if current == op_id) {
+                }
+                if !matches!(view.state, State::Loading { op_id: current, .. } if current == op_id)
+                {
                     log::debug!("gpui_details op_id={op_id} event=stale_request");
                     return;
                 }
@@ -260,52 +189,93 @@ impl Conversation {
                 };
                 log::debug!(
                     "gpui_details op_id={op_id} event=request_completed success={}",
-                    result.is_ok(),
+                    result.is_ok()
                 );
-                match result {
-                    Ok(details) => panel.state = Some(State::Ready(details)),
+                view.state = match result {
+                    Ok(details) => State::Ready(details),
                     Err(Problem::AccessLost) => {
-                        panel.state = None;
-                        view.fail(Failure::AccessLost, cx);
+                        let _ = view
+                            .conversation
+                            .update(cx, |chat, cx| chat.fail(Failure::AccessLost, cx));
+                        State::Failed(Problem::AccessLost)
                     }
-                    Err(error) => panel.state = Some(State::Failed(error)),
-                }
+                    Err(error) => State::Failed(error),
+                };
                 cx.notify();
             });
         });
-        panel.state = Some(State::Loading {
+        State::Loading {
             op_id,
             _request: task,
-        });
-        cx.notify();
-    }
-
-    /// Закрывает панель по явному действию и возвращает фокус её кнопке.
-    fn close_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(panel) = &mut self.details {
-            panel.clear();
-            window.focus(&panel.trigger);
-            cx.notify();
         }
     }
 
-    /// Привязывает Escape только к открытой панели, которая получила фокус.
-    pub(in crate::gpui_client) fn bind_details_keys(app: &mut App) {
-        app.bind_keys([KeyBinding::new("escape", Dismiss, Some(KEY_CONTEXT))]);
+    /// Показывает повтор только для временной ошибки.
+    fn render_problem(&self, problem: Problem, palette: Palette, cx: &Context<Self>) -> Div {
+        let message = match problem {
+            Problem::AccessLost => "Разговор недоступен",
+            Problem::Unsupported => "Сведения для этого разговора недоступны",
+            Problem::ProfileUnavailable => "Профиль недоступен",
+            Problem::Unavailable => "Не удалось загрузить сведения",
+        };
+        let target = cx.entity().downgrade();
+        div()
+            .flex()
+            .flex_col()
+            .items_start()
+            .gap_3()
+            .child(label(palette, TextRole::Body, message))
+            .when(matches!(problem, Problem::Unavailable), |content| {
+                content.child(
+                    Button::new("conversation-details-retry", "Повторить")
+                        .render(palette, Some(&self.retry), move |window, app| {
+                            let _ = target.update(app, |view, cx| {
+                                // Кнопка повтора исчезает во время загрузки. Передаём фокус в рамку.
+                                if view.retry.is_focused(window) {
+                                    window.focus_prev();
+                                }
+                                view.state =
+                                    Self::request(view.runtime.clone(), view.address.clone(), cx);
+                                cx.notify();
+                            });
+                        })
+                        .debug_selector(|| "conversation-details-retry".into()),
+                )
+            })
     }
+}
 
-    /// В узком окне оставляет Tab и Shift+Tab на видимых кнопках панели.
-    fn focus_next_detail(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(panel) = &self.details {
-            cx.stop_propagation();
-            let has_retry = matches!(panel.state, Some(State::Failed(Problem::Unavailable)));
-            let next = if has_retry && panel.close.is_focused(window) {
-                &panel.retry
-            } else {
-                &panel.close
-            };
-            window.focus(next);
+impl Drop for DetailsView {
+    /// Отмечает отмену, если стек закрыл экран во время запроса.
+    fn drop(&mut self) {
+        if let State::Loading { op_id, .. } = self.state {
+            log::debug!("gpui_details op_id={op_id} event=cancelled");
         }
+    }
+}
+
+impl Render for DetailsView {
+    /// Показывает текущее состояние сведений внутри общей рамки.
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
+        let content = match &self.state {
+            State::Loading { .. } => label(palette, TextRole::Body, "Загружаем сведения…")
+                .debug_selector(|| "conversation-details-loading".into()),
+            State::Ready(details) => render_details(details, palette)
+                .debug_selector(|| "conversation-details-ready".into()),
+            State::Failed(problem) => self
+                .render_problem(*problem, palette, cx)
+                .debug_selector(|| "conversation-details-error".into()),
+        };
+        div()
+            .id("conversation-details-content")
+            .min_h_0()
+            .min_w_0()
+            .overflow_x_hidden()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .p_3()
+            .child(content)
     }
 }
 
@@ -368,32 +338,30 @@ fn initials(name: &str) -> String {
         .collect()
 }
 
-/// Передаёт нажатие живому экрану разговора вместе с системным окном.
-fn action(
-    cx: &Context<Conversation>,
-    handle: impl Fn(&mut Conversation, &mut Window, &mut Context<Conversation>) + 'static,
-) -> impl Fn(&mut Window, &mut App) + 'static {
-    let target = cx.entity().downgrade();
-    move |window, app| {
-        let _ = target.update(app, |view, cx| handle(view, window, cx));
-    }
-}
-
 #[cfg(all(test, feature = "gpui-test"))]
 impl Conversation {
     /// Проверяет текущую видимость. GPUI сохраняет старые debug bounds удалённых элементов.
-    pub(in crate::gpui_client) fn tested_details_is_open(&self) -> bool {
+    pub(in crate::gpui_client) fn tested_details_is_open(&self, app: &App) -> bool {
         self.details
             .as_ref()
-            .is_some_and(|panel| panel.state.is_some())
+            .is_some_and(|panel| panel.host.read(app).is_active(&panel.key))
     }
 
-    /// Возвращает результат, из которого сейчас построена видимая карточка.
-    pub(in crate::gpui_client) fn tested_details(&self) -> Option<&ConversationDetails> {
-        match self.details.as_ref()?.state.as_ref()? {
+    /// Возвращает результат, из которого построена карточка сведений.
+    pub(in crate::gpui_client) fn tested_details<R>(
+        &self,
+        app: &App,
+        inspect: impl FnOnce(Option<&ConversationDetails>) -> R,
+    ) -> R {
+        let view = self
+            .details
+            .as_ref()
+            .and_then(|panel| panel.host.read(app).tested_view::<DetailsView>(&panel.key));
+        let details = view.as_ref().and_then(|view| match &view.read(app).state {
             State::Ready(details) => Some(details),
             _ => None,
-        }
+        });
+        inspect(details)
     }
 
     /// Возвращает координату строки из текущего кадра для замера открытия панели.
@@ -405,14 +373,13 @@ impl Conversation {
     pub(in crate::gpui_client) fn tested_details_focus(
         &self,
         window: &Window,
+        app: &App,
     ) -> Option<&'static str> {
         let panel = self.details.as_ref()?;
         if panel.trigger.is_focused(window) {
             Some("сведения")
-        } else if panel.close.is_focused(window) {
+        } else if panel.host.read(app).close_focus(&panel.key, window) {
             Some("закрыть")
-        } else if panel.retry.is_focused(window) {
-            Some("повторить")
         } else {
             None
         }
