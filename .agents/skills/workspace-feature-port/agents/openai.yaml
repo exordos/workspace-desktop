@@ -1,0 +1,4 @@
+interface:
+  display_name: "Перенос фичи Workspace Desktop"
+  short_description: "Перенос фичи из Electron по карточке проекта"
+  default_prompt: "$workspace-feature-port Перенеси [функцию] из Electron. Референс — [экран или действие]. В этой итерации доведи до [результата]."
