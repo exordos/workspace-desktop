@@ -1,5 +1,7 @@
 //! Стек правых панелей окна. Хранит открытые экраны, проверяет их контекст и ведёт фокус.
 
+use std::rc::Rc;
+
 use gpui::{
     AnyView, App, Context, Div, ElementId, Entity, EntityId, FocusHandle, KeyBinding, SharedString,
     Stateful, Window, actions, div, prelude::*, px,
@@ -8,7 +10,7 @@ use gpui::{
 use super::{
     NextControl, PreviousControl,
     contracts::{AccountSession, ConversationAddress},
-    ui::{Button, ButtonAppearance, Icon, Palette, TextRole, label},
+    ui::{Button, ButtonAppearance, Icon, Palette, TextRole, label, popup::tooltip},
 };
 
 const KEY_CONTEXT: &str = "WorkspaceRightPanel";
@@ -53,10 +55,20 @@ impl PanelKey {
     }
 }
 
+type ConversationTitle = Rc<dyn Fn(&App) -> &'static str>;
+type ConversationBack = Rc<dyn Fn(&mut App) -> bool>;
+
+/// Связывает общую рамку с текущим шагом экрана разговора.
+struct ConversationChrome {
+    title: ConversationTitle, // Заголовок со сведениями или выбором участников.
+    back: ConversationBack,   // Возвращает true, если обработан внутренний шаг.
+}
+
 /// Хранит один экран, пока он открыт или находится под другим экраном.
 struct Entry {
     key: PanelKey,       // Ключ для повторного открытия и проверки владельца.
     title: SharedString, // Заголовок общей рамки.
+    conversation_chrome: Option<ConversationChrome>, // Внутренний шаг сведений разговора.
     body: AnyView,       // Живой GPUI-вид со своим состоянием.
     opener: FocusHandle, // Элемент вне стека, к которому можно вернуться при закрытии.
     region: FocusHandle, // Область фокуса этого экрана.
@@ -182,6 +194,7 @@ impl RightPanel {
             self.entries.push(Entry {
                 key,
                 title: title.into(),
+                conversation_chrome: None,
                 body,
                 opener,
                 region: cx.focus_handle(),
@@ -194,8 +207,43 @@ impl RightPanel {
         self.changed("open", cx);
     }
 
-    /// Снимает верхний экран и открывает предыдущий с сохранённым содержимым.
+    /// Подключает заголовок разговора и возврат из его вложенной формы.
+    pub fn configure_conversation(
+        &mut self,
+        key: &PanelKey,
+        title: impl Fn(&App) -> &'static str + 'static,
+        back: impl Fn(&mut App) -> bool + 'static,
+    ) {
+        if let Some(entry) = self.entries.last_mut().filter(|entry| &entry.key == key) {
+            entry.conversation_chrome = Some(ConversationChrome {
+                title: Rc::new(title),
+                back: Rc::new(back),
+            });
+        }
+    }
+
+    /// Ставит фокус на закрытие только если этот экран сейчас сверху.
+    pub fn focus_close(&self, key: &PanelKey, window: &mut Window) {
+        if let Some(entry) = self.entries.last().filter(|entry| &entry.key == key) {
+            window.focus(&entry.close);
+        }
+    }
+
+    /// Возвращает из внутренней формы или снимает сам экран.
     pub fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(entry) = self.entries.last()
+            && let Some(chrome) = &entry.conversation_chrome
+            && (chrome.back)(cx)
+        {
+            window.focus(&entry.close);
+            self.changed("back", cx);
+            return;
+        }
+        self.pop(window, cx);
+    }
+
+    /// Снимает верхний экран по прямому действию его владельца.
+    pub fn pop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(entry) = self.entries.pop() {
             let focus = self
                 .entries
@@ -278,9 +326,18 @@ impl RightPanel {
         } else {
             ("conversation-details-close", "Закрыть")
         };
-        let mut close = Button::new(close_id, close_label);
+        let mut close = Button::new(close_id, if account_page { close_label } else { "" });
         close.icon = (!account_back).then_some(Icon::Close);
         close.appearance = ButtonAppearance::Ghost;
+        let title = entry.conversation_chrome.as_ref().map_or_else(
+            || entry.title.clone(),
+            |chrome| SharedString::from((chrome.title)(app)),
+        );
+        let text_role = if account_page {
+            TextRole::Label
+        } else {
+            TextRole::Heading
+        };
         let clear = Button::new("right-panel-close-all", "Закрыть все");
         let clear_focus = (stack.entries.len() > 1).then_some(&entry.clear);
 
@@ -295,10 +352,11 @@ impl RightPanel {
                 .w(px(315.))
                 .min_h_0()
                 .flex_none()
-                .rounded_md()
-                .border_1()
-                .border_color(palette.border)
                 .bg(palette.surface)
+                .when(account_page, |panel| {
+                    panel.rounded_md().border_1().border_color(palette.border)
+                })
+                .when(!account_page, |panel| panel.rounded(px(12.)).pt_2().pb_5())
                 .when(overlay, |panel| {
                     panel
                         .absolute()
@@ -323,8 +381,9 @@ impl RightPanel {
                         .justify_between()
                         .items_center()
                         .gap_3()
-                        .p_3()
-                        .child(label(palette, TextRole::Label, entry.title.clone()).truncate())
+                        .when(account_page, |header| header.p_3())
+                        .when(!account_page, |header| header.h(px(40.)).mx_2().px_2())
+                        .child(label(palette, text_role, title).truncate())
                         .child(
                             div()
                                 .flex()
@@ -346,7 +405,12 @@ impl RightPanel {
                                             Some(&entry.close),
                                             click(host, RightPanel::back),
                                         )
-                                        .debug_selector(move || close_id.into()),
+                                        .debug_selector(move || close_id.into())
+                                        .when(!account_page, |button| {
+                                            button.tooltip(move |_, app| {
+                                                tooltip(palette, close_label.into(), app)
+                                            })
+                                        }),
                                 ),
                         ),
                 )
@@ -384,18 +448,6 @@ impl RightPanel {
     #[cfg(all(test, feature = "gpui-test"))]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
-    }
-
-    /// Возвращает содержимое экрана для проверки его сохранённого состояния.
-    #[cfg(all(test, feature = "gpui-test"))]
-    pub fn tested_view<V: Render>(&self, key: &PanelKey) -> Option<Entity<V>> {
-        self.entries
-            .iter()
-            .find(|entry| &entry.key == key)?
-            .body
-            .clone()
-            .downcast()
-            .ok()
     }
 
     /// Возвращает живой фокус кнопки закрытия для проверок окна.

@@ -8,8 +8,8 @@ mod viewport;
 
 use futures::channel::oneshot;
 use gpui::{
-    App, Context, Entity, FocusHandle, IntoElement, KeyDownEvent, Render, Subscription, Window,
-    div, prelude::*, px,
+    App, Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyDownEvent, Render,
+    Subscription, Window, div, prelude::*, px,
 };
 use uuid::Uuid;
 use workspace_core::{
@@ -59,6 +59,14 @@ struct Heading {
     topic: Option<String>, // Название темы, если открыт её адрес.
     direct: bool,          // В заголовке лички показываем инициалы собеседника.
 }
+
+/// Переход из правой панели, который должна подтвердить оболочка.
+pub(super) struct OpenDetailsTopic {
+    pub address: ConversationAddress, // Полный адрес панели, откуда пришло действие.
+    pub topic_id: Uuid,               // UUID выбранной темы в том же канале.
+}
+
+impl EventEmitter<OpenDetailsTopic> for Conversation {}
 
 /// История, адрес открытия и очередь сообщений одного экрана.
 pub struct Conversation {
@@ -286,6 +294,9 @@ impl Conversation {
         let scope = self.address.route.scope;
         match update.change {
             SyncChange::MessengerReset => self.restart(cx),
+            SyncChange::SidebarDetailsChanged { stream_id } if scope.stream_id == stream_id => {
+                self.refresh_open_details(cx);
+            }
             SyncChange::HistoryAccessRevoked(HistoryRevocation::Stream(stream))
                 if scope.stream_id == stream =>
             {
@@ -317,7 +328,7 @@ impl Conversation {
 
     /// Очищает недействительные данные и начинает проверку прежней цели заново.
     fn restart(&mut self, cx: &mut Context<Self>) {
-        if let Some(details) = &self.details {
+        if let Some(details) = &mut self.details {
             details.clear(&self.address, None, cx);
         }
         self.invalidate_send_destination(cx);
@@ -332,7 +343,7 @@ impl Conversation {
 
     /// Скрывает историю и делает любые запоздавшие ответы неприменимыми.
     fn fail(&mut self, error: Failure, cx: &mut Context<Self>) {
-        if let Some(details) = &self.details {
+        if let Some(details) = &mut self.details {
             let fallback = matches!(error, Failure::AccessLost).then_some(&self.screen_focus);
             details.clear(&self.address, fallback, cx);
         }
@@ -931,6 +942,7 @@ impl Render for Conversation {
     /// Рисует историю и редактор в рабочей области разговора.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
+        self.restore_details_for_verified_history(window, cx);
         div()
             .id("conversation-layout")
             .relative()

@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::{
     auth::{Auth, AuthError},
     context::{OwnerContext, SessionGeneration},
+    messenger::details::{AvatarCache, SidebarCache, SidebarChange},
     notification_target::{NotificationTarget, NotificationTargetError},
     storage::{
         Cursor, DeliveryStatus, EventWrite, FolderChange, HistoryChange, HistoryMessage,
@@ -63,6 +64,9 @@ pub enum SyncChange {
         message_id: Uuid, // UUID исправленной или удалённой строки.
     },
     HistoryAccessRevoked(HistoryRevocation), // Область, которую больше нельзя показывать.
+    SidebarDetailsChanged {
+        stream_id: Uuid, // Стрим, чья открытая панель должна получить обновление.
+    },
     OutboxChanged {
         scope: HistoryScope, // Исходная тема, очередь которой нужно перечитать.
     },
@@ -102,13 +106,18 @@ pub enum Event {
         cursor: Cursor,        // Позиция изменения в журнале.
         change: HistoryChange, // Правка, удаление или отзыв доступа.
     },
+    SidebarChanged {
+        cursor: Cursor,        // Позиция в общем журнале Workspace.
+        change: SidebarChange, // Изменение профиля, стрима, темы или состава.
+    },
     UnreadChanged {
         cursor: Cursor, // Позиция события обновления папки в журнале.
         count: u32,     // Новый счётчик папки «Все чаты».
     },
     FolderChanged {
-        cursor: Cursor,       // Позиция изменения в журнале.
-        change: FolderChange, // Удаление или область, которую нужно сверить.
+        cursor: Cursor,                      // Позиция изменения в журнале.
+        change: FolderChange,                // Удаление или область, которую нужно сверить.
+        sidebar: Option<Box<SidebarChange>>, // Сведения того же события о стриме, если они есть.
     },
     UnreadBaseline {
         cursor: Cursor, // Позиция сервера перед чтением счётчика. Курсор сообщений не меняется.
@@ -125,6 +134,7 @@ impl Event {
             Self::MessageCreated { cursor, .. }
             | Self::IncomingDirectMessage { cursor, .. }
             | Self::HistoryChanged { cursor, .. }
+            | Self::SidebarChanged { cursor, .. }
             | Self::UnreadChanged { cursor, .. }
             | Self::FolderChanged { cursor, .. }
             | Self::UnreadBaseline { cursor, .. }
@@ -181,8 +191,10 @@ pub enum PrepareSendError {
 
 /// Проверяет право сессии на запись и передаёт события в хранилище.
 pub struct Sync {
-    auth: Auth,            // Авторизация для проверки владельца и поколения сессии.
-    storage: Arc<Storage>, // Общая локальная база сообщений, позиций и счётчиков.
+    pub(crate) avatar_cache: AvatarCache, // Временные файлы аватаров по владельцу и сессии.
+    pub(crate) sidebar_cache: SidebarCache, // Временные снимки панелей на время сессии.
+    auth: Auth,                           // Авторизация для проверки владельца и поколения сессии.
+    storage: Arc<Storage>,                // Общая локальная база сообщений, позиций и счётчиков.
     updates: broadcast::Sender<SyncUpdate>, // Канал изменений. Оформление окна получает их после записи.
 }
 
@@ -192,6 +204,8 @@ impl Sync {
         Self {
             auth,
             storage,
+            sidebar_cache: SidebarCache::default(),
+            avatar_cache: AvatarCache::default(),
             updates: broadcast::channel(128).0,
         }
     }
@@ -226,6 +240,8 @@ impl Sync {
         self.auth.with_active_generation(owner, generation, || {
             self.storage.reset_source(owner, source)?;
             if source == crate::messenger::SOURCE_ID {
+                self.sidebar_cache
+                    .invalidate(owner, generation, None, false);
                 self.publish(owner, generation, SyncChange::MessengerReset);
             }
             Ok(())
@@ -546,11 +562,50 @@ impl Sync {
                     self.publish(owner, generation, SyncChange::OutboxChanged { scope });
                 }
             }
-            if saved.outcome == ApplyOutcome::Applied
-                && source == crate::messenger::SOURCE_ID
-                && let Some(change) = history.and_then(history_update)
-            {
-                self.publish(owner, generation, change);
+            if saved.outcome == ApplyOutcome::Applied && source == crate::messenger::SOURCE_ID {
+                let sidebar = match &event {
+                    Event::SidebarChanged { change, .. } => Some(change),
+                    Event::FolderChanged { sidebar, .. } => sidebar.as_deref(),
+                    _ => None,
+                };
+                if let Some(change) = sidebar {
+                    for stream_id in self.sidebar_cache.apply(owner, generation, change) {
+                        self.publish(
+                            owner,
+                            generation,
+                            SyncChange::SidebarDetailsChanged { stream_id },
+                        );
+                    }
+                }
+                if let Some(change) = history.and_then(history_update) {
+                    match &change {
+                        SyncChange::HistoryAccessRevoked(HistoryRevocation::Stream(id)) => {
+                            self.sidebar_cache
+                                .invalidate(owner, generation, Some(*id), true);
+                        }
+                        SyncChange::HistoryAccessRevoked(HistoryRevocation::Topic {
+                            stream_id,
+                            topic_id,
+                        }) => {
+                            for stream_id in self.sidebar_cache.apply(
+                                owner,
+                                generation,
+                                &SidebarChange::RemoveTopic {
+                                    stream_id: *stream_id,
+                                    topic_id: *topic_id,
+                                },
+                            ) {
+                                self.publish(
+                                    owner,
+                                    generation,
+                                    SyncChange::SidebarDetailsChanged { stream_id },
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.publish(owner, generation, change);
+                }
             }
             if saved.message_inserted
                 && let Event::IncomingDirectMessage {
@@ -589,6 +644,56 @@ impl Sync {
                 },
             },
         );
+    }
+
+    /// Освобождает сведения и изображения после завершения сессии.
+    pub(crate) fn clear_sidebar_session(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+    ) {
+        self.sidebar_cache.clear_session(owner, generation);
+        self.avatar_cache.clear_session(owner, generation);
+    }
+
+    /// Перечитывает панель после подтверждённого действия текущего пользователя.
+    pub(crate) fn refresh_sidebar(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        stream_id: Uuid,
+    ) -> Result<(), AuthError> {
+        self.auth.with_active_generation(owner, generation, || {
+            self.sidebar_cache
+                .invalidate(owner, generation, Some(stream_id), false);
+            self.publish(
+                owner,
+                generation,
+                SyncChange::SidebarDetailsChanged { stream_id },
+            );
+        })
+    }
+
+    /// Скрывает историю сразу после выхода. Запись в базу обновит событие `stream.deleted`.
+    pub(crate) fn complete_sidebar_leave(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        stream_id: Uuid,
+        leave_grant: u64,
+    ) -> Result<(), AuthError> {
+        self.auth.with_active_generation(owner, generation, || {
+            if self
+                .sidebar_cache
+                .complete_leave(owner, generation, stream_id, leave_grant)
+            {
+                self.publish(
+                    owner,
+                    generation,
+                    SyncChange::HistoryAccessRevoked(HistoryRevocation::Stream(stream_id)),
+                );
+            }
+        })
     }
 
     /// Публикует изменение под блокировкой действующей сессии после записи в базу.

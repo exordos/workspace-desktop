@@ -135,12 +135,13 @@ impl Palette {
 /// Размер, вес и базовый цвет текста по роли.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TextRole {
-    Heading,  // Заголовок панели.
-    Label,    // Название строки или элемента.
-    Body,     // Текст сообщения или поля.
-    Caption,  // Подпись, время или превью.
-    Initials, // Инициалы внутри компактного аватара.
-    Badge,    // Число или знак упоминания внутри бейджа.
+    Heading,        // Заголовок панели.
+    ProfileHeading, // Крупное имя в карточке профиля.
+    Label,          // Название строки или элемента.
+    Body,           // Текст сообщения или поля.
+    Caption,        // Подпись, время или превью.
+    Initials,       // Инициалы внутри компактного аватара.
+    Badge,          // Число или знак упоминания внутри бейджа.
 }
 
 impl TextRole {
@@ -148,6 +149,7 @@ impl TextRole {
     fn style(self, palette: Palette) -> (Pixels, Pixels, FontWeight, Hsla) {
         let (size, height, weight, color) = match self {
             TextRole::Heading => (16., 22., FontWeight::SEMIBOLD, palette.text),
+            TextRole::ProfileHeading => (20., 24., FontWeight::MEDIUM, palette.text),
             TextRole::Label => (14., 20., FontWeight::MEDIUM, palette.text),
             TextRole::Body => (14., 20., FontWeight::NORMAL, palette.text),
             TextRole::Caption => (12., 18., FontWeight::NORMAL, palette.text_secondary),
@@ -170,7 +172,7 @@ pub fn label(palette: Palette, role: TextRole, text: impl Into<SharedString>) ->
 }
 
 /// Рисует одну строку уже после того, как GPUI выделил ширину под текст.
-pub(super) fn ellipsized_label(
+pub(in crate::gpui_client) fn ellipsized_label(
     palette: Palette,
     role: TextRole,
     text: impl Into<SharedString>,

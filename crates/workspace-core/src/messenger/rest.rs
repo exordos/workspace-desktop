@@ -4,6 +4,7 @@
 mod folders;
 mod message_actions;
 pub(super) mod mutations;
+pub(super) mod sidebar;
 
 use std::{collections::HashSet, time::Duration};
 
@@ -16,7 +17,6 @@ use uuid::Uuid;
 
 use crate::{
     context::OwnerContext,
-    directory::ProfileRow,
     runtime::SourceError,
     storage::{
         Cursor, FolderChange, HistoryChange, HistoryEdge, HistoryMessage, HistoryMetadata,
@@ -25,7 +25,7 @@ use crate::{
     sync::Event,
 };
 
-use super::details::{ConversationDetails, DetailsError};
+use super::details::{DetailsError, StreamNotificationMode, TopicNotificationMode};
 use super::history::OpenHistoryError;
 use super::read::ReadError;
 use super::send::{DirectSendError, SendError};
@@ -257,13 +257,25 @@ impl RestClient {
         token: &str,
         path: &str,
     ) -> Result<Vec<T>, SourceError> {
+        self.filtered_collection(owner, token, path, &[]).await
+    }
+
+    /// Сохраняет заданный фильтр при переходе ко всем страницам ресурса.
+    async fn filtered_collection<T: DeserializeOwned>(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        path: &str,
+        filters: &[(&str, &str)],
+    ) -> Result<Vec<T>, SourceError> {
         let mut rows = Vec::new();
         let mut seen = HashSet::new();
         let mut marker: Option<String> = None;
         loop {
             let mut request = self
                 .request(owner, token, path)?
-                .query(&[("page_limit", PAGE_LIMIT)]);
+                .query(&[("page_limit", PAGE_LIMIT)])
+                .query(filters);
             if let Some(marker) = &marker {
                 request = request.query(&[("page_marker", marker)]);
             }
@@ -353,64 +365,6 @@ impl RestClient {
             return Err(SourceError::InvalidResponse.into());
         }
         Ok(row)
-    }
-
-    /// Загружает сведения для точного адреса. Профиль запрашивается только после проверки стрима.
-    pub(super) async fn conversation_details(
-        &self,
-        owner: &OwnerContext,
-        token: &str,
-        scope: HistoryScope,
-    ) -> Result<ConversationDetails, DetailsError> {
-        let stream = self
-            .stream_access(owner, token, scope.stream_id)
-            .await
-            .map_err(details_access_error)?;
-        check_explicit_owner(
-            owner,
-            stream.project_id.as_deref(),
-            stream.user_uuid.as_deref(),
-        )?;
-        if let Some(topic_id) = scope.topic_id {
-            if stream.private || stream.direct_user_uuid.is_some() {
-                return Err(DetailsError::Unsupported);
-            }
-            let topic = self
-                .topic_access(owner, token, scope.stream_id, topic_id)
-                .await
-                .map_err(details_access_error)?;
-            check_explicit_owner(
-                owner,
-                topic.project_id.as_deref(),
-                topic.user_uuid.as_deref(),
-            )?;
-            return Ok(ConversationDetails::Topic {
-                channel: required_title(stream.name)?,
-                name: required_title(topic.name)?,
-                description: stream.description.filter(|value| !value.trim().is_empty()),
-                done: topic.is_done,
-            });
-        }
-
-        if !stream.private || !matches!(stream.encryption, Some(Value::Bool(false))) {
-            return Err(DetailsError::Unsupported);
-        }
-        let peer = stream
-            .direct_user_uuid
-            .as_deref()
-            .and_then(parse_uuid)
-            .ok_or(SourceError::InvalidResponse)?;
-        let profile: ProfileRow = self
-            .access_row(owner, token, &format!("/api/workspace/v1/users/{peer}"))
-            .await
-            .map_err(|error| match error {
-                OpenHistoryError::AccessLost => DetailsError::ProfileUnavailable,
-                other => details_access_error(other),
-            })?;
-        let profile = profile
-            .into_profile(peer)
-            .ok_or(SourceError::InvalidResponse)?;
-        Ok(ConversationDetails::Peer(profile))
     }
 
     /// Разрешает обычный текст в теме лички по умолчанию.
@@ -1061,6 +1015,9 @@ impl WireFolder {
 struct WireStream {
     name: Option<String>,        // Название, которое нужно только панели сведений.
     description: Option<String>, // Описание канала, если оно заполнено.
+    color: Option<u32>,          // Цвет значка стрима.
+    owner: Option<String>,       // UUID владельца стрима.
+    invite_only: Option<bool>,   // Доступ по приглашению.
     uuid: String,                // Идентификатор запрошенного разговора.
     project_id: Option<String>,  // Проект, если он есть в ответе.
     user_uuid: Option<String>,   // Пользователь, если он есть в ответе.
@@ -1112,6 +1069,10 @@ struct WireTopic {
     user_uuid: Option<String>,  // Пользователь, если он есть в ответе.
     is_done: Option<bool>,      // Закрытие темы, неизвестно у старых ответов.
     notification_mode: TopicNotificationMode, // Настройка уведомлений темы.
+    unread_count: Option<u32>,  // Общий счётчик, может отсутствовать в старом ответе.
+    active_unread_count: Option<u32>, // Счётчик сообщений с уведомлениями.
+    passive_unread_count: Option<u32>, // Счётчик остальных непрочитанных.
+    summary: Option<String>,    // Текст последней серверной сводки.
 }
 
 impl WireTopic {
@@ -1121,25 +1082,6 @@ impl WireTopic {
             && parse_uuid(&self.stream_uuid) == Some(stream)
             && matches_owner(owner, self.project_id.as_deref(), self.user_uuid.as_deref())
     }
-}
-
-/// Настройка уведомлений отдельного разговора на сервере.
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum StreamNotificationMode {
-    AllMessages,  // Включены уведомления о сообщениях.
-    MentionsOnly, // Настройка канала. В личном разговоре сообщения уведомляют.
-    Muted,        // Уведомления отключены, если тема не переопределяет настройку.
-}
-
-/// Настройка уведомлений отдельной темы на сервере.
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum TopicNotificationMode {
-    Default, // Использовать настройку разговора.
-    Mute,    // Отключить уведомления темы.
-    Unmute,  // Включить уведомления темы.
-    Follow,  // Следить за темой и получать её уведомления.
 }
 
 impl TopicNotificationMode {
@@ -1212,6 +1154,7 @@ fn folder_event(
     Ok(Some(Event::FolderChanged {
         cursor: cursor.clone(),
         change,
+        sidebar: None,
     }))
 }
 
@@ -1227,7 +1170,7 @@ pub(super) fn wire_event(
     epoch: &str,
 ) -> Result<(Event, Option<IncomingMessage>), SourceError> {
     let wire: WireEnvelope =
-        serde_json::from_value(value).map_err(|_| SourceError::InvalidResponse)?;
+        WireEnvelope::deserialize(&value).map_err(|_| SourceError::InvalidResponse)?;
     let cursor = Cursor {
         epoch_generation: epoch.to_owned(),
         epoch_version: wire.epoch_version,
@@ -1256,7 +1199,14 @@ pub(super) fn wire_event(
     if message_created != (wire.payload.kind == "message.created") {
         return Err(SourceError::InvalidResponse);
     }
-    if let Some(event) = folder_event(&wire, owner, &cursor)? {
+    if let Some(mut event) = folder_event(&wire, owner, &cursor)? {
+        // Один снимок стрима может обновить и папки, и открытые сведения.
+        if let Event::FolderChanged {
+            sidebar: details, ..
+        } = &mut event
+        {
+            *details = sidebar::wire_sidebar_change(&wire, &value["payload"], owner).map(Box::new);
+        }
         return Ok((event, None));
     }
     let message_updated = wire.object_type == "message" && wire.action == "updated";
@@ -1301,7 +1251,14 @@ pub(super) fn wire_event(
         return Ok((Event::HistoryChanged { cursor, change }, None));
     }
     if !message_created && !message_updated {
-        return Ok((Event::Checkpoint(cursor), None));
+        let event = sidebar::wire_sidebar_change(&wire, &value["payload"], owner).map_or_else(
+            || Event::Checkpoint(cursor.clone()),
+            |change| Event::SidebarChanged {
+                cursor: cursor.clone(),
+                change,
+            },
+        );
+        return Ok((event, None));
     }
     if message_updated && wire.payload.kind != "message.updated" {
         return Err(SourceError::InvalidResponse);
@@ -1406,7 +1363,7 @@ mod tests {
 
     /// Удаление привязки для оставшегося участника не означает отзыв канала.
     #[test]
-    fn stream_binding_deletion_only_advances_cursor() {
+    fn legacy_stream_binding_deletion_identifies_binding_without_revoking_history() {
         let event = json!({
             "schema_version": 1, "uuid": "event", "epoch_version": 1,
             "project_id": "project", "user_uuid": "recipient",
@@ -1415,7 +1372,8 @@ mod tests {
         });
         assert!(matches!(
             wire_event(event, &owner(), "epoch").unwrap().0,
-            Event::Checkpoint(_)
+            Event::SidebarChanged { change: crate::messenger::details::SidebarChange::MembershipBinding(id), .. }
+                if id == Uuid::from_u128(4)
         ));
     }
 
@@ -1540,6 +1498,7 @@ mod tests {
             decode_page(vec![event.clone()], &owner, &cursor(14)).unwrap(),
             [Event::FolderChanged {
                 cursor: cursor(15),
+                sidebar: None,
                 change: FolderChange::Refresh(Some(personal)),
             }]
         );
@@ -1549,6 +1508,7 @@ mod tests {
             decode_page(vec![event.clone()], &owner, &cursor(14)).unwrap(),
             [Event::FolderChanged {
                 cursor: cursor(15),
+                sidebar: None,
                 change: FolderChange::DeleteFolder(personal),
             }]
         );
@@ -1558,6 +1518,7 @@ mod tests {
             decode_page(vec![event.clone()], &owner, &cursor(14)).unwrap(),
             [Event::FolderChanged {
                 cursor: cursor(15),
+                sidebar: None,
                 change: FolderChange::DeleteItem(personal),
             }]
         );
@@ -1568,6 +1529,7 @@ mod tests {
             decode_page(vec![event], &owner, &cursor(14)).unwrap(),
             [Event::FolderChanged {
                 cursor: cursor(15),
+                sidebar: None,
                 change: FolderChange::StreamChanged {
                     stream_id: personal,
                     archived: true

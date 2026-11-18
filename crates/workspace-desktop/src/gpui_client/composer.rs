@@ -64,6 +64,11 @@ pub(super) struct Composer {
 }
 
 impl Composer {
+    /// Переводит фокус на ввод, когда пользователь выбирает «Написать» в сведениях лички.
+    pub(super) fn focus_editor(&self, window: &mut Window, app: &App) {
+        self.editor.read(app).focus_handle(app).focus(window);
+    }
+
     /// Создаёт редактор привязанного к открытому разговору черновика.
     pub fn new(address: ConversationAddress, cx: &mut Context<Self>) -> Self {
         let editor = cx.new(Editor::for_composer);

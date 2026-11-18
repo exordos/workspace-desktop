@@ -259,6 +259,28 @@ impl Shell {
         Some(self.open_conversation(route, generation))
     }
 
+    /// Открывает тему из проверенного снимка панели текущего разговора.
+    pub(super) fn open_details_topic(
+        &mut self,
+        source: &ConversationAddress,
+        topic_id: Uuid,
+    ) -> Option<ShellEffect> {
+        let session = self.selected()?;
+        if self.conversation() != Some(source)
+            || session.owner != source.route.owner
+            || session.generation != source.generation
+            || !self.is_active(session)
+            || source.route.scope.topic_id == Some(topic_id)
+        {
+            return None;
+        }
+        let mut route = source.route.clone();
+        route.scope.topic_id = Some(topic_id);
+        route.entry = ChatEntry::Latest;
+        self.begin_navigation();
+        Some(self.open_conversation(route, source.generation))
+    }
+
     /// Начинает проверку баннера, сохраняя видимый разговор до получения ответа.
     fn request_notification(&mut self, click: NotificationClick) -> Option<ShellEffect> {
         self.begin_navigation();
