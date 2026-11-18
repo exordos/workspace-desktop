@@ -7,7 +7,7 @@ use reqwest::{Method, StatusCode};
 use serde::Serialize;
 
 use super::*;
-use crate::directory::ProfileRow;
+use crate::directory::{ProfileRow, normalize_avatar_reference};
 use crate::messenger::details::{
     ChannelSidebar, DirectSidebar, SidebarAvatar, SidebarAvatarFormat, SidebarChange,
     SidebarDetails, SidebarMember, SidebarStreamKind, SidebarStreamMetadata, SidebarTopic,
@@ -26,6 +26,13 @@ struct WireBinding {
     stream_uuid: Uuid,  // Стрим, состав которого загружен.
     user_uuid: Uuid,    // Пользователь, которому принадлежит привязка.
     role: StreamRole,   // Роль привязки в ответе сервера.
+}
+
+/// Часть ответа справочника, необходимая для загрузки аватара.
+#[derive(Deserialize)]
+struct AvatarProfileRow {
+    uuid: Uuid,    // UUID запрошенного пользователя.
+    avatar: Value, // Значение `null` означает, что фото отсутствует.
 }
 
 /// Тело запроса смены настройки уведомлений.
@@ -149,18 +156,55 @@ impl RestClient {
         token: &str,
         user_id: Uuid,
     ) -> Result<Option<crate::directory::UserProfile>, DetailsError> {
-        let profile: ProfileRow = match self
-            .access_row(owner, token, &format!("{USERS_PATH}{user_id}"))
-            .await
-        {
-            Ok(profile) => profile,
-            Err(OpenHistoryError::AccessLost) => return Ok(None),
-            Err(error) => return Err(details_access_error(error)),
+        let Some(profile) = self.user_row::<ProfileRow>(owner, token, user_id).await? else {
+            return Ok(None);
         };
         profile
             .into_profile(user_id)
             .map(Some)
             .ok_or(SourceError::InvalidResponse.into())
+    }
+
+    /// Читает известную часть профиля, сохраняя ответ об отсутствии доступа.
+    async fn user_row<T: DeserializeOwned>(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        user_id: Uuid,
+    ) -> Result<Option<T>, DetailsError> {
+        match self
+            .access_row(owner, token, &format!("{USERS_PATH}{user_id}"))
+            .await
+        {
+            Ok(profile) => Ok(Some(profile)),
+            Err(OpenHistoryError::AccessLost) => Ok(None),
+            Err(error) => Err(details_access_error(error)),
+        }
+    }
+
+    /// Возвращает ссылку на фото и проверяет, что сервер вернул запрошенного пользователя.
+    pub(in crate::messenger) async fn avatar_reference(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        user_id: Uuid,
+    ) -> Result<Option<String>, DetailsError> {
+        let Some(row) = self
+            .user_row::<AvatarProfileRow>(owner, token, user_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if row.uuid != user_id {
+            return Err(SourceError::InvalidResponse.into());
+        }
+        match row.avatar {
+            Value::Null => Ok(None),
+            Value::String(reference) => normalize_avatar_reference(&reference)
+                .map(Some)
+                .ok_or(SourceError::InvalidResponse.into()),
+            _ => Err(SourceError::InvalidResponse.into()),
+        }
     }
 
     /// Читает справочник для поиска людей в диалоге добавления.

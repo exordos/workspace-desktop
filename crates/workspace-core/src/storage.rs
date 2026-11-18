@@ -1,11 +1,13 @@
-//! Хранит папки, сообщения, счётчики, позиции чтения, черновики и очередь отправки в SQLite.
+//! Хранит аватары, папки, сообщения, счётчики, позиции чтения, черновики и очередь отправки в SQLite.
 //! Сначала описаны данные и таблицы, затем чтение и запись.
 
+mod avatars;
 mod drafts;
 mod folders;
 mod history;
 mod outbox;
 
+pub(crate) use avatars::{AvatarEvent, AvatarFence, AvatarSnapshot};
 pub use drafts::{DraftAccess, DraftScope, DraftWriteOutcome, PlaintextDraft};
 pub use folders::FolderChange;
 pub(crate) use history::HistoryPageGuard;
@@ -21,6 +23,7 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::{context::OwnerContext, notification_target::NotificationTarget};
 
@@ -67,6 +70,7 @@ pub(crate) struct EventWrite<'a> {
     pub notification_conversation: Option<&'a str>, // Разговор для цели баннера.
     pub history: Option<&'a HistoryChange>,         // Правка или удаление.
     pub folder: Option<FolderChange>,               // Сверка состава папок или удаление связей.
+    pub avatar: Option<AvatarEvent<'a>>,            // Изменение ссылки, сверка или удаление файла.
 }
 
 /// Число непрочитанных и позиция журнала, до которой оно уже учитывает изменения.
@@ -85,10 +89,11 @@ pub enum ApplyOutcome {
 
 /// Результаты одной транзакции. Помогают опубликовать только записанные изменения.
 pub(crate) struct AppliedEvent {
-    pub outcome: ApplyOutcome,  // Была ли сохранена позиция источника.
-    pub message_inserted: bool, // Появилась ли новая строка с сообщением.
-    pub unread_changed: bool,   // Изменилось ли число непрочитанных.
-    pub send_confirmed: bool,   // Закрыта ли строка очереди отправки.
+    pub outcome: ApplyOutcome,     // Была ли сохранена позиция источника.
+    pub message_inserted: bool,    // Появилась ли новая строка с сообщением.
+    pub unread_changed: bool,      // Изменилось ли число непрочитанных.
+    pub send_confirmed: bool,      // Закрыта ли строка очереди отправки.
+    pub avatar_changed: Vec<Uuid>, // Пользователи, чьи фото или состояния сверки изменились.
 }
 
 /// Причины, по которым локальная база не смогла прочитать или записать данные.
@@ -287,6 +292,7 @@ impl Storage {
         outbox::initialize(&transaction)?;
         drafts::initialize(&transaction)?;
         folders::initialize(&transaction)?;
+        avatars::initialize(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -401,6 +407,7 @@ impl Storage {
             history::reset(&transaction, owner)?;
             drafts::invalidate_owner(&transaction, owner)?;
             folders::reset(&transaction, owner)?;
+            avatars::reset(&transaction, owner)?;
             bump_catalog_revision(&transaction, owner)?;
             for table in [
                 "sync_messages",
@@ -476,6 +483,7 @@ impl Storage {
                     message_inserted: false,
                     unread_changed: false,
                     send_confirmed: false,
+                    avatar_changed: Vec::new(),
                 });
             }
         }
@@ -604,6 +612,13 @@ impl Storage {
             )?,
             None => false,
         };
+        let avatar_changed = if source == crate::messenger::SOURCE_ID
+            && let Some(event) = change.avatar
+        {
+            avatars::apply(&transaction, owner, event)?
+        } else {
+            Vec::new()
+        };
         transaction.execute(
             "INSERT INTO sync_cursors
                  (account_id, server, organization_id, project_id, user_id,
@@ -634,6 +649,7 @@ impl Storage {
             message_inserted,
             unread_changed,
             send_confirmed,
+            avatar_changed,
         })
     }
 }

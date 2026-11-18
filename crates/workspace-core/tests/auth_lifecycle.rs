@@ -21,7 +21,9 @@ use workspace_core::context::{AccountId, OwnerContext};
 use workspace_core::notification_target::{NotificationTarget, NotificationTargetError};
 use workspace_core::runtime::{EventSource, EventStream, Runtime, SourceError, SourceSession};
 use workspace_core::storage::{Cursor, Message, Storage};
-use workspace_core::sync::{Event, Sync as EventSync, SyncChange, SyncUpdate};
+use workspace_core::sync::{
+    ApplyOutcome, AvatarUpdate, Event, Sync as EventSync, SyncChange, SyncUpdate,
+};
 
 #[path = "support/background_baseline.rs"]
 mod background_baseline;
@@ -555,6 +557,73 @@ async fn folders_keep_confirmed_cache_readable_during_temporary_auth_failure() {
     fixture.auth.logout(&owner.account_id).unwrap();
     assert!(folders.snapshot(&fixture.auth, &owner, generation).is_err());
     token.abort();
+}
+
+/// Подписчик узнаёт только об изменениях, зафиксированных вместе с курсором его владельца.
+#[test]
+fn avatar_updates_follow_the_committed_messenger_cursor() {
+    let fixture = Fixture::new(|_, _| unreachable!());
+    let owner = fixture.login("a");
+    let generation = fixture.auth.snapshot()[0].generation;
+    let sync = EventSync::new(
+        fixture.auth.clone(),
+        Arc::new(Storage::in_memory().unwrap()),
+    );
+    let mut changes = sync.subscribe();
+    let user_id = uuid::Uuid::from_u128(2);
+    let file = format!("urn:image:{}", uuid::Uuid::from_u128(3));
+    let cursor = |epoch_version| Cursor {
+        epoch_generation: "test".into(),
+        epoch_version,
+    };
+    let apply = |version, avatar| {
+        sync.apply(
+            &owner,
+            generation,
+            "messenger",
+            Event::UserUpdated {
+                cursor: cursor(version),
+                user_id,
+                avatar,
+                sidebar: None,
+            },
+        )
+        .unwrap()
+    };
+    let expected = SyncUpdate {
+        context: owner.clone(),
+        generation,
+        change: SyncChange::AvatarChanged { user_id },
+    };
+
+    assert_eq!(
+        apply(1, AvatarUpdate::Reference(Some(file.clone()))),
+        ApplyOutcome::Applied
+    );
+    assert_eq!(changes.try_recv().unwrap(), expected);
+    assert_eq!(sync.cursor(&owner, "messenger").unwrap(), Some(cursor(1)));
+
+    assert_eq!(
+        apply(1, AvatarUpdate::Reference(None)),
+        ApplyOutcome::Duplicate
+    );
+    assert_eq!(
+        apply(2, AvatarUpdate::Reference(Some(file))),
+        ApplyOutcome::Applied
+    );
+    assert!(matches!(
+        changes.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+
+    assert_eq!(apply(3, AvatarUpdate::Reconcile), ApplyOutcome::Applied);
+    assert_eq!(changes.try_recv().unwrap(), expected);
+    assert_eq!(
+        apply(4, AvatarUpdate::Reference(None)),
+        ApplyOutcome::Applied
+    );
+    assert_eq!(changes.try_recv().unwrap(), expected);
+    assert_eq!(sync.cursor(&owner, "messenger").unwrap(), Some(cursor(4)));
 }
 
 /// Проверяет, что медленный подписчик получает последнее состояние без секретов.

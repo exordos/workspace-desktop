@@ -40,6 +40,8 @@ use workspace_core::{
 
 use super::Fixture;
 
+#[path = "avatars.rs"]
+mod avatars;
 #[path = "folder_runtime.rs"]
 mod folder_runtime;
 #[path = "outgoing.rs"]
@@ -92,6 +94,7 @@ struct HistoryApi {
     topic_realtime: AtomicUsize, // 1 — включить отдельный сценарий событий двух тем.
     outgoing: Option<Arc<outgoing::Api>>, // Подмена маршрутов очереди для теста отправки.
     folders: Option<Arc<folder_runtime::Api>>, // Подмена маршрутов папок и журнала.
+    avatars: Option<Arc<avatars::Api>>, // Подмена профиля и файлов для тестов аватаров.
 }
 
 /// Формирует серверное сообщение с одинаковыми UUID для обоих аккаунтов.
@@ -130,6 +133,10 @@ async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
     }
     if let Some(folders) = &api.folders {
         folders.reply(socket, request, &method, &headers).await;
+        return;
+    }
+    if let Some(avatars) = &api.avatars {
+        avatars.reply(socket, request, &method, &headers).await;
         return;
     }
     if api.topic_realtime.load(Relaxed) == 1 && request.path().ends_with("/events/ws") {

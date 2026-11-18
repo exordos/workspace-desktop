@@ -1,7 +1,11 @@
-//! Данные пользователя Workspace, которые видны в карточке профиля.
+//! Данные пользователя Workspace и доступ к его аватару по UUID.
 
 use serde::Deserialize;
 use uuid::Uuid;
+
+mod avatars;
+pub(crate) use avatars::AvatarLoads;
+pub use avatars::{AvatarFormat, AvatarImage, AvatarState, AvatarStore};
 
 /// Публичные поля, подтверждённые ответом справочника.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -18,12 +22,41 @@ pub struct UserProfile {
 impl UserProfile {
     /// Возвращает UUID файла, если аватар хранится внутри Workspace.
     pub fn avatar_file_id(&self) -> Option<Uuid> {
-        self.avatar
-            .as_deref()?
-            .strip_prefix("urn:image:")
-            .and_then(|id| Uuid::parse_str(id).ok())
-            .filter(|id| !id.is_nil())
+        self.avatar.as_deref().and_then(avatar_file_id)
     }
+}
+
+/// Читает UUID файла из ссылки на аватар Workspace.
+fn avatar_file_id(reference: &str) -> Option<Uuid> {
+    Uuid::parse_str(reference.strip_prefix("urn:image:")?)
+        .ok()
+        .filter(|id| !id.is_nil())
+}
+
+/// Приводит ссылку Workspace к одному виду и проверяет известные внешние ссылки.
+pub(crate) fn normalize_avatar_reference(reference: &str) -> Option<String> {
+    let reference = reference.trim();
+    if reference.len() > 2048 {
+        return None;
+    }
+    if reference.starts_with("urn:image:") {
+        return avatar_file_id(reference).map(|id| format!("urn:image:{id}"));
+    }
+
+    // Внешняя ссылка тоже подтверждает замену файла Workspace. Core её не скачивает.
+    let external = match reference
+        .strip_prefix("urn:")
+        .and_then(|urn| urn.split_once(':'))
+    {
+        Some(("gravatar", hash)) => {
+            matches!(hash.len(), 32 | 64) && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }
+        Some(("url", url)) => reqwest::Url::parse(url)
+            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some()),
+        Some(("gavatar", id)) => Uuid::parse_str(id).is_ok_and(|id| !id.is_nil()),
+        _ => false,
+    };
+    external.then(|| reference.to_owned())
 }
 
 /// Известные значения присутствия из Workspace.

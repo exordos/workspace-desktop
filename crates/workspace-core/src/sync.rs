@@ -10,13 +10,14 @@ use uuid::Uuid;
 use crate::{
     auth::{Auth, AuthError},
     context::{OwnerContext, SessionGeneration},
+    directory::AvatarLoads,
     messenger::details::{AvatarCache, SidebarCache, SidebarChange},
     notification_target::{NotificationTarget, NotificationTargetError},
     storage::{
-        Cursor, DeliveryStatus, EventWrite, FolderChange, HistoryChange, HistoryMessage,
-        HistoryMetadata, HistoryPageEdges, HistoryPageGuard, HistoryPageOutcome, HistoryPageTarget,
-        HistoryScope, HistoryWindow, Message, MessagePlacement, OutboxEntry, PreparedSend, Storage,
-        StorageError,
+        AvatarEvent, Cursor, DeliveryStatus, EventWrite, FolderChange, HistoryChange,
+        HistoryMessage, HistoryMetadata, HistoryPageEdges, HistoryPageGuard, HistoryPageOutcome,
+        HistoryPageTarget, HistoryScope, HistoryWindow, Message, MessagePlacement, OutboxEntry,
+        PreparedSend, Storage, StorageError,
     },
 };
 
@@ -67,6 +68,9 @@ pub enum SyncChange {
     SidebarDetailsChanged {
         stream_id: Uuid, // Стрим, чья открытая панель должна получить обновление.
     },
+    AvatarChanged {
+        user_id: Uuid, // Пользователь, чей аватар нужно перечитать.
+    },
     OutboxChanged {
         scope: HistoryScope, // Исходная тема, очередь которой нужно перечитать.
     },
@@ -84,6 +88,13 @@ pub enum HistoryRevocation {
         stream_id: Uuid, // Стрим, включая его окно без фильтра темы.
         topic_id: Uuid,  // Удалённая или отозванная тема.
     },
+}
+
+/// Сведения об аватаре пользователя из события справочника.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AvatarUpdate {
+    Reference(Option<String>), // Подтверждённая ссылка или явное отсутствие изображения.
+    Reconcile,                 // Ссылка неизвестна. Нужно сверить профиль.
 }
 
 /// Изменение, которое источник передаёт для сохранения.
@@ -110,6 +121,16 @@ pub enum Event {
         cursor: Cursor,        // Позиция в общем журнале Workspace.
         change: SidebarChange, // Изменение профиля, стрима, темы или состава.
     },
+    UserUpdated {
+        cursor: Cursor,                      // Позиция снимка пользователя в журнале.
+        user_id: Uuid,                       // UUID пользователя, чей профиль изменился.
+        avatar: AvatarUpdate,                // Подтверждённая ссылка или запрос сверки аватара.
+        sidebar: Option<Box<SidebarChange>>, // Снимок правой панели, если его удалось прочитать.
+    },
+    FileDeleted {
+        cursor: Cursor, // Позиция удаления в журнале Workspace.
+        file_id: Uuid,  // UUID файла, на который мог ссылаться профиль.
+    },
     UnreadChanged {
         cursor: Cursor, // Позиция события обновления папки в журнале.
         count: u32,     // Новый счётчик папки «Все чаты».
@@ -135,6 +156,8 @@ impl Event {
             | Self::IncomingDirectMessage { cursor, .. }
             | Self::HistoryChanged { cursor, .. }
             | Self::SidebarChanged { cursor, .. }
+            | Self::UserUpdated { cursor, .. }
+            | Self::FileDeleted { cursor, .. }
             | Self::UnreadChanged { cursor, .. }
             | Self::FolderChanged { cursor, .. }
             | Self::UnreadBaseline { cursor, .. }
@@ -192,6 +215,7 @@ pub enum PrepareSendError {
 /// Проверяет право сессии на запись и передаёт события в хранилище.
 pub struct Sync {
     pub(crate) avatar_cache: AvatarCache, // Временные файлы аватаров по владельцу и сессии.
+    pub(crate) avatar_loads: AvatarLoads, // Общие запросы аватаров по UUID пользователя.
     pub(crate) sidebar_cache: SidebarCache, // Временные снимки панелей на время сессии.
     auth: Auth,                           // Авторизация для проверки владельца и поколения сессии.
     storage: Arc<Storage>,                // Общая локальная база сообщений, позиций и счётчиков.
@@ -206,6 +230,7 @@ impl Sync {
             storage,
             sidebar_cache: SidebarCache::default(),
             avatar_cache: AvatarCache::default(),
+            avatar_loads: AvatarLoads::default(),
             updates: broadcast::channel(128).0,
         }
     }
@@ -521,6 +546,24 @@ impl Sync {
                 Event::UnreadChanged { .. } => Some(FolderChange::Refresh(Some(Uuid::nil()))),
                 _ => None,
             };
+            let avatar = match (&event, source) {
+                (
+                    Event::UserUpdated {
+                        user_id, avatar, ..
+                    },
+                    crate::messenger::SOURCE_ID,
+                ) => Some(match avatar {
+                    AvatarUpdate::Reference(reference) => AvatarEvent::Snapshot {
+                        user_id: *user_id,
+                        reference: reference.as_deref(),
+                    },
+                    AvatarUpdate::Reconcile => AvatarEvent::Reconcile { user_id: *user_id },
+                }),
+                (Event::FileDeleted { file_id, .. }, crate::messenger::SOURCE_ID) => {
+                    Some(AvatarEvent::FileDeleted { file_id: *file_id })
+                }
+                _ => None,
+            };
             let saved = self.storage.apply(
                 owner,
                 source,
@@ -533,6 +576,7 @@ impl Sync {
                     metadata,
                     history,
                     folder,
+                    avatar,
                 },
             )?;
             if let Some(count) = unread.filter(|_| saved.unread_changed) {
@@ -563,9 +607,14 @@ impl Sync {
                 }
             }
             if saved.outcome == ApplyOutcome::Applied && source == crate::messenger::SOURCE_ID {
+                for &user_id in &saved.avatar_changed {
+                    self.publish_avatar_change(owner, generation, user_id);
+                }
                 let sidebar = match &event {
                     Event::SidebarChanged { change, .. } => Some(change),
-                    Event::FolderChanged { sidebar, .. } => sidebar.as_deref(),
+                    Event::FolderChanged { sidebar, .. } | Event::UserUpdated { sidebar, .. } => {
+                        sidebar.as_deref()
+                    }
                     _ => None,
                 };
                 if let Some(change) = sidebar {
@@ -694,6 +743,16 @@ impl Sync {
                 );
             }
         })
+    }
+
+    /// Сообщает подписчикам аватара об изменении после записи в базу в действующей сессии.
+    fn publish_avatar_change(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        user_id: Uuid,
+    ) {
+        self.publish(owner, generation, SyncChange::AvatarChanged { user_id });
     }
 
     /// Публикует изменение под блокировкой действующей сессии после записи в базу.

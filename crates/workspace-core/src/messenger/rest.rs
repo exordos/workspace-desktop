@@ -17,12 +17,13 @@ use uuid::Uuid;
 
 use crate::{
     context::OwnerContext,
+    directory::normalize_avatar_reference,
     runtime::SourceError,
     storage::{
         Cursor, FolderChange, HistoryChange, HistoryEdge, HistoryMessage, HistoryMetadata,
         HistoryScope, HistoryTime, Message, MessagePlacement,
     },
-    sync::Event,
+    sync::{AvatarUpdate, Event},
 };
 
 use super::details::{DetailsError, StreamNotificationMode, TopicNotificationMode};
@@ -1163,6 +1164,18 @@ fn parse_uuid(value: &str) -> Option<Uuid> {
     Uuid::parse_str(value).ok()
 }
 
+/// Различает подтверждённую ссылку, отсутствие фото и необходимость сверки профиля.
+fn wire_avatar_update(value: Option<&Value>) -> AvatarUpdate {
+    match value {
+        Some(Value::Null) => AvatarUpdate::Reference(None),
+        Some(Value::String(reference)) => normalize_avatar_reference(reference)
+            .map_or(AvatarUpdate::Reconcile, |reference| {
+                AvatarUpdate::Reference(Some(reference))
+            }),
+        _ => AvatarUpdate::Reconcile,
+    }
+}
+
 /// Проверяет контекст и преобразует событие журнала в изменение для Sync.
 pub(super) fn wire_event(
     value: Value,
@@ -1198,6 +1211,58 @@ pub(super) fn wire_event(
     let message_created = wire.object_type == "message" && wire.action == "created";
     if message_created != (wire.payload.kind == "message.created") {
         return Err(SourceError::InvalidResponse);
+    }
+    if wire.object_type == "file" && wire.action == "deleted" && wire.payload.kind == "file.deleted"
+    {
+        if !matches_owner(
+            owner,
+            wire.payload.project_id.as_deref(),
+            wire.payload.user_uuid.as_deref(),
+        ) {
+            return Err(SourceError::InvalidResponse);
+        }
+        let file_id = wire
+            .payload
+            .uuid
+            .as_deref()
+            .and_then(parse_uuid)
+            .filter(|id| !id.is_nil());
+        let event = match file_id {
+            Some(file_id) => Event::FileDeleted { cursor, file_id },
+            None => Event::Checkpoint(cursor),
+        };
+        return Ok((event, None));
+    }
+    if wire.object_type == "user" && wire.action == "updated" && wire.payload.kind == "user.updated"
+    {
+        if !matches_owner(
+            owner,
+            wire.payload.project_id.as_deref(),
+            wire.payload.user_uuid.as_deref(),
+        ) {
+            return Err(SourceError::InvalidResponse);
+        }
+        let Some(user_id) = wire
+            .payload
+            .uuid
+            .as_deref()
+            .and_then(parse_uuid)
+            .filter(|id| !id.is_nil())
+        else {
+            // Без UUID нельзя определить чей профиль сверять. Позиция журнала всё равно пригодна.
+            return Ok((Event::Checkpoint(cursor), None));
+        };
+        let payload = &value["payload"];
+        // Старое событие может содержать UUID и аватар без обязательных полей карточки.
+        return Ok((
+            Event::UserUpdated {
+                cursor,
+                user_id,
+                avatar: wire_avatar_update(payload.get("avatar")),
+                sidebar: sidebar::wire_sidebar_change(&wire, payload, owner).map(Box::new),
+            },
+            None,
+        ));
     }
     if let Some(mut event) = folder_event(&wire, owner, &cursor)? {
         // Один снимок стрима может обновить и папки, и открытые сведения.
@@ -1375,6 +1440,131 @@ mod tests {
             Event::SidebarChanged { change: crate::messenger::details::SidebarChange::MembershipBinding(id), .. }
                 if id == Uuid::from_u128(4)
         ));
+    }
+
+    /// Создаёт событие для получателя, отличного от пользователя в снимке.
+    fn user_updated(version: u64, fields: Value) -> Value {
+        let mut payload = json!({
+            "kind": "user.updated",
+            "uuid": Uuid::from_u128(4),
+        });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        json!({
+            "schema_version": 1, "uuid": "event", "epoch_version": version,
+            "project_id": "project", "user_uuid": "recipient",
+            "object_type": "user", "action": "updated", "payload": payload,
+        })
+    }
+
+    /// Снимок сохраняет карточку, а старые события обновляют аватар даже без имени пользователя.
+    #[test]
+    fn user_events_decode_avatar_independently_from_sidebar_profile() {
+        let file = format!("urn:image:{}", Uuid::from_u128(0xabc));
+        let wire_file = format!(
+            "urn:image:{}",
+            Uuid::from_u128(0xabc).to_string().to_uppercase()
+        );
+        let fallback = "urn:gravatar:abcdabcdabcdabcdabcdabcdabcdabcd";
+        let events = decode_page(
+            vec![
+                user_updated(1, json!({"username": "avatar-owner", "avatar": wire_file})),
+                user_updated(2, json!({"avatar": fallback})),
+                user_updated(3, json!({"avatar": null})),
+                user_updated(4, json!({})),
+                user_updated(5, json!({"avatar": "urn:image:wrong"})),
+            ],
+            &owner(),
+            &cursor(0),
+        )
+        .unwrap();
+        let [
+            Event::UserUpdated {
+                user_id,
+                avatar: AvatarUpdate::Reference(Some(reference)),
+                sidebar: Some(sidebar),
+                ..
+            },
+            Event::UserUpdated {
+                avatar: AvatarUpdate::Reference(Some(external)),
+                sidebar: None,
+                ..
+            },
+            Event::UserUpdated {
+                avatar: AvatarUpdate::Reference(None),
+                ..
+            },
+            Event::UserUpdated {
+                avatar: AvatarUpdate::Reconcile,
+                ..
+            },
+            Event::UserUpdated {
+                avatar: AvatarUpdate::Reconcile,
+                ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("неожиданное преобразование событий профиля: {events:?}");
+        };
+        assert_eq!(*user_id, Uuid::from_u128(4));
+        assert_eq!(reference, &file);
+        assert_eq!(external, fallback);
+        assert!(matches!(
+            sidebar.as_ref(),
+            crate::messenger::details::SidebarChange::Profile { user_id: target, profile }
+                if target == user_id && profile.display_name == "avatar-owner"
+        ));
+    }
+
+    /// Отклоняет событие, которое во вложенных полях указывает чужой контекст.
+    #[test]
+    fn refuses_user_events_from_a_different_context() {
+        for fields in [
+            json!({"project_id": "other"}),
+            json!({"user_uuid": "other"}),
+        ] {
+            assert_eq!(
+                wire_event(user_updated(1, fields), &owner(), "epoch").map(|(event, _)| event),
+                Err(SourceError::InvalidResponse)
+            );
+        }
+    }
+
+    /// Неполное событие без пользователя оставляет позицию журнала доступной для продолжения.
+    #[test]
+    fn user_events_without_a_subject_advance_as_checkpoints() {
+        let event = user_updated(1, json!({"uuid": null}));
+        assert_eq!(
+            wire_event(event, &owner(), "epoch").unwrap().0,
+            Event::Checkpoint(cursor(1))
+        );
+    }
+
+    /// Передаёт удаление файла в кэш, даже когда событие не содержит стрим и профиль.
+    #[test]
+    fn file_deletion_identifies_avatar_file_in_the_recipient_context() {
+        let file_id = Uuid::from_u128(7);
+        let event = json!({
+            "schema_version": 1, "uuid": "event", "epoch_version": 1,
+            "project_id": "project", "user_uuid": "recipient",
+            "object_type": "file", "action": "deleted",
+            "payload": { "kind": "file.deleted", "uuid": file_id, "stream_uuid": null },
+        });
+        assert_eq!(
+            decode_page(vec![event.clone()], &owner(), &cursor(0)).unwrap(),
+            [Event::FileDeleted {
+                cursor: cursor(1),
+                file_id
+            }],
+        );
+        let mut foreign = event;
+        foreign["payload"]["project_id"] = json!("other");
+        assert_eq!(
+            wire_event(foreign, &owner(), "epoch").map(|(event, _)| event),
+            Err(SourceError::InvalidResponse)
+        );
     }
 
     /// Создаёт JSON события о новом сообщении для теста.

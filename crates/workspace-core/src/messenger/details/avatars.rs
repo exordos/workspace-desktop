@@ -16,24 +16,10 @@ use crate::{
 
 use super::{DetailsError, MessengerSource};
 
+pub use crate::directory::{AvatarFormat as SidebarAvatarFormat, AvatarImage as SidebarAvatar};
+
 const ENTRY_LIMIT: usize = 128;
 const BYTE_LIMIT: usize = 64 * 1024 * 1024;
-
-/// Форматы, которые Workspace принимает при загрузке собственного аватара.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SidebarAvatarFormat {
-    Png,  // PNG.
-    Jpeg, // JPEG.
-    Gif,  // GIF.
-    Webp, // WebP.
-}
-
-/// Загруженный файл аватара с проверенным MIME.
-#[derive(Debug)]
-pub struct SidebarAvatar {
-    pub format: SidebarAvatarFormat, // Формат для декодера GPUI.
-    pub bytes: Vec<u8>,              // Содержимое файла в пределах серверного лимита.
-}
 
 type AvatarKey = (OwnerContext, SessionGeneration, Uuid);
 type AvatarEntry = Arc<OnceCell<Arc<SidebarAvatar>>>;
@@ -90,6 +76,26 @@ impl AvatarCache {
 }
 
 impl MessengerSource {
+    /// Получает ссылку на фото человека через общий HTTPS-клиент Workspace.
+    pub(crate) async fn avatar_reference(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        user_id: Uuid,
+    ) -> Result<Option<String>, DetailsError> {
+        self.rest.avatar_reference(owner, token, user_id).await
+    }
+
+    /// Скачивает фото для справочника, применяя общую проверку ответа Workspace.
+    pub(crate) async fn avatar_image(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        file_id: Uuid,
+    ) -> Result<SidebarAvatar, DetailsError> {
+        self.rest.sidebar_avatar(owner, token, file_id).await
+    }
+
     /// Загружает аватар через Workspace API и выдаёт байты только пока действует исходная сессия.
     pub async fn sidebar_avatar(
         &self,
