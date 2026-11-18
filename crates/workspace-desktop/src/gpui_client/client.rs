@@ -1,12 +1,16 @@
 //! Направляет действия между оболочкой, рабочим потоком, экраном разговора и AppKit.
 //! Здесь также собирается основная разметка окна из готовых компонентов.
 
+mod notification_banner;
+
 use std::collections::HashMap;
 
 use gpui::{
     Context, Entity, FocusHandle, SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 use workspace_core::{auth::SessionStatus, context::AccountId};
+
+use notification_banner::{NotificationBanner, NotificationBannerActions};
 
 use super::{
     Options,
@@ -46,6 +50,7 @@ pub(super) struct Client {
     sign_in: Option<Entity<SignIn>>, // Форма нужна, пока в профиле нет доступного входа.
     labels: HashMap<AccountId, String>, // Подписи для переключателя и баннеров.
     top_bar: Entity<TopBar>,  // Шапка хранит локальный фокус и показывает снимок оболочки.
+    notification_banner: Entity<NotificationBanner>, // Планка разрешения поверх рабочей области.
     _top_bar_subscription: Subscription, // Передаёт выбор в оболочку.
     initial_focus: FocusHandle, // Корневая точка обхода до выбора первого элемента.
     restore_focus: bool,      // После закрытия формы вернуть фокус в рабочую область.
@@ -68,6 +73,17 @@ impl Client {
         .detach();
         let top_bar = cx.new(TopBar::new);
         let initial_focus = cx.focus_handle();
+        let notification_banner = cx.new(|cx| {
+            NotificationBanner::new(
+                NotificationBannerActions {
+                    status: WindowPlatform::notification_permission,
+                    request: WindowPlatform::request_notification_permission,
+                    open_settings: WindowPlatform::open_notification_settings,
+                },
+                initial_focus.clone(),
+                cx,
+            )
+        });
         let right_panel = cx.new(|cx| RightPanel::new(initial_focus.clone(), cx));
         cx.observe(&right_panel, |_, _, cx| cx.notify()).detach();
         let selection = cx.subscribe(&top_bar, |client, _, selection: &TopBarSelection, cx| {
@@ -95,6 +111,7 @@ impl Client {
             sign_in: None,
             labels: options.labels,
             top_bar,
+            notification_banner,
             _top_bar_subscription: selection,
             initial_focus,
             restore_focus: false,
@@ -422,10 +439,10 @@ impl Render for Client {
             return root.child(div().flex().flex_1().min_h_0().child(sign_in.clone()));
         }
 
-        let issue = self.shell.route_error().or_else(|| {
-            WindowPlatform::notification_error(cx).map(|_| "Системные уведомления недоступны")
-        });
-        let content = if let Some(status) = self.status() {
+        let route_error = self.shell.route_error();
+        let status = self.status();
+        let show_notifications = status.is_none() && self.shell.selected().is_some();
+        let content = if let Some(status) = status {
             div()
                 .size_full()
                 .flex()
@@ -483,7 +500,7 @@ impl Render for Client {
         };
 
         root.child(self.top_bar.clone())
-            .children(issue.map(|message| {
+            .children(route_error.map(|message| {
                 label(palette, TextRole::Body, message)
                     .p_2()
                     .text_color(palette.danger)
@@ -497,6 +514,9 @@ impl Render for Client {
                     .pt(px(PANEL_GAP))
                     .child(content),
             )
+            .when(show_notifications, |root| {
+                root.child(gpui::deferred(self.notification_banner.clone()).with_priority(3))
+            })
             .child(self.sidebar.read(cx).folder_dialog())
     }
 }
@@ -535,6 +555,153 @@ mod tests {
             status: SessionStatus::Active,
             unread: None,
         }
+    }
+
+    /// Подменяет ответы системы для проверки планки в рабочей оболочке.
+    struct MockNotificationPermission {
+        status: crate::platform::notifications::NotificationPermission, // Текущий ответ macOS.
+        requesting: bool,               // Ждём ответа в системном диалоге.
+        requests: u32,                  // Сколько намерений дошло от кнопки до адаптера.
+        settings: std::cell::Cell<u32>, // Сколько раз пользователь открывал настройки.
+    }
+
+    impl gpui::Global for MockNotificationPermission {}
+
+    /// Проверяет сворачивание, предпросмотр, клавиатуру и действия для разных статусов.
+    #[gpui::test]
+    fn notification_permission_banner_overlays_the_chat_and_waits_for_explicit_action(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::platform::notifications::NotificationPermission;
+        use std::time::Duration;
+
+        cx.update(|app| {
+            bind_keys(app);
+            app.set_global(MockNotificationPermission {
+                status: NotificationPermission::NeedsPermission,
+                requesting: false,
+                requests: 0,
+                settings: Default::default(),
+            });
+        });
+        let clock = cx.executor();
+        let profile = tempfile::tempdir().unwrap();
+        let (runtime, _events) = RuntimeClient::start_in(profile.path().into()).unwrap();
+        let saved = account("A");
+        let (client, ui) = cx.add_window_view(|_, cx| {
+            let mut client = Client::new(Options::default(), runtime.clone(), cx);
+            let focus = client.initial_focus.clone();
+            client.notification_banner = cx.new(|cx| {
+                NotificationBanner::new(
+                    NotificationBannerActions {
+                        status: |app| {
+                            let state = app.global::<MockNotificationPermission>();
+                            (Some(state.status), state.requesting)
+                        },
+                        request: |app| {
+                            let state = app.global_mut::<MockNotificationPermission>();
+                            state.requests += 1;
+                            state.requesting = true;
+                            app.refresh_windows();
+                        },
+                        open_settings: |app| {
+                            let counter = &app.global::<MockNotificationPermission>().settings;
+                            counter.set(counter.get() + 1);
+                            false
+                        },
+                    },
+                    focus,
+                    cx,
+                )
+            });
+            client.ready = true;
+            client.handle_runtime(RuntimeEvent::Accounts(vec![saved]), cx);
+            client
+        });
+        ui.simulate_resize(size(px(700.), px(600.)));
+        let finish_slide = |ui: &mut gpui::VisualTestContext| {
+            ui.run_until_parked();
+            clock.advance_clock(Duration::from_millis(175));
+            ui.update(|window, _| window.refresh());
+            ui.run_until_parked();
+        };
+        let banner = "notification-permission-banner";
+        let strip = "notification-permission-strip";
+        let primary = "notification-permission-primary";
+        finish_slide(ui);
+        let sidebar = ui.debug_bounds("workspace-sidebar-panel").unwrap();
+        let expanded = ui.debug_bounds(banner).unwrap();
+        let top_bar = ui.debug_bounds("workspace-top-bar").unwrap();
+        assert!(expanded.top() <= top_bar.top());
+        let later = ui.debug_bounds("notification-permission-later").unwrap();
+        assert_eq!(
+            ui.read(|app| app.global::<MockNotificationPermission>().requests),
+            0
+        );
+
+        ui.simulate_mouse_move(later.center(), None, Modifiers::none());
+        ui.simulate_click(later.center(), Modifiers::none());
+        finish_slide(ui);
+        let collapsed = ui.debug_bounds(banner).unwrap();
+        assert!(collapsed.size.height < expanded.size.height);
+        assert_eq!(ui.debug_bounds("workspace-sidebar-panel"), Some(sidebar));
+        let outside = gpui::point(sidebar.center().x, sidebar.bottom() - px(24.));
+        ui.simulate_mouse_move(outside, None, Modifiers::none());
+        let strip_bounds = ui.debug_bounds(strip).unwrap();
+        ui.simulate_mouse_move(strip_bounds.center(), None, Modifiers::none());
+        finish_slide(ui);
+        ui.simulate_mouse_move(later.center(), None, Modifiers::none());
+        assert_eq!(ui.debug_bounds(banner), Some(expanded));
+        ui.simulate_mouse_move(outside, None, Modifiers::none());
+        finish_slide(ui);
+        assert_eq!(ui.debug_bounds(banner), Some(collapsed));
+        assert_eq!(
+            ui.read(|app| app.global::<MockNotificationPermission>().requests),
+            0
+        );
+
+        press_key(ui, "enter");
+        finish_slide(ui);
+        assert_eq!(ui.debug_bounds(banner), Some(expanded));
+        let button = ui.debug_bounds(primary).unwrap();
+        ui.simulate_click(button.center(), Modifiers::none());
+        ui.run_until_parked();
+        ui.simulate_click(button.center(), Modifiers::none());
+        assert_eq!(
+            ui.read(|app| app.global::<MockNotificationPermission>().requests),
+            1
+        );
+
+        ui.update(|_, app| {
+            let state = app.global_mut::<MockNotificationPermission>();
+            state.status = NotificationPermission::NeedsSettings;
+            state.requesting = false;
+            app.refresh_windows();
+        });
+        finish_slide(ui);
+        let button = ui.debug_bounds(primary).unwrap();
+        ui.simulate_click(button.center(), Modifiers::none());
+        assert_eq!(
+            ui.read(|app| app.global::<MockNotificationPermission>().settings.get()),
+            1
+        );
+        ui.update(|_, app| {
+            app.global_mut::<MockNotificationPermission>().status = NotificationPermission::Enabled;
+            app.refresh_windows();
+        });
+        finish_slide(ui);
+        assert_eq!(ui.debug_bounds("workspace-sidebar-panel"), Some(sidebar));
+        assert!(ui.update(|window, app| client.read(app).initial_focus.is_focused(window)));
+        // GPUI сохраняет последние debug_bounds даже после удаления элемента. Проверяем ввод.
+        ui.simulate_click(button.center(), Modifiers::none());
+        assert_eq!(
+            ui.read(|app| app.global::<MockNotificationPermission>().settings.get()),
+            1
+        );
+        assert_eq!(
+            futures::executor::block_on(runtime.shutdown()),
+            RuntimeExit::Clean,
+        );
     }
 
     /// Проверяет, что форма ждёт готовности профиля и отдаёт окно активному входу.
@@ -709,6 +876,8 @@ mod tests {
         ui.run_until_parked();
 
         let bar = ui.debug_bounds("workspace-top-bar").unwrap();
+        let sidebar = ui.debug_bounds("workspace-sidebar-panel").unwrap();
+        assert_eq!(sidebar.top() - bar.bottom(), px(PANEL_GAP));
         let chats = ui.debug_bounds("workspace-top-bar-chats").unwrap();
         assert_eq!(bar.center().x, chats.center().x);
         assert!(ui.debug_bounds("workspace-account-dot-1").is_some());

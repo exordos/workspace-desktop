@@ -16,7 +16,7 @@ use workspace_core::context::AccountId;
 
 use super::{contracts::RuntimeExit, runtime::RuntimeClient};
 use crate::platform::{
-    notifications::{NotificationClick, NotificationError, Notifications},
+    notifications::{NotificationClick, NotificationError, NotificationPermission, Notifications},
     tray::{Command, Tray},
     wake::WakeObserver,
 };
@@ -32,7 +32,9 @@ pub struct WindowPlatform {
     native: Option<macos::NativeWindow>, // Ссылка macOS для восстановления из Dock.
     runtime: RuntimeClient,  // Фоновая работа, которую нужно остановить до выхода.
     notifications: Notifications, // Центр уведомлений и связь баннера с исходной целью.
-    notification_error: Option<NotificationError>, // Текущая причина недоступности баннеров.
+    permission: Option<NotificationPermission>, // Последний применённый ответ macOS.
+    permission_read: u64,    // Номер последнего чтения, чтобы отсеять поздние ответы.
+    requesting_permission: bool, // Системный запрос занимает кнопку до чтения нового статуса.
     quitting: bool,          // Идёт завершение, повторные действия отбрасываются.
     _tray: Option<Tray>,     // Меню Workspace живёт вместе с оконным циклом.
     _wake: WakeObserver,     // Передаёт пробуждение macOS фоновой работе.
@@ -144,14 +146,14 @@ impl WindowPlatform {
                 }
             })
         });
-        let prepare = notifications.prepare();
-
         app.set_global(Self {
             window,
             native,
             runtime,
             notifications,
-            notification_error: None,
+            permission: None,
+            permission_read: 0,
+            requesting_permission: false,
             quitting: false,
             _tray: tray,
             _wake: wake,
@@ -168,13 +170,99 @@ impl WindowPlatform {
             items: vec![MenuItem::action("Выход", Quit)],
         }]);
 
+        Self::refresh_notification_permission(app);
+        Ok(())
+    }
+
+    /// Возвращает статус для планки и признак незавершённого системного запроса.
+    pub(super) fn notification_permission(app: &App) -> (Option<NotificationPermission>, bool) {
+        app.try_global::<Self>()
+            .map(|platform| (platform.permission, platform.requesting_permission))
+            .unwrap_or_default()
+    }
+
+    /// При запуске и возврате из настроек пассивно перечитывает разрешение.
+    pub(super) fn refresh_notification_permission(app: &mut App) {
+        let Some(platform) = app.try_global::<Self>() else {
+            return;
+        };
+        if !platform.quitting && !platform.requesting_permission {
+            Self::read_notification_permission(app, operation());
+        }
+    }
+
+    /// Запускает системный диалог ровно один раз до получения обновлённого статуса.
+    pub(super) fn request_notification_permission(app: &mut App) {
+        let Some(platform) = app.try_global::<Self>() else {
+            return;
+        };
+        if platform.quitting
+            || platform.requesting_permission
+            || platform.permission != Some(NotificationPermission::NeedsPermission)
+        {
+            return;
+        }
         let op_id = operation();
-        app.spawn(async move |app| {
-            let result = prepare.await;
-            let _ = app.update(|app| Self::notification_finished(app, op_id, result));
+        let platform = app.global_mut::<Self>();
+        platform.requesting_permission = true;
+        platform.permission_read = op_id;
+        log::debug!("op_id={op_id} event=workspace_notification_permission_requested");
+        let request = platform.notifications.request_permission();
+        app.refresh_windows();
+        app.spawn(async move |cx| {
+            let result = request.await;
+            log::debug!(
+                "op_id={op_id} event=workspace_notification_permission_answered result={}",
+                Self::notification_result(&result),
+            );
+            let _ = cx.update(|app| Self::read_notification_permission(app, op_id));
         })
         .detach();
-        Ok(())
+    }
+
+    /// Передаёт macOS ссылку на настройки, а окно при ошибке покажет путь вручную.
+    pub(super) fn open_notification_settings(app: &App) -> bool {
+        let opened = app
+            .try_global::<Self>()
+            .is_some_and(|platform| platform.notifications.open_settings());
+        log::debug!("event=workspace_notification_settings_opened result={opened}");
+        opened
+    }
+
+    /// Сохраняет только актуальный ответ ОС, включая обновление после диалога.
+    fn read_notification_permission(app: &mut App, op_id: u64) {
+        let platform = app.global_mut::<Self>();
+        if platform.quitting {
+            return;
+        }
+        platform.permission_read = op_id;
+        let read = platform.notifications.permission();
+        app.spawn(async move |cx| {
+            let result = read.await;
+            let _ = cx.update(|app| {
+                let platform = app.global_mut::<Self>();
+                if platform.quitting || platform.permission_read != op_id {
+                    return;
+                }
+                let status = match &result {
+                    Ok(NotificationPermission::NeedsPermission) => "needs_permission",
+                    Ok(NotificationPermission::NeedsSettings) => "needs_settings",
+                    Ok(NotificationPermission::Enabled) => "enabled",
+                    Err(error) => Self::notification_error_result(error),
+                };
+                log::debug!(
+                    "op_id={op_id} event=workspace_notification_permission_read result={status}"
+                );
+                let permission = result.ok();
+                let changed = platform.requesting_permission || platform.permission != permission;
+                platform.requesting_permission = false;
+                platform.permission = permission;
+                if changed {
+                    app.refresh_windows();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Поднимает существующее окно и оставляет фокус его текущему экрану.
@@ -210,16 +298,11 @@ impl WindowPlatform {
                 .show(&id, "Новое сообщение", &body, target, click.generation);
         let op_id = operation();
         log::debug!("op_id={op_id} event=workspace_notification_requested");
-        app.spawn(async move |app| {
+        app.spawn(async move |_| {
             let result = delivery.await;
-            let _ = app.update(|app| Self::notification_finished(app, op_id, result));
+            Self::notification_finished(op_id, result);
         })
         .detach();
-    }
-
-    /// Возвращает причину недоступности баннеров для сообщения в оболочке.
-    pub fn notification_error(app: &App) -> Option<&NotificationError> {
-        app.try_global::<Self>()?.notification_error.as_ref()
     }
 
     /// Останавливает Bootstrap и дожидается записи размера до завершения GPUI.
@@ -258,17 +341,26 @@ impl WindowPlatform {
         .detach();
     }
 
-    /// Запоминает результат запроса к macOS для следующей отрисовки оболочки.
-    fn notification_finished(app: &mut App, op_id: u64, result: Result<(), NotificationError>) {
-        log::debug!(
-            "op_id={op_id} event=workspace_notification_finished result={}",
-            if result.is_ok() { "ok" } else { "unavailable" },
-        );
-        let platform = app.global_mut::<Self>();
-        let changed = platform.notification_error.as_ref() != result.as_ref().err();
-        platform.notification_error = result.err();
-        if changed {
-            app.refresh_windows();
+    /// Записывает итог системной операции без текста уведомления и данных аккаунта.
+    fn notification_finished(op_id: u64, result: Result<(), NotificationError>) {
+        let status = Self::notification_result(&result);
+        log::debug!("op_id={op_id} event=workspace_notification_finished result={status}");
+    }
+
+    /// Преобразует системный результат в безопасное поле журнала.
+    fn notification_result<T>(result: &Result<T, NotificationError>) -> &'static str {
+        match result {
+            Ok(_) => "ok",
+            Err(error) => Self::notification_error_result(error),
+        }
+    }
+
+    /// Указывает тип сбоя, исключая из журнала свободный текст macOS.
+    fn notification_error_result(error: &NotificationError) -> &'static str {
+        match error {
+            NotificationError::Unavailable => "unavailable",
+            NotificationError::PermissionDenied => "permission_denied",
+            NotificationError::System(_) => "system_error",
         }
     }
 }

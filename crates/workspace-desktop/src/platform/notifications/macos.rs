@@ -11,16 +11,17 @@ use futures::channel::{mpsc, oneshot};
 use objc2::rc::Retained;
 use objc2::runtime::{Bool, ProtocolObject};
 use objc2::{ClassType, DeclaredClass, declare_class, mutability};
-use objc2_foundation::{NSBundle, NSError, NSObject, NSObjectProtocol, NSString, NSUUID};
+use objc2_app_kit::NSWorkspace;
+use objc2_foundation::{NSBundle, NSError, NSObject, NSObjectProtocol, NSString, NSURL, NSUUID};
 use objc2_user_notifications::{
-    UNAuthorizationOptions, UNAuthorizationStatus, UNErrorCode, UNErrorDomain,
+    UNAlertStyle, UNAuthorizationOptions, UNAuthorizationStatus, UNErrorCode, UNErrorDomain,
     UNMutableNotificationContent, UNNotification, UNNotificationDefaultActionIdentifier,
     UNNotificationPresentationOptions, UNNotificationRequest, UNNotificationResponse,
     UNNotificationSetting, UNNotificationSettings, UNUserNotificationCenter,
     UNUserNotificationCenterDelegate,
 };
 
-use super::{NotificationClick, NotificationError};
+use super::{NotificationClick, NotificationError, NotificationPermission};
 
 const RECENT_NOTIFICATIONS: usize = 128;
 const CLICK_BUFFER: usize = 32;
@@ -66,12 +67,24 @@ impl Center {
         self.click_receiver.lock().ok()?.take()
     }
 
-    /// Проверяет разрешение и просит его, если пользователь ещё не принимал решение.
-    pub(super) fn prepare(
+    /// Возвращает текущие настройки баннеров без запроса разрешения.
+    pub(super) fn permission(
+        &self,
+    ) -> impl Future<Output = Result<NotificationPermission, NotificationError>> + Send + 'static
+    {
+        let (sender, receiver) = oneshot::channel();
+        self.read_permission(move |permission| {
+            let _ = sender.send(Ok(permission));
+        });
+        await_callback(receiver)
+    }
+
+    /// Просит macOS показать диалог после нажатия кнопки в рабочем окне.
+    pub(super) fn request_permission(
         &self,
     ) -> impl Future<Output = Result<(), NotificationError>> + Send + 'static {
         let (sender, receiver) = oneshot::channel();
-        self.with_alert_permission(move |result| {
+        request_permission(&self.center, move |result| {
             let _ = sender.send(result);
         });
         await_callback(receiver)
@@ -89,9 +102,9 @@ impl Center {
         let id = format!("{}/{id}", self.prefix);
         let (title, body) = (title.to_owned(), body.to_owned());
         let clicks = Arc::clone(&self.clicks);
-        self.with_alert_permission(move |permission| {
-            if let Err(error) = permission {
-                let _ = sender.send(Err(error));
+        self.read_permission(move |permission| {
+            if permission != NotificationPermission::Enabled {
+                let _ = sender.send(Err(NotificationError::PermissionDenied));
                 return;
             }
             // Центр доступен из любого потока. Создаём объекты уведомления в самом обработчике.
@@ -126,28 +139,38 @@ impl Center {
         await_callback(receiver)
     }
 
-    /// Читает актуальные настройки ОС и при необходимости запускает системный запрос.
-    fn with_alert_permission(
-        &self,
-        complete: impl FnOnce(Result<(), NotificationError>) + Send + 'static,
-    ) {
+    /// Считывает актуальное разрешение и стиль баннеров, заданные пользователем.
+    fn read_permission(&self, complete: impl FnOnce(NotificationPermission) + Send + 'static) {
         let callback = RcBlock::new(once(move |settings: NonNull<UNNotificationSettings>| {
             let settings = unsafe { settings.as_ref() };
-            match unsafe { settings.authorizationStatus() } {
-                UNAuthorizationStatus::NotDetermined => request_permission(complete),
+            let permission = match unsafe { settings.authorizationStatus() } {
+                UNAuthorizationStatus::NotDetermined => NotificationPermission::NeedsPermission,
                 UNAuthorizationStatus::Authorized
-                    if unsafe { settings.alertSetting() } == UNNotificationSetting::Enabled =>
+                    if unsafe { settings.alertSetting() } == UNNotificationSetting::Enabled
+                        && unsafe { settings.alertStyle() } != UNAlertStyle::None =>
                 {
-                    complete(Ok(()));
+                    NotificationPermission::Enabled
                 }
-                _ => complete(Err(NotificationError::PermissionDenied)),
-            }
+                _ => NotificationPermission::NeedsSettings,
+            };
+            complete(permission);
         }));
         unsafe {
             self.center
                 .getNotificationSettingsWithCompletionHandler(&callback)
         };
     }
+}
+
+/// Открывает раздел уведомлений в новых и старых версиях macOS.
+pub(super) fn open_settings() -> bool {
+    let pane = if std::path::Path::new("/System/Applications/System Settings.app").exists() {
+        "x-apple.systempreferences:com.apple.Notifications-Settings.extension"
+    } else {
+        "x-apple.systempreferences:com.apple.preference.notifications"
+    };
+    let url = unsafe { NSURL::URLWithString(&NSString::from_str(pane)) };
+    url.is_some_and(|url| unsafe { NSWorkspace::sharedWorkspace().openURL(&url) })
 }
 
 /// Хранит цели последних отправленных баннеров и передаёт известные клики приложению.
@@ -187,7 +210,10 @@ impl ClickQueue {
 }
 
 /// Просит разрешение только на показ уведомлений. Звук и счётчик на иконке не используются.
-fn request_permission(complete: impl FnOnce(Result<(), NotificationError>) + Send + 'static) {
+fn request_permission(
+    center: &UNUserNotificationCenter,
+    complete: impl FnOnce(Result<(), NotificationError>) + Send + 'static,
+) {
     let callback = once(move |(granted, error): (Bool, *mut NSError)| {
         complete(system_result(unsafe { error.as_ref() }).and_then(|()| {
             if granted.as_bool() {
@@ -199,7 +225,6 @@ fn request_permission(complete: impl FnOnce(Result<(), NotificationError>) + Sen
     });
     let wrapper =
         RcBlock::new(move |granted: Bool, error: *mut NSError| callback((granted, error)));
-    let center = unsafe { UNUserNotificationCenter::currentNotificationCenter() };
     unsafe {
         center.requestAuthorizationWithOptions_completionHandler(
             UNAuthorizationOptions::UNAuthorizationOptionAlert,
@@ -220,9 +245,9 @@ fn once<T>(callback: impl FnOnce(T) + Send) -> impl Fn(T) + Send + Sync {
 }
 
 /// Возвращает результат запроса или ошибку, если ОС закрыла обработчик без ответа.
-async fn await_callback(
-    receiver: oneshot::Receiver<Result<(), NotificationError>>,
-) -> Result<(), NotificationError> {
+async fn await_callback<T>(
+    receiver: oneshot::Receiver<Result<T, NotificationError>>,
+) -> Result<T, NotificationError> {
     receiver.await.unwrap_or_else(|_| {
         Err(NotificationError::System(
             "Центр уведомлений macOS не ответил".to_owned(),

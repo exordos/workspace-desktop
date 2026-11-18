@@ -64,6 +64,14 @@ pub fn run(options: Options) -> io::Result<()> {
         };
 
         let target = client.downgrade();
+        let _ = window.update(app, |_, window, cx| {
+            cx.observe_window_activation(window, |_, window, cx| {
+                if window.is_window_active() {
+                    WindowPlatform::refresh_notification_permission(cx);
+                }
+            })
+            .detach();
+        });
         if WindowPlatform::install(
             app,
             window.into(),

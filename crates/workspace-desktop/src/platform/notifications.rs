@@ -10,7 +10,15 @@ use workspace_core::notification_target::NotificationTarget;
 #[cfg(target_os = "macos")]
 mod macos;
 
-/// Ошибка, которую оболочка может показать независимо от состояния синхронизации.
+/// Настройки macOS, от которых зависит показ системного баннера.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NotificationPermission {
+    NeedsPermission, // Пользователь ещё не отвечал на запрос macOS.
+    NeedsSettings,   // macOS не показывает баннеры при текущих настройках.
+    Enabled,         // macOS разрешает показывать баннеры.
+}
+
+/// Ошибка системной операции, независимой от синхронизации чатов.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NotificationError {
     /// У процесса нет доступа к центру уведомлений на этой платформе.
@@ -67,10 +75,29 @@ impl Notifications {
         None
     }
 
-    /// Запрашивает разрешение заранее, чтобы первое сообщение сразу могло показать баннер.
-    pub fn prepare(&self) -> impl Future<Output = Result<(), NotificationError>> + Send + 'static {
+    /// Получает настройки ОС без системного диалога.
+    pub fn permission(
+        &self,
+    ) -> impl Future<Output = Result<NotificationPermission, NotificationError>> + Send + 'static
+    {
         #[cfg(target_os = "macos")]
-        let authorization = self.macos.as_ref().map(macos::Center::prepare);
+        let settings = self.macos.as_ref().map(macos::Center::permission);
+
+        async move {
+            #[cfg(target_os = "macos")]
+            if let Some(settings) = settings {
+                return settings.await;
+            }
+            Err(NotificationError::Unavailable)
+        }
+    }
+
+    /// Вызывает системный запрос после явного действия пользователя.
+    pub fn request_permission(
+        &self,
+    ) -> impl Future<Output = Result<(), NotificationError>> + Send + 'static {
+        #[cfg(target_os = "macos")]
+        let authorization = self.macos.as_ref().map(macos::Center::request_permission);
 
         async move {
             #[cfg(target_os = "macos")]
@@ -79,6 +106,14 @@ impl Notifications {
             }
             Err(NotificationError::Unavailable)
         }
+    }
+
+    /// Открывает системный раздел уведомлений и сообщает, приняла ли macOS ссылку.
+    pub fn open_settings(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        return self.macos.is_some() && macos::open_settings();
+        #[cfg(not(target_os = "macos"))]
+        false
     }
 
     /// Отправляет уведомление с уникальным идентификатором. Успех означает, что ОС приняла запрос.
