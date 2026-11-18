@@ -68,6 +68,7 @@ const MARKER: &str =
 const MESSAGES: &str = "/api/workspace/v1/messenger/messages/";
 const STREAMS: &str = "/api/workspace/v1/messenger/streams/";
 const TOPICS: &str = "/api/workspace/v1/messenger/stream_topics/";
+const FOLDERS: &str = "/api/workspace/v1/messenger/folders/";
 const CHAT_ROW: &str = "catalog-chat-10000000-0000-4000-8000-000000000005";
 const CHANNEL_ROW: &str = "catalog-chat-10000000-0000-4000-8000-000000000007";
 const CHANNEL_TOPIC_ROW: &str =
@@ -261,6 +262,8 @@ struct Received {
     recovery: Option<Recovery>, // Сценарий сброса курсора, если тест его включил.
     topic: Option<TopicAcceptance>, // Канал с явной темой для UI-12.
     details: Option<DetailsFixture>, // Ответы для правой панели UI-13.
+    folders: Mutex<HashMap<(&'static str, Uuid), Value>>, // Папки, созданные в тестовых входах.
+    folder_posts: AtomicUsize, // Число запросов создания, дошедших через HTTPS.
 }
 
 /// Держит локальный сервер, пока существует сценарий.
@@ -468,6 +471,20 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         }
         _ => panic!("HTTPS должен использовать тестовый вход открытого профиля"),
     };
+    if path == FOLDERS && request.method() == Method::POST {
+        let bytes = request.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let id: Uuid = serde_json::from_value(body["uuid"].clone()).unwrap();
+        let mut folder = folder_row(id, body["title"].as_str().unwrap(), "created", 0);
+        folder["background_color_value"] = body["background_color_value"].clone();
+        state.folder_posts.fetch_add(1, Ordering::SeqCst);
+        state
+            .folders
+            .lock()
+            .unwrap()
+            .insert((user, id), folder.clone());
+        return json_response(StatusCode::CREATED, folder);
+    }
     if path == MESSAGES && request.method() == Method::POST {
         let bytes = request.into_body().collect().await.unwrap().to_bytes();
         let post: Value = serde_json::from_slice(&bytes).unwrap();
@@ -645,13 +662,35 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         path if path.ends_with(TOPIC) => {
             json!({"uuid": TOPIC, "stream_uuid": STREAM, "project_id": PROJECT, "user_uuid": user, "notification_mode":"default"})
         }
-        path if path.contains("/folders/") => json!({
-            "uuid":"00000000-0000-0000-0000-000000000000", "user_uuid":user,
-            "project_id":PROJECT, "unread_count":unread,
-        }),
+        FOLDERS => {
+            let mut rows = vec![folder_row(Uuid::nil(), "Все чаты", "all", unread)];
+            rows.extend(state.folders.lock().unwrap().iter()
+                .filter(|((owner, _), _)| *owner == user)
+                .map(|(_, folder)| folder.clone()));
+            json!(rows)
+        }
+        path if path.starts_with(FOLDERS) => {
+            let id: Uuid = path[FOLDERS.len()..].parse().unwrap();
+            if id.is_nil() {
+                folder_row(id, "Все чаты", "all", unread)
+            } else if let Some(folder) = state.folders.lock().unwrap().get(&(user, id)).cloned() {
+                folder
+            } else {
+                return json_response(StatusCode::NOT_FOUND, Value::Null);
+            }
+        }
         _ => return json_response(StatusCode::NOT_FOUND, Value::Null),
     };
     json_response(StatusCode::OK, result)
+}
+
+/// Готовит схему ответа папки, которую читает настоящий Core.
+fn folder_row(id: Uuid, title: &str, kind: &str, unread: u32) -> Value {
+    json!({
+        "uuid": id, "title": title, "system_type": kind, "folder_items": [],
+        "unread_count": unread, "created_at":"2026-11-18T12:00:00Z",
+        "updated_at":"2026-11-18T12:00:00Z",
+    })
 }
 
 /// Возвращает открытую конфигурацию канала с отдельной темой по умолчанию.
@@ -733,6 +772,23 @@ fn click(ui: &mut VisualTestContext, selector: &'static str) {
     ui.simulate_click(point, Modifiers::none());
 }
 
+/// Доходит клавишей Tab до поиска, включая новые кнопки папок в общем обходе.
+fn tab_to_catalog_search(client: &Entity<Client>, ui: &mut VisualTestContext) {
+    for _ in 0..24 {
+        if ui.update(|window, app| {
+            client
+                .read(app)
+                .sidebar
+                .read(app)
+                .tested_search_focused(window, app)
+        }) {
+            return;
+        }
+        ui.simulate_keystrokes("tab");
+    }
+    panic!("Tab не дошёл до поиска каталога");
+}
+
 /// Создаёт запись одного входа с тем же ID, который проверяет восстановление профиля.
 fn saved_account(server: &Server, user: &str, nonce: Uuid) -> AccountRecord {
     let identity = format!("{}\0{user}", server.address);
@@ -769,6 +825,62 @@ fn start_runtime(
     .unwrap()
 }
 
+/// Создаёт папку из рабочего окна и ждёт её возвращения через снимок Core.
+#[gpui::test]
+fn folder_creation_reaches_https_and_returns_through_the_core_snapshot(cx: &mut TestAppContext) {
+    cx.update(bind_keys);
+    let server = Server::start();
+    let profile = tempfile::tempdir().unwrap();
+    let (runtime, events) =
+        start_runtime(profile.path(), saved_account(&server, USER, Uuid::nil()));
+    let (client, ui) =
+        cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
+    ui.update(|_, app| {
+        let subscription = events.attach(&client, app, Client::handle_runtime);
+        client.update(app, |client, cx| client.attach(subscription, cx));
+    });
+    ui.simulate_resize(size(px(1000.), px(740.)));
+    until(
+        ui,
+        "панель папок активного входа",
+        |ui| {
+            ui.debug_bounds("folder-rail-create").is_some()
+                && server.state.ready.load(Ordering::SeqCst) > 0
+        },
+    );
+    click(ui, "folder-rail-create");
+    until(ui, "форма новой папки", |ui| {
+        ui.debug_bounds("folder-dialog").is_some()
+    });
+    ui.simulate_input("Папка проверки");
+    click(ui, "folder-dialog-submit");
+    until(
+        ui,
+        "снимок созданной папки и закрытие формы",
+        |ui| {
+            let id = server
+                .state
+                .folders
+                .lock()
+                .unwrap()
+                .keys()
+                .next()
+                .map(|(_, id)| *id);
+            id.is_some_and(|id| {
+                ui.read(|app| {
+                    let sidebar = client.read(app).sidebar.read(app);
+                    !sidebar.folder_dialog().read(app).is_open() && sidebar.tested_has_folder(id)
+                })
+            })
+        },
+    );
+    assert_eq!(server.state.folder_posts.load(Ordering::SeqCst), 1);
+    let folders = server.state.folders.lock().unwrap();
+    let ((owner, _), folder) = folders.iter().next().unwrap();
+    assert_eq!(*owner, USER);
+    assert_eq!(folder["title"], "Папка проверки");
+}
+
 /// Открывает чат, проверяет редактор после сужения и сохраняет черновик при повторной попытке.
 #[gpui::test]
 fn catalog_click_and_submission_reach_https_queue(cx: &mut TestAppContext) {
@@ -799,7 +911,8 @@ fn catalog_click_and_submission_reach_https_queue(cx: &mut TestAppContext) {
     });
     ui.run_until_parked();
     assert!(ui.read(|app| client.read(app).top_bar.read(app).menu_is_open()));
-    ui.simulate_keystrokes("escape tab");
+    ui.simulate_keystrokes("escape");
+    tab_to_catalog_search(&client, ui);
     ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string("Тест".to_owned())));
     ui.simulate_keystrokes("cmd-v");
     ui.run_until_parked();
@@ -1380,7 +1493,7 @@ fn explicit_topic_accepts_mouse_and_keyboard_in_each_account(cx: &mut TestAppCon
                 .is_some_and(|s| s.owner.account_id == a_id)
         }) && ui.debug_bounds(CHANNEL_ROW).is_some()
     });
-    ui.simulate_keystrokes("tab");
+    tab_to_catalog_search(&client, ui);
     ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string("Длинная тема".into())));
     ui.simulate_keystrokes("cmd-v");
     ui.run_until_parked();

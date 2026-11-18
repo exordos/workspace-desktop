@@ -1,11 +1,13 @@
 //! Управляет выбранным аккаунтом, счётчиками и маршрутом окна.
 //! Действия окна и события рабочего потока изменяют состояние и возвращают команды для клиента GPUI.
 
+use std::{collections::HashMap, sync::Arc};
 use uuid::Uuid;
 use workspace_core::{
     auth::SessionStatus,
     bootstrap::{ChatList, ChatLists},
-    context::{AccountId, SessionGeneration},
+    context::{AccountId, OwnerContext, SessionGeneration},
+    messenger::{FolderSnapshot, catalog::Chat},
     notification_target::NotificationTarget,
     storage::HistoryScope,
     sync::{SyncChange, SyncUpdate},
@@ -34,10 +36,11 @@ pub enum ShellEffect {
 pub struct Shell {
     accounts: Vec<AccountSnapshot>, // Последний снимок доступных аккаунтов и их счётчиков.
     catalogs: ChatLists,            // Каталоги всех аккаунтов, полученные от Bootstrap.
-    preferred: Option<AccountId>,   // Аккаунт, который по возможности нужно выбрать при запуске.
+    folders: HashMap<OwnerContext, Arc<FolderSnapshot>>, // Согласованный снимок, из которого видны строки папок.
+    preferred: Option<AccountId>, // Аккаунт, который по возможности нужно выбрать при запуске.
     selected: Option<AccountSession>, // Вход, чей каталог и экран сейчас показаны.
     conversation: Option<ConversationAddress>, // Открытая история, если выбран разговор.
-    revision: NavigationRevision,   // Последнее принятое намерение о переходе.
+    revision: NavigationRevision, // Последнее принятое намерение о переходе.
     pending_notification: Option<NotificationRequest>, // Клик, ответ на который окно ещё ждёт.
     route_error: Option<NotificationRouteError>, // Ошибка текущей цели уведомления для показа в окне.
 }
@@ -109,12 +112,16 @@ impl Shell {
                 self.catalogs = catalogs;
                 None
             }
+            RuntimeEvent::Folders(folders) => {
+                self.folders = folders;
+                None
+            }
             RuntimeEvent::Sync(update) => self.apply_sync(update),
             RuntimeEvent::SyncLagged => self
                 .conversation()
                 .cloned()
                 .map(ShellEffect::ReloadConversation),
-            RuntimeEvent::Stopped(_) => None,
+            RuntimeEvent::FolderPreferences(_) | RuntimeEvent::Stopped(_) => None,
         }
     }
 
@@ -227,13 +234,25 @@ impl Shell {
         route: ChatRoute,
         generation: SessionGeneration,
     ) -> Option<ShellEffect> {
-        if self.selected().is_none_or(|selected| {
-            selected.owner != route.owner || selected.generation != generation
-        }) || route.entry != ChatEntry::Latest
-            || !self
-                .selected_catalog()
-                .is_some_and(|catalog| catalog_contains(catalog, route.scope))
+        let selected = self.selected()?;
+        if selected.owner != route.owner
+            || selected.generation != generation
+            || !self.is_active(selected)
+            || route.entry != ChatEntry::Latest
         {
+            return None;
+        }
+        let chats = self
+            .folders
+            .get(&route.owner)
+            .filter(|snapshot| {
+                snapshot.owner == route.owner
+                    && snapshot.generation == generation
+                    && snapshot.folders.is_some()
+            })
+            .map(|snapshot| snapshot.chats.as_slice())
+            .or_else(|| self.selected_catalog()?.chats.as_deref())?;
+        if !catalog_contains(chats, route.scope) {
             return None;
         }
         self.begin_navigation();
@@ -360,17 +379,15 @@ fn matches_notification(route: &ChatRoute, target: &NotificationTarget) -> bool 
 }
 
 /// Проверяет, что каталог содержит личный чат или тему её канала.
-fn catalog_contains(catalog: &ChatList, scope: HistoryScope) -> bool {
-    catalog.chats.as_deref().is_some_and(|chats| {
-        chats.iter().any(|chat| {
-            chat.id == scope.stream_id
-                && match scope.topic_id {
-                    None => chat.direct,
-                    Some(topic_id) => {
-                        !chat.direct && chat.topics.iter().any(|topic| topic.id == topic_id)
-                    }
+fn catalog_contains(chats: &[Chat], scope: HistoryScope) -> bool {
+    chats.iter().any(|chat| {
+        chat.id == scope.stream_id
+            && match scope.topic_id {
+                None => chat.direct,
+                Some(topic_id) => {
+                    !chat.direct && chat.topics.iter().any(|topic| topic.id == topic_id)
                 }
-        })
+            }
     })
 }
 

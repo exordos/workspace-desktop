@@ -21,6 +21,7 @@ use workspace_core::{
 };
 
 use super::*;
+use crate::gpui_client::contracts::{FolderCommand, FolderCommandError, FolderRailPreferences};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 const PROFILE_SERVER: &str = "https://127.0.0.1:1";
@@ -351,6 +352,144 @@ async fn bootstrap_delivers_independent_sessions_and_recovers_lag() {
     assert!(
         JsonAccountStore::open(profile.path()).is_ok(),
         "профиль всё ещё заблокирован"
+    );
+}
+
+/// Проверяет, что мост отдаёт папки известного входа и восстанавливает его настройки из профиля.
+#[tokio::test(flavor = "current_thread")]
+async fn folder_events_and_preferences_follow_the_account_generation() {
+    let profile = tempfile::tempdir().unwrap();
+    let start = || {
+        let directory = profile.path().to_owned();
+        let (release_a, hold_a) = blocking::channel();
+        let (client, events) = RuntimeClient::start_using(move || {
+            let preferences = Arc::new(FolderPreferenceStore::open(&directory));
+            let (mut parts, released) = test_parts(directory, hold_a, Arc::default());
+            parts.services.folder_preferences = preferences;
+            Ok((parts, released))
+        })
+        .unwrap();
+        (client, events, release_a)
+    };
+    let a = record("a").context;
+    let b = record("b").context;
+    let (client, mut events, release_a) = start();
+    let mut known_b = None;
+    let session = wait_event(
+        &mut events,
+        "снимок папок B при восстановлении A",
+        |event| {
+            match event {
+                RuntimeEvent::Accounts(accounts) => {
+                    known_b = accounts.into_iter().find_map(|account| {
+                        (account.status == SessionStatus::Active && account.session.owner == b)
+                            .then_some(account.session)
+                    });
+                }
+                RuntimeEvent::Folders(snapshots) => {
+                    assert!(!snapshots.contains_key(&a));
+                    if let Some(snapshot) = snapshots.get(&b) {
+                        let session = known_b.as_ref().expect("поколение B уже передано окну");
+                        assert_eq!(snapshot.generation, session.generation);
+                        assert_eq!(&snapshot.owner, &session.owner);
+                        if snapshot.all_chats_unread == Some(1) {
+                            return Some(session.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            None
+        },
+    )
+    .await;
+
+    let chosen = FolderRailPreferences {
+        vertical: false,
+        show_system: false,
+    };
+    let expired = AccountSession {
+        generation: SessionGeneration(session.generation.0 + 1),
+        ..session.clone()
+    };
+    assert_eq!(
+        client
+            .folder_command(expired.clone(), FolderCommand::Retry)
+            .await,
+        Err(FolderCommandError::Unavailable)
+    );
+    assert_eq!(
+        client.save_folder_preferences(expired, chosen).await,
+        Err(FolderCommandError::Unavailable)
+    );
+    assert_eq!(
+        client
+            .folder_command(session.clone(), FolderCommand::Retry)
+            .await,
+        Ok(())
+    );
+    assert_eq!(
+        client.save_folder_preferences(session, chosen).await,
+        Ok(())
+    );
+    wait_event(
+        &mut events,
+        "подтверждённые настройки B",
+        |event| match event {
+            RuntimeEvent::FolderPreferences(preferences)
+                if preferences.get(&b) == Some(&chosen) =>
+            {
+                assert!(!preferences.contains_key(&a));
+                Some(())
+            }
+            _ => None,
+        },
+    )
+    .await;
+
+    release_a.send(()).unwrap();
+    wait_event(
+        &mut events,
+        "настройки двух активных входов",
+        |event| {
+            if let RuntimeEvent::FolderPreferences(preferences) = event
+                && preferences.get(&a) == Some(&FolderRailPreferences::default())
+                && preferences.get(&b) == Some(&chosen)
+            {
+                return Some(());
+            }
+            None
+        },
+    )
+    .await;
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, client.shutdown())
+            .await
+            .unwrap(),
+        RuntimeExit::Clean
+    );
+
+    let (client, mut events, release_a) = start();
+    release_a.send(()).unwrap();
+    wait_event(
+        &mut events,
+        "настройки B после открытия профиля заново",
+        |event| match event {
+            RuntimeEvent::FolderPreferences(preferences)
+                if preferences.get(&a) == Some(&FolderRailPreferences::default())
+                    && preferences.get(&b) == Some(&chosen) =>
+            {
+                Some(())
+            }
+            _ => None,
+        },
+    )
+    .await;
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, client.shutdown())
+            .await
+            .unwrap(),
+        RuntimeExit::Clean
     );
 }
 

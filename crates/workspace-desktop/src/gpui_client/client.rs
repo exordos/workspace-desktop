@@ -17,7 +17,7 @@ use super::{
     previous_control,
     runtime::{RuntimeClient, StartupError},
     shell::{Shell, ShellEffect},
-    sidebar::Sidebar,
+    sidebar::{FolderIntent, Sidebar},
     sign_in::SignIn,
     ui::{Palette, TextRole, ThemeMode, TopBar, TopBarAccount, TopBarSelection, label},
 };
@@ -25,7 +25,6 @@ use super::{
 const SIDEBAR_PREFERRED_WIDTH: f32 = 299.;
 const SIDEBAR_MIN_WIDTH: f32 = 240.;
 const SIDEBAR_MAX_WIDTH: f32 = 720.;
-const FOLDER_RAIL_SPACE: f32 = 72.;
 const PANEL_GAP: f32 = 4.;
 
 /// Ограничивает ширину каталога долей от окна, оставляя место открытому разговору.
@@ -60,6 +59,11 @@ impl Client {
     /// Создаёт оболочку и связывает события каталога с тем же маршрутом, что у баннеров.
     pub(super) fn new(options: Options, runtime: RuntimeClient, cx: &mut Context<Self>) -> Self {
         let sidebar = cx.new(Sidebar::new);
+        cx.observe(&sidebar, |_, _, cx| cx.notify()).detach();
+        cx.subscribe(&sidebar, |client, _, intent: &FolderIntent, cx| {
+            client.handle_folder_intent(intent.clone(), cx);
+        })
+        .detach();
         let top_bar = cx.new(TopBar::new);
         let selection = cx.subscribe(&top_bar, |client, _, selection: &TopBarSelection, cx| {
             client.handle_action(ShellAction::SelectAccount(selection.0.clone()), cx);
@@ -133,6 +137,21 @@ impl Client {
 
     /// Доставляет обновления аккаунтов и истории из подписки рабочего потока.
     pub(super) fn handle_runtime(&mut self, event: RuntimeEvent, cx: &mut Context<Self>) {
+        let event = match event {
+            RuntimeEvent::Folders(snapshots) => {
+                self.shell
+                    .handle_runtime(RuntimeEvent::Folders(snapshots.clone()));
+                self.sidebar
+                    .update(cx, |view, cx| view.set_folder_snapshots(snapshots, cx));
+                return;
+            }
+            RuntimeEvent::FolderPreferences(preferences) => {
+                self.sidebar
+                    .update(cx, |view, cx| view.set_folder_preferences(preferences, cx));
+                return;
+            }
+            event => event,
+        };
         match &event {
             RuntimeEvent::Accounts(accounts) => {
                 self.received_accounts = true;
@@ -162,6 +181,49 @@ impl Client {
         }
         let effect = self.shell.handle_runtime(event);
         self.apply(effect, cx);
+    }
+
+    /// Передаёт запрос папок рабочему потоку и возвращает результат исходному показу.
+    fn handle_folder_intent(&mut self, intent: FolderIntent, cx: &mut Context<Self>) {
+        let runtime = self.runtime.clone();
+        let sidebar = self.sidebar.downgrade();
+        match intent {
+            FolderIntent::Command {
+                session,
+                operation,
+                command,
+            } => {
+                if self.shell.selected() != Some(&session) {
+                    return;
+                }
+                cx.spawn(async move |_, cx| {
+                    log::debug!("op_id={operation} event=folder_ui_requested");
+                    let result = runtime.folder_command(session.clone(), command).await;
+                    log::debug!("op_id={operation} event=folder_ui_finished result={result:?}");
+                    let _ = sidebar.update(cx, |view, cx| {
+                        view.finish_folder_command(&session, operation, result, cx);
+                    });
+                })
+                .detach();
+            }
+            FolderIntent::Preferences { session, value } => {
+                if self.shell.selected() != Some(&session) {
+                    return;
+                }
+                cx.spawn(async move |_, cx| {
+                    if runtime
+                        .save_folder_preferences(session.clone(), value)
+                        .await
+                        .is_err()
+                    {
+                        let _ = sidebar.update(cx, |view, cx| {
+                            view.folder_preferences_failed(&session, value, cx);
+                        });
+                    }
+                })
+                .detach();
+            }
+        }
     }
 
     /// Выполняет команду оболочки и обновляет связанные части того же окна.
@@ -219,6 +281,14 @@ impl Client {
         }
         self.sidebar.update(cx, |view, cx| {
             view.update_snapshot(self.shell.selected(), catalog, conversation, cx);
+            view.set_folder_online(
+                self.shell.selected().is_some_and(|session| {
+                    self.shell.accounts().iter().any(|account| {
+                        &account.session == session && account.status == SessionStatus::Active
+                    })
+                }),
+                cx,
+            );
         });
         cx.notify();
     }
@@ -232,6 +302,7 @@ impl Client {
                 .all(|account| account.status == SessionStatus::ReauthenticationRequired);
         if show {
             if self.sign_in.is_none() {
+                self.sidebar.update(cx, |view, cx| view.dismiss_folders(cx));
                 let server = match accounts {
                     [account] => Some(account.session.owner.server.as_str()),
                     _ => None,
@@ -349,16 +420,13 @@ impl Render for Client {
                 .min_w_0()
                 .overflow_hidden()
                 .gap(px(PANEL_GAP))
-                // Папки появятся отдельным сценарием. Сохраняем ширину рабочей области.
-                .pl(px(FOLDER_RAIL_SPACE + PANEL_GAP))
                 .child(
                     div()
-                        .id("workspace-sidebar-panel")
-                        .debug_selector(|| "workspace-sidebar-panel".into())
-                        .w(sidebar_width(window.viewport_size().width))
+                        .id("workspace-sidebar-and-folders")
+                        .w(sidebar_width(window.viewport_size().width)
+                            + px(self.sidebar.read(cx).folder_rail_width()))
                         .h_full()
                         .flex_none()
-                        .rounded(px(6.))
                         .overflow_hidden()
                         .child(self.sidebar.clone()),
                 )
@@ -392,6 +460,7 @@ impl Render for Client {
                     .pt(px(PANEL_GAP))
                     .child(content),
             )
+            .child(self.sidebar.read(cx).folder_dialog())
     }
 }
 

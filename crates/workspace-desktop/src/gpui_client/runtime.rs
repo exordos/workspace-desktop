@@ -1,6 +1,7 @@
 //! Запускает Bootstrap вне потока GPUI и связывает его с окном.
 //! Сначала описаны команды и подписка окна, затем настройка профиля и фоновый цикл.
 
+mod folders;
 mod login;
 
 pub use login::{LoginAttempt, LoginError};
@@ -15,7 +16,7 @@ use workspace_core::{
     bootstrap::{self, CatalogStartup, ChatCatalog, ChatLists},
     context::{AccountId, OwnerContext, SessionGeneration},
     iam_http::WorkspaceIamHttp,
-    messenger::MessengerSource,
+    messenger::{MessengerSource, folders::Folders},
     runtime::{Runtime, RuntimeError},
     storage::{HistoryScope, Storage},
     sync::{Sync, SyncChange, SyncUpdate},
@@ -26,6 +27,8 @@ use super::contracts::{
     NotificationReply, NotificationRequest, NotificationRouteError, RuntimeEvent, RuntimeExit,
 };
 use crate::platform::{JsonAccountStore, MacKeychain, state_directory};
+
+use folders::{FolderPreferenceStore, folder_snapshot, send_folder_state};
 
 const EVENT_QUEUE: usize = 32;
 const REQUEST_QUEUE: usize = 32;
@@ -104,12 +107,13 @@ impl RuntimeClient {
                 .map_err(|_| StartupError::Database)?;
             let messenger =
                 MessengerSource::with_private_ca(&ca).map_err(|_| StartupError::Worker)?;
-            let parts = WorkerParts::with_sources(
+            let mut parts = WorkerParts::with_sources(
                 auth,
                 Arc::new(storage),
                 Arc::new(messenger),
                 |services| Runtime::new(services.sync.clone(), vec![services.messenger.clone()]),
             )?;
+            parts.services.folder_preferences = Arc::new(FolderPreferenceStore::open(&directory));
             Ok((parts, released))
         })
     }
@@ -210,27 +214,35 @@ impl RuntimeClient {
         F: FnOnce(WorkerServices) -> Fut + Send + 'static,
         Fut: Future<Output = T> + Send + 'static,
     {
+        let value = self.enqueue(move |services, mut reply| async move {
+            // При закрытии экрана нет причины продолжать отменяемый сетевой запрос.
+            tokio::select! {
+                biased;
+                _ = reply.closed() => {}
+                result = async { action(services).await } => { let _ = reply.send(result); }
+            }
+        })?;
+        value.await.map_err(|_| RequestError::Stopped)
+    }
+
+    /// Ставит задачу в общую очередь. Задача сама выбирает, отменяться ли при закрытии получателя.
+    fn enqueue<T, F, Fut>(&self, action: F) -> Result<oneshot::Receiver<T>, RequestError>
+    where
+        T: Send + 'static,
+        F: FnOnce(WorkerServices, oneshot::Sender<T>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
         if *self.stop.borrow() {
             return Err(RequestError::Stopped);
         }
         let (reply, value) = oneshot::channel();
         self.commands
-            .try_send(Box::new(move |services| {
-                Box::pin(async move {
-                    // При закрытии экрана нет причины продолжать отменяемый сетевой запрос.
-                    let mut reply = reply;
-                    tokio::select! {
-                        biased;
-                        _ = reply.closed() => {}
-                        result = async { action(services).await } => { let _ = reply.send(result); }
-                    }
-                })
-            }))
+            .try_send(Box::new(move |services| Box::pin(action(services, reply))))
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => RequestError::Busy,
                 mpsc::error::TrySendError::Closed(_) => RequestError::Stopped,
             })?;
-        value.await.map_err(|_| RequestError::Stopped)
+        Ok(value)
     }
 
     /// Возвращает ответ с тем же адресом, который экран передал перед запуском запроса.
@@ -342,6 +354,8 @@ pub struct WorkerServices {
     pub sync: Arc<Sync>, // История, счётчики, проверка целей и запись отправок.
     pub messenger: Arc<MessengerSource>, // Сетевые запросы к истории и разрешение адреса отправки.
     pub catalog: Arc<ChatCatalog>, // Снимки и повторы загрузки каталога.
+    folders: Folders,    // Снимок папок и серверные команды мессенджера.
+    folder_preferences: Arc<FolderPreferenceStore>, // Локальные настройки вида по аккаунтам.
     #[cfg(all(test, feature = "gpui-test"))]
     registration_url_for_test: Option<fn(&str) -> Option<String>>, // Подмена публичных настроек для формы.
 }
@@ -411,9 +425,11 @@ impl WorkerParts {
         let storage = Storage::open(directory.join("messenger.sqlite3"))
             .map_err(|_| StartupError::Database)?;
         let messenger = MessengerSource::new().map_err(|_| StartupError::Worker)?;
-        let parts = Self::with_sources(auth, Arc::new(storage), Arc::new(messenger), |services| {
-            Runtime::new(services.sync.clone(), vec![services.messenger.clone()])
-        })?;
+        let mut parts =
+            Self::with_sources(auth, Arc::new(storage), Arc::new(messenger), |services| {
+                Runtime::new(services.sync.clone(), vec![services.messenger.clone()])
+            })?;
+        parts.services.folder_preferences = Arc::new(FolderPreferenceStore::open(&directory));
         Ok((parts, released))
     }
 
@@ -425,11 +441,14 @@ impl WorkerParts {
         runtime: impl FnOnce(&WorkerServices) -> Result<Runtime, RuntimeError>,
     ) -> Result<Self, StartupError> {
         let (catalog, startup) = bootstrap::chat_catalog(messenger.catalog(storage.clone()));
+        let folders = messenger.folders(storage.clone());
         let services = WorkerServices {
             sync: Arc::new(Sync::new(auth.clone(), storage)),
             auth: Arc::new(auth),
             messenger,
             catalog: Arc::new(catalog),
+            folders,
+            folder_preferences: Arc::default(),
             #[cfg(all(test, feature = "gpui-test"))]
             registration_url_for_test: None,
         };
@@ -598,6 +617,8 @@ async fn forward_events(
     events: &mpsc::Sender<RuntimeEvent>,
 ) {
     let mut accounts = Vec::new();
+    let mut folders = services.folders.subscribe();
+    let mut preferences = services.folder_preferences.subscribe();
     if !send_accounts(
         &mut accounts,
         services.auth.snapshot(),
@@ -606,6 +627,7 @@ async fn forward_events(
     )
     .await
         || events.send(catalog_snapshot(&mut catalog)).await.is_err()
+        || !send_folder_state(&accounts, services, events).await
     {
         return;
     }
@@ -615,7 +637,9 @@ async fn forward_events(
         let event = tokio::select! {
             snapshot = sessions.next() => {
                 let Some(snapshot) = snapshot else { return; };
-                if !send_accounts(&mut accounts, snapshot, &services.sync, events).await {
+                if !send_accounts(&mut accounts, snapshot, &services.sync, events).await
+                    || !send_folder_state(&accounts, services, events).await
+                {
                     return;
                 }
                 continue;
@@ -624,12 +648,21 @@ async fn forward_events(
                 if changed.is_err() { return; }
                 catalog_snapshot(&mut catalog)
             }
+            changed = folders.changed() => {
+                if changed.is_err() { return; }
+                folder_snapshot(&accounts, services)
+            }
+            changed = preferences.changed() => {
+                if changed.is_err() { return; }
+                services.folder_preferences.snapshot(&accounts)
+            }
             update = updates.recv() => match update {
                 Ok(update) => RuntimeEvent::Sync(update),
                 Err(broadcast::error::RecvError::Closed) => return,
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     if !send_accounts(&mut accounts, services.auth.snapshot(), &services.sync, events).await
                         || events.send(catalog_snapshot(&mut catalog)).await.is_err()
+                        || !send_folder_state(&accounts, services, events).await
                     {
                         return;
                     }
@@ -651,13 +684,14 @@ async fn forward_events(
             _ => false,
         };
         if needs_accounts
-            && !send_accounts(
+            && (!send_accounts(
                 &mut accounts,
                 services.auth.snapshot(),
                 &services.sync,
                 events,
             )
             .await
+                || !send_folder_state(&accounts, services, events).await)
         {
             return;
         }

@@ -1,11 +1,14 @@
 //! Описывает общую адресацию аккаунтов, маршрутов и событий GPUI.
 //! Сначала идентификаторы и снимки, затем действия окна и ответы фоновой работы.
 
+use std::{collections::HashMap, sync::Arc};
+
 use uuid::Uuid;
 use workspace_core::{
     auth::{SessionSnapshot, SessionStatus},
     bootstrap::ChatLists,
     context::{OwnerContext, SessionGeneration},
+    messenger::FolderSnapshot,
     notification_target::NotificationTargetError,
     storage::HistoryScope,
     sync::SyncUpdate,
@@ -130,6 +133,63 @@ impl From<NotificationTargetError> for NotificationRouteError {
     }
 }
 
+/// Действие над папками для одного входа, переданное фоновому исполнителю.
+#[derive(Clone, Eq, PartialEq)]
+pub enum FolderCommand {
+    Retry, // Запросить новый полный снимок.
+    Create {
+        id: Uuid,           // UUID, сохраняемый при повторе той же команды.
+        title: String,      // Имя пользовательской папки.
+        color: Option<u32>, // Цвет папки. None означает отсутствие цвета.
+    },
+    Update {
+        id: Uuid,                   // UUID изменяемой пользовательской папки.
+        title: Option<String>,      // Новое имя. None сохраняет прежнее.
+        color: Option<Option<u32>>, // Новый цвет. Some(None) очищает его, None сохраняет.
+    },
+    Delete(Uuid), // Удалить папку с этим UUID.
+    Add {
+        folder: Uuid, // UUID пользовательской папки.
+        chat: Uuid,   // UUID добавляемого разговора.
+    },
+    Remove {
+        folder: Uuid, // UUID пользовательской папки.
+        item: Uuid,   // UUID связи разговора с этой папкой.
+    },
+    Pin {
+        folder: Uuid, // UUID папки, где действует закрепление.
+        item: Uuid,   // UUID связи разговора с этой папкой.
+        pinned: bool, // Истина закрепляет строку, ложь открепляет.
+    },
+}
+
+/// Причина отказа, которую можно показать без вывода данных ответа или профиля.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FolderCommandError {
+    Unknown,           // Сервер мог применить действие. До повтора нужна сверка.
+    Rejected,          // Введённые данные или действие отклонены.
+    Unavailable,       // Вход или данные для действия недоступны.
+    Refresh,           // Действие выполнено, а запрос на локальную сверку не сохранился.
+    WorkerUnavailable, // Команда не запущена или настройки не сохранились.
+}
+
+/// Локальный вид панели папок для аккаунта и проекта.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FolderRailPreferences {
+    pub vertical: bool, // Вертикальная панель слева. Ложь размещает её горизонтально.
+    pub show_system: bool, // Показывать «Личные» и «Каналы» вместе с «Все чаты».
+}
+
+impl Default for FolderRailPreferences {
+    /// Открывает вертикальную панель и показывает системные папки.
+    fn default() -> Self {
+        Self {
+            vertical: true,
+            show_system: true,
+        }
+    }
+}
+
 /// Итог штатного завершения фонового исполнителя.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeExit {
@@ -141,9 +201,11 @@ pub enum RuntimeExit {
 pub enum RuntimeEvent {
     Accounts(Vec<AccountSnapshot>), // Полный снимок доступных сессий и их счётчиков.
     Catalog(ChatLists),             // Полный каталог; записи сверяются по владельцу и поколению.
-    Sync(SyncUpdate),               // Изменение из core без тела сообщения и секретов.
-    SyncLagged,                     // Нужно перечитать снимки, включая открытую историю.
-    Stopped(RuntimeExit),           // Фоновый исполнитель закончил работу.
+    Folders(HashMap<OwnerContext, Arc<FolderSnapshot>>), // Папки доступных входов с поколением в каждом снимке.
+    FolderPreferences(HashMap<OwnerContext, FolderRailPreferences>), // Сохранённый вид панели доступных входов.
+    Sync(SyncUpdate),     // Изменение из core без тела сообщения и секретов.
+    SyncLagged,           // Нужно перечитать снимки, включая открытую историю.
+    Stopped(RuntimeExit), // Фоновый исполнитель закончил работу.
 }
 
 #[cfg(test)]

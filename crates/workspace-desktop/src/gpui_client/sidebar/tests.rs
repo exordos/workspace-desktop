@@ -592,3 +592,224 @@ fn row_menu_uses_navigation_and_ignores_click_through(cx: &mut TestAppContext) {
     enter(ui);
     assert_eq!(events.borrow().as_slice(), &[open(&a, 1, None)]);
 }
+
+/// Передаёт настоящий снимок Core с пользовательской папкой и двумя доступными чатами.
+fn publish_folders(
+    sidebar: &Entity<Sidebar>,
+    ui: &mut gpui::VisualTestContext,
+    owner: &AccountSession,
+    custom_order: &[u128],
+) {
+    use workspace_core::messenger::folders::{ChatType, Folder, FolderItem, FolderKind};
+    let folder_id = Uuid::from_u128(10);
+    let timestamp = "2026-01-01T12:00:00Z".to_owned();
+    let folder = Folder {
+        id: folder_id,
+        kind: FolderKind::Custom,
+        title: "Проверка".into(),
+        background_color_value: Some(0xff44_7799),
+        unread_count: 6,
+        created_at: timestamp.clone(),
+        updated_at: timestamp.clone(),
+        items: vec![FolderItem {
+            id: Uuid::from_u128(12),
+            stream_id: Uuid::from_u128(1),
+            chat_type: ChatType::Private,
+            pinned_at: Some(timestamp.clone()),
+            order_index: None,
+            unread_count: 6,
+            active_unread_count: 6,
+            passive_unread_count: 0,
+            created_at: timestamp.clone(),
+            updated_at: timestamp,
+        }],
+    };
+    let snapshot = FolderSnapshot {
+        owner: owner.owner.clone(),
+        generation: owner.generation,
+        folders: Some(
+            custom_order
+                .iter()
+                .map(|id| {
+                    if *id == 10 {
+                        folder.clone()
+                    } else {
+                        Folder {
+                            id: Uuid::from_u128(*id),
+                            title: format!("Папка {id}"),
+                            items: Vec::new(),
+                            ..folder.clone()
+                        }
+                    }
+                })
+                .collect(),
+        ),
+        chats: vec![
+            chat(1, "Общее первое", true, &[]),
+            chat(2, "Общее второе", true, &[]),
+        ],
+        all_chats_unread: Some(9),
+        needs_refresh: false,
+    };
+    ui.update(|_, app| {
+        sidebar.update(app, |sidebar, cx| {
+            sidebar.set_folder_online(true, cx);
+            sidebar.set_folder_snapshots(
+                HashMap::from([(owner.owner.clone(), Arc::new(snapshot))]),
+                cx,
+            );
+        })
+    });
+    ui.run_until_parked();
+}
+
+/// Переключает папку мышью, проверяет группы поиска и выбирает «Все чаты» после удаления.
+#[gpui::test]
+fn folder_switch_search_and_remote_delete_use_the_core_snapshot(cx: &mut TestAppContext) {
+    const CUSTOM: &str = "folder-rail-entry-00000000-0000-0000-0000-00000000000a";
+    let (sidebar, ui, events) = initialize(cx);
+    let owner = session("a", 1);
+    let chats = catalog(&owner, ChatListStatus::Ready, vec![]);
+    publish(&sidebar, ui, &owner, &chats);
+    publish_folders(&sidebar, ui, &owner, &[10]);
+    click(ui, CUSTOM);
+    ui.run_until_parked();
+    assert!(ui.debug_bounds(row(1, None)).is_some());
+    assert!(ui.read(|app| {
+        let active = sidebar.read(app).active.as_ref().unwrap();
+        active.folder == Uuid::from_u128(10) && !active.folder_contains(Uuid::from_u128(2))
+    }));
+
+    ui.update(|window, app| {
+        sidebar
+            .read(app)
+            .active
+            .as_ref()
+            .unwrap()
+            .search
+            .read(app)
+            .focus(window)
+    });
+    ui.simulate_input("общее");
+    ui.run_until_parked();
+    assert!(ui.debug_bounds("catalog-search-in-folder").is_some());
+    assert!(ui.debug_bounds("catalog-search-outside-folder").is_some());
+    ui.simulate_keystrokes("up");
+    enter(ui);
+    assert_eq!(events.borrow().as_slice(), &[open(&owner, 2, None)]);
+
+    publish_folders(&sidebar, ui, &owner, &[]);
+    assert!(ui.read(|app| sidebar.read(app).active.as_ref().unwrap().folder.is_nil()));
+    assert!(ui.debug_bounds(row(1, None)).is_some());
+    assert!(ui.debug_bounds(row(2, None)).is_some());
+}
+
+/// Проверяет UUID связи закрепления и игнорирует ошибку после смены каталога.
+#[gpui::test]
+fn pin_intent_uses_folder_item_and_ignores_an_old_account_reply(cx: &mut TestAppContext) {
+    let (sidebar, ui, _) = initialize(cx);
+    let owner = session("a", 1);
+    let next = session("b", 1);
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let recorded = requests.clone();
+    ui.update(|_, app| {
+        app.subscribe(&sidebar, move |_, intent: &FolderIntent, _| {
+            recorded.borrow_mut().push(intent.clone());
+        })
+        .detach()
+    });
+    publish(
+        &sidebar,
+        ui,
+        &owner,
+        &catalog(&owner, ChatListStatus::Ready, vec![]),
+    );
+    publish_folders(&sidebar, ui, &owner, &[10]);
+    click(ui, "folder-rail-entry-00000000-0000-0000-0000-00000000000a");
+    ui.run_until_parked();
+
+    let center = ui.debug_bounds(row(1, None)).unwrap().center();
+    ui.simulate_mouse_down(center, MouseButton::Right, Modifiers::none());
+    ui.simulate_mouse_up(center, MouseButton::Right, Modifiers::none());
+    ui.run_until_parked();
+    ui.simulate_keystrokes("down");
+    enter(ui);
+    let mut recorded = requests.borrow_mut();
+    assert_eq!(recorded.len(), 1);
+    let FolderIntent::Command {
+        session: requested,
+        operation,
+        command,
+    } = recorded.remove(0)
+    else {
+        panic!("Ожидается команда закрепления");
+    };
+    drop(recorded);
+    assert_eq!(requested, owner);
+    assert!(
+        matches!(command, FolderCommand::Pin { folder, item, pinned: false } if folder == Uuid::from_u128(10) && item == Uuid::from_u128(12))
+    );
+
+    publish(
+        &sidebar,
+        ui,
+        &next,
+        &catalog(&next, ChatListStatus::Ready, vec![]),
+    );
+    ui.update(|_, app| {
+        sidebar.update(app, |sidebar, cx| {
+            sidebar.finish_folder_command(
+                &requested,
+                operation,
+                Err(FolderCommandError::Unknown),
+                cx,
+            )
+        })
+    });
+    ui.run_until_parked();
+    ui.read(|app| {
+        let active = sidebar.read(app).active.as_ref().unwrap();
+        assert_eq!(active.session, next);
+        assert!(active.folder_error.is_none() && active.folder_view.is_none());
+    });
+}
+
+/// Сохраняет точную цель, если порядок папок меняется под открытым меню.
+#[gpui::test]
+fn open_assignment_menu_keeps_the_folder_uuid_when_the_snapshot_reorders(cx: &mut TestAppContext) {
+    let (sidebar, ui, _) = initialize(cx);
+    let owner = session("a", 1);
+    let choices = Rc::new(RefCell::new(Vec::new()));
+    let observed = choices.clone();
+    ui.update(|_, app| {
+        app.subscribe(&sidebar, move |_, intent: &FolderIntent, _| {
+            if let FolderIntent::Command { command, .. } = intent {
+                observed.borrow_mut().push(command.clone());
+            }
+        })
+        .detach();
+    });
+    publish(
+        &sidebar,
+        ui,
+        &owner,
+        &catalog(&owner, ChatListStatus::Ready, vec![]),
+    );
+    publish_folders(&sidebar, ui, &owner, &[10, 11]);
+    let center = ui.debug_bounds(row(2, None)).unwrap().center();
+    ui.simulate_mouse_down(center, MouseButton::Right, Modifiers::none());
+    ui.simulate_mouse_up(center, MouseButton::Right, Modifiers::none());
+    ui.simulate_keystrokes("down");
+    enter(ui);
+    ui.simulate_keystrokes("down down");
+    ui.run_until_parked();
+    publish_folders(&sidebar, ui, &owner, &[11, 10]);
+    enter(ui);
+    assert!(
+        choices.borrow().as_slice()
+            == [FolderCommand::Add {
+                folder: Uuid::from_u128(11),
+                chat: Uuid::from_u128(2),
+            }]
+    );
+}
