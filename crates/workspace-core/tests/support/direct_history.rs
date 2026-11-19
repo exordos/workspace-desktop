@@ -44,6 +44,8 @@ use super::Fixture;
 mod avatars;
 #[path = "folder_runtime.rs"]
 mod folder_runtime;
+#[path = "media_cache.rs"]
+mod media_cache;
 #[path = "outgoing.rs"]
 mod outgoing;
 
@@ -95,6 +97,7 @@ struct HistoryApi {
     outgoing: Option<Arc<outgoing::Api>>, // Подмена маршрутов очереди для теста отправки.
     folders: Option<Arc<folder_runtime::Api>>, // Подмена маршрутов папок и журнала.
     avatars: Option<Arc<avatars::Api>>, // Подмена профиля и файлов для тестов аватаров.
+    media: Option<Arc<media_cache::Api>>, // Подмена истории, байтов и журнала для кэша вложений.
 }
 
 /// Формирует серверное сообщение с одинаковыми UUID для обоих аккаунтов.
@@ -137,6 +140,10 @@ async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
     }
     if let Some(avatars) = &api.avatars {
         avatars.reply(socket, request, &method, &headers).await;
+        return;
+    }
+    if let Some(media) = &api.media {
+        media.reply(socket, request, &method, &headers).await;
         return;
     }
     if api.topic_realtime.load(Relaxed) == 1 && request.path().ends_with("/events/ws") {

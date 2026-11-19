@@ -54,7 +54,7 @@ mod platform {
     use workspace_core::iam_http::WorkspaceIamHttp;
     use workspace_core::messenger::MessengerSource;
     use workspace_core::runtime::Runtime;
-    use workspace_core::storage::Storage;
+    use workspace_core::storage::{Storage, media::MediaCachePolicy};
     use workspace_core::sync::Sync;
     use workspace_desktop::platform::{JsonAccountStore, MacKeychain, state_directory};
 
@@ -122,7 +122,17 @@ mod platform {
                 log::set_logger(&SyncLog).expect("logger initialized once");
                 log::set_max_level(log::LevelFilter::Info);
                 let storage = Arc::new(Storage::open(directory.join("messenger.sqlite3"))?);
-                let sync = Arc::new(Sync::new(auth.clone(), storage));
+                let sync = Sync::with_media_cache(
+                    auth.clone(),
+                    storage.clone(),
+                    directory.join("messenger-media"),
+                    MediaCachePolicy::default(),
+                )
+                .unwrap_or_else(|error| {
+                    log::warn!("Не удалось открыть кэш вложений: {error}");
+                    Sync::new(auth.clone(), storage)
+                });
+                let sync = Arc::new(sync);
                 let runtime = Runtime::new(sync, vec![Arc::new(MessengerSource::new()?)])?;
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()

@@ -13,11 +13,15 @@ use crate::{
     storage::{
         HistoryDirection, HistoryEdge, HistoryPageEdges, HistoryPageOutcome, HistoryPageTarget,
         HistoryScope, HistoryWindow,
+        media::{MediaHistoryCursor, MediaHistoryPage, MediaKind},
     },
     sync::{Sync, SyncError},
 };
 
-use super::MessengerSource;
+use super::{
+    MessengerSource,
+    files::{MediaConversation, MediaFile, OpenMediaError},
+};
 
 /// Причина, по которой мессенджер не смог вернуть окно.
 #[derive(Debug, Error)]
@@ -46,9 +50,99 @@ pub struct LatestHistoryOpening<'a> {
     generation: SessionGeneration, // Поколение входа при проверке доступа.
     scope: HistoryScope,           // Точная область, подтверждённая сервером.
     pub cached: Option<HistoryWindow>, // Пригодный хвост или None, если его нет.
+    media_generation: Option<i64>, // Версия истории, в которой доступ подтвердил сервер.
 }
 
-impl LatestHistoryOpening<'_> {
+impl<'a> LatestHistoryOpening<'a> {
+    /// Открывает вложение из этой темы или личного разговора.
+    pub async fn open_media(
+        &self,
+        message_id: Uuid,
+        file_id: Uuid,
+    ) -> Result<MediaFile<'a>, OpenMediaError> {
+        self.open_media_in_scope(self.scope, message_id, file_id)
+            .await
+    }
+
+    /// Открывает результат списка вложений из известной истории того же стрима.
+    pub async fn open_stream_media(
+        &self,
+        message_id: Uuid,
+        file_id: Uuid,
+    ) -> Result<MediaFile<'a>, OpenMediaError> {
+        self.open_media_in_scope(self.stream_scope(), message_id, file_id)
+            .await
+    }
+
+    /// Привязывает открытие вложения к доступу, подтверждённому для истории.
+    async fn open_media_in_scope(
+        &self,
+        scope: HistoryScope,
+        message_id: Uuid,
+        file_id: Uuid,
+    ) -> Result<MediaFile<'a>, OpenMediaError> {
+        let history_generation = self.media_generation.ok_or(OpenMediaError::Unconfigured)?;
+        self.source
+            .open_cached_media(
+                self.sync,
+                MediaConversation {
+                    owner: self.owner,
+                    generation: self.generation,
+                    scope,
+                    history_generation,
+                },
+                message_id,
+                file_id,
+            )
+            .await
+    }
+
+    /// Возвращает весь стрим, к которому относится подтверждённое открытие.
+    fn stream_scope(&self) -> HistoryScope {
+        HistoryScope {
+            stream_id: self.scope.stream_id,
+            topic_id: None,
+        }
+    }
+
+    /// Возвращает страницу вложений уже известной истории темы или её стрима.
+    pub fn list_media(
+        &self,
+        whole_stream: bool,
+        kind: Option<MediaKind>,
+        after: Option<MediaHistoryCursor>,
+        limit: usize,
+    ) -> Result<MediaHistoryPage, OpenMediaError> {
+        let history_generation = self.media_generation.ok_or(OpenMediaError::Unconfigured)?;
+        let cache = self
+            .sync
+            .media_cache()
+            .ok_or(OpenMediaError::Unconfigured)?;
+        let scope = if whole_stream {
+            self.stream_scope()
+        } else {
+            self.scope
+        };
+        self.sync
+            .auth()
+            .with_active_generation(self.owner, self.generation, || {
+                let current = if after.is_none() {
+                    self.sync.storage().index_media_history(
+                        self.owner,
+                        scope,
+                        history_generation,
+                        None,
+                    )?
+                } else {
+                    self.sync.storage().media_history_generation(self.owner)? == history_generation
+                };
+                if !current {
+                    return Err(OpenMediaError::Unavailable);
+                }
+                Ok(cache.list_history(self.owner, scope, kind, after, limit)?)
+            })?
+    }
+
     /// Запрашивает последнюю страницу; ошибка не удаляет ранее прочитанное окно.
     pub async fn refresh(&self) -> Result<HistoryWindow, OpenHistoryError> {
         self.source
@@ -66,6 +160,9 @@ impl MessengerSource {
         generation: SessionGeneration,
         scope: HistoryScope,
     ) -> Result<LatestHistoryOpening<'a>, OpenHistoryError> {
+        let media_generation = sync
+            .media_cache()
+            .and_then(|_| sync.storage().media_history_generation(owner).ok());
         let scope = self
             .verify_conversation_access(sync, owner, generation, scope)
             .await?;
@@ -82,6 +179,7 @@ impl MessengerSource {
             generation,
             scope,
             cached,
+            media_generation,
         })
     }
 

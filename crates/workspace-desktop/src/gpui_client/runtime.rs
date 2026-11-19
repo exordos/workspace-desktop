@@ -18,7 +18,7 @@ use workspace_core::{
     iam_http::WorkspaceIamHttp,
     messenger::{MessengerSource, folders::Folders},
     runtime::{Runtime, RuntimeError},
-    storage::{HistoryScope, Storage},
+    storage::{HistoryScope, Storage, media::MediaCachePolicy},
     sync::{Sync, SyncChange, SyncUpdate},
 };
 
@@ -425,25 +425,48 @@ impl WorkerParts {
         let storage = Storage::open(directory.join("messenger.sqlite3"))
             .map_err(|_| StartupError::Database)?;
         let messenger = MessengerSource::new().map_err(|_| StartupError::Worker)?;
-        let mut parts =
-            Self::with_sources(auth, Arc::new(storage), Arc::new(messenger), |services| {
-                Runtime::new(services.sync.clone(), vec![services.messenger.clone()])
-            })?;
+        let storage = Arc::new(storage);
+        let sync = Sync::with_media_cache(
+            auth.clone(),
+            storage.clone(),
+            directory.join("messenger-media"),
+            MediaCachePolicy::default(),
+        )
+        .unwrap_or_else(|error| {
+            log::warn!("Не удалось открыть кэш вложений: {error}");
+            Sync::new(auth.clone(), storage.clone())
+        });
+        let mut parts = Self::with_sync(auth, storage, Arc::new(messenger), sync, |services| {
+            Runtime::new(services.sync.clone(), vec![services.messenger.clone()])
+        })?;
         parts.services.folder_preferences = Arc::new(FolderPreferenceStore::open(&directory));
         Ok((parts, released))
     }
 
-    /// Собирает сервисы вокруг общего Auth и хранилища при выбранном источнике событий.
+    /// Собирает тестовые сервисы, которым не требуется дисковый кэш вложений.
+    #[cfg(test)]
     fn with_sources(
         auth: Auth,
         storage: Arc<Storage>,
         messenger: Arc<MessengerSource>,
         runtime: impl FnOnce(&WorkerServices) -> Result<Runtime, RuntimeError>,
     ) -> Result<Self, StartupError> {
+        let sync = Sync::new(auth.clone(), storage.clone());
+        Self::with_sync(auth, storage, messenger, sync, runtime)
+    }
+
+    /// Собирает сервисы вокруг того же профиля и выбранного источника событий.
+    fn with_sync(
+        auth: Auth,
+        storage: Arc<Storage>,
+        messenger: Arc<MessengerSource>,
+        sync: Sync,
+        runtime: impl FnOnce(&WorkerServices) -> Result<Runtime, RuntimeError>,
+    ) -> Result<Self, StartupError> {
         let (catalog, startup) = bootstrap::chat_catalog(messenger.catalog(storage.clone()));
         let folders = messenger.folders(storage.clone());
         let services = WorkerServices {
-            sync: Arc::new(Sync::new(auth.clone(), storage)),
+            sync: Arc::new(sync),
             auth: Arc::new(auth),
             messenger,
             catalog: Arc::new(catalog),

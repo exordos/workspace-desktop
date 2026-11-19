@@ -1,23 +1,30 @@
 //! Связывает получение событий с локальной базой.
 //! Проверяет сессию перед записью и публикует изменения для оболочки после записи.
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use thiserror::Error;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use uuid::Uuid;
 
 use crate::{
     auth::{Auth, AuthError},
     context::{OwnerContext, SessionGeneration},
     directory::AvatarLoads,
-    messenger::details::{AvatarCache, SidebarCache, SidebarChange},
+    messenger::{
+        details::{AvatarCache, SidebarCache, SidebarChange},
+        files::{MediaLoads, OpenMediaError},
+    },
     notification_target::{NotificationTarget, NotificationTargetError},
     storage::{
         AvatarEvent, Cursor, DeliveryStatus, EventWrite, FolderChange, HistoryChange,
         HistoryMessage, HistoryMetadata, HistoryPageEdges, HistoryPageGuard, HistoryPageOutcome,
         HistoryPageTarget, HistoryScope, HistoryWindow, Message, MessagePlacement, OutboxEntry,
         PreparedSend, Storage, StorageError,
+        media::{
+            MediaCache, MediaCacheError, MediaCachePolicy, MediaClearReport, MediaCopyPage,
+            MediaCopyQuery, MediaEstimate, MediaFilter,
+        },
     },
 };
 
@@ -220,6 +227,9 @@ pub struct Sync {
     auth: Auth,                           // Авторизация для проверки владельца и поколения сессии.
     storage: Arc<Storage>,                // Общая локальная база сообщений, позиций и счётчиков.
     updates: broadcast::Sender<SyncUpdate>, // Канал изменений. Оформление окна получает их после записи.
+    media_cache: Option<MediaCache>,        // Дисковые копии вложений, если профиль указал каталог.
+    media_updates: watch::Sender<()>,       // Сигнал повторно проверить незавершённое чтение.
+    pub(crate) media_loads: MediaLoads,     // Одна работа на вложение и поколение сессии.
 }
 
 impl Sync {
@@ -232,7 +242,111 @@ impl Sync {
             avatar_cache: AvatarCache::default(),
             avatar_loads: AvatarLoads::default(),
             updates: broadcast::channel(128).0,
+            media_cache: None,
+            media_updates: watch::channel(()).0,
+            media_loads: MediaLoads::default(),
         }
+    }
+
+    /// Открывает кэш вложений профиля рядом с переданной базой.
+    pub fn with_media_cache(
+        auth: Auth,
+        storage: Arc<Storage>,
+        root: PathBuf,
+        policy: MediaCachePolicy,
+    ) -> Result<Self, MediaCacheError> {
+        let cache = MediaCache::new(storage.clone(), root, policy)?;
+        Ok(Self {
+            media_cache: Some(cache),
+            ..Self::new(auth, storage)
+        })
+    }
+
+    /// Даёт файловому модулю доступ к копиям того же профиля.
+    pub(crate) fn media_cache(&self) -> Option<&MediaCache> {
+        self.media_cache.as_ref()
+    }
+
+    /// Даёт выполняющимся загрузкам сигнал перечитать границы доступа после фиксации.
+    pub(crate) fn media_changes(&self) -> watch::Receiver<()> {
+        self.media_updates.subscribe()
+    }
+
+    /// Уведомляет загрузки об изменении проекции и запускает фоновую очистку.
+    pub(crate) fn note_media_change(&self) {
+        self.media_updates.send_replace(());
+    }
+
+    /// Убирает отозванные байты и повторяет вытеснение после закрытия читателей.
+    pub(crate) async fn run_media_cleanup(&self) {
+        let Some(cache) = self.media_cache() else {
+            return std::future::pending::<()>().await;
+        };
+        let mut changes = self.media_changes();
+        let mut retry = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                delta = changes.changed() => {
+                    if delta.is_err() {
+                        return;
+                    }
+                }
+                _ = retry.tick() => {}
+            }
+            let cache = cache.clone();
+            let removed = tokio::task::spawn_blocking(move || cache.enforce_budget()).await;
+            if let Ok(Err(error)) = removed {
+                log::warn!("Не удалось убрать отозванную копию вложения: {error}");
+            }
+        }
+    }
+
+    /// Возвращает страницу локальных копий только для действующего входа.
+    pub fn list_media_copies(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        query: MediaCopyQuery,
+    ) -> Result<MediaCopyPage, OpenMediaError> {
+        let cache = self.media_cache().ok_or(OpenMediaError::Unconfigured)?;
+        Ok(self
+            .auth
+            .with_active_generation(owner, generation, || cache.list(owner, query))??)
+    }
+
+    /// Подсчитывает место по выбранным копиям действующего входа.
+    pub fn estimate_media(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        filter: &MediaFilter,
+    ) -> Result<MediaEstimate, OpenMediaError> {
+        let cache = self.media_cache().ok_or(OpenMediaError::Unconfigured)?;
+        Ok(self
+            .auth
+            .with_active_generation(owner, generation, || cache.estimate(owner, filter))??)
+    }
+
+    /// Сразу отзывает выдачу выбранных копий, затем пытается освободить их место.
+    pub fn clear_media(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        filter: &MediaFilter,
+    ) -> Result<MediaClearReport, OpenMediaError> {
+        let cache = self.media_cache().ok_or(OpenMediaError::Unconfigured)?;
+        let candidates = self
+            .auth
+            .with_active_generation(owner, generation, || cache.begin_clear(owner, filter))??;
+        self.note_media_change();
+        let report = cache.finish_clear(candidates)?;
+        let operation = Uuid::new_v4();
+        log::debug!(
+            "Очистка кэша вложений: op_id={operation} freed_bytes={} pending_bytes={}",
+            report.freed_bytes,
+            report.pending_bytes
+        );
+        Ok(report)
     }
 
     /// Даёт фоновой задаче доступ к авторизации и состояниям сессий.
@@ -267,6 +381,7 @@ impl Sync {
             if source == crate::messenger::SOURCE_ID {
                 self.sidebar_cache
                     .invalidate(owner, generation, None, false);
+                self.note_media_change();
                 self.publish(owner, generation, SyncChange::MessengerReset);
             }
             Ok(())
@@ -577,8 +692,18 @@ impl Sync {
                     history,
                     folder,
                     avatar,
+                    media_deleted: match &event {
+                        Event::FileDeleted { file_id, .. } => Some(*file_id),
+                        _ => None,
+                    },
                 },
             )?;
+            if saved.outcome == ApplyOutcome::Applied
+                && source == crate::messenger::SOURCE_ID
+                && (history.is_some() || matches!(event, Event::FileDeleted { .. }))
+            {
+                self.note_media_change();
+            }
             if let Some(count) = unread.filter(|_| saved.unread_changed) {
                 self.publish(owner, generation, SyncChange::Unread(count));
             }

@@ -3,12 +3,14 @@
 
 pub mod catalog;
 pub mod details;
+pub mod files;
 mod folder_sync;
 pub mod folders;
 pub mod history;
 pub mod message_actions;
 mod outbox;
 pub mod read;
+pub(crate) mod references;
 mod rest;
 pub mod send;
 mod socket;
@@ -120,7 +122,8 @@ impl EventSource for MessengerSource {
         Box::pin(async move {
             tokio::join!(
                 outbox::run(self, sync.clone(), session.clone(), ready.clone()),
-                folder_sync::run(self, sync, session, ready),
+                folder_sync::run(self, sync.clone(), session, ready),
+                sync.run_media_cleanup(),
             );
         })
     }

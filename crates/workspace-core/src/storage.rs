@@ -5,6 +5,7 @@ mod avatars;
 mod drafts;
 mod folders;
 mod history;
+pub mod media;
 mod outbox;
 
 pub(crate) use avatars::{AvatarEvent, AvatarFence, AvatarSnapshot};
@@ -71,6 +72,7 @@ pub(crate) struct EventWrite<'a> {
     pub history: Option<&'a HistoryChange>,         // Правка или удаление.
     pub folder: Option<FolderChange>,               // Сверка состава папок или удаление связей.
     pub avatar: Option<AvatarEvent<'a>>,            // Изменение ссылки, сверка или удаление файла.
+    pub media_deleted: Option<Uuid>,                // UUID удалённого вложения мессенджера.
 }
 
 /// Число непрочитанных и позиция журнала, до которой оно уже учитывает изменения.
@@ -293,6 +295,7 @@ impl Storage {
         drafts::initialize(&transaction)?;
         folders::initialize(&transaction)?;
         avatars::initialize(&transaction)?;
+        media::initialize(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -405,6 +408,7 @@ impl Storage {
         let reset_messenger = source == crate::messenger::SOURCE_ID;
         if reset_messenger {
             history::reset(&transaction, owner)?;
+            media::reset(&transaction, owner)?;
             drafts::invalidate_owner(&transaction, owner)?;
             folders::reset(&transaction, owner)?;
             avatars::reset(&transaction, owner)?;
@@ -492,6 +496,14 @@ impl Storage {
             && history::before_change(&transaction, owner, history)?
         {
             apply_history(&transaction, owner, history)?;
+            if source == crate::messenger::SOURCE_ID {
+                apply_media_history(&transaction, owner, history)?;
+            }
+        }
+        if source == crate::messenger::SOURCE_ID
+            && let Some(file_id) = change.media_deleted
+        {
+            media::revoke_file(&transaction, owner, file_id)?;
         }
 
         let mut folder_changed = false;
@@ -560,6 +572,9 @@ impl Storage {
                     change.placement,
                     change.metadata,
                 )?;
+                if source == crate::messenger::SOURCE_ID {
+                    history::project_media_message(&transaction, owner, &message.id)?;
+                }
             }
             inserted
         } else {
@@ -740,6 +755,47 @@ fn bump_catalog_revision(
             owner.user_id
         ],
     )?;
+    Ok(())
+}
+
+/// Меняет ссылки на вложения в той же транзакции, что и история с курсором.
+fn apply_media_history(
+    connection: &Connection,
+    owner: &OwnerContext,
+    change: &HistoryChange,
+) -> Result<(), StorageError> {
+    match change {
+        HistoryChange::Edit { message, .. } => {
+            history::project_media_message(connection, owner, &message.id)?;
+        }
+        HistoryChange::RemoveMessage(id) if let Ok(id) = id.parse() => {
+            media::remove_message_refs(connection, owner, id)?;
+        }
+        HistoryChange::RemoveStream(id) if let Ok(stream_id) = id.parse() => {
+            media::revoke_scope(
+                connection,
+                owner,
+                HistoryScope {
+                    stream_id,
+                    topic_id: None,
+                },
+            )?;
+        }
+        HistoryChange::RemoveTopic(address)
+            if let (Ok(stream_id), Ok(topic_id)) =
+                (address.stream_id.parse(), address.topic_id.parse()) =>
+        {
+            media::revoke_scope(
+                connection,
+                owner,
+                HistoryScope {
+                    stream_id,
+                    topic_id: Some(topic_id),
+                },
+            )?;
+        }
+        _ => {}
+    }
     Ok(())
 }
 

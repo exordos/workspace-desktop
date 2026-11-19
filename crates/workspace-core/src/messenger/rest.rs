@@ -687,6 +687,35 @@ impl RestClient {
         ]))
     }
 
+    /// Запрашивает полный оригинал напрямую. Отказ доступа возвращается без чтения тела.
+    pub(super) async fn media_download(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        file_id: Uuid,
+    ) -> Result<Option<reqwest::Response>, SourceError> {
+        let mut url = workspace_origin(owner)?;
+        url.set_path(&format!(
+            "/api/workspace/v1/messenger/files/{file_id}/actions/download"
+        ));
+        let response = self
+            .read
+            .get(url)
+            .header(ACCEPT, "*/*")
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(request_error)?;
+        if matches!(
+            response.status(),
+            StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+        ) {
+            return Ok(None);
+        }
+        check_status(response.status())?;
+        Ok(Some(response))
+    }
+
     /// Собирает GET-запрос к серверу владельца и добавляет токен доступа.
     fn request(
         &self,

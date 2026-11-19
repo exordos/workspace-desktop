@@ -218,6 +218,7 @@ impl Storage {
                     }),
                     Some(&message.metadata),
                 )?;
+                history::project_media_message(&transaction, owner, &message.id.to_string())?;
             }
         }
         transaction.commit()?;
