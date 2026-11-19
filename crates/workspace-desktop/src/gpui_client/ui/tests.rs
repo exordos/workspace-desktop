@@ -21,8 +21,8 @@ struct Controls {
 
 impl Render for Controls {
     /// Показывает активную и недоступную кнопку в порядке обхода Tab.
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let palette = Palette::for_mode(ThemeMode::Dark);
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = Palette::for_mode(ThemeMode::Dark).with_window_input(window, cx);
         let active_entity = cx.entity().downgrade();
         let blocked_entity = active_entity.clone();
         let mut blocked = Button::new("blocked", "Недоступная");
@@ -33,6 +33,7 @@ impl Render for Controls {
             .flex()
             .flex_col()
             .items_start()
+            .child(track_focus_input(cx))
             .on_action(|_: &NextFocus, window, _| window.focus_next())
             .child(
                 blocked
@@ -72,6 +73,7 @@ fn buttons_accept_mouse_and_keyboard_only_when_enabled(cx: &mut TestAppContext) 
         }
     });
     ui.run_until_parked();
+    assert!(!ui.update(|window, app| Palette::for_window(window, app).keyboard_focus_visible()));
     ui.simulate_keystrokes("tab");
     ui.update(|window, app| {
         assert!(
@@ -79,6 +81,7 @@ fn buttons_accept_mouse_and_keyboard_only_when_enabled(cx: &mut TestAppContext) 
             "Tab должен обойти недоступную кнопку"
         );
         assert!(!root.read(app).blocked.is_focused(window));
+        assert!(Palette::for_window(window, app).keyboard_focus_visible());
     });
     // GPUI превращает отпускание Enter и пробела в активацию кнопки.
     for key in ["enter", "space"] {
@@ -89,14 +92,24 @@ fn buttons_accept_mouse_and_keyboard_only_when_enabled(cx: &mut TestAppContext) 
     let blocked = ui
         .debug_bounds("blocked-button")
         .expect("видна недоступная кнопка");
-    ui.simulate_click(blocked.center(), Modifiers::none());
     let active = ui
         .debug_bounds("active-button")
         .expect("видна доступная кнопка");
     ui.simulate_mouse_move(active.center(), None, Modifiers::none());
     ui.run_until_parked();
     ui.read(|app| assert!(root.read(app).hovered, "указатель должен войти в кнопку"));
+    assert!(ui.update(|window, app| Palette::for_window(window, app).keyboard_focus_visible()));
     ui.simulate_click(active.center(), Modifiers::none());
+    ui.update(|window, app| {
+        assert!(root.read(app).active.is_focused(window));
+        assert!(!Palette::for_window(window, app).keyboard_focus_visible());
+    });
+    ui.simulate_keystrokes("down");
+    ui.update(|window, app| {
+        assert!(root.read(app).active.is_focused(window));
+        assert!(Palette::for_window(window, app).keyboard_focus_visible());
+    });
+    ui.simulate_click(blocked.center(), Modifiers::none());
     ui.simulate_mouse_move(point(px(250.), px(150.)), None, Modifiers::none());
     ui.run_until_parked();
     ui.read(|app| {

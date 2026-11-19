@@ -451,7 +451,9 @@ fn render_member(member: &MemberView, palette: Palette, dispatch: &Dispatch) -> 
                 )
                 .opacity(0.)
                 .group_hover("details-member", |style| style.opacity(1.))
-                .focus(|style| style.border_color(palette.focus).opacity(1.)),
+                .when(palette.keyboard_focus_visible(), |button| {
+                    button.focus(|style| style.border_color(palette.focus).opacity(1.))
+                }),
             )
         })
 }

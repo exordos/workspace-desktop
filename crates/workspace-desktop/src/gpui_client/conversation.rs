@@ -31,7 +31,7 @@ use super::{
     contracts::{AccountSession, ChatEntry, ConversationAddress},
     right_panel::RightPanel,
     runtime::RuntimeClient,
-    ui::{Avatar, Button, ButtonAppearance, Icon, Palette, TextRole, ThemeMode, label},
+    ui::{Avatar, Button, ButtonAppearance, Icon, Palette, TextRole, label},
 };
 
 /// Один запрос экрана и его идентификатор в журнале.
@@ -734,7 +734,9 @@ impl Conversation {
             .min_w_0()
             .border_1()
             .border_color(gpui::transparent_black())
-            .focus(|style| style.border_color(palette.focus))
+            .when(palette.keyboard_focus_visible(), |frame| {
+                frame.focus(|style| style.border_color(palette.focus))
+            })
             .on_key_down(cx.listener(Self::scroll_key))
             .child(viewport)
             .when(
@@ -1050,7 +1052,7 @@ impl Conversation {
 impl Render for Conversation {
     /// Рисует историю и редактор в рабочей области разговора.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
+        let palette = Palette::for_window(window, cx);
         self.restore_details_for_verified_history(window, cx);
         div()
             .id("conversation-layout")

@@ -15,9 +15,7 @@ use self::editor::SubmitRequested;
 pub(super) use self::source::{DestinationError, SendSource};
 use super::{
     contracts::{ConversationAddress, ConversationReply},
-    ui::{
-        Button, ButtonAppearance, FieldAppearance, Icon, Palette, TextRole, ThemeMode, field, label,
-    },
+    ui::{Button, ButtonAppearance, FieldAppearance, Icon, Palette, TextRole, field, label},
 };
 
 const MAX_MESSAGE_CHARS: usize = 40_000;
@@ -252,7 +250,7 @@ impl EventEmitter<ComposerEvent> for Composer {}
 impl Render for Composer {
     /// Показывает поле, доступность отправки и причину, если сохранить текст не получилось.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
+        let palette = Palette::for_window(window, cx);
         let editor = self.editor.read(cx);
         let too_long = over_limit(editor.text());
         let save_failed = self.error_version == Some(editor.version());

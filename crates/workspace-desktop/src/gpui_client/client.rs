@@ -25,7 +25,7 @@ use super::{
     shell::{Shell, ShellEffect},
     sidebar::{FolderIntent, Sidebar},
     sign_in::SignIn,
-    ui::{Palette, TextRole, ThemeMode, TopBar, TopBarAccount, TopBarSelection, label},
+    ui::{Palette, TextRole, TopBar, TopBarAccount, TopBarSelection, label},
 };
 
 const SIDEBAR_PREFERRED_WIDTH: f32 = 299.;
@@ -475,11 +475,12 @@ impl Render for Client {
         self.focus_workspace(window, cx);
         self.sync_profile_avatar(cx);
         RightPanel::restore_focus(&self.right_panel, window, cx);
-        let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
+        let palette = Palette::for_window(window, cx);
         let root = div()
             .size_full()
             .flex()
             .flex_col()
+            .child(super::ui::track_focus_input(cx))
             .bg(palette.background)
             .text_color(palette.text)
             .track_focus(&self.initial_focus)

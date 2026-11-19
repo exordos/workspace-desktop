@@ -12,7 +12,7 @@ use workspace_desktop::gpui_client::{
         Avatar, AvatarPresence, AvatarSize, BadgeTone, Button, ButtonAppearance, ChatRow,
         ChatRowPreview, DeliveryMark, FieldAppearance, Icon, MessageBubble, Palette,
         SEARCH_ICON_SIZE, TextRole, ThemeMode, TopBar, TopBarAccount, TopBarSelection,
-        WorkspaceAssets, field, label,
+        WorkspaceAssets, field, label, track_focus_input,
     },
 };
 
@@ -160,7 +160,7 @@ impl Panel {
 impl Render for Panel {
     /// Оставляет редактор видимым при прокрутке примеров внутри панели.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let palette = Palette::for_mode(self.mode);
+        let palette = Palette::for_mode(self.mode).with_window_input(window, cx);
         let appearance = if self.draft.focus_handle(cx).is_focused(window) {
             FieldAppearance::Focused
         } else {
@@ -222,11 +222,12 @@ impl Gallery {
 
 impl Render for Gallery {
     /// Рисует обе палитры в равных колонках и подключает обход Tab.
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
             .flex()
             .flex_col()
+            .child(track_focus_input(cx))
             .on_action(|_: &NextControl, window, _| window.focus_next())
             .on_action(|_: &PreviousControl, window, _| window.focus_prev())
             .child(self.top_bar.clone())

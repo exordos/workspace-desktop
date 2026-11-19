@@ -3,6 +3,7 @@
 
 mod content;
 mod controls;
+mod focus;
 mod icons;
 pub(super) mod popup;
 mod text_input;
@@ -18,6 +19,7 @@ pub use content::{
 };
 pub(in crate::gpui_client) use controls::activate;
 pub use controls::{Button, ButtonAppearance, FieldAppearance, field};
+pub use focus::track_focus_input;
 pub use icons::{Icon, SEARCH_ICON_SIZE, WorkspaceAssets};
 pub(crate) use text_input::{TextInput, TextInputChanged, TextInputSubmitted};
 pub(in crate::gpui_client) use theme::ellipsized_label;

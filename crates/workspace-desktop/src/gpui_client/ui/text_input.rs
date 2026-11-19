@@ -11,7 +11,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::{FieldAppearance, Palette, ThemeMode, field};
+use super::{FieldAppearance, Palette, field};
 
 gpui::actions!(
     workspace_text_input,
@@ -446,7 +446,7 @@ impl Line {
 impl Render for TextInput {
     /// Рисует поле в общей рамке или отдаёт голый ввод для поля каталога.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
+        let palette = Palette::for_window(window, cx);
         let appearance = if !self.enabled {
             FieldAppearance::Disabled
         } else if self.invalid {

@@ -9,7 +9,7 @@ use gpui::{
 };
 
 use super::{
-    Avatar, AvatarSize, BadgeTone, Button, ButtonAppearance, Icon, Palette, TextRole, ThemeMode,
+    Avatar, AvatarSize, BadgeTone, Button, ButtonAppearance, Icon, Palette, TextRole,
     controls::activate,
     icons::ORGANIZATION_LOGO,
     label,
@@ -371,7 +371,7 @@ impl TopBar {
 impl Render for TopBar {
     /// Ставит «Чаты» в геометрический центр окна и оставляет меню доступным при сужении.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
+        let palette = Palette::for_window(window, cx);
         let viewport = window.viewport_size();
         let width = f32::from(viewport.width);
         let chat = CHAT_SIZE.min((width - 2. * TRIGGER_SIZE).max(0.));

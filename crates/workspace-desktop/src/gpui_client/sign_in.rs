@@ -11,7 +11,7 @@ use super::{
     runtime::{LoginAttempt, LoginError, RuntimeClient},
     ui::{
         Button, ButtonAppearance, Icon, Palette, TextInput, TextInputChanged, TextInputSubmitted,
-        TextRole, ThemeMode, label,
+        TextRole, label,
     },
 };
 
@@ -570,7 +570,7 @@ impl Render for SignIn {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.focus_current_step(window, cx);
         self.keep_project_in_view(window);
-        let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
+        let palette = Palette::for_window(window, cx);
         let (hint, submit) = self.copy();
         div()
             .id("workspace-sign-in")

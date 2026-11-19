@@ -20,7 +20,7 @@ use crate::gpui_client::{
     contracts::{AccountSession, ConversationAddress},
     right_panel::{PanelKey, RightPanel, Scope},
     runtime::RuntimeClient,
-    ui::{Button, Palette, TextRole, ThemeMode, label},
+    ui::{Button, Palette, TextRole, label},
 };
 use picker::Picker;
 use source::{Mutation, Problem};
@@ -308,7 +308,7 @@ struct DetailsBody {
 impl Render for DetailsBody {
     /// Перерисовывает содержимое и возвращает фокус в рамку после исчезновения выбора.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
+        let palette = Palette::for_window(window, cx);
         self.conversation
             .update(cx, |view, cx| {
                 let Some(panel) = view.details.as_mut() else {

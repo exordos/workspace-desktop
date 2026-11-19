@@ -33,7 +33,7 @@ use super::{
     runtime::RuntimeClient,
     ui::{
         Avatar, AvatarPresence, BadgeTone, Button, ButtonAppearance, ChatRow, ChatRowPreview, Icon,
-        Palette, TextInput, TextInputChanged, TextRole, ThemeMode, label,
+        Palette, TextInput, TextInputChanged, TextRole, label,
         popup::{MenuInput, menu_layer, menu_navigation, menu_surface, tooltip},
     },
 };
@@ -910,7 +910,7 @@ impl Render for Sidebar {
     /// Показывает поиск и состояние загрузки, прокручивая отдельно строки каталога.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.open_requested_folder_dialog(window, cx);
-        let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
+        let palette = Palette::for_window(window, cx);
         let id = self.active.as_ref().map_or_else(
             || "sidebar-unselected".into(),
             |active| ElementId::View(active.search.entity_id()),

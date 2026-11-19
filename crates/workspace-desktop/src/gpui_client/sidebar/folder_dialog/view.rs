@@ -6,9 +6,7 @@ use gpui::{
     px, rgb, rgba,
 };
 
-use crate::gpui_client::ui::{
-    Button, ButtonAppearance, Icon, Palette, TextRole, ThemeMode, label, popup,
-};
+use crate::gpui_client::ui::{Button, ButtonAppearance, Icon, Palette, TextRole, label, popup};
 
 use super::{
     COLORS, Dismiss, FolderCommandError, FolderDialog, KEY_CONTEXT, MAX_TITLE_LENGTH, Mode, Next,
@@ -33,7 +31,7 @@ impl Render for FolderDialog {
         }
 
         let viewport = window.viewport_size();
-        let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
+        let palette = Palette::for_window(window, cx);
         let backdrop = div()
             .id("folder-dialog-backdrop")
             .debug_selector(|| "folder-dialog-backdrop".into())
@@ -201,7 +199,9 @@ impl FolderDialog {
                 swatch
                     .focusable()
                     .tab_stop(true)
-                    .focus(|style| style.border_color(palette.focus))
+                    .when(palette.keyboard_focus_visible(), |row| {
+                        row.focus(|style| style.border_color(palette.focus))
+                    })
                     .cursor_pointer()
                     .active(|style| style.opacity(0.7))
                     .on_click(cx.listener(move |view, _, _, cx| view.choose_color(argb, cx)))

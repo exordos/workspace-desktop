@@ -10,7 +10,7 @@ use workspace_core::messenger::folders::{ALL_CHATS_ID, FolderKind};
 
 use super::{
     super::super::ui::{
-        BadgeTone, Button, ButtonAppearance, Icon, Palette, TextRole, ThemeMode, label,
+        BadgeTone, Button, ButtonAppearance, Icon, Palette, TextRole, label,
         popup::{menu_layer, menu_navigation, menu_surface, tooltip},
         unread_badge,
     },
@@ -430,7 +430,7 @@ impl FolderRail {
 impl Render for FolderRail {
     /// Показывает выбранное размещение и поверх него открытое меню, если оно есть.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
+        let palette = Palette::for_window(window, cx);
         let panel = if self.state.vertical {
             self.vertical(palette, cx)
         } else {

@@ -9,9 +9,7 @@ use gpui::{
 };
 
 use crate::{
-    gpui_client::ui::{
-        Button, ButtonAppearance, Palette, TextRole, ThemeMode, label, popup::tooltip,
-    },
+    gpui_client::ui::{Button, ButtonAppearance, Palette, TextRole, label, popup::tooltip},
     platform::notifications::NotificationPermission,
 };
 
@@ -261,7 +259,7 @@ impl NotificationBanner {
                 }
             }));
         }
-        let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
+        let palette = Palette::for_window(window, cx);
         let strip_view = cx.entity().downgrade();
         let strip = div()
             .id("notification-permission-strip")
@@ -274,7 +272,9 @@ impl NotificationBanner {
                     .track_focus(&self.strip.clone().tab_stop(true))
                     .tab_stop(true)
                     .cursor_pointer()
-                    .focus(|style| style.bg(palette.focus))
+                    .when(palette.keyboard_focus_visible(), |strip| {
+                        strip.focus(|style| style.bg(palette.focus))
+                    })
                     .on_click(move |_, window, app| {
                         let _ = strip_view.update(app, |banner, cx| {
                             banner.set_mode(BannerMode::Pinned, cx);

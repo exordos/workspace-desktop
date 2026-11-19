@@ -1,8 +1,8 @@
 //! Переносит цвета Blue Mist в GPUI и задаёт общие роли текста.
 
 use gpui::{
-    Div, FontWeight, Hsla, Pixels, ShapedLine, SharedString, WindowAppearance, canvas, div,
-    prelude::*, px, rgb,
+    App, Div, FontWeight, Hsla, Pixels, ShapedLine, SharedString, Window, WindowAppearance, canvas,
+    div, prelude::*, px, rgb,
 };
 
 use unicode_segmentation::UnicodeSegmentation;
@@ -34,7 +34,7 @@ impl From<WindowAppearance> for ThemeMode {
     }
 }
 
-/// Цвета Blue Mist, названные по назначению в интерфейсе.
+/// Цвета Blue Mist и видимость рамки фокуса для текущей отрисовки.
 #[derive(Clone, Copy, Debug)]
 pub struct Palette {
     pub background: Hsla,       // Фон окна и нейтральная подложка аватара.
@@ -64,9 +64,26 @@ pub struct Palette {
     pub icon_hover: Hsla,       // Иконка под указателем.
     pub presence_online: Hsla,  // Индикатор «В сети».
     pub presence_away: Hsla,    // Индикатор «Отошёл».
+    pub(in crate::gpui_client) keyboard_focus_visible: bool, // Можно показать рамку у элемента с фокусом.
 }
 
 impl Palette {
+    /// Берёт оформление и видимость рамки фокуса из текущего окна.
+    pub(in crate::gpui_client) fn for_window(window: &Window, app: &App) -> Self {
+        Self::for_mode(ThemeMode::from(window.appearance())).with_window_input(window, app)
+    }
+
+    /// Добавляет способ ввода окна к выбранной палитре, например в галерее двух тем.
+    pub fn with_window_input(mut self, window: &Window, app: &App) -> Self {
+        self.keyboard_focus_visible = super::focus::is_visible(window, app);
+        self
+    }
+
+    /// Проверяет, надо ли рисовать рамки у элементов с фокусом.
+    pub fn keyboard_focus_visible(&self) -> bool {
+        self.keyboard_focus_visible
+    }
+
     /// Возвращает рабочую палитру для темы окна или галереи.
     pub fn for_mode(mode: ThemeMode) -> Self {
         match mode {
@@ -98,6 +115,7 @@ impl Palette {
                 icon_hover: rgb(0x1a2330).into(),
                 presence_online: rgb(0x26c038).into(),
                 presence_away: rgb(0xff8900).into(),
+                keyboard_focus_visible: false,
             },
             ThemeMode::Dark => Self {
                 background: rgb(0x15181d).into(),
@@ -127,6 +145,7 @@ impl Palette {
                 icon_hover: rgb(0xaab9cc).into(),
                 presence_online: rgb(0x26c038).into(),
                 presence_away: rgb(0xff8900).into(),
+                keyboard_focus_visible: false,
             },
         }
     }
