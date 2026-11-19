@@ -1,5 +1,7 @@
 # UI-07. Шапка и история разговора
 
+[План стабильности ленты и восстановления позиции](gpui-ui-parity-history-position.md).
+
 Основа сравнения — Electron `workspace_ui@af0999886daaffefc2a7be33f8dcf3f484a0e9c1`. Использованы [фиксированные сцены UI-02](gpui-ui-parity-fixtures/README.md) и ширины области истории [из UI-05](gpui-ui-parity-shell.md). В Figma Bridge сверены `Exordos Core (Copy)`, «Личные сообщения» (`2473:7898`), «Тема в чате» (`2473:7584`) и их шапки (`2473:8082`, `2473:7802`). Геометрию готового окна берём из Electron.
 
 | Сценарий | GPUI и сопоставление с Electron |

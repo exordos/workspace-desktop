@@ -1,6 +1,10 @@
 //! Экран открытого разговора. Здесь находятся запросы, переходы истории и отображение состояний.
 
 mod details;
+#[path = "history/fixtures.rs"]
+mod history_fixtures;
+#[path = "history/lab.rs"]
+pub mod history_lab;
 #[path = "history/source.rs"]
 mod source;
 #[path = "history/viewport.rs"]

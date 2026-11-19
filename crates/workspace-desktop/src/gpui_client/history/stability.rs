@@ -2,6 +2,8 @@
 
 use std::time::Instant;
 
+use crate::gpui_client::conversation::history_fixtures::fixture_rows;
+
 use super::*;
 
 #[path = "stability_data.rs"]

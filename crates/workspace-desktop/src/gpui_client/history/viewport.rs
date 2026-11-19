@@ -15,9 +15,14 @@ use workspace_core::storage::{DeliveryStatus, HistoryWindow, OutboxEntry, SendBl
 
 use super::Conversation;
 
+#[path = "paging.rs"]
+mod paging;
+pub(super) use paging::PageNeed;
+
 use crate::gpui_client::ui::{Avatar, DeliveryMark, MessageBubble, Palette, TextRole, label};
 
 const DATE_SPACE: Pixels = px(32.);
+const BOTTOM_PADDING: Pixels = px(12.);
 
 /// Строка, которую можно рисовать после переноса снимка на поток UI.
 #[derive(Clone, Eq, PartialEq)]
@@ -90,10 +95,15 @@ pub(super) struct Viewport {
 impl Viewport {
     /// Создаёт пустой список с нижней привязкой и ограниченной областью дополнительной отрисовки.
     pub(super) fn new() -> Self {
+        Self::with_overdraw(px(100.))
+    }
+
+    /// Задаёт, на сколько логических px за пределами окна список измеряет строки.
+    fn with_overdraw(overdraw: Pixels) -> Self {
         Self {
             rows: Rc::default(),
             index: Rc::default(),
-            list: ListState::new(0, ListAlignment::Bottom, px(100.)),
+            list: ListState::new(0, ListAlignment::Bottom, overdraw),
             painted: Rc::default(),
             measure: None,
         }
@@ -228,6 +238,11 @@ impl Viewport {
         self.index = Rc::new(index);
     }
 
+    /// Показывает список с локальными строками в отдельном окне.
+    pub(super) fn render_standalone(&mut self, palette: Palette, peer: String) -> impl IntoElement {
+        self.render(palette, Some(peer), HashMap::new())
+    }
+
     /// Рисует список и пишет фактическую координату опоры, когда GPUI дойдёт до её строки.
     pub(super) fn render(
         &mut self,
@@ -261,7 +276,7 @@ impl Viewport {
                     }
                 }).absolute().inset_0()))
                 .into_any_element()
-        }).flex_1().min_h_0().w_full().pb_3()
+        }).flex_1().min_h_0().w_full().pb(BOTTOM_PADDING)
     }
 
     /// После отрисовки строк собирает аватары тех групп, что действительно пересекли область списка.
@@ -308,6 +323,13 @@ impl Viewport {
             .borrow()
             .get(&id)
             .map(|bounds| f32::from(bounds.top() - self.list.viewport_bounds().top()))
+    }
+
+    /// Возвращает опору чтения после показанного кадра для проверки вставки.
+    #[cfg(all(test, feature = "gpui-test"))]
+    pub(super) fn tested_reading_anchor(&self) -> Option<(Uuid, f32)> {
+        self.anchor(&self.index)
+            .map(|row| (row.id, f32::from(row.y)))
     }
 
     /// Возвращает авторов видимых групп для проверки виртуализации.
