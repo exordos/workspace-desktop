@@ -161,12 +161,15 @@ impl Sidebar {
         }
     }
 
-    /// Сбрасывает временные действия при уходе с рабочего раздела.
+    /// Сбрасывает временные действия и подписки, когда каталог скрывается.
     pub(in crate::gpui_client) fn dismiss_folders(&mut self, cx: &mut Context<Self>) {
         self.folders.reset(cx);
         if let Some(active) = &mut self.active {
             active.folder_pending = None;
             active.menu = None;
+            active.avatars.clear();
+            active.avatar_users.clear();
+            active.avatar_frame = active.avatar_frame.wrapping_add(1);
         }
         self.update_folder_rail(cx);
     }

@@ -6,6 +6,8 @@ mod source;
 #[path = "history/viewport.rs"]
 mod viewport;
 
+use std::collections::HashMap;
+
 use futures::channel::oneshot;
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyDownEvent, Render,
@@ -24,6 +26,7 @@ use self::{
     viewport::{Position, Viewport},
 };
 use super::{
+    avatars::AvatarImages,
     composer::{Composer, ComposerEvent, SendSource, Submission},
     contracts::{AccountSession, ChatEntry, ConversationAddress},
     right_panel::RightPanel,
@@ -55,9 +58,10 @@ struct Sending {
 /// Подписи разговора из каталога того же входа.
 #[derive(Default, PartialEq, Eq)]
 struct Heading {
-    chat: Option<String>,  // Имя собеседника или канала.
-    topic: Option<String>, // Название темы, если открыт её адрес.
-    direct: bool,          // В заголовке лички показываем инициалы собеседника.
+    chat: Option<String>,         // Имя собеседника или канала.
+    topic: Option<String>,        // Название темы, если открыт её адрес.
+    direct: bool,                 // В заголовке лички оставляем место под аватар.
+    direct_peer_id: Option<Uuid>, // UUID собеседника из каталога этого входа, если он известен.
 }
 
 /// Переход из правой панели, который должна подтвердить оболочка.
@@ -83,7 +87,12 @@ pub struct Conversation {
     history_focus: FocusHandle, // Точка клавиатурной прокрутки в открытом разговоре.
     sending: Option<Sending>, // Рабочий редактор; изолированные тесты истории могут его не подключать.
     heading: Heading,         // Отображаемые названия из текущего каталога.
-    details: Option<Panel>,   // Панель штатного разговора с доступом к рабочему потоку.
+    avatar_runtime: Option<RuntimeClient>, // Рабочий поток аватаров. Отсутствует в тестах истории без Core.
+    avatars_visible: bool,                 // Разговор показан окном и может запрашивать фото.
+    heading_avatars: AvatarImages,         // Подписка на фото собеседника, указанного в шапке.
+    history_avatars: AvatarImages,         // Подписки на фото авторов в видимой части истории.
+    history_avatar_users: Vec<Uuid>, // UUID из последнего размещения истории, в порядке сортировки.
+    details: Option<Panel>,          // Панель штатного разговора с доступом к рабочему потоку.
 }
 
 impl Conversation {
@@ -96,6 +105,7 @@ impl Conversation {
     ) -> Self {
         let mut view = Self::with_source(address, runtime_source(runtime.clone()), cx);
         view.attach_composer(SendSource::runtime(runtime.clone()), cx);
+        view.avatar_runtime = Some(runtime.clone());
         view.details = Some(Panel::new(right_panel, view.address.clone(), runtime, cx));
         view
     }
@@ -117,6 +127,11 @@ impl Conversation {
             history_focus: cx.focus_handle().tab_stop(true),
             sending: None,
             heading: Heading::default(),
+            avatar_runtime: None,
+            avatars_visible: false,
+            heading_avatars: AvatarImages::default(),
+            history_avatars: AvatarImages::default(),
+            history_avatar_users: Vec::new(),
             details: None,
         };
         let target = cx.entity().downgrade();
@@ -236,11 +251,11 @@ impl Conversation {
         cx: &mut Context<Self>,
     ) {
         let scope = self.address.route.scope;
+        let session = session.filter(|session| {
+            session.owner == self.address.route.owner
+                && session.generation == self.address.generation
+        });
         let heading = session
-            .filter(|session| {
-                session.owner == self.address.route.owner
-                    && session.generation == self.address.generation
-            })
             .and(catalog)
             .filter(|catalog| catalog.generation == self.address.generation)
             .and_then(|catalog| catalog.chats.as_deref())
@@ -253,11 +268,50 @@ impl Conversation {
                     .find(|topic| Some(topic.id) == scope.topic_id)
                     .map(|topic| topic.name.clone()),
                 direct: chat.direct,
+                direct_peer_id: chat
+                    .metadata
+                    .direct_peer_id
+                    .filter(|id| chat.direct && !id.is_nil()),
             })
             .unwrap_or_default();
         if heading != self.heading {
             self.heading = heading;
+            self.refresh_heading_avatar(cx);
             cx.notify();
+        }
+    }
+
+    /// Включает фото, только пока разговор виден в рабочем разделе окна.
+    pub(super) fn set_avatars_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.avatars_visible == visible {
+            return;
+        }
+        self.avatars_visible = visible;
+        self.refresh_heading_avatar(cx);
+        if !visible {
+            self.clear_history_avatars();
+        }
+        cx.notify();
+    }
+
+    /// Подписывает шапку на фото собеседника, выбранного из каталога текущего входа.
+    fn refresh_heading_avatar(&mut self, cx: &mut Context<Self>) {
+        if self.avatars_visible
+            && let Some(runtime) = self.avatar_runtime.as_ref()
+        {
+            let session = self.avatar_session();
+            self.heading_avatars
+                .refresh(self.heading.direct_peer_id, runtime, &session, cx);
+        } else {
+            self.heading_avatars.clear();
+        }
+    }
+
+    /// Возвращает тот вход, которому оболочка открыла этот разговор.
+    fn avatar_session(&self) -> AccountSession {
+        AccountSession {
+            owner: self.address.route.owner.clone(),
+            generation: self.address.generation,
         }
     }
 
@@ -338,6 +392,7 @@ impl Conversation {
         self.action_error = None;
         self.outbox.clear();
         self.viewport.clear();
+        self.clear_history_avatars();
         self.start(Load::Open(self.entry), cx);
     }
 
@@ -354,6 +409,7 @@ impl Conversation {
         self.action_error = None;
         self.outbox.clear();
         self.viewport.clear();
+        self.clear_history_avatars();
         cx.notify();
     }
 
@@ -526,6 +582,9 @@ impl Conversation {
             position,
             flight.id,
         );
+        if window.messages.is_empty() {
+            self.clear_history_avatars();
+        }
         self.state = State::Ready(window);
         if let Some(sending) = &self.sending {
             sending.view.update(cx, |editor, cx| {
@@ -668,6 +727,7 @@ impl Conversation {
             .id("conversation-history-focus")
             .debug_selector(|| "conversation-history-focus".into())
             .track_focus(&self.history_focus)
+            .relative()
             .flex()
             .flex_1()
             .min_h_0()
@@ -677,6 +737,38 @@ impl Conversation {
             .focus(|style| style.border_color(palette.focus))
             .on_key_down(cx.listener(Self::scroll_key))
             .child(viewport)
+            .when(
+                self.avatars_visible && self.avatar_runtime.is_some(),
+                |frame| {
+                    frame.child(
+                        self.viewport.track_visible_avatars(
+                            cx.entity().downgrade(),
+                            &self.history_avatar_users,
+                        ),
+                    )
+                },
+            )
+    }
+
+    /// Подключает только авторов, чьи аватары нужны в видимой части подтверждённой истории.
+    fn update_history_avatars(&mut self, users: Vec<Uuid>, cx: &mut Context<Self>) {
+        let Some(runtime) = self.avatar_runtime.as_ref() else {
+            return;
+        };
+        if !self.avatars_visible || self.history_avatar_users == users || !self.has_access() {
+            return;
+        }
+        let session = self.avatar_session();
+        self.history_avatars
+            .refresh(users.iter().copied(), runtime, &session, cx);
+        self.history_avatar_users = users;
+        cx.notify();
+    }
+
+    /// Освобождает подписки, когда история скрывается или теряет доступ.
+    fn clear_history_avatars(&mut self) {
+        self.history_avatars.clear();
+        self.history_avatar_users.clear();
     }
 }
 
@@ -706,7 +798,16 @@ impl Conversation {
                     .next()
                     .map(|first| first.to_uppercase().collect::<String>())
                     .unwrap_or_default();
-                heading.child(Avatar::from_initials(initial).render(palette))
+                let mut avatar = Avatar::from_initials(initial);
+                avatar.image = self
+                    .heading
+                    .direct_peer_id
+                    .and_then(|id| self.heading_avatars.image(id, cx));
+                heading.child(
+                    avatar
+                        .render(palette)
+                        .debug_selector(|| "conversation-heading-avatar".into()),
+                )
             })
             .child(
                 div()
@@ -900,7 +1001,15 @@ impl Conversation {
                         .debug_selector(|| "history-empty".into())
                         .into_any_element()
                 } else {
-                    self.viewport.render(palette, peer).into_any_element()
+                    let images: HashMap<_, _> = self
+                        .history_avatar_users
+                        .iter()
+                        .copied()
+                        .filter_map(|id| Some((id, self.history_avatars.image(id, cx)?)))
+                        .collect();
+                    self.viewport
+                        .render(palette, peer, images)
+                        .into_any_element()
                 };
                 root.child(
                     div()

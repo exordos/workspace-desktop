@@ -1,8 +1,10 @@
 //! Рисует постоянную шапку и меню аккаунтов в окне GPUI.
 //! Подсветка, фокус и прокрутка принадлежат меню. Выбранный вход сообщает оболочка.
 
+use std::sync::Arc;
+
 use gpui::{
-    App, Context, Div, EventEmitter, FocusHandle, ImageSource, Resource, ScrollHandle,
+    App, Context, Div, EventEmitter, FocusHandle, ImageSource, RenderImage, Resource, ScrollHandle,
     SharedString, Stateful, Window, div, img, point, prelude::*, px,
 };
 
@@ -41,10 +43,11 @@ pub struct TopBarSelection(pub AccountSession); // Вход, видимый на
 /// Самостоятельный компонент верхней панели; меню живёт вместе с окном.
 pub struct TopBar {
     accounts: Vec<TopBarAccount>, // Последний снимок из оболочки.
+    profile_avatar: Option<(AccountSession, Arc<RenderImage>)>, // Готовое фото входа, переданное окном.
     quick_focus: Vec<(AccountSession, FocusHandle)>, // Фокус быстрых кнопок закреплён за входом.
-    trigger_focus: FocusHandle,   // Сюда возвращается фокус после закрытия меню.
-    menu_focus: FocusHandle,      // Одна точка клавиатурного ввода для всего меню.
-    menu_scroll: ScrollHandle,    // Удерживает активную строку в видимой части меню.
+    trigger_focus: FocusHandle,                      // Сюда возвращается фокус после закрытия меню.
+    menu_focus: FocusHandle, // Одна точка клавиатурного ввода для всего меню.
+    menu_scroll: ScrollHandle, // Удерживает активную строку в видимой части меню.
     highlight: Option<AccountSession>, // Подсвеченная строка. None означает закрытое меню.
 }
 
@@ -55,11 +58,24 @@ impl TopBar {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             accounts: Vec::new(),
+            profile_avatar: None,
             quick_focus: Vec::new(),
             trigger_focus: cx.focus_handle(),
             menu_focus: cx.focus_handle(),
             menu_scroll: ScrollHandle::new(),
             highlight: None,
+        }
+    }
+
+    /// Подменяет инициалы готовым изображением указанного входа.
+    pub(in crate::gpui_client) fn set_profile_avatar(
+        &mut self,
+        avatar: Option<(AccountSession, Arc<RenderImage>)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.profile_avatar != avatar {
+            self.profile_avatar = avatar;
+            cx.notify();
         }
     }
 
@@ -448,7 +464,14 @@ impl Render for TopBar {
                 self.accounts
                     .iter()
                     .find(|account| account.selected)
-                    .map(|account| active_identity(account, px(side), palette)),
+                    .map(|account| {
+                        let image = self
+                            .profile_avatar
+                            .as_ref()
+                            .filter(|(session, _)| *session == account.session)
+                            .map(|(_, image)| ImageSource::Render(image.clone()));
+                        active_identity(account, image, px(side), palette)
+                    }),
             )
             .when(self.highlight.is_some(), |bar| {
                 let origin = point(px(trigger_x), px((HEIGHT + TRIGGER_SIZE) / 2. + 6.));
@@ -462,10 +485,17 @@ impl Render for TopBar {
 }
 
 /// Показывает подпись активного аккаунта, даже если он скрыт среди быстрых кнопок.
-fn active_identity(account: &TopBarAccount, side: gpui::Pixels, palette: Palette) -> Div {
+fn active_identity(
+    account: &TopBarAccount,
+    image: Option<ImageSource>,
+    side: gpui::Pixels,
+    palette: Palette,
+) -> Div {
     let initials: String = account.label.chars().next().into_iter().collect();
     let mut avatar = Avatar::from_initials(initials);
     avatar.size = AvatarSize::Small;
+    avatar.image = image;
+    let has_image = avatar.image.is_some();
     div()
         .w(side)
         .pr(px(END_INSET))
@@ -477,7 +507,9 @@ fn active_identity(account: &TopBarAccount, side: gpui::Pixels, palette: Palette
         .justify_end()
         .gap_2()
         .overflow_hidden()
-        .child(avatar.render(palette))
+        .child(avatar.render(palette).when(has_image, |photo| {
+            photo.debug_selector(|| "workspace-profile-avatar-photo".into())
+        }))
         .child(
             div()
                 .min_w_0()

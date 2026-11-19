@@ -17,6 +17,28 @@ use crate::gpui_client::contracts::{ChatRoute, ConversationReply, NavigationRevi
 
 use super::*;
 
+impl Conversation {
+    /// Возвращает фото шапки и видимой истории для общей приёмки аватаров.
+    pub(in crate::gpui_client) fn tested_chat_avatars(
+        &self,
+        author: Uuid,
+        app: &App,
+    ) -> (Option<gpui::ImageId>, Option<gpui::ImageId>) {
+        let image_id = |source| match source {
+            Some(gpui::ImageSource::Render(image)) => Some(image.id),
+            _ => None,
+        };
+        (
+            image_id(
+                self.heading
+                    .direct_peer_id
+                    .and_then(|peer| self.heading_avatars.image(peer, app)),
+            ),
+            image_id(self.history_avatars.image(author, app)),
+        )
+    }
+}
+
 /// Хранит неотвеченный запрос, чтобы проверить клики до и после ответа.
 struct Request {
     address: ConversationAddress,     // Адрес на момент запроса.
@@ -178,6 +200,126 @@ fn sync(
     ui.run_until_parked();
 }
 
+/// Проверяет, что UUID собеседника берётся из каталога правильного входа и маршрута.
+#[gpui::test]
+fn heading_uses_direct_peer_from_current_catalog(cx: &mut TestAppContext) {
+    let address = address(ChatEntry::Latest);
+    let peer = Uuid::from_u128(910);
+    let mut catalog = ChatList {
+        generation: address.generation,
+        chats: Some(Arc::from([Chat {
+            id: address.route.scope.stream_id,
+            name: "Собеседник".into(),
+            direct: true,
+            topics: Vec::new(),
+            metadata: workspace_core::messenger::catalog::ChatMetadata {
+                direct_peer_id: Some(peer),
+            },
+        }])),
+        status: ChatListStatus::Ready,
+    };
+    let session = AccountSession {
+        owner: address.route.owner.clone(),
+        generation: address.generation,
+    };
+    let (view, ui, requests) = scenario(cx, &address);
+    answer(
+        request(&requests, Load::Open(ChatEntry::Latest)),
+        window(
+            address.route.scope,
+            0..0,
+            HistoryEdge::End,
+            HistoryEdge::End,
+        ),
+        ui,
+    );
+    let mut other = session.clone();
+    other.owner.account_id = AccountId("other".into());
+    for (current, expected) in [(&other, None), (&session, Some(peer))] {
+        ui.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.set_catalog(Some(current), Some(&catalog), cx)
+            })
+        });
+        assert_eq!(
+            ui.read(|app| view.read(app).heading.direct_peer_id),
+            expected
+        );
+    }
+    ui.run_until_parked();
+    assert_eq!(
+        ui.read(|app| view.read(app).tested_chat_avatars(peer, app)),
+        (None, None)
+    );
+    assert_eq!(
+        ui.debug_bounds("conversation-heading-avatar")
+            .unwrap()
+            .size
+            .width,
+        px(40.)
+    );
+
+    catalog.generation.0 += 1;
+    ui.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.set_catalog(Some(&session), Some(&catalog), cx)
+        })
+    });
+    assert!(ui.read(|app| view.read(app).heading.direct_peer_id.is_none()));
+}
+
+/// Проверяет выбор UUID по реально видимым входящим группам при первом кадре и переносе опоры.
+#[gpui::test]
+fn visible_history_selects_only_incoming_group_avatars(cx: &mut TestAppContext) {
+    let first = Uuid::from_u128(40);
+    let address = address(ChatEntry::Around(first));
+    let (view, ui, requests) = scenario(cx, &address);
+    let mut page = window(
+        address.route.scope,
+        1..80,
+        HistoryEdge::End,
+        HistoryEdge::End,
+    );
+    for (index, message) in page.messages.iter_mut().enumerate() {
+        message.metadata.author_id = Some(Uuid::from_u128(1001 + index as u128));
+    }
+    let group_author = Uuid::from_u128(1041);
+    let current_user: Uuid = address.route.owner.user_id.parse().unwrap();
+    page.messages[39].metadata.author_id = Some(group_author);
+    page.messages[41].metadata.author_id = Some(current_user);
+    page.messages[42].metadata.author_id = None;
+    answer(
+        request(&requests, Load::Open(ChatEntry::Around(first))),
+        page,
+        ui,
+    );
+    let visible = ui.read(|app| view.read(app).viewport.tested_visible_avatars());
+    assert!(
+        visible.contains(&group_author),
+        "Последняя строка входящей группы видна"
+    );
+    for hidden in [Uuid::from_u128(1001), Uuid::from_u128(1079), current_user] {
+        assert!(
+            !visible.contains(&hidden),
+            "Аватар {hidden} вне видимых входящих групп"
+        );
+    }
+
+    ui.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.viewport.list().scroll_to(gpui::ListOffset {
+                item_ix: 66,
+                offset_in_item: px(0.),
+            });
+            cx.notify();
+        })
+    });
+    ui.run_until_parked();
+    let scrolled = ui.read(|app| view.read(app).viewport.tested_visible_avatars());
+    assert!(scrolled.contains(&Uuid::from_u128(1067)));
+    assert!(!scrolled.contains(&group_author));
+}
+
 /// Проверяет открытие у цели, ввод пользователя и неизменность координаты после страницы и события.
 #[gpui::test]
 fn preserves_visible_uuid_during_pages_and_updates(cx: &mut TestAppContext) {
@@ -287,6 +429,7 @@ fn fixed_topic_groups_and_wraps_at_both_panel_sizes(cx: &mut TestAppContext) {
                 id: topic_id,
                 name: topic_name.to_owned(),
             }],
+            metadata: Default::default(),
         }])),
         status: ChatListStatus::Ready,
     };

@@ -7,11 +7,13 @@ use std::{
 };
 
 use gpui::{
-    Bounds, Div, IntoElement, ListAlignment, ListOffset, ListState, Pixels, canvas, div, list,
-    prelude::*, px,
+    Bounds, Div, ImageSource, IntoElement, ListAlignment, ListOffset, ListState, Pixels,
+    WeakEntity, canvas, div, list, prelude::*, px,
 };
 use uuid::Uuid;
 use workspace_core::storage::{DeliveryStatus, HistoryWindow, OutboxEntry, SendBlock};
+
+use super::Conversation;
 
 use crate::gpui_client::ui::{Avatar, DeliveryMark, MessageBubble, Palette, TextRole, label};
 
@@ -47,6 +49,12 @@ impl Row {
             && self.topic == other.topic
             && self.date == other.date
     }
+
+    /// Возвращает автора строки, возле которой рисуется фото входящей группы.
+    fn avatar_author(&self) -> Option<Uuid> {
+        self.author
+            .filter(|id| !self.own && self.ends_group && !id.is_nil())
+    }
 }
 
 /// Что должен показать список после принятия снимка.
@@ -73,6 +81,7 @@ struct Measurement {
 /// Снимок виртуального списка и реально нарисованные границы последнего кадра.
 pub(super) struct Viewport {
     rows: Rc<Vec<Row>>, // Состав списка для отложенного построения видимых элементов.
+    index: Rc<HashMap<Uuid, usize>>, // Индекс строк истории по UUID сообщения.
     list: ListState,    // Позиция и размеры строк в GPUI.
     painted: Rc<RefCell<HashMap<Uuid, Bounds<Pixels>>>>, // Фактические прямоугольники строк.
     measure: Option<Measurement>, // Следующее измерение после замены снимка.
@@ -83,6 +92,7 @@ impl Viewport {
     pub(super) fn new() -> Self {
         Self {
             rows: Rc::default(),
+            index: Rc::default(),
             list: ListState::new(0, ListAlignment::Bottom, px(100.)),
             painted: Rc::default(),
             measure: None,
@@ -107,6 +117,7 @@ impl Viewport {
     /// Очищает список и координаты доступных раньше сообщений.
     pub(super) fn clear(&mut self) {
         self.rows = Rc::default();
+        self.index = Rc::default();
         self.list.reset(0);
         self.painted.borrow_mut().clear();
         self.measure = None;
@@ -214,10 +225,16 @@ impl Viewport {
                 }
             }
         }
+        self.index = Rc::new(index);
     }
 
     /// Рисует список и пишет фактическую координату опоры, когда GPUI дойдёт до её строки.
-    pub(super) fn render(&mut self, palette: Palette, peer: Option<String>) -> impl IntoElement {
+    pub(super) fn render(
+        &mut self,
+        palette: Palette,
+        peer: Option<String>,
+        images: HashMap<Uuid, ImageSource>,
+    ) -> impl IntoElement {
         self.painted.borrow_mut().clear();
         let rows = self.rows.clone();
         let painted = self.painted.clone();
@@ -226,12 +243,13 @@ impl Viewport {
         list(self.list.clone(), move |index, _, _| {
             let row = &rows[index];
             let id = row.id;
+            let photo = row.avatar_author().and_then(|id| images.get(&id).cloned());
             let painted = painted.clone();
             let measurement = measurement.clone();
             let list_state = list_state.clone();
             div().relative().w_full().px_3().pt(row.inset())
                 .children(row.date.as_deref().filter(|_| row.starts_day).map(|date| date_separator(palette, date, id)))
-                .child(message_row(row, palette, peer.as_deref()).relative().child(canvas(|_, _, _| (), move |bounds, (), _, _| {
+                .child(message_row(row, palette, peer.as_deref(), photo).relative().child(canvas(|_, _, _| (), move |bounds, (), _, _| {
                     painted.borrow_mut().insert(id, bounds);
                     let mut measurement = measurement.borrow_mut();
                     if measurement.as_ref().is_some_and(|m| m.anchor.id == id)
@@ -246,6 +264,43 @@ impl Viewport {
         }).flex_1().min_h_0().w_full().pb_3()
     }
 
+    /// После отрисовки строк собирает аватары тех групп, что действительно пересекли область списка.
+    pub(super) fn track_visible_avatars(
+        &self,
+        conversation: WeakEntity<Conversation>,
+        previous: &[Uuid],
+    ) -> impl IntoElement {
+        let rows = self.rows.clone();
+        let index = self.index.clone();
+        let painted = self.painted.clone();
+        let list_state = self.list.clone();
+        let previous = previous.to_vec();
+        canvas(
+            |_, _, _| (),
+            move |_, (), _, app| {
+                let users = visible_avatar_users(
+                    &rows,
+                    &index,
+                    &painted.borrow(),
+                    list_state.viewport_bounds(),
+                );
+                if users == previous {
+                    return;
+                }
+                // Пока кадр рисовался, история могла получить другой снимок. Применяем только текущий.
+                app.defer(move |app| {
+                    let _ = conversation.update(app, |view, cx| {
+                        if Rc::ptr_eq(&view.viewport.rows, &rows) {
+                            view.update_history_avatars(users, cx);
+                        }
+                    });
+                });
+            },
+        )
+        .absolute()
+        .inset_0()
+    }
+
     /// Возвращает координату реально показанной строки для теста геометрии.
     #[cfg(all(test, feature = "gpui-test"))]
     pub(super) fn y(&self, id: Uuid) -> Option<f32> {
@@ -254,6 +309,41 @@ impl Viewport {
             .get(&id)
             .map(|bounds| f32::from(bounds.top() - self.list.viewport_bounds().top()))
     }
+
+    /// Возвращает авторов видимых групп для проверки виртуализации.
+    #[cfg(all(test, feature = "gpui-test"))]
+    pub(super) fn tested_visible_avatars(&self) -> Vec<Uuid> {
+        visible_avatar_users(
+            &self.rows,
+            &self.index,
+            &self.painted.borrow(),
+            self.list.viewport_bounds(),
+        )
+    }
+}
+
+/// Отбирает авторов по реально нарисованным строкам, исключая запас списка за границами окна.
+fn visible_avatar_users(
+    rows: &[Row],
+    index: &HashMap<Uuid, usize>,
+    painted: &HashMap<Uuid, Bounds<Pixels>>,
+    viewport: Bounds<Pixels>,
+) -> Vec<Uuid> {
+    if viewport.size.height <= px(0.) || viewport.size.width <= px(0.) {
+        return Vec::new();
+    }
+    let mut users: Vec<_> = painted
+        .iter()
+        .filter_map(|(id, bounds)| {
+            if !bounds.intersects(&viewport) {
+                return None;
+            }
+            rows.get(*index.get(id)?)?.avatar_author()
+        })
+        .collect();
+    users.sort_unstable();
+    users.dedup();
+    users
 }
 
 /// Рисует дату перед первым сообщением дня, не добавляя отдельный адрес в список.
@@ -278,7 +368,7 @@ fn date_separator(palette: Palette, date: &str, id: Uuid) -> Div {
 }
 
 /// Рисует сообщение с общим пузырём и оставляет место аватару в группе собеседника.
-fn message_row(row: &Row, palette: Palette, peer: Option<&str>) -> Div {
+fn message_row(row: &Row, palette: Palette, peer: Option<&str>, photo: Option<ImageSource>) -> Div {
     let author = peer.unwrap_or("Участник");
     let id = row.id;
     // Время и пояснения должны читаться и на более тёмной подложке исходящего.
@@ -305,8 +395,10 @@ fn message_row(row: &Row, palette: Palette, peer: Option<&str>) -> Div {
                 .map(|initial| initial.to_uppercase().collect::<String>())
                 .unwrap_or_default();
             view.child(div().w(px(40.)).flex_none().when(row.ends_group, |slot| {
+                let mut avatar = Avatar::from_initials(avatar);
+                avatar.image = photo;
                 slot.child(
-                    Avatar::from_initials(avatar)
+                    avatar
                         .render(palette)
                         .debug_selector(move || format!("history-avatar-{id}")),
                 )

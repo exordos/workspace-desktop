@@ -25,10 +25,12 @@ use workspace_core::{
 };
 
 use super::{
+    avatars::AvatarImages,
     contracts::{
         AccountSession, ChatEntry, ChatRoute, ConversationAddress, FolderCommand,
         FolderCommandError, FolderRailPreferences, SidebarAction,
     },
+    runtime::RuntimeClient,
     ui::{
         Avatar, AvatarPresence, BadgeTone, Button, ButtonAppearance, ChatRow, ChatRowPreview, Icon,
         Palette, TextInput, TextInputChanged, TextRole, ThemeMode, label,
@@ -56,6 +58,7 @@ gpui::actions!(catalog_results, [PreviousResult, NextResult, OpenRowMenu]);
 /// Состояние каталога в окне. Оболочка передаёт выбранный вход и актуальный снимок.
 pub struct Sidebar {
     active: Option<Active>, // Показанный каталог или ожидание выбора входа.
+    runtime: Option<RuntimeClient>, // Рабочий поток для фото. None оставляет заглушки.
     saved: HashMap<AccountSession, Preferences>, // Поиск и раскрытые каналы других входов.
     menu_focus: FocusHandle, // Удерживает клавиатурный ввод внутри открытого меню.
     menu_scroll: ScrollHandle, // Не даёт подсветке уйти за края длинного списка папок.
@@ -79,6 +82,9 @@ struct Active {
     _search_observer: gpui::Subscription, // Подписка на изменение поискового запроса.
     expanded: HashSet<Uuid>,              // Каналы, раскрытые вне режима поиска.
     scroll: ScrollHandle,                 // Позиция прокрутки только текущего показа.
+    avatars: AvatarImages,                // Подписки на фото в видимой части каталога.
+    avatar_users: Vec<Uuid>,              // UUID собеседников из последнего видимого диапазона.
+    avatar_frame: u64,                    // Номер кадра, для которого рассчитаны подписки.
     focus: HashMap<RowKey, FocusHandle>,  // Фокус строки остаётся у UUID при перестановке.
     menu: Option<RowMenu>,                // Открытая строка и место раскрытия в окне.
     folder: Uuid,                         // UUID выбранной папки.
@@ -198,10 +204,19 @@ impl Sidebar {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             active: None,
+            runtime: None,
             saved: HashMap::new(),
             menu_focus: cx.focus_handle(),
             menu_scroll: ScrollHandle::new(),
             folders: FolderPane::new(cx),
+        }
+    }
+
+    /// Создаёт рабочий каталог с доступом к аватарам текущего входа.
+    pub(super) fn with_runtime(runtime: RuntimeClient, cx: &mut Context<Self>) -> Self {
+        Self {
+            runtime: Some(runtime),
+            ..Self::new(cx)
         }
     }
 
@@ -261,6 +276,9 @@ impl Sidebar {
                     _search_observer: observer,
                     expanded: preferences.expanded,
                     scroll: ScrollHandle::new(),
+                    avatars: AvatarImages::default(),
+                    avatar_users: Vec::new(),
+                    avatar_frame: 0,
                     focus: HashMap::new(),
                     menu: None,
                     folder: preferences.folder,
@@ -676,6 +694,12 @@ impl Sidebar {
         };
         let mut avatar = Avatar::from_initials(initials.to_owned());
         avatar.presence = details.presence;
+        if chat.direct {
+            avatar.image = chat
+                .metadata
+                .direct_peer_id
+                .and_then(|user| active.avatars.image(user, cx));
+        }
         let row = ChatRow {
             id: ElementId::Uuid(chat.id),
             avatar,
@@ -819,6 +843,65 @@ impl Sidebar {
             .debug_selector(|| "catalog-error".into())
         }
     }
+
+    /// После размещения списка подписывает каталог на фото видимых собеседников.
+    fn track_avatar_rows(
+        rows: Div,
+        active: &Active,
+        peers: Vec<Option<Uuid>>,
+        cx: &Context<Self>,
+    ) -> Div {
+        let scroll = active.scroll.clone();
+        let previous = active.avatar_users.clone();
+        let session = active.session.clone();
+        let avatar_frame = active.avatar_frame;
+        let sidebar = cx.entity().downgrade();
+        rows.on_children_prepainted(move |_, _, app| {
+            let start = scroll.top_item();
+            let end = (scroll.bottom_item() + 1).min(peers.len());
+            let users: Vec<_> = peers
+                .get(start..end)
+                .unwrap_or_default()
+                .iter()
+                .flatten()
+                .copied()
+                .collect();
+            if users == previous {
+                return;
+            }
+            let sidebar = sidebar.clone();
+            let session = session.clone();
+            // Открываем подписки после кадра. Поиск и смена входа могут заменить эту проекцию.
+            app.defer(move |app| {
+                let _ = sidebar.update(app, |this, cx| {
+                    this.update_avatar_users(&session, avatar_frame, users, cx);
+                });
+            });
+        })
+    }
+
+    /// Обновляет подписки, только пока измеренный кадр относится к текущему входу и списку.
+    fn update_avatar_users(
+        &mut self,
+        session: &AccountSession,
+        avatar_frame: u64,
+        users: Vec<Uuid>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(active) = &mut self.active
+            && &active.session == session
+            && active.avatar_frame == avatar_frame
+            && active.avatar_users != users
+        {
+            if let Some(runtime) = &self.runtime {
+                active
+                    .avatars
+                    .refresh(users.iter().copied(), runtime, session, cx);
+            }
+            active.avatar_users = users;
+            cx.notify();
+        }
+    }
 }
 
 impl EventEmitter<SidebarAction> for Sidebar {}
@@ -854,6 +937,7 @@ impl Render for Sidebar {
                 None,
             )));
         };
+        active.avatar_frame = active.avatar_frame.wrapping_add(1);
         if active.menu.is_none() && self.menu_focus.is_focused(window) {
             active.search.read(cx).focus(window);
         }
@@ -894,7 +978,6 @@ impl Render for Sidebar {
         }
 
         let mut rows = div()
-            .id("catalog-scroll")
             .w_full()
             .min_w_0()
             .min_h_0()
@@ -903,10 +986,9 @@ impl Render for Sidebar {
             .flex_col()
             .gap(px(2.))
             .px(px(8.))
-            .overflow_y_scroll()
-            .track_scroll(&active.scroll)
             .debug_selector(|| "catalog-scroll".into());
         let mut results = Vec::new();
+        let mut peers = Vec::new();
         let mut row_index = 0;
         if snapshot
             .as_deref()
@@ -939,8 +1021,14 @@ impl Render for Sidebar {
                             .px_2()
                             .debug_selector(move || id.into()),
                     );
+                    peers.push(None);
                     row_index += 1;
                 }
+                peers.push(if chat.direct {
+                    chat.metadata.direct_peer_id.filter(|id| !id.is_nil())
+                } else {
+                    None
+                });
                 let opened = !chat.direct && (searching || active.expanded.contains(&chat.id));
                 rows = rows.child(Self::chat_row(
                     active,
@@ -957,6 +1045,7 @@ impl Render for Sidebar {
                 row_index += 1;
                 if opened {
                     for topic in visible_topics {
+                        peers.push(None);
                         rows = rows.child(Self::topic_row(
                             active, chat.id, topic, row_index, palette, cx,
                         ));
@@ -1003,7 +1092,12 @@ impl Render for Sidebar {
                 }));
         }
         let panel = panel
-            .child(rows)
+            .child(
+                Self::track_avatar_rows(rows, active, peers, cx)
+                    .id("catalog-scroll")
+                    .overflow_y_scroll()
+                    .track_scroll(&active.scroll),
+            )
             .when_some(active.menu.as_ref(), |panel, menu| {
                 let viewport = window.viewport_size();
                 let actions = active.row_actions(menu.key, menu.folders, cx);

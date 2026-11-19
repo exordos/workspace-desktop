@@ -46,6 +46,7 @@ fn chat(id: u128, name: &str, direct: bool, topics: &[(u128, &str)]) -> Chat {
                 name: (*name).into(),
             })
             .collect(),
+        metadata: Default::default(),
     }
 }
 
@@ -478,6 +479,86 @@ fn retries_exact_generation_and_resets_scroll_on_account_switch(cx: &mut TestApp
         events.borrow().as_slice(),
         &[Recorded::Retry(a), open(&b, 1, None)]
     );
+}
+
+/// После прокрутки, поиска и смены входа подписки соответствуют видимым личным чатам.
+#[gpui::test]
+fn avatar_requests_follow_visible_direct_chat_rows(cx: &mut TestAppContext) {
+    let (sidebar, ui, _) = initialize(cx);
+    let a = session("a", 11);
+    let b = session("b", 12);
+    let chats = |first| {
+        (1..=20)
+            .map(|id| {
+                let title = if id == 20 {
+                    "Искомая личка"
+                } else {
+                    "Чат"
+                };
+                let mut row = chat(id, title, id != 2, &[]);
+                row.metadata.direct_peer_id = Some(if id == 1 {
+                    first
+                } else {
+                    Uuid::from_u128(100 + id)
+                });
+                row
+            })
+            .collect()
+    };
+    let users = |ui: &gpui::VisualTestContext| {
+        ui.read(|app| {
+            sidebar
+                .read(app)
+                .active
+                .as_ref()
+                .unwrap()
+                .avatar_users
+                .clone()
+        })
+    };
+    let top = Uuid::from_u128(101);
+    let channel = Uuid::from_u128(102);
+    let last = Uuid::from_u128(120);
+
+    ui.simulate_resize(size(px(300.), px(260.)));
+    publish(
+        &sidebar,
+        ui,
+        &a,
+        &catalog(&a, ChatListStatus::Ready, chats(top)),
+    );
+    let viewport = ui
+        .debug_bounds("catalog-scroll")
+        .expect("область прокрутки");
+    ui.run_until_parked();
+    let initial = users(ui);
+    assert!(initial.contains(&top));
+    assert!(!initial.contains(&channel) && !initial.contains(&last));
+
+    ui.simulate_event(ScrollWheelEvent {
+        position: viewport.center(),
+        delta: ScrollDelta::Pixels(point(px(0.), px(-360.))),
+        modifiers: Modifiers::none(),
+        touch_phase: TouchPhase::Moved,
+    });
+    ui.run_until_parked();
+    let scrolled = users(ui);
+    assert!(!scrolled.is_empty() && !scrolled.contains(&top) && !scrolled.contains(&last));
+
+    click(ui, "catalog-search");
+    ui.simulate_input("Искомая");
+    ui.run_until_parked();
+    assert_eq!(users(ui), vec![last]);
+
+    let next_person = Uuid::from_u128(201);
+    publish(
+        &sidebar,
+        ui,
+        &b,
+        &catalog(&b, ChatListStatus::Ready, chats(next_person)),
+    );
+    let switched = users(ui);
+    assert!(switched.contains(&next_person) && !switched.contains(&last));
 }
 
 /// Удерживает фокус UUID при обновлении порядка и очищает его при повторном входе.

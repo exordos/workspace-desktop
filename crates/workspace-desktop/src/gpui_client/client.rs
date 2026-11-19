@@ -14,6 +14,7 @@ use notification_banner::{NotificationBanner, NotificationBannerActions};
 
 use super::{
     Options,
+    avatars::AvatarImages,
     contracts::{RuntimeEvent, RuntimeExit, ShellAction, SidebarAction},
     conversation::{Conversation, OpenDetailsTopic},
     next_control,
@@ -49,6 +50,7 @@ pub(super) struct Client {
     details_navigation: Option<Subscription>, // Подписка на переход из правой панели текущего экрана.
     right_panel: Entity<RightPanel>,          // Общая история правых панелей рабочего окна.
     sign_in: Option<Entity<SignIn>>,          // Форма нужна, пока в профиле нет доступного входа.
+    profile_avatar: AvatarImages,             // Фото активного входа для верхней панели.
     labels: HashMap<AccountId, String>,       // Подписи для переключателя и баннеров.
     top_bar: Entity<TopBar>, // Шапка хранит локальный фокус и показывает снимок оболочки.
     notification_banner: Entity<NotificationBanner>, // Планка разрешения поверх рабочей области.
@@ -66,7 +68,7 @@ pub(super) struct Client {
 impl Client {
     /// Создаёт оболочку и связывает события каталога с тем же маршрутом, что у баннеров.
     pub(super) fn new(options: Options, runtime: RuntimeClient, cx: &mut Context<Self>) -> Self {
-        let sidebar = cx.new(Sidebar::new);
+        let sidebar = cx.new(|cx| Sidebar::with_runtime(runtime.clone(), cx));
         cx.observe(&sidebar, |_, _, cx| cx.notify()).detach();
         cx.subscribe(&sidebar, |client, _, intent: &FolderIntent, cx| {
             client.handle_folder_intent(intent.clone(), cx);
@@ -111,6 +113,7 @@ impl Client {
             right_panel,
             details_navigation: None,
             sign_in: None,
+            profile_avatar: AvatarImages::default(),
             labels: options.labels,
             top_bar,
             notification_banner,
@@ -263,6 +266,13 @@ impl Client {
         self.right_panel.update(cx, |panel, cx| {
             panel.set_context(account, conversation, cx);
         });
+        if matches!(
+            &effect,
+            Some(ShellEffect::OpenConversation(_) | ShellEffect::CloseConversation)
+        ) && let Some(previous) = &self.conversation
+        {
+            previous.update(cx, |view, cx| view.set_avatars_visible(false, cx));
+        }
         match effect {
             Some(ShellEffect::OpenConversation(address)) => {
                 let runtime = self.runtime.clone();
@@ -320,8 +330,10 @@ impl Client {
         let catalog = self.shell.selected_catalog();
         let conversation = self.shell.conversation();
         if let Some(view) = &self.conversation {
+            let visible = self.sign_in.is_none() && self.status().is_none();
             view.update(cx, |view, cx| {
-                view.set_catalog(self.shell.selected(), catalog, cx)
+                view.set_catalog(self.shell.selected(), catalog, cx);
+                view.set_avatars_visible(visible, cx);
             });
         }
         self.sidebar.update(cx, |view, cx| {
@@ -426,6 +438,29 @@ impl Client {
         None
     }
 
+    /// Передаёт шапке изображение активного входа из общей подписки аватара.
+    fn sync_profile_avatar(&mut self, cx: &mut Context<Self>) {
+        let active = self
+            .shell
+            .selected()
+            .filter(|_| self.sign_in.is_none() && self.status().is_none());
+        let avatar = if let Some((session, id)) =
+            active.and_then(|session| Some((session, session.user_uuid()?)))
+        {
+            self.profile_avatar
+                .refresh([id], &self.runtime, session, cx);
+            match self.profile_avatar.image(id, cx) {
+                Some(gpui::ImageSource::Render(image)) => Some((session.clone(), image)),
+                _ => None,
+            }
+        } else {
+            self.profile_avatar.clear();
+            None
+        };
+        self.top_bar
+            .update(cx, |bar, cx| bar.set_profile_avatar(avatar, cx));
+    }
+
     /// Устанавливает фокус внутри окна, чтобы Tab работал до первого клика.
     fn focus_workspace(&mut self, window: &mut Window, cx: &Context<Self>) {
         if std::mem::take(&mut self.restore_focus) || window.focused(cx).is_none() {
@@ -438,6 +473,7 @@ impl Render for Client {
     /// Показывает форму входа или рабочую область с выбранным аккаунтом.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.focus_workspace(window, cx);
+        self.sync_profile_avatar(cx);
         RightPanel::restore_focus(&self.right_panel, window, cx);
         let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
         let root = div()
@@ -823,6 +859,7 @@ mod tests {
                             id: Uuid::from_u128(row),
                             name: "Тестовый чат".to_owned(),
                             direct: true,
+                            metadata: Default::default(),
                             topics: vec![],
                         }]);
                         (

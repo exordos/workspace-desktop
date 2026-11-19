@@ -1,6 +1,6 @@
 //! Преобразует подтверждённые данные Messenger в видимые сведения и разрешённые кнопки.
 
-use gpui::{SharedString, rgb};
+use gpui::{App, ImageSource, SharedString, rgb};
 use workspace_core::{
     directory::{ProfilePresence, UserProfile},
     messenger::details::{
@@ -11,7 +11,6 @@ use workspace_core::{
 
 use super::{
     MutationKind, Panel, State,
-    avatar::Avatars,
     view::{
         Availability, AvatarView, ChannelView, MemberView, NotificationLevel, NotificationsView,
         PanelContent, PeerActions, PeerView, ProfileField, SelectedTopicView, TopicView,
@@ -27,17 +26,23 @@ pub(super) fn content(
     panel: &Panel,
     details: &SidebarDetails,
     address: &ConversationAddress,
+    app: &App,
 ) -> PanelContent {
     match details {
-        SidebarDetails::Peer(peer) => PanelContent::Peer(peer_content(panel, peer, address)),
+        SidebarDetails::Peer(peer) => PanelContent::Peer(peer_content(panel, peer, address, app)),
         SidebarDetails::Channel(channel) => {
-            PanelContent::Channel(channel_content(panel, channel, address))
+            PanelContent::Channel(channel_content(panel, channel, address, app))
         }
     }
 }
 
 /// Собирает сведения профиля и кнопки для своего и чужого профиля.
-fn peer_content(panel: &Panel, peer: &DirectSidebar, address: &ConversationAddress) -> PeerView {
+fn peer_content(
+    panel: &Panel,
+    peer: &DirectSidebar,
+    address: &ConversationAddress,
+    app: &App,
+) -> PeerView {
     let profile = &peer.profile;
     let share = if sidebar_profile_link(&address.route.owner, peer.user_id).is_ok() {
         Availability::Enabled
@@ -63,7 +68,11 @@ fn peer_content(panel: &Panel, peer: &DirectSidebar, address: &ConversationAddre
     };
     PeerView {
         name: profile.display_name.clone().into(),
-        avatar: avatar(&profile.display_name, Some(profile), &panel.avatars),
+        avatar: avatar(
+            &profile.display_name,
+            Some(profile),
+            panel.avatars.image(peer.user_id, app),
+        ),
         custom_status: custom_status(profile).map(Into::into),
         presence: presence_label(profile.presence).map(Into::into),
         fields: vec![
@@ -130,12 +139,13 @@ fn channel_content(
     panel: &Panel,
     channel: &ChannelSidebar,
     address: &ConversationAddress,
+    app: &App,
 ) -> ChannelView {
     let can_change = matches!(panel.state, Some(State::Ready)) && panel.mutation.is_none();
     let current_topic = address.route.scope.topic_id;
     ChannelView {
         name: channel.name.clone().into(),
-        avatar: avatar(&channel.name, None, &panel.avatars),
+        avatar: avatar(&channel.name, None, None),
         color: channel
             .color
             .filter(|color| *color <= 0xFF_FF_FF)
@@ -199,7 +209,7 @@ fn channel_content(
         members: channel
             .members
             .iter()
-            .map(|member| member_view(member, can_change, &panel.avatars))
+            .map(|member| member_view(member, can_change, panel.avatars.image(member.user_id, app)))
             .collect(),
         add_members: available(channel.can_add_members, can_change),
         member_error: (panel.mutation_error == Some(MutationKind::Remove))
@@ -217,7 +227,7 @@ pub(super) fn stream_mode(level: NotificationLevel) -> StreamNotificationMode {
 }
 
 /// Представляет привязку даже до появления её профиля в справочнике.
-fn member_view(member: &SidebarMember, can_change: bool, avatars: &Avatars) -> MemberView {
+fn member_view(member: &SidebarMember, can_change: bool, image: Option<ImageSource>) -> MemberView {
     let profile = member.profile.as_ref();
     let name = profile
         .map(|profile| profile.display_name.clone())
@@ -237,7 +247,7 @@ fn member_view(member: &SidebarMember, can_change: bool, avatars: &Avatars) -> M
     };
     MemberView {
         id: member.binding_id,
-        avatar: avatar(&name, profile, avatars),
+        avatar: avatar(&name, profile, image),
         name: name.into(),
         role: role.map(Into::into),
         secondary: secondary.map(Into::into),
@@ -255,7 +265,7 @@ fn available(visible: bool, enabled: bool) -> Availability {
 }
 
 /// Готовит заглушку и метку присутствия для аватара.
-fn avatar(name: &str, profile: Option<&UserProfile>, avatars: &Avatars) -> AvatarView {
+fn avatar(name: &str, profile: Option<&UserProfile>, image: Option<ImageSource>) -> AvatarView {
     let initial: SharedString = name
         .chars()
         .next()
@@ -269,7 +279,7 @@ fn avatar(name: &str, profile: Option<&UserProfile>, avatars: &Avatars) -> Avata
     };
     AvatarView {
         initials: initial,
-        image: avatars.image(profile),
+        image,
         presence,
     }
 }

@@ -6,15 +6,28 @@ mod login;
 
 pub use login::{LoginAttempt, LoginError};
 
-use std::{fmt, future::Future, io, path::PathBuf, pin::Pin, sync::Arc, thread};
+use std::{
+    fmt,
+    future::Future,
+    io,
+    path::PathBuf,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread,
+};
 
 use futures::{Stream, StreamExt, stream::FuturesUnordered};
 use gpui::{App, Context, Entity, Task};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use uuid::Uuid;
 use workspace_core::{
     auth::{AccountRecord, AccountStore, Auth, SessionSnapshot, SessionStatus, StoreError},
     bootstrap::{self, CatalogStartup, ChatCatalog, ChatLists},
     context::{AccountId, OwnerContext, SessionGeneration},
+    directory::{AvatarState, AvatarStore},
     iam_http::WorkspaceIamHttp,
     messenger::{MessengerSource, folders::Folders},
     runtime::{Runtime, RuntimeError},
@@ -33,6 +46,7 @@ use folders::{FolderPreferenceStore, folder_snapshot, send_folder_state};
 const EVENT_QUEUE: usize = 32;
 const REQUEST_QUEUE: usize = 32;
 const ACTIVE_REQUESTS: usize = 16;
+static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
 type JobFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 type Job = Box<dyn FnOnce(WorkerServices) -> JobFuture + Send>;
@@ -65,12 +79,19 @@ pub enum RequestError {
     Stopped, // Фоновая работа остановлена или ответ уже не будет получен.
 }
 
+/// Отдаёт подписку Core или ожидание восстановления выбранного входа.
+pub(super) enum AvatarSubscription {
+    Ready(watch::Receiver<AvatarState>), // Изменения аватара в действующем входе.
+    Waiting(futures::future::BoxFuture<'static, bool>), // Истина разрешает попробовать снова.
+}
+
 /// Вход в фоновые службы для истории, редактора и системных действий.
 #[derive(Clone)]
 pub struct RuntimeClient {
+    avatar_runtime_id: u64, // Отделяет изображения разных запусков рабочего профиля в одном App.
     commands: mpsc::Sender<Job>, // Ограниченная очередь запросов экрана.
-    wake: mpsc::Sender<()>,      // Несколько сигналов пробуждения можно объединить.
-    stop: watch::Sender<bool>,   // Истина запрещает новые запросы и будит цикл остановки.
+    wake: mpsc::Sender<()>, // Несколько сигналов пробуждения можно объединить.
+    stop: watch::Sender<bool>, // Истина запрещает новые запросы и будит цикл остановки.
     started: watch::Receiver<Option<Result<(), StartupError>>>, // Итог инициализации; None, пока она идёт.
     ended: watch::Receiver<Option<RuntimeExit>>, // Итог остановки; None, пока исполнитель работает.
 }
@@ -169,6 +190,7 @@ impl RuntimeClient {
 
         Ok((
             Self {
+                avatar_runtime_id: NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed),
                 commands,
                 wake,
                 stop,
@@ -205,6 +227,53 @@ impl RuntimeClient {
     pub async fn shutdown(&self) -> RuntimeExit {
         self.stop.send_replace(true);
         wait_for_exit(&mut self.ended.clone()).await
+    }
+
+    /// Даёт ключ общего исполнителя всем копиям клиентского дескриптора.
+    pub(super) fn avatar_runtime_id(&self) -> u64 {
+        self.avatar_runtime_id
+    }
+
+    /// Создаёт подписку в Core и сразу освобождает место в очереди фонового потока.
+    pub(super) async fn subscribe_avatar(
+        &self,
+        session: AccountSession,
+        user_id: Uuid,
+    ) -> Result<AvatarSubscription, RequestError> {
+        self.request(move |services| async move {
+            match AvatarStore::new(services.sync, services.messenger).subscribe(
+                &session.owner,
+                session.generation,
+                user_id,
+            ) {
+                Ok(receiver) => AvatarSubscription::Ready(receiver),
+                Err(_) => {
+                    let mut updates = Box::pin(services.auth.subscribe());
+                    // Ожидание живёт у подписчика GPUI и не занимает очередь команд.
+                    AvatarSubscription::Waiting(Box::pin(async move {
+                        while let Some(accounts) = updates.next().await {
+                            let status = accounts
+                                .iter()
+                                .find(|account| {
+                                    account.context == session.owner
+                                        && account.generation == session.generation
+                                })
+                                .map(|account| account.status);
+                            match status {
+                                Some(SessionStatus::Active) => return true,
+                                Some(
+                                    SessionStatus::Restoring
+                                    | SessionStatus::TemporarilyUnavailable,
+                                ) => {}
+                                _ => return false,
+                            }
+                        }
+                        false
+                    }))
+                }
+            }
+        })
+        .await
     }
 
     /// Ставит запрос в ограниченную очередь. Службы доступны только в фоне.

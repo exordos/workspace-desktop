@@ -23,7 +23,7 @@ use hyper::{
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use serde_json::{Value, json};
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, oneshot, watch};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{
     WebSocketStream,
@@ -255,6 +255,8 @@ struct TopicAcceptance {
 }
 
 const AVATAR_FILE: &str = "33333333-3333-4333-8333-333333333333";
+const AVATAR_REPLACEMENT: &str = "33333333-3333-4333-8333-333333333334";
+const OWN_AVATAR_FILE: &str = "33333333-3333-4333-8333-333333333335";
 const AVATAR_PNG: &[u8] = &[
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2, 8, 2, 0,
     0, 0, 253, 212, 154, 115, 0, 0, 0, 16, 73, 68, 65, 84, 120, 156, 99, 208, 205, 222, 13, 68, 12,
@@ -303,13 +305,33 @@ impl ChannelMembership {
 #[derive(Default)]
 struct DetailsFixture {
     avatar_fetches: AtomicUsize, // Сколько раз сервер прочитал изображение собеседника.
+    profile_avatar: Option<OwnAvatarFixture>, // Включает отдельные счётчики аватара текущего входа.
     users: Mutex<Vec<(&'static str, &'static str)>>, // Токен владельца и UUID собеседника.
-    unblock: Mutex<Option<oneshot::Receiver<()>>>, // Удерживает ровно один ответ профиля.
+    unblock: Mutex<Option<watch::Receiver<bool>>>, // Удерживает ответы профиля собеседника B.
     live: Mutex<Option<broadcast::Sender<RecoverySignal>>>, // Кадры журнала аккаунта A.
     membership: Option<ChannelMembership>, // Сценарий приглашения, удаления и выхода.
     notifications_muted: AtomicBool, // Последняя настройка канала на сервере.
     channel_requests: AtomicUsize, // Число чтений тем для построения сведений.
     omit_stream_user: AtomicBool, // Имитирует старый ответ, который не подтверждает владельца.
+}
+
+/// Отдельные запросы к своему фото для проверки всех его виджетов.
+#[derive(Default)]
+struct OwnAvatarFixture {
+    lookups: AtomicUsize,   // Число чтений ссылки на своё фото по UUID пользователя.
+    downloads: AtomicUsize, // Число скачиваний его файла.
+}
+
+impl DetailsFixture {
+    /// Считает сведения и чтения ссылки только для выбранной пары владельца и собеседника.
+    fn user_reads(&self, owner: &str, peer: &str) -> usize {
+        self.users
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&&(account, user)| account == owner && user == peer)
+            .count()
+    }
 }
 
 /// Записывает наблюдения сервера о готовности подключений и принятой отправке.
@@ -593,7 +615,30 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
     }
 
     if let Some(details) = &state.details {
-        if path == format!("/api/workspace/v1/messenger/files/{AVATAR_FILE}/actions/download") {
+        if let Some(own) = &details.profile_avatar {
+            if path == format!("/api/workspace/v1/users/{USER}") && user == USER {
+                assert_eq!(request.method(), Method::GET);
+                own.lookups.fetch_add(1, Ordering::SeqCst);
+                return json_response(
+                    StatusCode::OK,
+                    json!({"uuid":USER,"avatar":format!("urn:image:{OWN_AVATAR_FILE}")}),
+                );
+            }
+            if path
+                == format!("/api/workspace/v1/messenger/files/{OWN_AVATAR_FILE}/actions/download")
+            {
+                assert_eq!((request.method(), user), (&Method::GET, USER));
+                own.downloads.fetch_add(1, Ordering::SeqCst);
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "image/png")
+                    .body(Full::new(Bytes::from_static(AVATAR_PNG)))
+                    .unwrap();
+            }
+        }
+        if [AVATAR_FILE, AVATAR_REPLACEMENT].iter().any(|file_id| {
+            path == format!("/api/workspace/v1/messenger/files/{file_id}/actions/download")
+        }) {
             assert_eq!(request.method(), Method::GET);
             assert_eq!(user, USER);
             details.avatar_fetches.fetch_add(1, Ordering::SeqCst);
@@ -606,9 +651,11 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         if path == format!("/api/workspace/v1/users/{peer}") {
             assert_eq!(request.method(), Method::GET);
             details.users.lock().unwrap().push((user, peer));
-            let waiting = details.unblock.lock().unwrap().take();
-            if let Some(waiting) = waiting {
-                let _ = waiting.await;
+            let waiting = (user == PEER && peer == USER)
+                .then(|| details.unblock.lock().unwrap().clone())
+                .flatten();
+            if let Some(mut waiting) = waiting {
+                let _ = waiting.wait_for(|ready| *ready).await;
             }
             let name = if peer == PEER {
                 "Собеседник A"
@@ -988,6 +1035,48 @@ fn start_runtime(
         ca.to_vec(),
     )
     .unwrap()
+}
+
+/// Шапка показывает своё фото, скачанное под текущим входом.
+#[gpui::test]
+fn own_avatar_is_loaded_for_the_active_top_bar_account(cx: &mut TestAppContext) {
+    cx.update(bind_keys);
+    let server = Server::serve(Received {
+        details: Some(DetailsFixture {
+            profile_avatar: Some(OwnAvatarFixture::default()),
+            ..DetailsFixture::default()
+        }),
+        ..Received::default()
+    });
+    let counters = server
+        .state
+        .details
+        .as_ref()
+        .unwrap()
+        .profile_avatar
+        .as_ref()
+        .unwrap();
+    let profile = tempfile::tempdir().unwrap();
+    let (runtime, events) =
+        start_runtime(profile.path(), saved_account(&server, USER, Uuid::nil()));
+    let (client, ui) =
+        cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
+    ui.update(|_, app| {
+        let subscription = events.attach(&client, app, Client::handle_runtime);
+        client.update(app, |client, cx| client.attach(subscription, cx));
+    });
+    ui.simulate_resize(size(px(1440.), px(900.)));
+    until(
+        ui,
+        "фото этого входа отображается в шапке",
+        |ui| ui.debug_bounds("workspace-profile-avatar-photo").is_some(),
+    );
+    assert_eq!(counters.lookups.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.downloads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        futures::executor::block_on(runtime.shutdown()),
+        RuntimeExit::Clean
+    );
 }
 
 /// Создаёт папку из рабочего окна и ждёт её возвращения через снимок Core.
@@ -1419,6 +1508,17 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
         ui.debug_bounds("workspace-composer-editor").is_some()
     });
     let first = ui.read(|app| client.read(app).conversation.as_ref().unwrap().clone());
+    let peer = PEER.parse().unwrap();
+    until(
+        ui,
+        "шапка и история получили общий аватар",
+        |ui| {
+            ui.read(|app| {
+                let (heading, history) = first.read(app).tested_chat_avatars(peer, app);
+                heading.is_some() && heading == history
+            })
+        },
+    );
     let composer = ui.read(|app| first.read(app).tested_composer().unwrap().clone());
     click(ui, "workspace-composer-editor");
     ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(MARKER.into())));
@@ -1446,7 +1546,6 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
         "старый ответ стрима не подтверждает владельца",
         |ui| ui.debug_bounds("conversation-details-error").is_some(),
     );
-    assert!(details.users.lock().unwrap().is_empty());
     details.omit_stream_user.store(false, Ordering::SeqCst);
     click(ui, "conversation-details-retry");
     until(
@@ -1456,11 +1555,18 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
     );
     until(
         ui,
-        "загруженные байты аватара готовы к отрисовке",
-        |ui| ui.read(|app| first.read(app).tested_details_avatar(app)),
+        "панель, шапка и история используют одно декодированное фото",
+        |ui| {
+            ui.read(|app| {
+                let view = first.read(app);
+                let avatar = view.tested_details_avatar(app);
+                avatar.is_some() && view.tested_chat_avatars(peer, app) == (avatar, avatar)
+            })
+        },
     );
     assert_eq!(details.avatar_fetches.load(Ordering::SeqCst), 1);
-    assert_eq!(details.users.lock().unwrap().as_slice(), &[(USER, PEER)]);
+    let profile_reads = details.user_reads(USER, PEER);
+    assert_eq!(profile_reads, 2); // Снимок панели и первое чтение аватара по UUID.
     ui.read(|app| {
         first.read(app).tested_details(app, |details| {
             let Some(SidebarDetails::Peer(peer)) = details else {
@@ -1499,7 +1605,7 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
     click(ui, "right-panel-back");
     click(ui, "right-panel-close");
     assert!(ui.read(|app| first.read(app).tested_details_is_open(app)));
-    assert_eq!(details.users.lock().unwrap().as_slice(), &[(USER, PEER)]);
+    assert_eq!(details.user_reads(USER, PEER), profile_reads);
     assert_eq!(
         ui.update(|window, app| first.read(app).tested_details_focus(window, app)),
         Some("закрыть")
@@ -1530,14 +1636,38 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
     until(
         ui,
         "повторное открытие рисует фото из кэша core",
-        |ui| ui.read(|app| first.read(app).tested_details_avatar(app)),
+        |ui| ui.read(|app| first.read(app).tested_details_avatar(app).is_some()),
     );
     assert_eq!(details.avatar_fetches.load(Ordering::SeqCst), 1);
-    assert_eq!(details.users.lock().unwrap().as_slice(), &[(USER, PEER)]);
+    assert_eq!(details.user_reads(USER, PEER), profile_reads);
     assert_eq!(server.state.targets.load(Ordering::SeqCst), stream_reads);
 
-    let profile_updated = json!({
+    let previous_avatar = ui
+        .read(|app| first.read(app).tested_details_avatar(app))
+        .unwrap();
+    let avatar_updated = json!({
         "schema_version":1, "uuid":Uuid::new_v4(), "epoch_generation":"local", "epoch_version":2,
+        "project_id":PROJECT, "user_uuid":USER, "object_type":"user", "action":"updated",
+        "payload": {"kind":"user.updated", "uuid":PEER, "avatar":format!("urn:image:{AVATAR_REPLACEMENT}")},
+    });
+    assert!(live.send(RecoverySignal::Event(avatar_updated)).is_ok());
+    until(
+        ui,
+        "панель, шапка и история отобразили новый файл из подписки Core",
+        |ui| {
+            ui.read(|app| {
+                let view = first.read(app);
+                let avatar = view.tested_details_avatar(app);
+                avatar.is_some_and(|id| id != previous_avatar)
+                    && view.tested_chat_avatars(peer, app) == (avatar, avatar)
+            })
+        },
+    );
+    assert_eq!(details.avatar_fetches.load(Ordering::SeqCst), 2);
+    assert_eq!(details.user_reads(USER, PEER), profile_reads);
+
+    let profile_updated = json!({
+        "schema_version":1, "uuid":Uuid::new_v4(), "epoch_generation":"local", "epoch_version":3,
         "project_id":PROJECT, "user_uuid":USER, "object_type":"user", "action":"updated",
         "payload": {"kind":"user.updated", "uuid":PEER, "username":"peer",
                     "first_name":"Профиль после события", "status":"active", "avatar":null},
@@ -1553,8 +1683,18 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
             )))
         },
     );
-    assert!(!ui.read(|app| first.read(app).tested_details_avatar(app)));
-    assert_eq!(details.users.lock().unwrap().as_slice(), &[(USER, PEER)]);
+    until(
+        ui,
+        "после удаления фото панель, шапка и история рисуют инициалы",
+        |ui| {
+            ui.read(|app| {
+                let view = first.read(app);
+                view.tested_details_avatar(app).is_none()
+                    && view.tested_chat_avatars(peer, app) == (None, None)
+            })
+        },
+    );
+    assert_eq!(details.user_reads(USER, PEER), profile_reads);
 
     open_account_panel(&client, ui, "test-account-main");
     open_account_panel(&client, ui, "test-account-settings");
@@ -1587,13 +1727,14 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
             })
         },
     );
-    let (release, unblock) = oneshot::channel();
+    let reads_before = details.user_reads(PEER, USER);
+    let (release, unblock) = watch::channel(false);
     *details.unblock.lock().unwrap() = Some(unblock);
     click(ui, DETAILS_TRIGGER);
     until(
         ui,
         "сервер удерживает профиль B",
-        |_| details.users.lock().unwrap().last() == Some(&(PEER, USER)),
+        |_| details.user_reads(PEER, USER) > reads_before,
     );
     click_account(&client, ui, &a_id);
     click(ui, CHAT_ROW);
@@ -1611,7 +1752,7 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
         },
     );
     click(ui, DETAILS_TRIGGER);
-    let _ = release.send(());
+    release.send_replace(true);
     until(
         ui,
         "поздний профиль B не подменяет карточку A",

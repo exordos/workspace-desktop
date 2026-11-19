@@ -28,6 +28,15 @@ pub struct Chat {
     pub name: String,       // Название канала или имя собеседника.
     pub direct: bool,       // У разговора один собеседник или это чат с собой.
     pub topics: Vec<Topic>, // Доступные темы канала.
+    #[serde(default)]
+    pub metadata: ChatMetadata, // Сведения для строки разговора и переходов.
+}
+
+/// Сведения о разговоре из каталога и справочника собеседников.
+#[derive(Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct ChatMetadata {
+    pub direct_peer_id: Option<Uuid>, // Собеседник в личном чате.
 }
 
 /// Тема канала в списке чатов.
@@ -233,6 +242,9 @@ impl Catalog {
                     name,
                     direct,
                     topics,
+                    metadata: ChatMetadata {
+                        direct_peer_id: chat.direct_user_uuid.filter(|id| direct && !id.is_nil()),
+                    },
                 }
             })
             .collect();
@@ -322,6 +334,16 @@ mod tests {
         storage::{Cursor, EventWrite, HistoryChange},
     };
 
+    /// Ранее сохранённые каталоги загружаются до первой сверки с сервером.
+    #[test]
+    fn legacy_snapshot_without_metadata_still_opens() {
+        let data = serde_json::json!([{
+            "id": Uuid::from_u128(1), "name": "Личный чат", "direct": true, "topics": []
+        }]);
+        let chats: Vec<Chat> = serde_json::from_value(data).unwrap();
+        assert!(chats[0].metadata.direct_peer_id.is_none());
+    }
+
     /// Снимок, уже ожидающий публикации, перечитывается после отзыва из базы.
     #[test]
     fn publication_reloads_snapshot_committed_before_revocation() {
@@ -338,6 +360,7 @@ mod tests {
             name: "channel".into(),
             direct: false,
             topics: Vec::new(),
+            metadata: ChatMetadata::default(),
         }];
         let snapshot = serde_json::to_string(&old).unwrap();
         let storage = Arc::new(Storage::in_memory().unwrap());

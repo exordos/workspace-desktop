@@ -93,6 +93,7 @@ fn save_catalog(storage: &Storage, owner: &OwnerContext) {
         name: "Команда".into(),
         direct: false,
         topics: vec![],
+        metadata: Default::default(),
     }])
     .unwrap();
     let revision = storage.catalog_revision(owner).unwrap();

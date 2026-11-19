@@ -1,6 +1,5 @@
 //! Управляет открытием, фокусом, загрузкой и действиями правой панели разговора.
 
-mod avatar;
 mod picker;
 mod presentation;
 mod source;
@@ -17,7 +16,8 @@ use workspace_core::messenger::details::{SidebarDetails, sidebar_profile_link};
 
 use super::{Conversation, Failure, OpenDetailsTopic};
 use crate::gpui_client::{
-    contracts::ConversationAddress,
+    avatars::AvatarImages,
+    contracts::{AccountSession, ConversationAddress},
     right_panel::{PanelKey, RightPanel, Scope},
     runtime::RuntimeClient,
     ui::{Button, Palette, TextRole, ThemeMode, label},
@@ -57,7 +57,7 @@ pub(super) struct Panel {
     _host_changes: gpui::Subscription,     // Сбрасывает данные после закрытия через общую рамку.
     runtime: RuntimeClient,                // Тот же рабочий поток, что читает историю.
     state: Option<State>,                  // None, пока панель закрыта.
-    avatars: avatar::Avatars,              // Декодированные фото текущей панели.
+    avatars: AvatarImages,                 // Подписки панели на общие фото по UUID человека.
     snapshot: Option<Arc<SidebarDetails>>, // Последний снимок до закрытия или сброса.
     reopen_on_access: bool, // Перенос открытой панели при переходе в другую тему канала.
     topics_expanded: bool,  // Показ списка тем в текущей панели.
@@ -98,7 +98,7 @@ impl Panel {
             _host_changes: host_changes,
             runtime,
             state: None,
-            avatars: avatar::Avatars::default(),
+            avatars: AvatarImages::default(),
             snapshot: None,
             reopen_on_access: false,
             topics_expanded: true,
@@ -139,7 +139,7 @@ impl Panel {
         }
         self.state = None;
         self.snapshot = None;
-        self.avatars = avatar::Avatars::default();
+        self.avatars.clear();
         self.reopen_on_access = false;
         self.topics_expanded = true;
         self.share_feedback = None;
@@ -147,6 +147,28 @@ impl Panel {
         self.mutation_error = None;
         self.picker = None;
         self.refocus_close = false;
+    }
+
+    /// Оставляет подписки собеседника или участников текущего канала.
+    fn refresh_avatars(
+        &mut self,
+        details: &SidebarDetails,
+        address: &ConversationAddress,
+        cx: &mut Context<Conversation>,
+    ) {
+        let users = match details {
+            SidebarDetails::Peer(peer) => vec![peer.user_id],
+            SidebarDetails::Channel(channel) => channel
+                .members
+                .iter()
+                .map(|member| member.user_id)
+                .collect(),
+        };
+        let session = AccountSession {
+            owner: address.route.owner.clone(),
+            generation: address.generation,
+        };
+        self.avatars.refresh(users, &self.runtime, &session, cx);
     }
 
     /// Рисует действие из шапки для мыши, Enter и пробела.
@@ -189,7 +211,7 @@ impl Panel {
                 self.mutation_error == Some(MutationKind::Add),
             )
         } else if let Some(details) = self.snapshot.as_deref() {
-            let data = presentation::content(self, details, address);
+            let data = presentation::content(self, details, address, cx);
             let target = cx.entity().downgrade();
             view::render(&data, palette, move |intent, window, app| {
                 let _ = target.update(app, |screen, cx| {
@@ -449,14 +471,14 @@ impl Conversation {
                         if !matches!(details.as_ref(), SidebarDetails::Channel(channel) if channel.can_add_members) {
                             panel.refocus_close |= panel.picker.take().is_some();
                         }
-                        panel.avatars.refresh(&details, view.address.clone(), panel.runtime.clone(), cx);
+                        panel.refresh_avatars(&details, &view.address, cx);
                         panel.snapshot = Some(details);
                         panel.state = Some(State::Ready);
                     }
                     Err(Problem::AccessLost) => view.fail(Failure::AccessLost, cx),
                     Err(error) => {
                         panel.snapshot = None;
-                        panel.avatars = avatar::Avatars::default();
+                        panel.avatars.clear();
                         panel.refocus_close |= panel.picker.take().is_some();
                         panel.state = Some(State::Failed(error));
                     }
@@ -675,16 +697,18 @@ impl Conversation {
         inspect(details.and_then(|panel| panel.snapshot.as_deref()))
     }
 
-    /// Проверяет, что фото открытого профиля готово к отрисовке.
-    pub(in crate::gpui_client) fn tested_details_avatar(&self, app: &App) -> bool {
+    /// Возвращает идентификатор изображения для проверки замены фото после события.
+    pub(in crate::gpui_client) fn tested_details_avatar(&self, app: &App) -> Option<gpui::ImageId> {
         self.tested_details(app, |details| {
             let Some(SidebarDetails::Peer(peer)) = details else {
-                return false;
+                return None;
             };
-            self.details
-                .as_ref()
-                .and_then(|panel| panel.avatars.image(Some(&peer.profile)))
-                .is_some()
+            let gpui::ImageSource::Render(image) =
+                self.details.as_ref()?.avatars.image(peer.user_id, app)?
+            else {
+                return None;
+            };
+            Some(image.id)
         })
     }
 

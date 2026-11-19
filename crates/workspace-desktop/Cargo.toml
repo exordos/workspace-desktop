@@ -17,6 +17,7 @@ workspace-core = { path = "../workspace-core" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "runtime_shaders"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"], optional = true }
 block2 = { version = "0.5", optional = true }
 objc2 = { version = "0.5", optional = true }
 objc2-app-kit = { version = "0.2", features = ["NSWorkspace"], optional = true }
@@ -27,7 +28,7 @@ security-framework = "3"
 [features]
 default = ["gpui"]
 macos-adapters = ["dep:block2", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:objc2-user-notifications"]
-gpui = ["dep:gpui", "dep:unicode-segmentation", "macos-adapters"]
+gpui = ["dep:gpui", "dep:image", "dep:unicode-segmentation", "macos-adapters"]
 gpui-test = ["gpui", "gpui/test-support"]
 
 [dev-dependencies]

@@ -80,6 +80,7 @@ fn setup() -> (Shell, AccountSnapshot, AccountSnapshot) {
                                 id: Uuid::from_u128(9),
                                 name: "Другая тема".into(),
                             }],
+                            metadata: Default::default(),
                         }])),
                     },
                 )

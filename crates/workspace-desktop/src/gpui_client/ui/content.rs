@@ -33,7 +33,7 @@ pub enum AvatarPresence {
 /// Аватар из готового изображения, инициалов или заглушки.
 pub struct Avatar {
     pub initials: SharedString, // Инициалы, рассчитанные экраном. Пустые показывают заглушку.
-    pub image: Option<ImageSource>, // Изображение, выбранное экраном.
+    pub image: Option<ImageSource>, // Квадратное изображение, подготовленное для круга аватара.
     pub size: AvatarSize,       // Размер слота в окне.
     pub presence: AvatarPresence, // Видимость и цвет индикатора.
 }

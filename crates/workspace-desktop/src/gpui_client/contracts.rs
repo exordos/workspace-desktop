@@ -23,6 +23,15 @@ pub struct AccountSession {
     pub generation: SessionGeneration, // Номер входа; старый вход не подходит после повторной авторизации.
 }
 
+impl AccountSession {
+    /// Возвращает UUID самого пользователя из подтверждённого контекста входа.
+    pub(super) fn user_uuid(&self) -> Option<Uuid> {
+        Uuid::parse_str(&self.owner.user_id)
+            .ok()
+            .filter(|id| !id.is_nil())
+    }
+}
+
 /// Сводка для переключателя аккаунтов без учётных данных.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccountSnapshot {
