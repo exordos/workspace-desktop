@@ -10,7 +10,9 @@ use super::{
     Icon, Palette, TextRole,
     controls::activate,
     label,
-    theme::{CONTROL_BORDER, CONTROL_RADIUS, ellipsized_label},
+    theme::{
+        CONTROL_BORDER, MESSAGE_BUBBLE_RADIUS, PANEL_RADIUS, SURFACE_RADIUS, ellipsized_label,
+    },
 };
 
 /// Размер аватара в пределах рабочего среза.
@@ -227,7 +229,7 @@ impl ChatRow {
             .py(px(9.))
             .flex()
             .gap(px(12.))
-            .rounded(CONTROL_RADIUS)
+            .rounded(PANEL_RADIUS)
             .border(CONTROL_BORDER)
             .border_color(gpui::transparent_black())
             .bg(if self.selected {
@@ -351,8 +353,13 @@ pub struct MessageBubble {
 }
 
 impl MessageBubble {
-    /// Рисует пузырь и переносит длинное сообщение по доступной ширине.
+    /// Рисует отдельный пузырь и переносит длинное сообщение по доступной ширине.
     pub fn render(self, palette: Palette) -> Div {
+        self.render_in_group(palette, true)
+    }
+
+    /// Рисует текстовый пузырь с учётом положения сообщения в группе.
+    pub(in crate::gpui_client) fn render_in_group(self, palette: Palette, ends_group: bool) -> Div {
         let status = self.delivery.filter(|_| self.own).map(|state| match state {
             DeliveryMark::Pending | DeliveryMark::Unknown => {
                 Icon::Pending.element(px(16.), palette.message_time)
@@ -387,12 +394,11 @@ impl MessageBubble {
                         .children(status),
                 )
             });
-        let bubble = div()
+        let bubble = message_bubble_surface(self.own, ends_group)
             .max_w(px(680.))
             .min_w_0()
             .px(px(12.))
             .py(px(8.))
-            .rounded(px(8.))
             .bg(if self.own {
                 palette.message_own
             } else {
@@ -411,5 +417,44 @@ impl MessageBubble {
             .flex()
             .when(self.own, |row| row.justify_end())
             .child(bubble)
+    }
+}
+
+/// Уменьшает радиус со стороны автора, чтобы соседние пузыри выглядели как группа.
+fn message_bubble_surface(own: bool, ends_group: bool) -> Div {
+    let surface = div().rounded(MESSAGE_BUBBLE_RADIUS);
+    match (own, ends_group) {
+        (true, true) => surface.rounded_br(PANEL_RADIUS),
+        (false, true) => surface.rounded_bl(PANEL_RADIUS),
+        (true, false) => surface.rounded_r(SURFACE_RADIUS),
+        (false, false) => surface.rounded_l(SURFACE_RADIUS),
+    }
+}
+
+#[cfg(test)]
+mod radius_tests {
+    use super::*;
+
+    /// Проверяет четыре формы пузыря по направлению и месту сообщения в группе.
+    #[test]
+    fn message_bubble_rounds_corners_by_author_and_group_position() {
+        for (own, ends_group, expected) in [
+            (true, true, [18., 18., 6., 18.]),
+            (false, true, [18., 18., 18., 6.]),
+            (true, false, [18., 10., 10., 18.]),
+            (false, false, [10., 18., 18., 10.]),
+        ] {
+            let mut bubble = message_bubble_surface(own, ends_group);
+            let corners = &bubble.style().corner_radii;
+            assert_eq!(
+                [
+                    corners.top_left,
+                    corners.top_right,
+                    corners.bottom_right,
+                    corners.bottom_left,
+                ],
+                expected.map(|radius| Some(px(radius).into())),
+            );
+        }
     }
 }

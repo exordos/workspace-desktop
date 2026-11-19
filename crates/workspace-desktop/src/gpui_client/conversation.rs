@@ -31,7 +31,10 @@ use super::{
     contracts::{AccountSession, ChatEntry, ConversationAddress},
     right_panel::RightPanel,
     runtime::RuntimeClient,
-    ui::{Avatar, Button, ButtonAppearance, Icon, Palette, TextRole, label},
+    ui::{
+        Avatar, Button, ButtonAppearance, Icon, PANEL_RADIUS, Palette, SURFACE_RADIUS, TextRole,
+        label,
+    },
 };
 
 /// Один запрос экрана и его идентификатор в журнале.
@@ -792,7 +795,7 @@ impl Conversation {
             .items_center()
             .gap_3()
             .px_4()
-            .rounded_md()
+            .rounded(PANEL_RADIUS)
             .bg(palette.surface)
             .when(self.heading.direct, |heading| {
                 let initial = title
@@ -963,7 +966,7 @@ impl Conversation {
             .items_center()
             .justify_center()
             .m_3()
-            .rounded_md()
+            .rounded(SURFACE_RADIUS)
             .bg(palette.field)
             .border_1()
             .border_color(palette.border);
@@ -1033,7 +1036,7 @@ impl Conversation {
                                 .justify_center()
                                 .child(
                                     problem
-                                        .rounded_md()
+                                        .rounded(PANEL_RADIUS)
                                         .bg(palette.surface)
                                         .border_1()
                                         .border_color(palette.border),

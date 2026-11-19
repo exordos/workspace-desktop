@@ -1,4 +1,4 @@
-//! Переносит цвета Blue Mist в GPUI и задаёт общие роли текста.
+//! Переносит цвета Blue Mist в GPUI и задаёт общие радиусы и роли текста.
 
 use gpui::{
     App, Div, FontWeight, Hsla, Pixels, ShapedLine, SharedString, Window, WindowAppearance, canvas,
@@ -7,7 +7,15 @@ use gpui::{
 
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Радиус компактных панелей управления, поля и строки каталога.
+/// Радиус панелей рабочего окна, строк каталога и меню действий.
+pub(in crate::gpui_client) const PANEL_RADIUS: Pixels = px(6.);
+/// Радиус композера, диалога, всплывающей панели и подсказки.
+pub(in crate::gpui_client) const SURFACE_RADIUS: Pixels = px(10.);
+/// Радиус кнопки раздела в верхней навигации.
+pub(super) const NAVIGATION_CHIP_RADIUS: Pixels = px(12.);
+/// Радиус внешних углов пузыря сообщения.
+pub(super) const MESSAGE_BUBBLE_RADIUS: Pixels = px(18.);
+/// Радиус компактных кнопок и полей ввода UI-кита.
 pub(super) const CONTROL_RADIUS: Pixels = px(8.);
 /// Толщина обычной и резервной границы компонентов UI-кита.
 pub(super) const CONTROL_BORDER: Pixels = px(1.);

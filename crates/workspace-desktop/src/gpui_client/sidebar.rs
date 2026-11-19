@@ -33,7 +33,7 @@ use super::{
     runtime::RuntimeClient,
     ui::{
         Avatar, AvatarPresence, BadgeTone, Button, ButtonAppearance, ChatRow, ChatRowPreview, Icon,
-        Palette, TextInput, TextInputChanged, TextRole, label,
+        PANEL_RADIUS, Palette, TextInput, TextInputChanged, TextRole, label,
         popup::{MenuInput, menu_layer, menu_navigation, menu_surface, tooltip},
     },
 };
@@ -772,6 +772,7 @@ impl Sidebar {
                 row
             })
             .gap(px(12.))
+            .rounded(PANEL_RADIUS)
             .when(selected, |row| row.bg(palette.card_selected))
             .child(
                 div()
@@ -827,7 +828,7 @@ impl Sidebar {
                 .items_center()
                 .justify_between()
                 .gap_1()
-                .rounded(px(8.))
+                .rounded(PANEL_RADIUS)
                 .border_1()
                 .border_color(palette.border)
                 .bg(palette.card)
@@ -920,7 +921,7 @@ impl Render for Sidebar {
             .debug_selector(|| "workspace-sidebar-panel".into())
             .w_full()
             .h_full()
-            .rounded(px(6.))
+            .rounded(PANEL_RADIUS)
             .min_w_0()
             .min_h_0()
             .flex()
@@ -1130,7 +1131,7 @@ fn catalog_status(palette: Palette, text: &'static str, action: Option<gpui::Any
         .flex_col()
         .items_center()
         .gap_2()
-        .rounded(px(8.))
+        .rounded(PANEL_RADIUS)
         .border_1()
         .border_color(palette.border)
         .bg(palette.card)

@@ -15,7 +15,10 @@ use self::editor::SubmitRequested;
 pub(super) use self::source::{DestinationError, SendSource};
 use super::{
     contracts::{ConversationAddress, ConversationReply},
-    ui::{Button, ButtonAppearance, FieldAppearance, Icon, Palette, TextRole, field, label},
+    ui::{
+        Button, ButtonAppearance, FieldAppearance, Icon, Palette, SURFACE_RADIUS, TextRole, field,
+        label,
+    },
 };
 
 const MAX_MESSAGE_CHARS: usize = 40_000;
@@ -296,8 +299,7 @@ impl Render for Composer {
             .min_w_0()
             .gap(px(4.))
             .p_2()
-            .border_t_1()
-            .border_color(palette.border)
+            .rounded(SURFACE_RADIUS)
             .bg(palette.surface)
             .debug_selector(|| "conversation-composer".into())
             .child(
@@ -310,7 +312,7 @@ impl Render for Composer {
                         field(palette, appearance, self.editor.clone())
                             .flex_1()
                             .debug_selector(|| "conversation-composer-field".into())
-                            .rounded(px(12.)),
+                            .rounded(SURFACE_RADIUS),
                     )
                     .child(
                         send.render(palette, None, move |window, app| {
@@ -322,7 +324,7 @@ impl Render for Composer {
                         .size(px(40.))
                         .flex_none()
                         .p(px(0.))
-                        .rounded(px(12.))
+                        .rounded(SURFACE_RADIUS)
                         .when(saving, |button| button.bg(palette.accent_soft))
                         .child(send_icon)
                         .tooltip(move |_, app| {
@@ -384,7 +386,7 @@ impl Render for SendTooltip {
         label(self.palette, TextRole::Caption, self.text.clone())
             .px_2()
             .py_1()
-            .rounded_md()
+            .rounded(SURFACE_RADIUS)
             .bg(self.palette.surface)
             .border_1()
             .border_color(self.palette.border)

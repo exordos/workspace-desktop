@@ -9,12 +9,12 @@ use gpui::{
 };
 
 use super::{
-    Avatar, AvatarSize, BadgeTone, Button, ButtonAppearance, Icon, Palette, TextRole,
+    Avatar, AvatarSize, BadgeTone, Button, ButtonAppearance, Icon, PANEL_RADIUS, Palette, TextRole,
     controls::activate,
     icons::ORGANIZATION_LOGO,
     label,
     popup::{MenuInput, bind_menu_keys, menu_layer, menu_navigation, menu_surface, tooltip},
-    theme::ellipsized_label,
+    theme::{NAVIGATION_CHIP_RADIUS, ellipsized_label},
     unread_badge,
 };
 use crate::gpui_client::contracts::AccountSession;
@@ -397,9 +397,7 @@ impl Render for TopBar {
             .flex_none()
             .flex()
             .items_center()
-            .rounded_b(px(8.))
-            .border_b_1()
-            .border_color(palette.border)
+            .rounded_b(PANEL_RADIUS)
             .bg(palette.surface)
             .child(
                 div()
@@ -453,7 +451,7 @@ impl Render for TopBar {
                     .items_center()
                     .justify_center()
                     .overflow_hidden()
-                    .rounded(px(6.))
+                    .rounded(NAVIGATION_CHIP_RADIUS)
                     .border_1()
                     .border_color(palette.border)
                     .bg(palette.card_selected)
@@ -560,7 +558,7 @@ fn organization_logo(palette: Palette, selected: bool, size: f32) -> Div {
         .items_center()
         .justify_center()
         .overflow_hidden()
-        .rounded(px(6.))
+        .rounded(PANEL_RADIUS)
         .border_1()
         .border_color(if selected {
             palette.accent

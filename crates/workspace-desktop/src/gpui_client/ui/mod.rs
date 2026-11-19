@@ -23,5 +23,6 @@ pub use focus::track_focus_input;
 pub use icons::{Icon, SEARCH_ICON_SIZE, WorkspaceAssets};
 pub(crate) use text_input::{TextInput, TextInputChanged, TextInputSubmitted};
 pub(in crate::gpui_client) use theme::ellipsized_label;
+pub(super) use theme::{PANEL_RADIUS, SURFACE_RADIUS};
 pub use theme::{Palette, TextRole, ThemeMode, label};
 pub use top_bar::{TopBar, TopBarAccount, TopBarSelection};

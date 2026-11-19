@@ -10,7 +10,7 @@ use gpui::{
 use super::{
     NextControl, PreviousControl,
     contracts::{AccountSession, ConversationAddress},
-    ui::{Button, ButtonAppearance, Icon, Palette, TextRole, label, popup::tooltip},
+    ui::{Button, ButtonAppearance, Icon, PANEL_RADIUS, Palette, TextRole, label, popup::tooltip},
 };
 
 const KEY_CONTEXT: &str = "WorkspaceRightPanel";
@@ -352,11 +352,12 @@ impl RightPanel {
                 .w(px(315.))
                 .min_h_0()
                 .flex_none()
+                .rounded(PANEL_RADIUS)
                 .bg(palette.surface)
                 .when(account_page, |panel| {
-                    panel.rounded_md().border_1().border_color(palette.border)
+                    panel.border_1().border_color(palette.border)
                 })
-                .when(!account_page, |panel| panel.rounded(px(12.)).pt_2().pb_5())
+                .when(!account_page, |panel| panel.pt_2().pb_5())
                 .when(overlay, |panel| {
                     panel
                         .absolute()

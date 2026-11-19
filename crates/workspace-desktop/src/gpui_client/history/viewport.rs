@@ -413,7 +413,7 @@ fn message_row(row: &Row, palette: Palette, peer: Option<&str>, photo: Option<Im
                     own: row.own,
                     delivery: row.delivery,
                 }
-                .render(bubble_palette)
+                .render_in_group(bubble_palette, row.ends_group)
                 .debug_selector(move || format!("history-message-{id}"))
                 .when(row.delivery == Some(DeliveryMark::Unknown), |bubble| {
                     bubble.debug_selector(|| "history-delivery-unknown".into())

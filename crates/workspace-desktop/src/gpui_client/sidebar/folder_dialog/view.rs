@@ -6,7 +6,9 @@ use gpui::{
     px, rgb, rgba,
 };
 
-use crate::gpui_client::ui::{Button, ButtonAppearance, Icon, Palette, TextRole, label, popup};
+use crate::gpui_client::ui::{
+    Button, ButtonAppearance, Icon, Palette, SURFACE_RADIUS, TextRole, label, popup,
+};
 
 use super::{
     COLORS, Dismiss, FolderCommandError, FolderDialog, KEY_CONTEXT, MAX_TITLE_LENGTH, Mode, Next,
@@ -50,7 +52,7 @@ impl Render for FolderDialog {
             .flex_col()
             .gap(px(16.))
             .p(px(20.))
-            .rounded(px(12.))
+            .rounded(SURFACE_RADIUS)
             .border_1()
             .border_color(palette.border)
             .bg(palette.surface)

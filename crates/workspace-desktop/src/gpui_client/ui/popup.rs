@@ -6,7 +6,7 @@ use gpui::{
     prelude::*, px,
 };
 
-use super::{Palette, TextRole, label};
+use super::{PANEL_RADIUS, Palette, SURFACE_RADIUS, TextRole, label};
 
 actions!(
     workspace_popup,
@@ -93,7 +93,7 @@ pub(in crate::gpui_client) fn menu_surface(
         .p_1()
         .flex()
         .flex_col()
-        .rounded(px(12.))
+        .rounded(PANEL_RADIUS)
         .border_1()
         .border_color(palette.border)
         .bg(palette.surface)
@@ -133,7 +133,7 @@ impl Render for Tooltip {
             .max_w(px(320.).min((window.viewport_size().width - MARGIN * 2.).max(px(0.))))
             .px_2()
             .py_1()
-            .rounded(px(6.))
+            .rounded(SURFACE_RADIUS)
             .border_1()
             .border_color(self.palette.border)
             .bg(self.palette.surface)
