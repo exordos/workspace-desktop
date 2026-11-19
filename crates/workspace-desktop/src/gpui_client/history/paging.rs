@@ -71,7 +71,7 @@ impl Viewport {
     }
 
     /// Считает запас измеренных строк от видимой области до указанного края.
-    fn distance_to_edge(&self, direction: HistoryDirection) -> Pixels {
+    pub(in super::super) fn distance_to_edge(&self, direction: HistoryDirection) -> Pixels {
         let offset = self.list.logical_scroll_top();
         let max_scroll = self.list.max_offset_for_scrollbar().height + BOTTOM_PADDING;
         let top = if offset.item_ix == self.rows.len() {

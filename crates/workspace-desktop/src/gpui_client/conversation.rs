@@ -14,8 +14,8 @@ use std::collections::HashMap;
 
 use futures::channel::oneshot;
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyDownEvent, Render,
-    Subscription, Window, div, prelude::*, px,
+    App, Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyDownEvent, Pixels, Render,
+    ScrollWheelEvent, Subscription, Window, canvas, div, prelude::*, px,
 };
 use uuid::Uuid;
 use workspace_core::{
@@ -40,6 +40,16 @@ use super::{
         label,
     },
 };
+
+const HISTORY_PAGE_AHEAD: Pixels = px(1200.);
+const HISTORY_PAGING_HEIGHT: Pixels = px(32.);
+
+/// Точка чтения, которую рабочее окно может восстановить при повторном открытии чата.
+#[derive(Clone, Copy)]
+pub(super) struct ReadingAnchor {
+    pub id: Uuid,  // UUID подтверждённого сообщения.
+    pub y: Pixels, // Верх пузыря относительно области прокрутки, в логических px.
+}
 
 /// Один запрос экрана и его идентификатор в журнале.
 #[derive(Clone, Copy)]
@@ -83,6 +93,7 @@ impl EventEmitter<OpenDetailsTopic> for Conversation {}
 pub struct Conversation {
     address: ConversationAddress, // Владелец, область, поколение и ревизия от оболочки.
     entry: ChatEntry,             // Текущая точка открытия, включая переход к последним.
+    restore: Option<ReadingAnchor>, // Сохранённая опора до первого успешного снимка.
     source: Source,               // Переносит запросы на рабочий поток.
     state: State,                 // Текущее подтверждённое окно или сообщение о проблеме.
     active: Option<Flight>,       // Один запрос истории, пока не применён его последний ответ.
@@ -90,7 +101,8 @@ pub struct Conversation {
     action_error: Option<Flight>, // Запрос, который можно повторить, пока открыта история.
     outbox: Vec<OutboxEntry>, // Последний снимок очереди в области разговора.
     viewport: Viewport, // Виртуальный список и его положение.
-    screen_focus: FocusHandle, // Запасной фокус при исчезновении истории и панели.
+    scroll_direction: Option<HistoryDirection>, // Последний жест, до него проверяем заполнение окна.
+    screen_focus: FocusHandle,                  // Запасной фокус при исчезновении истории и панели.
     history_focus: FocusHandle, // Точка клавиатурной прокрутки в открытом разговоре.
     sending: Option<Sending>, // Рабочий редактор; изолированные тесты истории могут его не подключать.
     heading: Heading,         // Отображаемые названия из текущего каталога.
@@ -108,9 +120,10 @@ impl Conversation {
         address: ConversationAddress,
         runtime: RuntimeClient,
         right_panel: Entity<RightPanel>,
+        restore: Option<ReadingAnchor>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut view = Self::with_source(address, runtime_source(runtime.clone()), cx);
+        let mut view = Self::with_source(address, runtime_source(runtime.clone()), restore, cx);
         view.attach_composer(SendSource::runtime(runtime.clone()), cx);
         view.avatar_runtime = Some(runtime.clone());
         view.details = Some(Panel::new(right_panel, view.address.clone(), runtime, cx));
@@ -118,18 +131,25 @@ impl Conversation {
     }
 
     /// Создаёт экран с заданным источником, в том числе с управляемыми ответами в GPUI-тестах.
-    fn with_source(address: ConversationAddress, source: Source, cx: &mut Context<Self>) -> Self {
+    fn with_source(
+        address: ConversationAddress,
+        source: Source,
+        restore: Option<ReadingAnchor>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let entry = address.route.entry;
         let mut conversation = Self {
             address,
             entry,
+            restore: restore.filter(|_| entry == ChatEntry::Latest),
             source,
             state: State::Opening,
             active: None,
             read_pending: false,
             action_error: None,
             outbox: Vec::new(),
-            viewport: Viewport::new(),
+            viewport: Viewport::with_page_ahead(HISTORY_PAGE_AHEAD),
+            scroll_direction: None,
             screen_focus: cx.focus_handle(),
             history_focus: cx.focus_handle().tab_stop(true),
             sending: None,
@@ -141,21 +161,26 @@ impl Conversation {
             history_avatar_users: Vec::new(),
             details: None,
         };
-        let target = cx.entity().downgrade();
-        // GPUI держит состояние незавершённо созданной Entity до выхода из cx.new.
+        conversation.start(Load::Open(conversation.opening_entry()), cx);
         conversation
-            .viewport
-            .list()
-            .set_scroll_handler(move |event, _, app| {
-                let visible = event.visible_range.clone();
-                let count = event.count;
-                let target = target.clone();
-                app.defer(move |app| {
-                    let _ = target.update(app, |view, cx| view.scroll(visible, count, cx));
-                });
-            });
-        conversation.start(Load::Open(entry), cx);
-        conversation
+    }
+
+    /// Снимает точку чтения при уходе с экрана. Подтверждённый хвост открывается штатным Latest.
+    pub(super) fn reading_position(&self) -> Option<ReadingAnchor> {
+        match &self.state {
+            State::Ready(window) if window.newer == HistoryEdge::End && self.viewport.at_tail() => {
+                None
+            }
+            State::Ready(_) => self.viewport.saved_anchor(),
+            State::Opening | State::Failed(Failure::Unavailable | Failure::Changed) => self.restore,
+            State::Failed(_) => None,
+        }
+    }
+
+    /// Использует обычную загрузку вокруг UUID для восстановления разрешённого окна.
+    fn opening_entry(&self) -> ChatEntry {
+        self.restore
+            .map_or(self.entry, |anchor| ChatEntry::Around(anchor.id))
     }
 
     /// Подключает редактор после создания экрана, пока первое окно истории ещё загружается.
@@ -387,8 +412,14 @@ impl Conversation {
         }
     }
 
-    /// Очищает недействительные данные и начинает проверку прежней цели заново.
+    /// Перепроверяет окно, удерживая текущую точку чтения.
     fn restart(&mut self, cx: &mut Context<Self>) {
+        self.restore = self.reading_position();
+        self.reopen(cx);
+    }
+
+    /// Скрывает прежние строки и начинает загрузку выбранного окна.
+    fn reopen(&mut self, cx: &mut Context<Self>) {
         if let Some(details) = &mut self.details {
             details.clear(&self.address, None, cx);
         }
@@ -397,10 +428,11 @@ impl Conversation {
         self.active = None;
         self.read_pending = false;
         self.action_error = None;
+        self.scroll_direction = None;
         self.outbox.clear();
         self.viewport.clear();
         self.clear_history_avatars();
-        self.start(Load::Open(self.entry), cx);
+        self.start(Load::Open(self.opening_entry()), cx);
     }
 
     /// Скрывает историю и делает любые запоздавшие ответы неприменимыми.
@@ -411,6 +443,9 @@ impl Conversation {
         }
         self.invalidate_send_destination(cx);
         self.state = State::Failed(error);
+        if matches!(error, Failure::AccessLost | Failure::MissingMessage) {
+            self.restore = None;
+        }
         self.active = None;
         self.read_pending = false;
         self.action_error = None;
@@ -508,6 +543,7 @@ impl Conversation {
                 return;
             }
             Err(Failure::AccessLost) => self.fail(Failure::AccessLost, cx),
+            Err(Failure::MissingMessage) if self.abandon_restore(flight, cx) => return,
             Err(Failure::MissingMessage) => self.fail(Failure::MissingMessage, cx),
             Err(error) if self.has_access() => {
                 if matches!(flight.load, Load::Extend(_, _)) && error == Failure::Changed {
@@ -529,6 +565,17 @@ impl Conversation {
         cx.notify();
     }
 
+    /// При исчезновении сохранённой опоры открывает обычный хвост того же разговора.
+    fn abandon_restore(&mut self, flight: Flight, cx: &mut Context<Self>) -> bool {
+        if self.restore.is_some() && flight.load == Load::Open(self.opening_entry()) {
+            self.restore = None;
+            self.entry = ChatEntry::Latest;
+            self.reopen(cx);
+            return true;
+        }
+        false
+    }
+
     /// Обновляет потерявший подтверждение хвост, только когда пользователь остался у него.
     fn needs_fresh_tail(&self, flight: Flight, window: &HistoryWindow) -> bool {
         matches!(flight.load, Load::Read(_))
@@ -545,14 +592,27 @@ impl Conversation {
             self.fail(Failure::Changed, cx);
             return;
         }
-        if let ChatEntry::Around(id) = self.entry
+        if let Load::Open(ChatEntry::Around(id)) = flight.load
             && !window.messages.iter().any(|row| row.id == id)
-            && (matches!(flight.load, Load::Open(ChatEntry::Around(_)))
-                || matches!(&self.state, State::Ready(previous) if previous.messages.iter().any(|row| row.id == id)))
         {
-            self.fail(Failure::MissingMessage, cx);
+            if !self.abandon_restore(flight, cx) {
+                self.fail(Failure::MissingMessage, cx);
+            }
             return;
         }
+        let stalled = match (&self.state, flight.load) {
+            (State::Ready(previous), Load::Extend(_, HistoryDirection::Older)) => {
+                matches!(window.older, HistoryEdge::More(_))
+                    && previous.messages.first().map(|row| row.id)
+                        == window.messages.first().map(|row| row.id)
+            }
+            (State::Ready(previous), Load::Extend(_, HistoryDirection::Newer)) => {
+                matches!(window.newer, HistoryEdge::More(_))
+                    && previous.messages.last().map(|row| row.id)
+                        == window.messages.last().map(|row| row.id)
+            }
+            _ => false,
+        };
         let position = match &self.state {
             State::Ready(previous)
                 if cached && previous.id != window.id && self.entry == ChatEntry::Latest =>
@@ -562,12 +622,12 @@ impl Conversation {
             State::Ready(previous)
                 if previous.newer == HistoryEdge::End
                     && window.newer == HistoryEdge::End
-                    && self.viewport.at_tail()
-                    && !matches!(flight.load, Load::Extend(_, HistoryDirection::Older)) =>
+                    && self.viewport.at_tail() =>
             {
                 Position::Tail
             }
             State::Ready(_) => Position::Reading,
+            _ if self.restore.is_some() => Position::Restore(self.restore.take().unwrap()),
             _ => match self.entry {
                 ChatEntry::Latest => Position::Tail,
                 ChatEntry::Around(id) => Position::Around(id),
@@ -593,6 +653,9 @@ impl Conversation {
             self.clear_history_avatars();
         }
         self.state = State::Ready(window);
+        if stalled {
+            self.action_error = Some(flight);
+        }
         if let Some(sending) = &self.sending {
             sending.view.update(cx, |editor, cx| {
                 editor.check_destination(&sending.source, cx)
@@ -621,23 +684,51 @@ impl Conversation {
         }
     }
 
-    /// Догружает край после жеста прокрутки. После ошибки ждёт явного повтора.
-    fn scroll(&mut self, visible: std::ops::Range<usize>, count: usize, cx: &mut Context<Self>) {
-        if self.active.is_some() || self.action_error.is_some() || count == 0 {
+    /// Догружает короткое окно или запрашивает страницу до края по геометрии готового кадра.
+    fn prefetch(&mut self, cx: &mut Context<Self>) {
+        if self.active.is_some() || self.action_error.is_some() {
             return;
         }
-        if visible.start == 0 && visible.end < count {
-            self.extend(HistoryDirection::Older, cx);
-        } else if visible.end >= count && visible.start > 0 {
-            self.extend(HistoryDirection::Newer, cx);
+        if let State::Ready(window) = &self.state
+            && let Some(need) = self.viewport.page_need(
+                &window.older,
+                &window.newer,
+                self.scroll_direction,
+                HISTORY_PAGE_AHEAD,
+            )
+        {
+            self.extend(need.direction, cx);
+            if let Some(flight) = self.active {
+                log::debug!(
+                    "gpui_history op_id={} event=page_ahead direction={:?} distance_px={}",
+                    flight.id,
+                    need.direction,
+                    f32::from(need.distance)
+                );
+            }
+        }
+    }
+
+    /// Запоминает направление жеста. Сами строки прокручивает GPUI.
+    fn scroll_wheel(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let delta = event.delta.pixel_delta(px(20.)).y;
+        if delta != px(0.) {
+            self.scroll_direction = Some(if delta > px(0.) {
+                HistoryDirection::Older
+            } else {
+                HistoryDirection::Newer
+            });
+            cx.notify();
         }
     }
 
     /// Переходит к последним сообщениям, запрашивая подтверждённый хвост при разрыве или переходе к UUID.
     fn latest(&mut self, cx: &mut Context<Self>) {
-        if self.active.is_some() {
+        if self.active.is_some() && !self.has_access() {
             return;
         }
+        self.restore = None;
+        self.scroll_direction = None;
         if self.entry == ChatEntry::Latest
             && let State::Ready(window) = &self.state
             && window.newer == HistoryEdge::End
@@ -653,7 +744,7 @@ impl Conversation {
             cx.notify();
         } else {
             self.entry = ChatEntry::Latest;
-            self.restart(cx);
+            self.reopen(cx);
         }
     }
 
@@ -663,7 +754,11 @@ impl Conversation {
             return;
         }
         if let Some(failure) = self.action_error.take() {
-            self.start(failure.load, cx);
+            if matches!(failure.load, Load::Open(_)) {
+                self.restart(cx);
+            } else {
+                self.start(failure.load, cx);
+            }
         } else {
             self.restart(cx);
         }
@@ -694,6 +789,11 @@ impl Conversation {
             self.latest(cx);
             return;
         }
+        self.scroll_direction = Some(if distance < px(0.) {
+            HistoryDirection::Older
+        } else {
+            HistoryDirection::Newer
+        });
         if (distance < px(0.) && at_start) || (distance > px(0.) && at_tail) {
             if self.active.is_none() && self.action_error.is_none() {
                 let direction = if distance < px(0.) {
@@ -730,6 +830,7 @@ impl Conversation {
         viewport: impl IntoElement,
         cx: &Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let target = cx.entity().downgrade();
         div()
             .id("conversation-history-focus")
             .debug_selector(|| "conversation-history-focus".into())
@@ -745,7 +846,21 @@ impl Conversation {
                 frame.focus(|style| style.border_color(palette.focus))
             })
             .on_key_down(cx.listener(Self::scroll_key))
+            .on_scroll_wheel(cx.listener(Self::scroll_wheel))
             .child(viewport)
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |_, (), _, app| {
+                        let target = target.clone();
+                        app.defer(move |app| {
+                            let _ = target.update(app, Self::prefetch);
+                        });
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            )
             .when(
                 self.avatars_visible && self.avatar_runtime.is_some(),
                 |frame| {
@@ -854,7 +969,14 @@ impl Conversation {
             || self
                 .action_error
                 .is_some_and(|error| matches!(error.load, Load::Open(_)));
-        let mut paging = div().flex().flex_wrap().justify_center().gap_2().px_2();
+        let mut paging = div()
+            .h(HISTORY_PAGING_HEIGHT)
+            .flex_none()
+            .flex()
+            .justify_center()
+            .gap_2()
+            .px_2()
+            .overflow_hidden();
         for (edge, id, title, direction) in [
             (
                 &history.older,

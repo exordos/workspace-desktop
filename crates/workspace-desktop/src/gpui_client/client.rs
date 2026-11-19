@@ -1,6 +1,7 @@
 //! Направляет действия между оболочкой, рабочим потоком, экраном разговора и AppKit.
 //! Здесь также собирается основная разметка окна из готовых компонентов.
 
+mod history_positions;
 mod notification_banner;
 mod profile;
 
@@ -9,15 +10,21 @@ use std::collections::HashMap;
 use gpui::{
     Context, Entity, FocusHandle, SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
-use workspace_core::{auth::SessionStatus, context::AccountId};
+use workspace_core::{
+    auth::SessionStatus,
+    context::{AccountId, OwnerContext, SessionGeneration},
+};
 
+use history_positions::HistoryPositions;
 use notification_banner::{NotificationBanner, NotificationBannerActions};
 use profile::Profile;
 
 use super::{
     Options,
     avatars::AvatarImages,
-    contracts::{AccountSession, RuntimeEvent, RuntimeExit, ShellAction, SidebarAction},
+    contracts::{
+        AccountSession, AccountSnapshot, RuntimeEvent, RuntimeExit, ShellAction, SidebarAction,
+    },
     conversation::{Conversation, OpenDetailsTopic},
     next_control,
     platform_window::WindowPlatform,
@@ -29,6 +36,22 @@ use super::{
     sign_in::SignIn,
     ui::{Palette, TextRole, TopBar, TopBarAccount, TopBarAction, TopBarSelection, label},
 };
+
+/// Проверяет, что позиции и черновики ещё принадлежат действующему поколению входа.
+fn keeps_session(
+    accounts: &[AccountSnapshot],
+    owner: &OwnerContext,
+    generation: SessionGeneration,
+) -> bool {
+    accounts.iter().any(|account| {
+        account.session.owner == *owner
+            && account.session.generation == generation
+            && matches!(
+                account.status,
+                SessionStatus::Active | SessionStatus::TemporarilyUnavailable
+            )
+    })
+}
 
 const SIDEBAR_PREFERRED_WIDTH: f32 = 299.;
 const SIDEBAR_MIN_WIDTH: f32 = 240.;
@@ -49,6 +72,7 @@ pub(super) struct Client {
     runtime: RuntimeClient,   // Очередь команд рабочего потока этого профиля.
     sidebar: Entity<Sidebar>, // Единственный каталог; хранит поиск каждого входа.
     conversation: Option<Entity<Conversation>>, // Экран актуального адреса, если он открыт.
+    history_positions: HistoryPositions, // Опоры чтения недавних разговоров этого окна.
     details_navigation: Option<Subscription>, // Подписка на переход из правой панели текущего экрана.
     right_panel: Entity<RightPanel>,          // Общая история правых панелей рабочего окна.
     sign_in: Option<Entity<SignIn>>,          // Форма нужна, пока в профиле нет доступного входа.
@@ -123,6 +147,7 @@ impl Client {
             runtime,
             sidebar,
             conversation: None,
+            history_positions: HistoryPositions::default(),
             right_panel,
             details_navigation: None,
             sign_in: None,
@@ -196,6 +221,8 @@ impl Client {
         };
         match &event {
             RuntimeEvent::Accounts(accounts) => {
+                self.history_positions
+                    .keep_sessions(|owner, generation| keeps_session(accounts, owner, generation));
                 self.received_accounts = true;
                 let active = accounts
                     .iter()
@@ -217,6 +244,31 @@ impl Client {
                     "event=workspace_catalog_updated count={} ready={ready}",
                     catalogs.len()
                 );
+            }
+            RuntimeEvent::Sync(update) => {
+                use workspace_core::sync::{HistoryRevocation, SyncChange};
+                match update.change {
+                    SyncChange::HistoryAccessRevoked(HistoryRevocation::Stream(stream)) => {
+                        self.history_positions.revoke(
+                            &update.context,
+                            update.generation,
+                            stream,
+                            None,
+                        );
+                    }
+                    SyncChange::HistoryAccessRevoked(HistoryRevocation::Topic {
+                        stream_id,
+                        topic_id,
+                    }) => {
+                        self.history_positions.revoke(
+                            &update.context,
+                            update.generation,
+                            stream_id,
+                            Some(topic_id),
+                        );
+                    }
+                    _ => {}
+                }
             }
             RuntimeEvent::Stopped(RuntimeExit::Failed) => self.stopped = true,
             _ => {}
@@ -289,9 +341,12 @@ impl Client {
         }
         match effect {
             Some(ShellEffect::OpenConversation(address)) => {
+                self.save_history_position(cx);
                 let runtime = self.runtime.clone();
                 let panel = self.right_panel.clone();
-                let conversation = cx.new(|cx| Conversation::open(address, runtime, panel, cx));
+                let restore = self.history_positions.take(&address);
+                let conversation =
+                    cx.new(|cx| Conversation::open(address, runtime, panel, restore, cx));
                 self.details_navigation = Some(cx.subscribe(
                     &conversation,
                     |client, _, target: &OpenDetailsTopic, cx| {
@@ -301,6 +356,7 @@ impl Client {
                 self.conversation = Some(conversation);
             }
             Some(ShellEffect::CloseConversation) => {
+                self.save_history_position(cx);
                 self.details_navigation = None;
                 self.conversation = None;
             }
@@ -362,6 +418,23 @@ impl Client {
             );
         });
         cx.notify();
+    }
+
+    /// Запоминает опору старого экрана перед тем, как заменить его новым адресом.
+    fn save_history_position(&mut self, cx: &Context<Self>) {
+        let Some(conversation) = &self.conversation else {
+            return;
+        };
+        let view = conversation.read(cx);
+        let address = view.address();
+        if keeps_session(
+            self.shell.accounts(),
+            &address.route.owner,
+            address.generation,
+        ) && let Some(anchor) = view.reading_position()
+        {
+            self.history_positions.save(address, anchor);
+        }
     }
 
     /// Переключает тему из открытой панели и оставляет панель на новом адресе.

@@ -1,7 +1,7 @@
 //! Рисует виртуальную историю и восстанавливает опору по UUID после изменения состава строк.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     rc::Rc,
 };
@@ -13,7 +13,7 @@ use gpui::{
 use uuid::Uuid;
 use workspace_core::storage::{DeliveryStatus, HistoryWindow, OutboxEntry, SendBlock};
 
-use super::Conversation;
+use super::{Conversation, ReadingAnchor};
 
 #[path = "paging.rs"]
 mod paging;
@@ -64,23 +64,17 @@ impl Row {
 
 /// Что должен показать список после принятия снимка.
 pub(super) enum Position {
-    Tail,         // Перейти к последней строке.
-    Around(Uuid), // Поставить указанное сообщение в начало видимой истории.
-    Reading,      // Сохранить верхнюю видимую строку и её смещение.
-}
-
-/// Видимая относительная координата строки и верхний отступ.
-#[derive(Clone, Copy)]
-struct Anchor {
-    id: Uuid,  // Идентификатор строки, которую продолжают читать.
-    y: Pixels, // Координата верхней границы относительно списка, в логических px.
+    Tail,                   // Перейти к последней строке.
+    Around(Uuid),           // Поставить указанное сообщение в начало видимой истории.
+    Reading,                // Сохранить верхнюю видимую строку и её смещение.
+    Restore(ReadingAnchor), // Выставить сохранённую координату после открытия.
 }
 
 /// Запись для сравнения координат после нового прохода GPUI.
 #[derive(Clone, Copy)]
 struct Measurement {
-    op_id: Uuid,    // Операция, которая поменяла список.
-    anchor: Anchor, // Положение той же строки до замены снимка.
+    op_id: Uuid,           // Операция, которая поменяла список.
+    anchor: ReadingAnchor, // Положение той же строки до замены снимка.
 }
 
 /// Снимок виртуального списка и реально нарисованные границы последнего кадра.
@@ -89,15 +83,11 @@ pub(super) struct Viewport {
     index: Rc<HashMap<Uuid, usize>>, // Индекс строк истории по UUID сообщения.
     list: ListState,    // Позиция и размеры строк в GPUI.
     painted: Rc<RefCell<HashMap<Uuid, Bounds<Pixels>>>>, // Фактические прямоугольники строк.
+    painted_offset: Rc<Cell<Option<ListOffset>>>, // Смещение, для которого измерены прямоугольники.
     measure: Option<Measurement>, // Следующее измерение после замены снимка.
 }
 
 impl Viewport {
-    /// Создаёт пустой список с нижней привязкой и ограниченной областью дополнительной отрисовки.
-    pub(super) fn new() -> Self {
-        Self::with_overdraw(px(100.))
-    }
-
     /// Задаёт, на сколько логических px за пределами окна список измеряет строки.
     fn with_overdraw(overdraw: Pixels) -> Self {
         Self {
@@ -105,6 +95,7 @@ impl Viewport {
             index: Rc::default(),
             list: ListState::new(0, ListAlignment::Bottom, overdraw),
             painted: Rc::default(),
+            painted_offset: Rc::default(),
             measure: None,
         }
     }
@@ -116,12 +107,16 @@ impl Viewport {
 
     /// Проверяет, читает ли пользователь хвост, к которому можно прикрепить новые строки.
     pub(super) fn at_tail(&self) -> bool {
-        self.list.logical_scroll_top().item_ix == self.rows.len()
-            || self
-                .rows
-                .last()
-                .and_then(|row| self.painted.borrow().get(&row.id).copied())
-                .is_some_and(|last| last.bottom() <= self.list.viewport_bounds().bottom() + px(2.))
+        let logical = self.list.logical_scroll_top();
+        logical.item_ix == self.rows.len()
+            || self.paint_matches(logical)
+                && self
+                    .rows
+                    .last()
+                    .and_then(|row| self.painted.borrow().get(&row.id).copied())
+                    .is_some_and(|last| {
+                        last.bottom() <= self.list.viewport_bounds().bottom() + px(2.)
+                    })
     }
 
     /// Очищает список и координаты доступных раньше сообщений.
@@ -130,11 +125,19 @@ impl Viewport {
         self.index = Rc::default();
         self.list.reset(0);
         self.painted.borrow_mut().clear();
+        self.painted_offset.set(None);
         self.measure = None;
     }
 
+    /// Сверяет последний отрисованный кадр с текущим смещением списка.
+    fn paint_matches(&self, offset: ListOffset) -> bool {
+        self.painted_offset.get().is_some_and(|painted| {
+            painted.item_ix == offset.item_ix && painted.offset_in_item == offset.offset_in_item
+        })
+    }
+
     /// Берёт верхнюю видимую строку и сохраняет её смещение до замены данных.
-    fn anchor(&self, index: &HashMap<Uuid, usize>) -> Option<Anchor> {
+    fn anchor(&self, index: &HashMap<Uuid, usize>) -> Option<ReadingAnchor> {
         let viewport = self.list.viewport_bounds();
         let logical = self.list.logical_scroll_top();
         let painted = self.painted.borrow();
@@ -143,12 +146,15 @@ impl Viewport {
             .get(logical.item_ix)
             .filter(|row| index.contains_key(&row.id))
         {
-            let y = painted
-                .get(&row.id)
+            // Жест уже мог сдвинуть логическое смещение между двумя кадрами.
+            let y = self
+                .paint_matches(logical)
+                .then(|| painted.get(&row.id))
+                .flatten()
                 .map_or(row.inset() - logical.offset_in_item, |bounds| {
                     bounds.top() - viewport.top()
                 });
-            return Some(Anchor { id: row.id, y });
+            return Some(ReadingAnchor { id: row.id, y });
         }
         self.rows
             .iter()
@@ -157,9 +163,15 @@ impl Viewport {
                 let bounds = painted.get(&row.id)?;
                 (bounds.bottom() > viewport.top() && bounds.top() < viewport.bottom()).then(|| {
                     let y = bounds.top() - viewport.top();
-                    Anchor { id: row.id, y }
+                    ReadingAnchor { id: row.id, y }
                 })
             })
+    }
+
+    /// Возвращает опору, которую сервер сможет открыть по UUID.
+    pub(super) fn saved_anchor(&self) -> Option<ReadingAnchor> {
+        self.anchor(&self.index)
+            .filter(|anchor| self.rows[self.index[&anchor.id]].date.is_some())
     }
 
     /// Обновляет только изменившийся отрезок и переносит опору в его новый индекс.
@@ -178,9 +190,11 @@ impl Viewport {
             .enumerate()
             .map(|(i, row)| (row.id, i))
             .collect();
-        let anchor = matches!(position, Position::Reading)
-            .then(|| self.anchor(&index))
-            .flatten();
+        let anchor = match position {
+            Position::Reading => self.anchor(&index),
+            Position::Restore(anchor) => index.contains_key(&anchor.id).then_some(anchor),
+            Position::Tail | Position::Around(_) => None,
+        };
         let prefix = self
             .rows
             .iter()
@@ -200,6 +214,7 @@ impl Viewport {
             );
             self.rows = Rc::new(rows);
         }
+        self.index = Rc::new(index);
         self.measure = anchor.map(|anchor| Measurement { op_id, anchor });
         log::debug!(
             "gpui_history op_id={op_id} event=rows_applied rows_before={previous_count} rows_after={} row_count_delta={} position={}",
@@ -209,6 +224,7 @@ impl Viewport {
                 Position::Tail => "tail",
                 Position::Around(_) => "target",
                 Position::Reading => "reading",
+                Position::Restore(_) => "restored",
             }
         );
         match position {
@@ -217,16 +233,16 @@ impl Viewport {
                 offset_in_item: px(0.),
             }),
             Position::Around(id) => {
-                if let Some(&item_ix) = index.get(&id) {
+                if let Some(&item_ix) = self.index.get(&id) {
                     self.list.scroll_to(ListOffset {
                         item_ix,
                         offset_in_item: self.rows[item_ix].inset(),
                     });
                 }
             }
-            Position::Reading => {
+            Position::Reading | Position::Restore(_) => {
                 if let Some(anchor) = anchor {
-                    let item_ix = index[&anchor.id];
+                    let item_ix = self.index[&anchor.id];
                     // При догрузке дата и отступ группы могут исчезнуть над тем же UUID.
                     self.list.scroll_to(ListOffset {
                         item_ix,
@@ -235,7 +251,6 @@ impl Viewport {
                 }
             }
         }
-        self.index = Rc::new(index);
     }
 
     /// Показывает список с локальными строками в отдельном окне.
@@ -251,8 +266,10 @@ impl Viewport {
         images: HashMap<Uuid, ImageSource>,
     ) -> impl IntoElement {
         self.painted.borrow_mut().clear();
+        self.painted_offset.set(None);
         let rows = self.rows.clone();
         let painted = self.painted.clone();
+        let painted_offset = self.painted_offset.clone();
         let measurement = Rc::new(RefCell::new(self.measure.take()));
         let list_state = self.list.clone();
         list(self.list.clone(), move |index, _, _| {
@@ -260,12 +277,14 @@ impl Viewport {
             let id = row.id;
             let photo = row.avatar_author().and_then(|id| images.get(&id).cloned());
             let painted = painted.clone();
+            let painted_offset = painted_offset.clone();
             let measurement = measurement.clone();
             let list_state = list_state.clone();
             div().relative().w_full().px_3().pt(row.inset())
                 .children(row.date.as_deref().filter(|_| row.starts_day).map(|date| date_separator(palette, date, id)))
                 .child(message_row(row, palette, peer.as_deref(), photo).relative().child(canvas(|_, _, _| (), move |bounds, (), _, _| {
                     painted.borrow_mut().insert(id, bounds);
+                    painted_offset.set(Some(list_state.logical_scroll_top()));
                     let mut measurement = measurement.borrow_mut();
                     if measurement.as_ref().is_some_and(|m| m.anchor.id == id)
                         && let Some(m) = measurement.take()

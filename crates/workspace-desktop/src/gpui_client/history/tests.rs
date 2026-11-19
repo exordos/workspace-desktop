@@ -18,6 +18,29 @@ use crate::gpui_client::contracts::{ChatRoute, ConversationReply, NavigationRevi
 use super::*;
 
 impl Conversation {
+    /// Даёт измерения рабочего списка для прогона перехода и ранней догрузки на HTTPS.
+    pub(in crate::gpui_client) fn tested_older_distance(&self) -> (f32, f32) {
+        (
+            f32::from(self.viewport.distance_to_edge(HistoryDirection::Older)),
+            f32::from(self.viewport.list().viewport_bounds().size.height),
+        )
+    }
+
+    /// Возвращает верх пузыря относительно рабочего окна, включая положение самого списка.
+    pub(in crate::gpui_client) fn tested_message_window_y(&self, id: Uuid) -> Option<gpui::Pixels> {
+        self.viewport
+            .y(id)
+            .map(|y| self.viewport.list().viewport_bounds().top() + px(y))
+    }
+
+    /// Сверяет применение страницы вместе с её границей после полного ответа Core.
+    pub(in crate::gpui_client) fn tested_older_page(&self) -> Option<(usize, HistoryEdge)> {
+        let State::Ready(window) = &self.state else {
+            return None;
+        };
+        Some((window.messages.len(), window.older.clone()))
+    }
+
     /// Возвращает фото шапки и видимой истории для общей приёмки аватаров.
     pub(in crate::gpui_client) fn tested_chat_avatars(
         &self,
@@ -150,7 +173,8 @@ fn scenario<'a>(
         })
     });
     let address = address.clone();
-    let (view, ui) = cx.add_window_view(|_, cx| Conversation::with_source(address, source, cx));
+    let (view, ui) =
+        cx.add_window_view(|_, cx| Conversation::with_source(address, source, None, cx));
     ui.simulate_resize(size(px(630.), px(400.)));
     ui.run_until_parked();
     (view, ui, requests)
@@ -562,8 +586,9 @@ fn hides_revoked_and_reset_history_before_network_answers(cx: &mut TestAppContex
     );
     click(ui, "history-older");
     let delayed = request(&requests, Load::Extend(41, HistoryDirection::Older));
+    let anchor = ui.read(|app| view.read(app).reading_position().unwrap());
     sync(&view, ui, &address, SyncChange::MessengerReset);
-    let reopening = request(&requests, Load::Open(ChatEntry::Latest));
+    let reopening = request(&requests, Load::Open(ChatEntry::Around(anchor.id)));
     answer(delayed, reading(&address, 1..80), ui);
     assert!(ui.read(|cx| matches!(view.read(cx).state, State::Opening)));
     let mut old_address = address.clone();

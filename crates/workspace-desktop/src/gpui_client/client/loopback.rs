@@ -1,5 +1,7 @@
 //! Проверяет путь от окна через каталог и очередь до локального HTTPS/WSS-сервера.
 
+mod position;
+
 use std::{
     convert::Infallible,
     net::{Ipv4Addr, TcpListener},
@@ -337,6 +339,7 @@ impl DetailsFixture {
 /// Записывает наблюдения сервера о готовности подключений и принятой отправке.
 #[derive(Default)]
 struct Received {
+    history_position: Option<position::Fixture>, // Длинная личка и управляемая догрузка старой страницы.
     sent: Mutex<Vec<Uuid>>, // Публичные UUID реально принятых POST в порядке поступления.
     ready: AtomicUsize,     // Сколько подключений подтвердили готовность через WSS.
     targets: AtomicUsize,   // Сколько проверок доступа к стриму вернул HTTPS.
@@ -793,6 +796,12 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
                     .map(|post| topic_message(user, user, post.id, "2026-11-17T10:01:00Z", MARKER)),
             );
             json!(rows)
+        }
+        MESSAGES if state.history_position.is_some() => {
+            return state.history_position.as_ref().unwrap().page(&request, user, peer).await;
+        }
+        path if state.history_position.is_some() && path.starts_with(MESSAGES) => {
+            return state.history_position.as_ref().unwrap().anchor(path, user, peer);
         }
         MESSAGES if state.details.is_some() => json!(
             (DETAILS_FIRST_ROW..DETAILS_LAST_ROW)

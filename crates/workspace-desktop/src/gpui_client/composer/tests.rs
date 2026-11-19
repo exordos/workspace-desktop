@@ -142,7 +142,7 @@ fn conversation(
         drop(cache);
         send_request(&history, (address, load))
     });
-    let mut view = Conversation::with_source(address, source, cx);
+    let mut view = Conversation::with_source(address, source, None, cx);
     view.attach_composer(
         SendSource {
             resolve: Arc::new(move |address, _| send_request(&resolve, address)),
