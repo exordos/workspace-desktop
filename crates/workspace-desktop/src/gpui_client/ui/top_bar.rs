@@ -40,11 +40,17 @@ pub struct TopBarAccount {
 /// Пользователь попросил открыть конкретный вход.
 pub struct TopBarSelection(pub AccountSession); // Вход, видимый на момент действия.
 
+/// Действие верхней панели для текущего входа.
+pub(in crate::gpui_client) enum TopBarAction {
+    OpenProfile, // Открывает или закрывает корневую страницу профиля.
+}
+
 /// Самостоятельный компонент верхней панели; меню живёт вместе с окном.
 pub struct TopBar {
     accounts: Vec<TopBarAccount>, // Последний снимок из оболочки.
     profile_avatar: Option<(AccountSession, Arc<RenderImage>)>, // Готовое фото входа, переданное окном.
     quick_focus: Vec<(AccountSession, FocusHandle)>, // Фокус быстрых кнопок закреплён за входом.
+    profile_focus: FocusHandle,                      // Кнопка профиля и точка возврата из панели.
     trigger_focus: FocusHandle,                      // Сюда возвращается фокус после закрытия меню.
     menu_focus: FocusHandle, // Одна точка клавиатурного ввода для всего меню.
     menu_scroll: ScrollHandle, // Удерживает активную строку в видимой части меню.
@@ -52,6 +58,7 @@ pub struct TopBar {
 }
 
 impl EventEmitter<TopBarSelection> for TopBar {}
+impl EventEmitter<TopBarAction> for TopBar {}
 
 impl TopBar {
     /// Создаёт закрытое меню и независимые точки фокуса.
@@ -59,6 +66,7 @@ impl TopBar {
         Self {
             accounts: Vec::new(),
             profile_avatar: None,
+            profile_focus: cx.focus_handle(),
             quick_focus: Vec::new(),
             trigger_focus: cx.focus_handle(),
             menu_focus: cx.focus_handle(),
@@ -77,6 +85,11 @@ impl TopBar {
             self.profile_avatar = avatar;
             cx.notify();
         }
+    }
+
+    /// Возвращает точку фокуса, из которой открыли профиль.
+    pub(in crate::gpui_client) fn profile_focus(&self) -> FocusHandle {
+        self.profile_focus.clone()
     }
 
     /// Ограничивает обработку клавиш открытым списком, не меняя обход остальных полей окна.
@@ -366,6 +379,78 @@ impl TopBar {
             MenuInput::Close => self.dismiss_menu(window, cx),
         }
     }
+
+    /// Показывает активный аккаунт и открывает его панель профиля.
+    fn active_identity(
+        &self,
+        account: &TopBarAccount,
+        side: gpui::Pixels,
+        palette: Palette,
+        cx: &Context<Self>,
+    ) -> Div {
+        let initials: String = account.label.chars().next().into_iter().collect();
+        let mut avatar = Avatar::from_initials(initials);
+        avatar.size = AvatarSize::Small;
+        avatar.image = self
+            .profile_avatar
+            .as_ref()
+            .filter(|(session, _)| *session == account.session)
+            .map(|(_, image)| ImageSource::Render(image.clone()));
+        let has_image = avatar.image.is_some();
+        let target = cx.weak_entity();
+        div()
+            .w(side)
+            .pr(px(END_INSET))
+            .pl_2()
+            .min_w_0()
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_end()
+            .child(
+                activate(
+                    div()
+                        .id("workspace-profile-trigger")
+                        .h(px(40.))
+                        .min_w_0()
+                        .px_1()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(gpui::transparent_black())
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .overflow_hidden()
+                        .hover(|row| row.bg(palette.card_hover))
+                        .child(avatar.render(palette).when(has_image, |photo| {
+                            photo.debug_selector(|| "workspace-profile-avatar-photo".into())
+                        }))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .w(px(164.))
+                                .child(ellipsized_label(
+                                    palette,
+                                    TextRole::Label,
+                                    account.label.clone(),
+                                ))
+                                .child(ellipsized_label(
+                                    palette,
+                                    TextRole::Caption,
+                                    account.detail.clone(),
+                                )),
+                        )
+                        .child(Icon::ChevronDown.element(px(16.), palette.text_secondary)),
+                    Some(&self.profile_focus),
+                    palette,
+                    move |_, app| {
+                        let _ = target.update(app, |_, cx| cx.emit(TopBarAction::OpenProfile));
+                    },
+                )
+                .debug_selector(|| "workspace-profile-trigger".into())
+                .tooltip(move |_, app| tooltip(palette, "Профиль".into(), app)),
+            )
+    }
 }
 
 impl Render for TopBar {
@@ -462,14 +547,7 @@ impl Render for TopBar {
                 self.accounts
                     .iter()
                     .find(|account| account.selected)
-                    .map(|account| {
-                        let image = self
-                            .profile_avatar
-                            .as_ref()
-                            .filter(|(session, _)| *session == account.session)
-                            .map(|(_, image)| ImageSource::Render(image.clone()));
-                        active_identity(account, image, px(side), palette)
-                    }),
+                    .map(|account| self.active_identity(account, px(side), palette, cx)),
             )
             .when(self.highlight.is_some(), |bar| {
                 let origin = point(px(trigger_x), px((HEIGHT + TRIGGER_SIZE) / 2. + 6.));
@@ -480,49 +558,6 @@ impl Render for TopBar {
                 ))
             })
     }
-}
-
-/// Показывает подпись активного аккаунта, даже если он скрыт среди быстрых кнопок.
-fn active_identity(
-    account: &TopBarAccount,
-    image: Option<ImageSource>,
-    side: gpui::Pixels,
-    palette: Palette,
-) -> Div {
-    let initials: String = account.label.chars().next().into_iter().collect();
-    let mut avatar = Avatar::from_initials(initials);
-    avatar.size = AvatarSize::Small;
-    avatar.image = image;
-    let has_image = avatar.image.is_some();
-    div()
-        .w(side)
-        .pr(px(END_INSET))
-        .pl_2()
-        .min_w_0()
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_end()
-        .gap_2()
-        .overflow_hidden()
-        .child(avatar.render(palette).when(has_image, |photo| {
-            photo.debug_selector(|| "workspace-profile-avatar-photo".into())
-        }))
-        .child(
-            div()
-                .min_w_0()
-                .w(px(164.))
-                .child(ellipsized_label(
-                    palette,
-                    TextRole::Label,
-                    account.label.clone(),
-                ))
-                .child(ellipsized_label(
-                    palette,
-                    TextRole::Caption,
-                    account.detail.clone(),
-                )),
-        )
 }
 
 /// Считает быстрые кнопки, оставляя место стрелке и счётчику скрытых аккаунтов.

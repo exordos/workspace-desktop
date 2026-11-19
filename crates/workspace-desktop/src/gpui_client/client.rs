@@ -2,6 +2,7 @@
 //! Здесь также собирается основная разметка окна из готовых компонентов.
 
 mod notification_banner;
+mod profile;
 
 use std::collections::HashMap;
 
@@ -11,11 +12,12 @@ use gpui::{
 use workspace_core::{auth::SessionStatus, context::AccountId};
 
 use notification_banner::{NotificationBanner, NotificationBannerActions};
+use profile::Profile;
 
 use super::{
     Options,
     avatars::AvatarImages,
-    contracts::{RuntimeEvent, RuntimeExit, ShellAction, SidebarAction},
+    contracts::{AccountSession, RuntimeEvent, RuntimeExit, ShellAction, SidebarAction},
     conversation::{Conversation, OpenDetailsTopic},
     next_control,
     platform_window::WindowPlatform,
@@ -25,7 +27,7 @@ use super::{
     shell::{Shell, ShellEffect},
     sidebar::{FolderIntent, Sidebar},
     sign_in::SignIn,
-    ui::{Palette, TextRole, TopBar, TopBarAccount, TopBarSelection, label},
+    ui::{Palette, TextRole, TopBar, TopBarAccount, TopBarAction, TopBarSelection, label},
 };
 
 const SIDEBAR_PREFERRED_WIDTH: f32 = 299.;
@@ -50,11 +52,12 @@ pub(super) struct Client {
     details_navigation: Option<Subscription>, // Подписка на переход из правой панели текущего экрана.
     right_panel: Entity<RightPanel>,          // Общая история правых панелей рабочего окна.
     sign_in: Option<Entity<SignIn>>,          // Форма нужна, пока в профиле нет доступного входа.
+    profile_requested: Option<AccountSession>, // Нажатие профиля ждёт окно для передачи фокуса.
     profile_avatar: AvatarImages,             // Фото активного входа для верхней панели.
     labels: HashMap<AccountId, String>,       // Подписи для переключателя и баннеров.
     top_bar: Entity<TopBar>, // Шапка хранит локальный фокус и показывает снимок оболочки.
     notification_banner: Entity<NotificationBanner>, // Планка разрешения поверх рабочей области.
-    _top_bar_subscription: Subscription, // Передаёт выбор в оболочку.
+    _top_bar_subscriptions: [Subscription; 2], // Выбор аккаунта и открытие профиля из шапки.
     initial_focus: FocusHandle, // Корневая точка обхода до выбора первого элемента.
     restore_focus: bool,     // После закрытия формы вернуть фокус в рабочую область.
     ready: bool,             // Рабочий поток открыл профиль и подготовил подписки.
@@ -92,6 +95,16 @@ impl Client {
         let selection = cx.subscribe(&top_bar, |client, _, selection: &TopBarSelection, cx| {
             client.handle_action(ShellAction::SelectAccount(selection.0.clone()), cx);
         });
+        let open_profile =
+            cx.subscribe(
+                &top_bar,
+                |client, _, action: &TopBarAction, cx| match action {
+                    TopBarAction::OpenProfile => {
+                        client.profile_requested = client.shell.selected().cloned();
+                        cx.notify();
+                    }
+                },
+            );
         let subscription = cx.subscribe(&sidebar, |client, _, action: &SidebarAction, cx| {
             let action = match action {
                 SidebarAction::OpenChat { route, generation } => SidebarAction::OpenChat {
@@ -113,11 +126,12 @@ impl Client {
             right_panel,
             details_navigation: None,
             sign_in: None,
+            profile_requested: None,
             profile_avatar: AvatarImages::default(),
             labels: options.labels,
             top_bar,
             notification_banner,
-            _top_bar_subscription: selection,
+            _top_bar_subscriptions: [selection, open_profile],
             initial_focus,
             restore_focus: false,
             ready: false,
@@ -438,6 +452,20 @@ impl Client {
         None
     }
 
+    /// Передаёт запрос профиля общему стеку с фокусом кнопки в шапке.
+    fn open_requested_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(session) = self.profile_requested.take()
+            && self.shell.selected() == Some(&session)
+            && self.sign_in.is_none()
+            && self.status().is_none()
+        {
+            let opener = self.top_bar.read(cx).profile_focus();
+            self.right_panel.update(cx, |panel, cx| {
+                Profile::toggle(panel, session, opener, &self.runtime, window, cx);
+            });
+        }
+    }
+
     /// Передаёт шапке изображение активного входа из общей подписки аватара.
     fn sync_profile_avatar(&mut self, cx: &mut Context<Self>) {
         let active = self
@@ -475,6 +503,7 @@ impl Render for Client {
         self.focus_workspace(window, cx);
         self.sync_profile_avatar(cx);
         RightPanel::restore_focus(&self.right_panel, window, cx);
+        self.open_requested_profile(window, cx);
         let palette = Palette::for_window(window, cx);
         let root = div()
             .size_full()

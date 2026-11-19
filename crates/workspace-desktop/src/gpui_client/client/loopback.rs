@@ -468,12 +468,17 @@ impl Drop for Server {
 /// Применяет реальные методы и заголовки протокола к синтетическому чату.
 async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Response<Full<Bytes>> {
     let path = request.uri().path();
+    let two_accounts = state.delayed.is_some()
+        || state.recovery.is_some()
+        || state.topic.is_some()
+        || state
+            .details
+            .as_ref()
+            .is_some_and(|details| details.profile_avatar.is_some());
     if path == "/api/workspace/v1/events/ws" {
         let protocol = request.headers()[header::SEC_WEBSOCKET_PROTOCOL]
             .to_str()
             .unwrap();
-        let two_accounts =
-            state.delayed.is_some() || state.recovery.is_some() || state.topic.is_some();
         let user = match protocol {
             "workspace.events.v1, bearer.local-user" => USER,
             "workspace.events.v1, bearer.local-peer" if two_accounts => PEER,
@@ -554,11 +559,7 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
 
     let (user, peer) = match request.headers()[header::AUTHORIZATION].to_str().unwrap() {
         "Bearer local-user" => (USER, PEER),
-        "Bearer local-peer"
-            if state.delayed.is_some() || state.recovery.is_some() || state.topic.is_some() =>
-        {
-            (PEER, USER)
-        }
+        "Bearer local-peer" if two_accounts => (PEER, USER),
         _ => panic!("HTTPS должен использовать тестовый вход открытого профиля"),
     };
     if path == FOLDERS && request.method() == Method::POST {
@@ -1037,9 +1038,9 @@ fn start_runtime(
     .unwrap()
 }
 
-/// Шапка показывает своё фото, скачанное под текущим входом.
+/// Показывает одно фото под текущим входом и завершает профиль при смене аккаунта.
 #[gpui::test]
-fn own_avatar_is_loaded_for_the_active_top_bar_account(cx: &mut TestAppContext) {
+fn own_avatar_is_shared_between_top_bar_and_profile_root(cx: &mut TestAppContext) {
     cx.update(bind_keys);
     let server = Server::serve(Received {
         details: Some(DetailsFixture {
@@ -1057,10 +1058,25 @@ fn own_avatar_is_loaded_for_the_active_top_bar_account(cx: &mut TestAppContext) 
         .as_ref()
         .unwrap();
     let profile = tempfile::tempdir().unwrap();
-    let (runtime, events) =
-        start_runtime(profile.path(), saved_account(&server, USER, Uuid::nil()));
-    let (client, ui) =
-        cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
+    let a = saved_account(&server, USER, Uuid::nil());
+    let b = saved_account(&server, PEER, PEER.parse().unwrap());
+    let a_id = a.context.account_id.clone();
+    let b_id = b.context.account_id.clone();
+    JsonAccountStore::open(profile.path())
+        .unwrap()
+        .save(&b)
+        .unwrap();
+    let (runtime, events) = start_runtime(profile.path(), a);
+    let (client, ui) = cx.add_window_view(|_, cx| {
+        Client::new(
+            Options {
+                active: Some(a_id.clone()),
+                ..Options::default()
+            },
+            runtime.clone(),
+            cx,
+        )
+    });
     ui.update(|_, app| {
         let subscription = events.attach(&client, app, Client::handle_runtime);
         client.update(app, |client, cx| client.attach(subscription, cx));
@@ -1071,7 +1087,71 @@ fn own_avatar_is_loaded_for_the_active_top_bar_account(cx: &mut TestAppContext) 
         "фото этого входа отображается в шапке",
         |ui| ui.debug_bounds("workspace-profile-avatar-photo").is_some(),
     );
+    let session = ui.read(|app| client.read(app).shell.selected().unwrap().clone());
+    let profile_key = |id: &'static str| PanelKey {
+        scope: Scope::Account(session.clone()),
+        id: id.into(),
+    };
+    let root = profile_key("profile-root");
+    let personal_info = profile_key("profile-personal-info");
+    let active = |ui: &VisualTestContext, key: &PanelKey| {
+        ui.read(|app| client.read(app).right_panel.read(app).is_active(key))
+    };
+    click(ui, "workspace-profile-trigger");
+    until(
+        ui,
+        "фото этого же входа видно в профиле",
+        |ui| active(ui, &root) && ui.debug_bounds("profile-root-avatar-photo").is_some(),
+    );
     assert_eq!(counters.lookups.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.downloads.load(Ordering::SeqCst), 1);
+
+    click(ui, "profile-personal-info");
+    until(
+        ui,
+        "открыта личная информация",
+        |ui| active(ui, &personal_info),
+    );
+    click(ui, "right-panel-back");
+    until(ui, "возврат в профиль", |ui| {
+        active(ui, &root)
+    });
+    click(ui, "right-panel-close");
+    until(ui, "кнопка закрывает профиль", |ui| {
+        !active(ui, &root)
+    });
+    assert!(ui.update(|window, app| {
+        client
+            .read(app)
+            .top_bar
+            .read(app)
+            .profile_focus()
+            .is_focused(window)
+    }));
+    ui.simulate_keystrokes("enter");
+    ui.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("enter").unwrap(),
+    });
+    until(
+        ui,
+        "Enter снова открывает профиль с кнопки в фокусе",
+        |ui| active(ui, &root),
+    );
+    until(
+        ui,
+        "загружен каталог второго входа",
+        |ui| {
+            ui.read(|app| {
+                client.read(app).shell.accounts().iter().any(|row| {
+                    row.session.owner.account_id == b_id && row.status == SessionStatus::Active
+                })
+            })
+        },
+    );
+    click_account(&client, ui, &b_id);
+    assert!(!active(ui, &root));
+    let user = session.user_uuid().expect("UUID первого аккаунта");
+    assert!(ui.read(|app| client.read(app).profile_avatar.image(user, app).is_none()));
     assert_eq!(counters.downloads.load(Ordering::SeqCst), 1);
     assert_eq!(
         futures::executor::block_on(runtime.shutdown()),
