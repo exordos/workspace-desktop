@@ -205,6 +205,7 @@ fn publish_with_older(
             .send(ConversationReply {
                 address,
                 value: Ok(Some(Snapshot {
+                    media_access: None,
                     window: HistoryWindow {
                         id: 7,
                         scope,

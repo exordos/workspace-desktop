@@ -1,5 +1,7 @@
 //! Экран открытого разговора. Здесь находятся запросы, переходы истории и отображение состояний.
 
+#[path = "history/attachments.rs"]
+mod attachments;
 mod details;
 #[path = "history/fixtures.rs"]
 mod history_fixtures;
@@ -25,6 +27,7 @@ use workspace_core::{
 };
 
 use self::{
+    attachments::Attachments,
     details::Panel,
     source::{Failure, Load, LoadResult, Snapshot, Source, runtime_source},
     viewport::{Position, Viewport},
@@ -102,7 +105,8 @@ pub struct Conversation {
     outbox: Vec<OutboxEntry>, // Последний снимок очереди в области разговора.
     viewport: Viewport, // Виртуальный список и его положение.
     scroll_direction: Option<HistoryDirection>, // Последний жест, до него проверяем заполнение окна.
-    screen_focus: FocusHandle,                  // Запасной фокус при исчезновении истории и панели.
+    attachments: Attachments, // Карточки и одиночный просмотр вложений этого разговора.
+    screen_focus: FocusHandle, // Запасной фокус при исчезновении истории и панели.
     history_focus: FocusHandle, // Точка клавиатурной прокрутки в открытом разговоре.
     sending: Option<Sending>, // Рабочий редактор; изолированные тесты истории могут его не подключать.
     heading: Heading,         // Отображаемые названия из текущего каталога.
@@ -115,6 +119,11 @@ pub struct Conversation {
 }
 
 impl Conversation {
+    /// Регистрирует клавиши просмотра фото для рабочего окна.
+    pub(super) fn bind_attachment_keys(app: &mut App) {
+        Attachments::bind_keys(app);
+    }
+
     /// Создаёт экран и сразу запрашивает историю в адресе, переданном оболочкой.
     pub(super) fn open(
         address: ConversationAddress,
@@ -125,6 +134,7 @@ impl Conversation {
     ) -> Self {
         let mut view = Self::with_source(address, runtime_source(runtime.clone()), restore, cx);
         view.attach_composer(SendSource::runtime(runtime.clone()), cx);
+        view.attachments.runtime = Some(runtime.clone());
         view.avatar_runtime = Some(runtime.clone());
         view.details = Some(Panel::new(right_panel, view.address.clone(), runtime, cx));
         view
@@ -150,6 +160,7 @@ impl Conversation {
             outbox: Vec::new(),
             viewport: Viewport::with_page_ahead(HISTORY_PAGE_AHEAD),
             scroll_direction: None,
+            attachments: Attachments::new(cx),
             screen_focus: cx.focus_handle(),
             history_focus: cx.focus_handle().tab_stop(true),
             sending: None,
@@ -322,6 +333,8 @@ impl Conversation {
         self.refresh_heading_avatar(cx);
         if !visible {
             self.clear_history_avatars();
+            self.attachments.invalidate(|_| true, cx);
+            self.attachments.take_restore();
         }
         cx.notify();
     }
@@ -377,6 +390,20 @@ impl Conversation {
         {
             return;
         }
+        match &update.change {
+            SyncChange::HistoryAccessRevoked(_) => {
+                // Файл может принадлежать другой области того же владельца.
+                self.attachments.invalidate(|_| true, cx);
+            }
+            SyncChange::HistoryMessageChanged { message_id } => {
+                self.attachments
+                    .invalidate(|key| key.message == *message_id, cx);
+            }
+            SyncChange::MediaFileInvalidated { file_id } => {
+                self.attachments.invalidate(|key| key.file == *file_id, cx);
+            }
+            _ => {}
+        }
         let scope = self.address.route.scope;
         match update.change {
             SyncChange::MessengerReset => self.restart(cx),
@@ -431,6 +458,7 @@ impl Conversation {
         self.scroll_direction = None;
         self.outbox.clear();
         self.viewport.clear();
+        self.attachments.reset(cx);
         self.clear_history_avatars();
         self.start(Load::Open(self.opening_entry()), cx);
     }
@@ -451,6 +479,7 @@ impl Conversation {
         self.action_error = None;
         self.outbox.clear();
         self.viewport.clear();
+        self.attachments.reset(cx);
         self.clear_history_avatars();
         cx.notify();
     }
@@ -587,7 +616,11 @@ impl Conversation {
 
     /// Устанавливает снимок и восстанавливает позицию чтения, когда пользователь ушёл от хвоста.
     fn show(&mut self, snapshot: Snapshot, flight: Flight, cached: bool, cx: &mut Context<Self>) {
-        let Snapshot { window, outbox } = snapshot;
+        let Snapshot {
+            window,
+            outbox,
+            media_access,
+        } = snapshot;
         if window.scope != self.address.route.scope {
             self.fail(Failure::Changed, cx);
             return;
@@ -636,6 +669,9 @@ impl Conversation {
         if let Some(outbox) = outbox {
             self.outbox = outbox;
         }
+        if matches!(flight.load, Load::Open(_)) {
+            self.attachments.access = media_access;
+        }
         log::debug!(
             "gpui_history op_id={} event=page_received window_id={} rows={} cached={cached}",
             flight.id,
@@ -649,6 +685,8 @@ impl Conversation {
             position,
             flight.id,
         );
+        self.attachments
+            .retain(|key| self.viewport.has_attachment(key), cx);
         if window.messages.is_empty() {
             self.clear_history_avatars();
         }
@@ -1138,8 +1176,9 @@ impl Conversation {
                         .copied()
                         .filter_map(|id| Some((id, self.history_avatars.image(id, cx)?)))
                         .collect();
+                    let cards = self.attachments.cards(cx);
                     self.viewport
-                        .render(palette, peer, images)
+                        .render(palette, peer, images, Some(cards))
                         .into_any_element()
                 };
                 root.child(
@@ -1183,6 +1222,16 @@ impl Render for Conversation {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::for_window(window, cx);
         self.restore_details_for_verified_history(window, cx);
+        if let Some((key, focus)) = self.attachments.take_restore() {
+            if self.viewport.has_visible_attachment(key) {
+                window.focus(&focus);
+            } else if self.has_access() {
+                window.focus(&self.history_focus);
+            } else {
+                window.focus(&self.screen_focus);
+            }
+        }
+        let photo = self.attachments.overlay(window, palette, cx);
         div()
             .id("conversation-layout")
             .relative()
@@ -1191,7 +1240,13 @@ impl Render for Conversation {
             .min_h_0()
             .min_w_0()
             .track_focus(&self.screen_focus)
+            .on_key_down(cx.listener(|view, _: &KeyDownEvent, _, cx| {
+                if view.attachments.is_open() {
+                    cx.stop_propagation();
+                }
+            }))
             .child(self.render_chat(palette, cx))
+            .children(photo)
     }
 }
 

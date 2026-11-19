@@ -309,6 +309,7 @@ pub(crate) fn revoke_scope(
     let topic = scope.topic_id.map(|id| id.to_string());
     // Файловый ACL может относиться к другому стриму, который HTTP-ответ не указал.
     bump(connection, &owner, "")?;
+    bump(connection, &owner, &access_key(scope))?;
     connection.execute(
         "UPDATE messenger_media_objects AS object SET pending = 1
          WHERE owner = ?1 AND pending = 0 AND (
@@ -335,8 +336,8 @@ pub(crate) fn revoke_scope(
     Ok(())
 }
 
-/// Инвалидирует варианты файла и старые сетевые ответы только этого владельца.
-pub(crate) fn revoke_file(
+/// Инвалидирует варианты и ответы без изменения прямых ссылок в сообщениях.
+pub(crate) fn invalidate_cached_file(
     connection: &Connection,
     owner: &OwnerContext,
     file_id: Uuid,
@@ -348,6 +349,7 @@ pub(crate) fn revoke_file(
 pub(crate) fn reset(connection: &Connection, owner: &OwnerContext) -> Result<(), StorageError> {
     let owner = owner_key(owner);
     bump(connection, &owner, "")?;
+    bump(connection, &owner, "access")?;
     connection.execute(
         "DELETE FROM messenger_media_refs WHERE owner = ?1",
         params![owner],
@@ -379,6 +381,36 @@ fn scope_key(stream: Uuid, topic: Option<Uuid>) -> String {
     match topic {
         Some(topic) => format!("scope:{stream}/{topic}"),
         None => format!("scope:{stream}"),
+    }
+}
+
+/// Хранит изменения права на разговор отдельно от ручной очистки его кэша.
+fn access_key(scope: HistoryScope) -> String {
+    format!("access:{}", scope_key(scope.stream_id, scope.topic_id))
+}
+
+impl Storage {
+    /// Читает версии сброса, отзыва стрима и точной темы одним локальным запросом.
+    pub(crate) fn media_access_revision(
+        &self,
+        owner: &OwnerContext,
+        scope: HistoryScope,
+    ) -> Result<i64, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let stream = HistoryScope {
+            stream_id: scope.stream_id,
+            topic_id: None,
+        };
+        let revision = connection
+            .prepare_cached(
+                "SELECT COALESCE(SUM(version), 0) FROM messenger_media_versions
+                 WHERE owner = ?1 AND file IN ('access', ?2, ?3)",
+            )?
+            .query_row(
+                params![owner_key(owner), access_key(stream), access_key(scope)],
+                |row| row.get(0),
+            )?;
+        Ok(revision)
     }
 }
 

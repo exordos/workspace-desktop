@@ -7,13 +7,19 @@ use std::{
 };
 
 use gpui::{
-    Bounds, Div, ImageSource, IntoElement, ListAlignment, ListOffset, ListState, Pixels,
+    App, Bounds, Div, ImageSource, IntoElement, ListAlignment, ListOffset, ListState, Pixels,
     WeakEntity, canvas, div, list, prelude::*, px,
 };
 use uuid::Uuid;
-use workspace_core::storage::{DeliveryStatus, HistoryWindow, OutboxEntry, SendBlock};
+use workspace_core::{
+    messenger::references::{MediaReference, media_references},
+    storage::{DeliveryStatus, HistoryWindow, OutboxEntry, SendBlock},
+};
 
-use super::{Conversation, ReadingAnchor};
+use super::{
+    Conversation, ReadingAnchor,
+    attachments::{AttachmentKey, Cards},
+};
 
 #[path = "paging.rs"]
 mod paging;
@@ -33,6 +39,7 @@ struct Row {
     topic: Uuid,                    // Смена темы начинает новую группу.
     date: Option<String>,           // День создания UTC, если сообщение принято сервером.
     body: String,                   // Текст, полученный из истории или очереди.
+    media: Vec<MediaReference>,     // Прямые вложения подтверждённой строки.
     time: Option<String>,           // Время сервера или пояснение рядом со статусом очереди.
     delivery: Option<DeliveryMark>, // Состояние отправки исходящей строки.
     starts_day: bool,               // Над этой строкой виден новый день.
@@ -253,9 +260,29 @@ impl Viewport {
         }
     }
 
+    /// Проверяет присутствие прямой ссылки в текущем окне разговора.
+    pub(super) fn has_attachment(&self, key: AttachmentKey) -> bool {
+        self.index.get(&key.message).is_some_and(|&index| {
+            self.rows[index]
+                .media
+                .get(key.position)
+                .is_some_and(|reference| reference.file_id == key.file)
+        })
+    }
+
+    /// Проверяет, есть ли у карточки показанная строка, куда можно вернуть фокус.
+    pub(super) fn has_visible_attachment(&self, key: AttachmentKey) -> bool {
+        self.has_attachment(key)
+            && self
+                .painted
+                .borrow()
+                .get(&key.message)
+                .is_some_and(|bounds| bounds.intersects(&self.list.viewport_bounds()))
+    }
+
     /// Показывает список с локальными строками в отдельном окне.
     pub(super) fn render_standalone(&mut self, palette: Palette, peer: String) -> impl IntoElement {
-        self.render(palette, Some(peer), HashMap::new())
+        self.render(palette, Some(peer), HashMap::new(), None)
     }
 
     /// Рисует список и пишет фактическую координату опоры, когда GPUI дойдёт до её строки.
@@ -264,6 +291,7 @@ impl Viewport {
         palette: Palette,
         peer: Option<String>,
         images: HashMap<Uuid, ImageSource>,
+        cards: Option<Cards>,
     ) -> impl IntoElement {
         self.painted.borrow_mut().clear();
         self.painted_offset.set(None);
@@ -272,7 +300,7 @@ impl Viewport {
         let painted_offset = self.painted_offset.clone();
         let measurement = Rc::new(RefCell::new(self.measure.take()));
         let list_state = self.list.clone();
-        list(self.list.clone(), move |index, _, _| {
+        list(self.list.clone(), move |index, _, app| {
             let row = &rows[index];
             let id = row.id;
             let photo = row.avatar_author().and_then(|id| images.get(&id).cloned());
@@ -282,7 +310,7 @@ impl Viewport {
             let list_state = list_state.clone();
             div().relative().w_full().px_3().pt(row.inset())
                 .children(row.date.as_deref().filter(|_| row.starts_day).map(|date| date_separator(palette, date, id)))
-                .child(message_row(row, palette, peer.as_deref(), photo).relative().child(canvas(|_, _, _| (), move |bounds, (), _, _| {
+                .child(message_row(row, palette, peer.as_deref(), photo, cards.as_ref().map(|cards| (cards, app))).relative().child(canvas(|_, _, _| (), move |bounds, (), _, _| {
                     painted.borrow_mut().insert(id, bounds);
                     painted_offset.set(Some(list_state.logical_scroll_top()));
                     let mut measurement = measurement.borrow_mut();
@@ -409,7 +437,13 @@ fn date_separator(palette: Palette, date: &str, id: Uuid) -> Div {
 }
 
 /// Рисует сообщение с общим пузырём и оставляет место аватару в группе собеседника.
-fn message_row(row: &Row, palette: Palette, peer: Option<&str>, photo: Option<ImageSource>) -> Div {
+fn message_row(
+    row: &Row,
+    palette: Palette,
+    peer: Option<&str>,
+    photo: Option<ImageSource>,
+    cards: Option<(&Cards, &mut App)>,
+) -> Div {
     let author = peer.unwrap_or("Участник");
     let id = row.id;
     // Время и пояснения должны читаться и на более тёмной подложке исходящего.
@@ -424,6 +458,42 @@ fn message_row(row: &Row, palette: Palette, peer: Option<&str>, photo: Option<Im
             accent: palette.text_secondary,
             ..palette
         }
+    };
+    let bubble = MessageBubble {
+        author: (!row.own && row.starts_group).then(|| author.to_owned().into()),
+        body: row.body.clone().into(),
+        time: row.time.clone().map(Into::into),
+        own: row.own,
+        delivery: row.delivery,
+    };
+    let bubble = match cards.filter(|_| !row.media.is_empty()) {
+        Some((cards, app)) => bubble.render_with_body(
+            bubble_palette,
+            div()
+                .flex()
+                .flex_col()
+                .min_w_0()
+                .max_w_full()
+                .gap_1()
+                .children(attachment_caption(row).map(|caption| {
+                    label(bubble_palette, TextRole::Body, caption)
+                        .debug_selector(move || format!("history-media-caption-{id}"))
+                }))
+                .children(row.media.iter().enumerate().map(|(position, reference)| {
+                    cards.render(
+                        AttachmentKey {
+                            message: id,
+                            file: reference.file_id,
+                            position,
+                        },
+                        reference,
+                        bubble_palette,
+                        app,
+                    )
+                })),
+            row.ends_group,
+        ),
+        None => bubble.render_in_group(bubble_palette, row.ends_group),
     };
     div()
         .w_full()
@@ -447,20 +517,26 @@ fn message_row(row: &Row, palette: Palette, peer: Option<&str>, photo: Option<Im
         })
         .child(
             div().flex_1().min_w_0().child(
-                MessageBubble {
-                    author: (!row.own && row.starts_group).then(|| author.to_owned().into()),
-                    body: row.body.clone().into(),
-                    time: row.time.clone().map(Into::into),
-                    own: row.own,
-                    delivery: row.delivery,
-                }
-                .render_in_group(bubble_palette, row.ends_group)
-                .debug_selector(move || format!("history-message-{id}"))
-                .when(row.delivery == Some(DeliveryMark::Unknown), |bubble| {
-                    bubble.debug_selector(|| "history-delivery-unknown".into())
-                }),
+                bubble
+                    .debug_selector(move || format!("history-message-{id}"))
+                    .when(row.delivery == Some(DeliveryMark::Unknown), |bubble| {
+                        bubble.debug_selector(|| "history-delivery-unknown".into())
+                    }),
             ),
         )
+}
+
+/// Убирает из подписи ссылки, которые уже показаны карточками.
+fn attachment_caption(row: &Row) -> Option<String> {
+    let mut caption = String::new();
+    let mut offset = 0;
+    for reference in &row.media {
+        caption.push_str(&row.body[offset..reference.range.start]);
+        offset = reference.range.end;
+    }
+    caption.push_str(&row.body[offset..]);
+    let caption = caption.trim();
+    (!caption.is_empty()).then(|| caption.to_owned())
 }
 
 /// Готовит историю и добавляет уникальные строки очереди только после подтверждённого хвоста.
@@ -483,6 +559,7 @@ fn build_rows(history: &HistoryWindow, outbox: &[OutboxEntry], user: Option<Uuid
                     &stamp[0..4]
                 )),
                 body: message.text.clone(),
+                media: media_references(&message.text),
                 time: Some(stamp[11..16].to_owned()),
                 delivery: own.then_some(DeliveryMark::Sent),
                 starts_day: false,
@@ -504,6 +581,7 @@ fn build_rows(history: &HistoryWindow, outbox: &[OutboxEntry], user: Option<Uuid
                     topic: entry.snapshot.topic_id,
                     date: None,
                     body: entry.snapshot.markdown.clone(),
+                    media: Vec::new(),
                     time: Some(delivery_caption(entry.status).into()),
                     delivery: Some(match entry.status {
                         DeliveryStatus::Waiting | DeliveryStatus::Sending => DeliveryMark::Pending,

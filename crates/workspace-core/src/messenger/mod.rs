@@ -10,7 +10,7 @@ pub mod history;
 pub mod message_actions;
 mod outbox;
 pub mod read;
-pub(crate) mod references;
+pub mod references;
 mod rest;
 pub mod send;
 mod socket;

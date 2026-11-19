@@ -21,12 +21,13 @@ use workspace_core::{
     auth::Auth,
     context::{OwnerContext, SessionGeneration},
     messenger::{MessengerSource, SOURCE_ID, history::LatestHistoryOpening},
+    notification_target::NotificationTarget,
     runtime::{EventSource, SourceSession},
     storage::{
-        Cursor, HistoryChange, HistoryScope, Message, Storage,
+        Cursor, HistoryChange, HistoryScope, Message, MessagePlacement, Storage,
         media::{MediaCachePolicy, MediaFilter},
     },
-    sync::{Event, Sync},
+    sync::{Event, Sync, SyncChange, SyncUpdate},
 };
 
 use super::{
@@ -46,6 +47,7 @@ pub(super) struct Api {
     downloads: AtomicUsize,       // Только запросы байтов вложения.
     hold_next: AtomicBool,        // Задержать следующий запрос файла до сигнала.
     download_status: AtomicUsize, // Подменённый статус файлового API, 0 означает полный ответ.
+    anchor_changed: AtomicBool,   // Сервер уже убрал вложение из целевого сообщения.
     received: Notify,             // Сервер получил задержанный запрос.
     release: Notify,              // Тест разрешил вернуть задержанный ответ.
 }
@@ -112,6 +114,18 @@ impl Api {
                 "uuid": topic, "stream_uuid": CHAT, "user_uuid": user,
                 "project_id": "project", "notification_mode": "default"
             }))
+        } else if path.ends_with(&format!("/streams/{CHAT}")) {
+            json_response(json!({
+                "uuid": CHAT, "user_uuid": user, "project_id": "project", "private": true,
+                "direct_user_uuid": ANCHOR, "is_archived": false, "notification_mode": "all_messages"
+            }))
+        } else if path.ends_with(&format!("/messages/{NEWER}")) {
+            let content = if self.anchor_changed.load(Relaxed) {
+                "Вложение убрано на сервере".into()
+            } else {
+                format!("[вложение](urn:file:{FILE})")
+            };
+            json_response(history_message(NEWER, TOPIC, user, content))
         } else {
             assert!(
                 path.ends_with("/messages/"),
@@ -120,10 +134,7 @@ impl Api {
             let topic: Uuid = request
                 .query_pairs()
                 .find(|(key, _)| key == "topic_uuid")
-                .unwrap()
-                .1
-                .parse()
-                .unwrap();
+                .map_or(TOPIC, |(_, value)| value.parse().unwrap());
             let (linked, plain) = if topic == TOPIC {
                 (NEWER, OLDER)
             } else {
@@ -586,4 +597,251 @@ async fn media_cache_scope_cleanup_keeps_shared_copy_until_explicit_clear() {
     })
     .await
     .expect("не завершилась очистка общей копии");
+}
+
+/// Окно вокруг сообщения выдаёт независимый допуск для команды из лички и темы.
+#[tokio::test]
+async fn media_access_works_after_opening_around_and_moves_to_blocking_reader() {
+    timeout(DEADLINE, async {
+        let api = Arc::new(Api::default());
+        let (url, server) = server(api.clone()).await;
+        let fixture = Fixture::new(|_, _| unreachable!());
+        let owner = fixture.login_at(&url, "first");
+        let generation = generation(&fixture.auth, &owner);
+        let profile = tempfile::tempdir().unwrap();
+        let sync = sync_for(&fixture.auth, &profile);
+        let client = source();
+
+        let around = client
+            .open_topic_history_with_media(&sync, &owner, generation, CHAT, TOPIC, NEWER)
+            .await
+            .unwrap();
+        assert!(
+            around
+                .window
+                .messages
+                .iter()
+                .any(|message| message.id == NEWER)
+        );
+        let access = around.media_access.unwrap();
+        let requests = api.requests.load(Relaxed);
+        let reader = client
+            .open_media(&sync, &access, NEWER, FILE)
+            .await
+            .unwrap();
+        let content = tokio::task::spawn_blocking(move || bytes(reader))
+            .await
+            .unwrap();
+        assert_eq!(content, FIRST_BYTES);
+        assert_eq!(api.requests.load(Relaxed), requests + 1);
+
+        let target = NotificationTarget {
+            context: owner,
+            conversation_id: CHAT.to_string(),
+            message_id: NEWER.to_string(),
+        };
+        let direct = client
+            .open_direct_history_with_media(&sync, &target, generation)
+            .await
+            .unwrap()
+            .media_access
+            .unwrap();
+        let requests = api.requests.load(Relaxed);
+        let content = bytes(
+            client
+                .open_media(&sync, &direct, NEWER, FILE)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(content, FIRST_BYTES);
+        assert_eq!(
+            api.requests.load(Relaxed),
+            requests,
+            "превью из лички читает диск"
+        );
+        server.abort();
+    })
+    .await
+    .expect("не завершилась проверка допуска окна вокруг сообщения");
+}
+
+/// Сохраняет допуск этой темы после отзыва соседней и никогда не переносит его в другой профиль.
+#[tokio::test]
+async fn media_access_checks_scope_owner_and_profile_without_rechecking_membership() {
+    timeout(DEADLINE, async {
+        let api = Arc::new(Api::default());
+        let (url, server) = server(api.clone()).await;
+        let fixture = Fixture::new(|_, _| unreachable!());
+        let owner = fixture.login_at(&url, "first");
+        let generation = generation(&fixture.auth, &owner);
+        let profile = tempfile::tempdir().unwrap();
+        let sync = sync_for(&fixture.auth, &profile);
+        let client = source();
+        let opening = load_history(&client, &sync, &owner, generation, TOPIC).await;
+        let access = opening.media_access().unwrap();
+        assert_eq!(
+            bytes(
+                client
+                    .open_media(&sync, &access, NEWER, FILE)
+                    .await
+                    .unwrap()
+            ),
+            FIRST_BYTES
+        );
+        let requests = api.requests.load(Relaxed);
+        let other_profile = tempfile::tempdir().unwrap();
+        let other = sync_for(&fixture.auth, &other_profile);
+        assert!(
+            client
+                .open_media(&other, &access, NEWER, FILE)
+                .await
+                .is_err()
+        );
+
+        for (position, topic) in [(1, OTHER_TOPIC), (2, TOPIC)] {
+            sync.apply(
+                &owner,
+                generation,
+                SOURCE_ID,
+                Event::HistoryChanged {
+                    cursor: Cursor {
+                        epoch_generation: "test".into(),
+                        epoch_version: position,
+                    },
+                    change: HistoryChange::RemoveTopic(MessagePlacement {
+                        stream_id: CHAT.to_string(),
+                        topic_id: topic.to_string(),
+                    }),
+                },
+            )
+            .unwrap();
+            let result = client.open_media(&sync, &access, NEWER, FILE).await;
+            if topic == TOPIC {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(bytes(result.unwrap()), FIRST_BYTES);
+                assert!(opening.list_media(true, None, None, 20).is_err());
+                assert!(opening.open_stream_media(NEWER, FILE).await.is_err());
+            }
+        }
+        assert_eq!(api.requests.load(Relaxed), requests);
+        server.abort();
+    })
+    .await
+    .expect("не завершилась проверка предметного отзыва");
+}
+
+/// Публикует только принятое изменение файла, инвалидирует читатель и разрешает свежий запрос.
+#[tokio::test]
+async fn media_file_events_publish_scoped_invalidation_and_refresh_current_link() {
+    timeout(DEADLINE, async {
+        let api = Arc::new(Api::default());
+        let (url, server) = server(api.clone()).await;
+        let fixture = Fixture::new(|_, _| unreachable!());
+        let owner = fixture.login_at(&url, "first");
+        let generation = generation(&fixture.auth, &owner);
+        let profile = tempfile::tempdir().unwrap();
+        let sync = sync_for(&fixture.auth, &profile);
+        let client = source();
+        let opening = load_history(&client, &sync, &owner, generation, TOPIC).await;
+        let mut opened = opening.open_media(NEWER, FILE).await.unwrap();
+        let mut events = sync.subscribe();
+        let updated = Event::FileUpdated {
+            cursor: Cursor {
+                epoch_generation: "test".into(),
+                epoch_version: 1,
+            },
+            file_id: FILE,
+        };
+        let expected = SyncUpdate {
+            context: owner.clone(),
+            generation,
+            change: SyncChange::MediaFileInvalidated { file_id: FILE },
+        };
+        sync.apply(&owner, generation, SOURCE_ID, updated.clone())
+            .unwrap();
+        assert_eq!(events.try_recv().unwrap(), expected);
+        assert!(opened.read(&mut [0]).is_err());
+        sync.apply(&owner, generation, SOURCE_ID, updated).unwrap();
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        let requests = api.requests.load(Relaxed);
+        let mut fresh = opening.open_media(NEWER, FILE).await.unwrap();
+        assert_eq!(api.requests.load(Relaxed), requests + 1);
+        let mut first_byte = [0];
+        fresh.read_exact(&mut first_byte).unwrap();
+        assert_eq!(first_byte[0], FIRST_BYTES[0]);
+
+        api.download_status.store(404, Relaxed);
+        sync.apply(
+            &owner,
+            generation,
+            SOURCE_ID,
+            Event::FileDeleted {
+                cursor: Cursor {
+                    epoch_generation: "test".into(),
+                    epoch_version: 2,
+                },
+                file_id: FILE,
+            },
+        )
+        .unwrap();
+        assert_eq!(events.try_recv().unwrap(), expected);
+        assert!(fresh.read(&mut [0]).is_err());
+        let requests = api.requests.load(Relaxed);
+        assert!(opening.open_media(NEWER, FILE).await.is_err());
+        assert_eq!(
+            api.requests.load(Relaxed),
+            requests + 1,
+            "права проверяет файловый GET"
+        );
+        server.abort();
+    })
+    .await
+    .expect("не завершилась инвалидация изменений файла");
+}
+
+/// Свежий ответ для целевого сообщения вытесняет старую ссылку ещё до события журнала.
+#[tokio::test]
+async fn media_access_around_replaces_an_attachment_removed_from_the_fresh_anchor() {
+    timeout(DEADLINE, async {
+        let api = Arc::new(Api::default());
+        let (url, server) = server(api.clone()).await;
+        let fixture = Fixture::new(|_, _| unreachable!());
+        let owner = fixture.login_at(&url, "first");
+        let generation = generation(&fixture.auth, &owner);
+        let profile = tempfile::tempdir().unwrap();
+        let sync = sync_for(&fixture.auth, &profile);
+        let client = source();
+        let latest = load_history(&client, &sync, &owner, generation, TOPIC).await;
+        let old = latest.media_access().unwrap();
+        assert_eq!(
+            bytes(client.open_media(&sync, &old, NEWER, FILE).await.unwrap()),
+            FIRST_BYTES
+        );
+
+        api.anchor_changed.store(true, Relaxed);
+        let around = client
+            .open_topic_history_with_media(&sync, &owner, generation, CHAT, TOPIC, NEWER)
+            .await
+            .unwrap();
+        let anchor = around
+            .window
+            .messages
+            .iter()
+            .find(|row| row.id == NEWER)
+            .unwrap();
+        assert_eq!(anchor.text, "Вложение убрано на сервере");
+        let requests = api.requests.load(Relaxed);
+        let new = around.media_access.unwrap();
+        assert!(client.open_media(&sync, &old, NEWER, FILE).await.is_err());
+        assert!(client.open_media(&sync, &new, NEWER, FILE).await.is_err());
+        assert_eq!(api.requests.load(Relaxed), requests);
+        server.abort();
+    })
+    .await
+    .expect("не завершилась проверка свежей ссылки на целевом сообщении");
 }

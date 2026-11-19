@@ -192,6 +192,7 @@ fn request(requests: &mpsc::Receiver<Request>, expected: Load) -> Request {
 /// Возвращает успешный ответ и даёт GPUI отрисовать принятый снимок.
 fn answer(request: Request, window: HistoryWindow, ui: &mut VisualTestContext) {
     request.finish(Ok(Some(Snapshot {
+        media_access: None,
         window,
         outbox: Some(Vec::new()),
     })));
@@ -684,6 +685,7 @@ fn cached_tail_refreshes_and_deduplicates_outbox(cx: &mut TestAppContext) {
     pending
         .cache
         .send(Snapshot {
+            media_access: None,
             window: window(
                 address.route.scope,
                 20..80,
@@ -703,6 +705,7 @@ fn cached_tail_refreshes_and_deduplicates_outbox(cx: &mut TestAppContext) {
         .send(ConversationReply {
             address: pending.address,
             value: Ok(Some(Snapshot {
+                media_access: None,
                 window: window(
                     address.route.scope,
                     20..81,

@@ -1241,12 +1241,19 @@ pub(super) fn wire_event(
     if message_created != (wire.payload.kind == "message.created") {
         return Err(SourceError::InvalidResponse);
     }
-    if wire.object_type == "file" && wire.action == "deleted" && wire.payload.kind == "file.deleted"
+    if wire.object_type == "file"
+        && matches!(
+            (wire.action.as_str(), wire.payload.kind.as_str()),
+            ("deleted", "file.deleted") | ("updated", "file.updated")
+        )
     {
+        let deleted = wire.action == "deleted";
+        // У file.updated поле user_uuid внутри payload — загрузивший файл. Получатель уже сверен
+        // по конверту, а file.deleted не передаёт в payload автора файла.
         if !matches_owner(
             owner,
             wire.payload.project_id.as_deref(),
-            wire.payload.user_uuid.as_deref(),
+            wire.payload.user_uuid.as_deref().filter(|_| deleted),
         ) {
             return Err(SourceError::InvalidResponse);
         }
@@ -1257,7 +1264,8 @@ pub(super) fn wire_event(
             .and_then(parse_uuid)
             .filter(|id| !id.is_nil());
         let event = match file_id {
-            Some(file_id) => Event::FileDeleted { cursor, file_id },
+            Some(file_id) if deleted => Event::FileDeleted { cursor, file_id },
+            Some(file_id) => Event::FileUpdated { cursor, file_id },
             None => Event::Checkpoint(cursor),
         };
         return Ok((event, None));
@@ -1593,6 +1601,31 @@ mod tests {
         assert_eq!(
             wire_event(foreign, &owner(), "epoch").map(|(event, _)| event),
             Err(SourceError::InvalidResponse)
+        );
+    }
+
+    /// В file.updated автор файла может отличаться от получателя, а проект должен совпадать.
+    #[test]
+    fn file_update_distinguishes_uploader_from_recipient() {
+        let file_id = Uuid::from_u128(8);
+        let mut event = json!({
+            "schema_version": 1, "uuid": "event", "epoch_version": 1,
+            "project_id": "project", "user_uuid": "recipient",
+            "object_type": "file", "action": "updated",
+            "payload": {"kind": "file.updated", "uuid": file_id,
+                        "user_uuid": Uuid::from_u128(9), "project_id": "project"},
+        });
+        assert_eq!(
+            decode_page(vec![event.clone()], &owner(), &cursor(0)).unwrap(),
+            [Event::FileUpdated {
+                cursor: cursor(1),
+                file_id
+            }],
+        );
+        event["payload"]["project_id"] = json!("other");
+        assert_eq!(
+            wire_event(event, &owner(), "epoch").map(|(event, _)| event),
+            Err(SourceError::InvalidResponse),
         );
     }
 

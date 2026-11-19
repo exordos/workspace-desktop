@@ -5,7 +5,7 @@ use std::sync::Arc;
 use futures::{channel::oneshot, future::BoxFuture};
 use uuid::Uuid;
 use workspace_core::{
-    messenger::history::OpenHistoryError,
+    messenger::history::{MediaAccess, OpenHistoryError},
     notification_target::NotificationTarget,
     storage::{HistoryDirection, HistoryWindow, OutboxEntry},
 };
@@ -25,8 +25,9 @@ pub(super) enum Load {
 
 /// Снимок для экрана, связанный с проверенным окном истории.
 pub(super) struct Snapshot {
-    pub window: HistoryWindow,            // Подтверждённое окно с краями.
-    pub outbox: Option<Vec<OutboxEntry>>, // None при ошибке чтения очереди.
+    pub window: HistoryWindow,             // Подтверждённое окно с краями.
+    pub outbox: Option<Vec<OutboxEntry>>,  // None при ошибке чтения очереди.
+    pub media_access: Option<MediaAccess>, // Допуск после открытия разговора, если профиль настроил кэш.
 }
 
 /// Причина, которую можно показать без содержимого сетевой ошибки.
@@ -102,24 +103,33 @@ async fn fetch(
     let scope = route.scope;
     let source = &services.messenger;
     let sync = &services.sync;
-    let window = match load {
+    let (window, media_access) = match load {
         Load::Open(ChatEntry::Latest) => {
             let mut opening = source
                 .open_latest_history(sync, owner, generation, scope)
                 .await?;
+            let media_access = opening.media_access();
             if let Some(window) = opening.cached.take() {
-                if let Some(snapshot) = read(services, address, window.id)? {
+                if let Some(mut snapshot) = read(services, address, window.id)? {
+                    snapshot.media_access = media_access.clone();
                     let _ = cached.send(snapshot);
                 }
             } else {
                 drop(cached);
             }
-            opening.refresh().await?
+            (opening.refresh().await?, media_access)
         }
         Load::Open(ChatEntry::Around(id)) => {
-            if let Some(topic) = scope.topic_id {
+            let opening = if let Some(topic) = scope.topic_id {
                 source
-                    .open_topic_history(sync, owner, generation, scope.stream_id, topic, id)
+                    .open_topic_history_with_media(
+                        sync,
+                        owner,
+                        generation,
+                        scope.stream_id,
+                        topic,
+                        id,
+                    )
                     .await?
             } else {
                 let target = NotificationTarget {
@@ -128,9 +138,10 @@ async fn fetch(
                     message_id: id.to_string(),
                 };
                 source
-                    .open_direct_history(sync, &target, generation)
+                    .open_direct_history_with_media(sync, &target, generation)
                     .await?
-            }
+            };
+            (opening.window, opening.media_access)
         }
         Load::Extend(id, direction) => {
             let result = match direction {
@@ -153,12 +164,15 @@ async fn fetch(
                         .await?;
                     return Err(Failure::Changed);
                 }
-                other => other?,
+                other => (other?, None),
             }
         }
         Load::Read(id) => return read(services, address, id),
     };
-    read(services, address, window.id)
+    Ok(read(services, address, window.id)?.map(|mut snapshot| {
+        snapshot.media_access = media_access;
+        snapshot
+    }))
 }
 
 /// Читает очередь перед историей. Если подтверждение придёт между чтениями, UI сверит UUID.
@@ -172,5 +186,9 @@ fn read(services: &WorkerServices, address: &ConversationAddress, id: i64) -> Lo
         .sync
         .refresh_history_window(&route.owner, address.generation, route.scope, id)
         .map_err(|_| Failure::Unavailable)?;
-    Ok(window.map(|window| Snapshot { window, outbox }))
+    Ok(window.map(|window| Snapshot {
+        window,
+        outbox,
+        media_access: None,
+    }))
 }

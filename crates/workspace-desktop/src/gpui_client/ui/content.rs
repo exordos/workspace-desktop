@@ -360,6 +360,19 @@ impl MessageBubble {
 
     /// Рисует текстовый пузырь с учётом положения сообщения в группе.
     pub(in crate::gpui_client) fn render_in_group(self, palette: Palette, ends_group: bool) -> Div {
+        let body = label(palette, TextRole::Body, self.body.clone())
+            .min_w_0()
+            .max_w_full();
+        self.render_with_body(palette, body, ends_group)
+    }
+
+    /// Рисует тот же пузырь с подготовленным содержимым сообщения.
+    pub(in crate::gpui_client) fn render_with_body(
+        self,
+        palette: Palette,
+        content: impl gpui::IntoElement,
+        ends_group: bool,
+    ) -> Div {
         let status = self.delivery.filter(|_| self.own).map(|state| match state {
             DeliveryMark::Pending | DeliveryMark::Unknown => {
                 Icon::Pending.element(px(16.), palette.message_time)
@@ -375,11 +388,7 @@ impl MessageBubble {
             .items_end()
             .gap_x(px(8.))
             .gap_y(px(2.))
-            .child(
-                label(palette, TextRole::Body, self.body)
-                    .min_w_0()
-                    .max_w_full(),
-            )
+            .child(content)
             .when(self.time.is_some() || status.is_some(), |body| {
                 body.child(
                     div()

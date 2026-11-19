@@ -1,46 +1,104 @@
 //! Находит прямые ссылки Workspace на вложения в обычном Markdown сообщений.
+//! Данные для карточки и индекса доступа получаются из одного разбора.
+
+use std::ops::Range;
 
 use markdown::{ParseOptions, mdast::Node, to_mdast};
 use uuid::Uuid;
 
 use crate::storage::media::{MediaKind, MediaLink};
 
-/// Извлекает вложения из Markdown, пропуская код, цитаты и снимки других сообщений.
-pub(crate) fn media_links(text: &str) -> Vec<MediaLink> {
+/// Вложение и сведения, которые можно взять из самого сообщения для показа карточки.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MediaReference {
+    pub range: Range<usize>,  // Границы всей ссылки в байтах исходного Markdown.
+    pub label: String,        // Текст Markdown-ссылки или alt изображения.
+    pub name: Option<String>, // Имя из параметра URN, если оно пригодно для показа.
+    pub file_id: Uuid,        // UUID, который Core сверяет с текущей ссылкой сообщения.
+    pub kind: MediaKind,      // Вид, объявленный в URN.
+    pub image_syntax: bool,   // true для изображения Markdown, false для обычной ссылки.
+}
+
+/// Выделяет подтверждаемые Core вложения в порядке чтения и сохраняет исходные границы.
+pub fn media_references(text: &str) -> Vec<MediaReference> {
     if !text.contains("urn") {
         return Vec::new();
     }
     let Ok(document) = to_mdast(text, &ParseOptions::default()) else {
         return Vec::new();
     };
-    let mut links = Vec::new();
+    let mut references = Vec::new();
     let mut pending = vec![&document];
     while let Some(node) = pending.pop() {
-        match node {
+        let details = match node {
             Node::Blockquote(_) => continue,
-            Node::Image(image) => links.extend(parse_media_url(&image.url)),
-            Node::Link(link) => {
-                if link.url.starts_with("urn:quote:") || link.url.starts_with("urn:forward:") {
-                    continue;
-                }
-                // CommonMark также превращает <urn:...> в Link, но у ссылки Workspace есть метка.
-                if link
-                    .position
-                    .as_ref()
-                    .is_some_and(|range| text.as_bytes().get(range.start.offset) == Some(&b'['))
-                {
-                    links.extend(parse_media_url(&link.url));
-                }
+            Node::Image(image) => Some((image.url.as_str(), true)),
+            Node::Link(link)
+                if link.url.starts_with("urn:quote:") || link.url.starts_with("urn:forward:") =>
+            {
+                continue;
             }
-            _ => {}
+            Node::Link(link)
+                if link.position.as_ref().is_some_and(|range| {
+                    text.as_bytes().get(range.start.offset) == Some(&b'[')
+                }) =>
+            {
+                Some((link.url.as_str(), false))
+            }
+            _ => None,
+        };
+        if let Some(reference) = details.and_then(|(url, image_syntax)| {
+            let position = node.position()?;
+            let range = position.start.offset..position.end.offset;
+            text.get(range.clone())?;
+            let (file_id, kind, name) = parse_media_url(url)?;
+            Some(MediaReference {
+                range,
+                label: display_label(node),
+                name,
+                file_id,
+                kind,
+                image_syntax,
+            })
+        }) {
+            // Если внешняя ссылка уже стала карточкой, её дочерние ссылки входят в тот же диапазон.
+            references.push(reference);
+        } else {
+            pending.extend(node.children().into_iter().flatten().rev());
         }
-        pending.extend(node.children().into_iter().flatten().rev());
     }
-    links
+    references
+}
+
+/// Извлекает те же вложения для локального индекса доступа.
+pub(crate) fn media_links(text: &str) -> Vec<MediaLink> {
+    media_references(text)
+        .into_iter()
+        .map(|reference| MediaLink {
+            file_id: reference.file_id,
+            kind: reference.kind,
+        })
+        .collect()
+}
+
+/// Собирает читаемую подпись, оставляя Markdown-разметку в исходной строке.
+fn display_label(node: &Node) -> String {
+    let mut label = String::new();
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        match node {
+            Node::Image(image) => label.push_str(&image.alt),
+            Node::Text(text) => label.push_str(&text.value),
+            Node::InlineCode(code) => label.push_str(&code.value),
+            Node::Break(_) => label.push(' '),
+            _ => pending.extend(node.children().into_iter().flatten().rev()),
+        }
+    }
+    label.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Разбирает только документированные файловые URN и проверяет формат UUID и параметров.
-fn parse_media_url(url: &str) -> Option<MediaLink> {
+fn parse_media_url(url: &str) -> Option<(Uuid, MediaKind, Option<String>)> {
     let (kind, resource) = url.strip_prefix("urn:")?.split_once(':')?;
     let kind = match kind {
         "file" => MediaKind::File,
@@ -48,48 +106,55 @@ fn parse_media_url(url: &str) -> Option<MediaLink> {
         "video" => MediaKind::Video,
         _ => return None,
     };
-    let (id, query) = resource.split_once('?').unwrap_or((resource, ""));
-    if id.len() != 36 || (resource.contains('?') && !valid_query(query)) {
+    let (id, name) = match resource.split_once('?') {
+        Some((id, query)) => (id, query_name(query)?),
+        None => (resource, None),
+    };
+    if id.len() != 36 {
         return None;
     }
     let file_id = Uuid::parse_str(id).ok().filter(|id| !id.is_nil())?;
-    Some(MediaLink { file_id, kind })
+    Some((file_id, kind, name))
 }
 
-/// Проверяет целые UTF-8 последовательности и percent-encoding в параметрах ссылки.
-fn valid_query(query: &str) -> bool {
-    query.split('&').all(|pair| {
-        let Some((key, value)) = pair.split_once('=') else {
-            return false;
-        };
-        !key.is_empty()
-            && key
+/// Проверяет параметры URN и берёт первое допустимое имя для показа.
+fn query_name(query: &str) -> Option<Option<String>> {
+    let mut name = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=')?;
+        if key.is_empty()
+            || !key
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-            && valid_query_value(value)
-    })
+        {
+            return None;
+        }
+        let decoded = decode_query_value(value)?;
+        if key == "name" && name.is_none() && !decoded.trim().is_empty() {
+            name = Some(decoded.trim().to_owned());
+        }
+    }
+    Some(name)
 }
 
-/// Проверяет, что параметр декодируется без пропуска байтов и управляющих символов.
-fn valid_query_value(value: &str) -> bool {
+/// Декодирует параметр с полными UTF-8 последовательностями, без управляющих символов.
+fn decode_query_value(value: &str) -> Option<String> {
     let mut input = value.bytes();
     let mut decoded = Vec::new();
     while let Some(byte) = input.next() {
         if byte == b'%' {
-            let Some(high) = input.next().and_then(|part| char::from(part).to_digit(16)) else {
-                return false;
-            };
-            let Some(low) = input.next().and_then(|part| char::from(part).to_digit(16)) else {
-                return false;
-            };
+            let high = char::from(input.next()?).to_digit(16)?;
+            let low = char::from(input.next()?).to_digit(16)?;
             decoded.push((high * 16 + low) as u8);
         } else if byte == b'#' || byte.is_ascii_control() {
-            return false;
+            return None;
         } else {
-            decoded.push(byte);
+            decoded.push(if byte == b'+' { b' ' } else { byte });
         }
     }
-    std::str::from_utf8(&decoded).is_ok_and(|text| !text.chars().any(char::is_control))
+    String::from_utf8(decoded)
+        .ok()
+        .filter(|text| !text.chars().any(char::is_control))
 }
 
 #[cfg(test)]
@@ -118,5 +183,28 @@ mod tests {
             ids,
             vec![(file, MediaKind::File), (image, MediaKind::Image)]
         );
+    }
+
+    /// Сверяет границы UTF-8 и подписи для самостоятельной ссылки и изображения внутри текста.
+    #[test]
+    fn projects_file_labels_and_ranges_for_rendering() {
+        let file = Uuid::from_u128(10);
+        let image = Uuid::from_u128(11);
+        let file_link = format!("[**Документ**](urn:file:{file}?name=%D0%B8%D0%BC%D1%8F.txt)");
+        let image_link = format!("![Кадр](urn:image:{image}?content_type=image%2Fpng)");
+        let text = format!("{file_link}\n\nТекст {image_link} после фото.");
+        let references = media_references(&text);
+        assert_eq!(references.len(), 2);
+        let first = &references[0];
+        assert_eq!(&text[first.range.clone()], &file_link);
+        assert_eq!(first.label, "Документ");
+        assert_eq!(first.name.as_deref(), Some("имя.txt"));
+        assert_eq!(first.kind, MediaKind::File);
+        assert!(!first.image_syntax);
+        let second = &references[1];
+        assert_eq!(&text[second.range.clone()], &image_link);
+        assert_eq!(second.label, "Кадр");
+        assert_eq!(second.kind, MediaKind::Image);
+        assert!(second.image_syntax);
     }
 }

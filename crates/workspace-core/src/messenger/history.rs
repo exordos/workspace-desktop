@@ -1,6 +1,9 @@
 //! Открывает историю, догружает её края и находит окно для уведомления.
 
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    sync::{Arc, Weak},
+};
 
 use thiserror::Error;
 use uuid::Uuid;
@@ -20,7 +23,7 @@ use crate::{
 
 use super::{
     MessengerSource,
-    files::{MediaConversation, MediaFile, OpenMediaError},
+    files::{MediaFile, OpenMediaError},
 };
 
 /// Причина, по которой мессенджер не смог вернуть окно.
@@ -42,6 +45,56 @@ pub enum OpenHistoryError {
     Source(#[from] SourceError), // Сбой REST или неожиданный ответ.
 }
 
+/// Допуск к вложениям области, которую Core уже подтвердил при открытии истории.
+#[derive(Clone)]
+pub struct MediaAccess {
+    authority: Weak<()>,            // Идентичность Sync, который выдал допуск.
+    pub(super) owner: OwnerContext, // Владелец истории.
+    pub(super) generation: SessionGeneration, // Подтверждённый вход владельца.
+    pub(super) scope: HistoryScope, // Точная область подтверждённого открытия.
+    revision: i64,                  // Версия отзыва области и сброса журнала перед запросом.
+}
+
+impl MediaAccess {
+    /// Захватывает условия до запроса доступа. Допуск выдаётся только после успешного запроса.
+    fn capture(
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        scope: HistoryScope,
+    ) -> Option<Self> {
+        sync.media_cache()?;
+        Some(Self {
+            authority: Arc::downgrade(sync.media_authority()),
+            owner: owner.clone(),
+            generation,
+            scope,
+            revision: sync.storage().media_access_revision(owner, scope).ok()?,
+        })
+    }
+
+    /// Проверяет профиль и область под блокировкой текущей сессии.
+    pub(super) fn verify(&self, sync: &Sync) -> Result<(), OpenMediaError> {
+        if !self
+            .authority
+            .ptr_eq(&Arc::downgrade(sync.media_authority()))
+            || sync
+                .storage()
+                .media_access_revision(&self.owner, self.scope)?
+                != self.revision
+        {
+            return Err(OpenMediaError::Unavailable);
+        }
+        Ok(())
+    }
+}
+
+/// Подтверждённое окно вокруг сообщения и допуск для открытия его вложений.
+pub struct AnchorHistoryOpening {
+    pub window: HistoryWindow,             // Окно с целевым сообщением.
+    pub media_access: Option<MediaAccess>, // Настроенный для этого профиля допуск.
+}
+
 /// Подтверждённое открытие: сохранённый хвост доступен до сетевого обновления.
 pub struct LatestHistoryOpening<'a> {
     source: &'a MessengerSource,   // Источник для запроса последней страницы.
@@ -50,17 +103,28 @@ pub struct LatestHistoryOpening<'a> {
     generation: SessionGeneration, // Поколение входа при проверке доступа.
     scope: HistoryScope,           // Точная область, подтверждённая сервером.
     pub cached: Option<HistoryWindow>, // Пригодный хвост или None, если его нет.
-    media_generation: Option<i64>, // Версия истории, в которой доступ подтвердил сервер.
+    media_access: Option<MediaAccess>, // Подтверждённый допуск к вложениям.
+    gallery_generation: Option<i64>, // Версия истории владельца, пока пригодны все темы и курсоры.
 }
 
-impl<'a> LatestHistoryOpening<'a> {
+impl LatestHistoryOpening<'_> {
+    /// Возвращает допуск, который можно передать следующей фоновой команде.
+    pub fn media_access(&self) -> Option<MediaAccess> {
+        self.media_access.clone()
+    }
+
     /// Открывает вложение из этой темы или личного разговора.
     pub async fn open_media(
         &self,
         message_id: Uuid,
         file_id: Uuid,
-    ) -> Result<MediaFile<'a>, OpenMediaError> {
-        self.open_media_in_scope(self.scope, message_id, file_id)
+    ) -> Result<MediaFile, OpenMediaError> {
+        let access = self
+            .media_access
+            .as_ref()
+            .ok_or(OpenMediaError::Unconfigured)?;
+        self.source
+            .open_media(self.sync, access, message_id, file_id)
             .await
     }
 
@@ -69,30 +133,22 @@ impl<'a> LatestHistoryOpening<'a> {
         &self,
         message_id: Uuid,
         file_id: Uuid,
-    ) -> Result<MediaFile<'a>, OpenMediaError> {
-        self.open_media_in_scope(self.stream_scope(), message_id, file_id)
-            .await
-    }
-
-    /// Привязывает открытие вложения к доступу, подтверждённому для истории.
-    async fn open_media_in_scope(
-        &self,
-        scope: HistoryScope,
-        message_id: Uuid,
-        file_id: Uuid,
-    ) -> Result<MediaFile<'a>, OpenMediaError> {
-        let history_generation = self.media_generation.ok_or(OpenMediaError::Unconfigured)?;
+    ) -> Result<MediaFile, OpenMediaError> {
+        let access = self
+            .media_access
+            .as_ref()
+            .ok_or(OpenMediaError::Unconfigured)?;
+        let generation = self
+            .gallery_generation
+            .ok_or(OpenMediaError::Unconfigured)?;
         self.source
             .open_cached_media(
                 self.sync,
-                MediaConversation {
-                    owner: self.owner,
-                    generation: self.generation,
-                    scope,
-                    history_generation,
-                },
+                access,
+                self.stream_scope(),
                 message_id,
                 file_id,
+                Some(generation),
             )
             .await
     }
@@ -113,7 +169,13 @@ impl<'a> LatestHistoryOpening<'a> {
         after: Option<MediaHistoryCursor>,
         limit: usize,
     ) -> Result<MediaHistoryPage, OpenMediaError> {
-        let history_generation = self.media_generation.ok_or(OpenMediaError::Unconfigured)?;
+        let access = self
+            .media_access
+            .as_ref()
+            .ok_or(OpenMediaError::Unconfigured)?;
+        let history_generation = self
+            .gallery_generation
+            .ok_or(OpenMediaError::Unconfigured)?;
         let cache = self
             .sync
             .media_cache()
@@ -126,15 +188,12 @@ impl<'a> LatestHistoryOpening<'a> {
         self.sync
             .auth()
             .with_active_generation(self.owner, self.generation, || {
+                access.verify(self.sync)?;
+                let storage = self.sync.storage();
                 let current = if after.is_none() {
-                    self.sync.storage().index_media_history(
-                        self.owner,
-                        scope,
-                        history_generation,
-                        None,
-                    )?
+                    storage.index_media_history(self.owner, scope, history_generation, None)?
                 } else {
-                    self.sync.storage().media_history_generation(self.owner)? == history_generation
+                    storage.media_history_generation(self.owner)? == history_generation
                 };
                 if !current {
                     return Err(OpenMediaError::Unavailable);
@@ -160,8 +219,9 @@ impl MessengerSource {
         generation: SessionGeneration,
         scope: HistoryScope,
     ) -> Result<LatestHistoryOpening<'a>, OpenHistoryError> {
-        let media_generation = sync
-            .media_cache()
+        let media_access = MediaAccess::capture(sync, owner, generation, scope);
+        let gallery_generation = media_access
+            .as_ref()
             .and_then(|_| sync.storage().media_history_generation(owner).ok());
         let scope = self
             .verify_conversation_access(sync, owner, generation, scope)
@@ -179,7 +239,8 @@ impl MessengerSource {
             generation,
             scope,
             cached,
-            media_generation,
+            media_access,
+            gallery_generation,
         })
     }
 
@@ -353,6 +414,19 @@ impl MessengerSource {
         target: &NotificationTarget,
         generation: SessionGeneration,
     ) -> Result<HistoryWindow, OpenHistoryError> {
+        Ok(self
+            .open_direct_history_with_media(sync, target, generation)
+            .await?
+            .window)
+    }
+
+    /// Открывает личку вокруг сообщения и возвращает подтверждённый допуск к вложениям.
+    pub async fn open_direct_history_with_media(
+        &self,
+        sync: &Sync,
+        target: &NotificationTarget,
+        generation: SessionGeneration,
+    ) -> Result<AnchorHistoryOpening, OpenHistoryError> {
         let owner = &target.context;
         let stream_id = target
             .conversation_id
@@ -380,6 +454,22 @@ impl MessengerSource {
         topic_id: Uuid,
         anchor_id: Uuid,
     ) -> Result<HistoryWindow, OpenHistoryError> {
+        Ok(self
+            .open_topic_history_with_media(sync, owner, generation, stream_id, topic_id, anchor_id)
+            .await?
+            .window)
+    }
+
+    /// Открывает тему вокруг сообщения и возвращает подтверждённый допуск к вложениям.
+    pub async fn open_topic_history_with_media(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        stream_id: Uuid,
+        topic_id: Uuid,
+        anchor_id: Uuid,
+    ) -> Result<AnchorHistoryOpening, OpenHistoryError> {
         let scope = HistoryScope {
             stream_id,
             topic_id: Some(topic_id),
@@ -396,7 +486,8 @@ impl MessengerSource {
         generation: SessionGeneration,
         scope: HistoryScope,
         anchor_id: Uuid,
-    ) -> Result<HistoryWindow, OpenHistoryError> {
+    ) -> Result<AnchorHistoryOpening, OpenHistoryError> {
+        let media_access = MediaAccess::capture(sync, owner, generation, scope);
         let auth = sync.auth();
         let token = auth
             .access_token_for_generation(owner, Service::Messenger, generation)
@@ -430,13 +521,18 @@ impl MessengerSource {
             .into_iter()
             .find(|window| {
                 !window.needs_refresh
-                    && window
-                        .messages
-                        .iter()
-                        .any(|message| message.id == anchor_id)
+                    && window.messages.iter().any(|message| {
+                        message.id == anchor.id
+                            && message.stream_id == anchor.stream_id
+                            && message.topic_id == anchor.topic_id
+                            && message.text == anchor.text
+                    })
             })
         {
-            return Ok(window);
+            return Ok(AnchorHistoryOpening {
+                window,
+                media_access,
+            });
         }
 
         let fetched = self
@@ -466,7 +562,8 @@ impl MessengerSource {
         let HistoryPageOutcome::Saved(id) = outcome else {
             return Err(OpenHistoryError::StaleWindow);
         };
-        sync.history_windows(owner, generation, scope)?
+        let window = sync
+            .history_windows(owner, generation, scope)?
             .into_iter()
             .find(|window| {
                 window.id == id
@@ -476,6 +573,10 @@ impl MessengerSource {
                         .iter()
                         .any(|message| message.id == anchor_id)
             })
-            .ok_or(OpenHistoryError::StaleWindow)
+            .ok_or(OpenHistoryError::StaleWindow)?;
+        Ok(AnchorHistoryOpening {
+            window,
+            media_access,
+        })
     }
 }

@@ -15,7 +15,7 @@ use tokio::{sync::mpsc, task::spawn_blocking};
 use uuid::Uuid;
 
 use crate::{
-    auth::{AuthError, Service},
+    auth::{Auth, AuthError, Service},
     context::{OwnerContext, SessionGeneration},
     runtime::SourceError,
     storage::{
@@ -28,7 +28,7 @@ use crate::{
     sync::Sync,
 };
 
-use super::{MessengerSource, rest::RestClient};
+use super::{MessengerSource, history::MediaAccess, rest::RestClient};
 
 /// Причина отказа при открытии вложения.
 #[derive(Debug, Error)]
@@ -54,23 +54,15 @@ impl From<StorageError> for OpenMediaError {
     }
 }
 
-/// Контекст открытия для уже подтверждённого разговора.
-pub(super) struct MediaConversation<'a> {
-    pub owner: &'a OwnerContext,       // Владелец с подтверждённым доступом.
-    pub generation: SessionGeneration, // Вход, подтвердивший область.
-    pub scope: HistoryScope,           // Стрим или тема, выданные открытием истории.
-    pub history_generation: i64,       // Версия отзыва и сброса истории до проверки.
-}
-
 /// Читает завершённую копию через действующую сессию и проверенную ссылку.
-pub struct MediaFile<'a> {
-    sync: &'a Sync,                // Авторизация текущего профиля.
+pub struct MediaFile {
+    auth: Auth,                    // Авторизация профиля остаётся доступной в фоновом потоке.
     owner: OwnerContext,           // Владелец открытого объекта.
     generation: SessionGeneration, // Сессия, которой разрешено чтение.
     reader: MediaReader,           // Дескриптор и версии ссылки и физической записи.
 }
 
-impl MediaFile<'_> {
+impl MediaFile {
     /// Возвращает длину завершённой копии.
     pub fn size(&self) -> u64 {
         self.reader.size()
@@ -82,10 +74,10 @@ impl MediaFile<'_> {
     }
 }
 
-impl Read for MediaFile<'_> {
+impl Read for MediaFile {
     /// Передаёт порцию байтов только пока сессия и копия действительны.
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let auth = self.sync.auth();
+        let auth = &self.auth;
         let revoked = |_| io::Error::new(io::ErrorKind::PermissionDenied, "media session revoked");
         auth.with_active_generation(&self.owner, self.generation, || ())
             .map_err(revoked)?;
@@ -138,20 +130,30 @@ impl MediaLoads {
 }
 
 impl MessengerSource {
-    /// Открывает готовую копию или загружает оригинал, пока ссылка и сессия действительны.
-    pub(super) async fn open_cached_media<'a>(
+    /// Открывает вложение по допуску истории, не подтверждая разговор повторным HTTP-запросом.
+    pub async fn open_media(
         &self,
-        sync: &'a Sync,
-        conversation: MediaConversation<'_>,
+        sync: &Sync,
+        access: &MediaAccess,
         message_id: Uuid,
         file_id: Uuid,
-    ) -> Result<MediaFile<'a>, OpenMediaError> {
-        let MediaConversation {
-            owner,
-            generation,
-            scope,
-            history_generation,
-        } = conversation;
+    ) -> Result<MediaFile, OpenMediaError> {
+        self.open_cached_media(sync, access, access.scope, message_id, file_id, None)
+            .await
+    }
+
+    /// Открывает готовую копию или загружает оригинал, пока ссылка и сессия действительны.
+    pub(super) async fn open_cached_media(
+        &self,
+        sync: &Sync,
+        access: &MediaAccess,
+        scope: HistoryScope,
+        message_id: Uuid,
+        file_id: Uuid,
+        gallery_generation: Option<i64>,
+    ) -> Result<MediaFile, OpenMediaError> {
+        let owner = &access.owner;
+        let generation = access.generation;
         let cache = sync.media_cache().ok_or(OpenMediaError::Unconfigured)?;
         let source = MediaSource { scope, message_id };
         let key = MediaKey {
@@ -159,18 +161,25 @@ impl MessengerSource {
             variant: MediaVariant::Original,
         };
         let fence = sync.auth().with_active_generation(owner, generation, || {
-            if sync.storage().media_history_generation(owner)? != history_generation {
+            access.verify(sync)?;
+            let storage = sync.storage();
+            if let Some(expected) = gallery_generation
+                && storage.media_history_generation(owner)? != expected
+            {
                 return Err(OpenMediaError::Unavailable);
             }
             match cache.prepare(owner, source, key) {
                 Err(MediaCacheError::Unavailable) => {
                     // Старый профиль индексирует запрошенное сообщение при первом открытии вложения.
-                    sync.storage().index_media_history(
+                    let history_generation = storage.media_history_generation(owner)?;
+                    if !storage.index_media_history(
                         owner,
                         scope,
                         history_generation,
                         Some(message_id),
-                    )?;
+                    )? {
+                        return Err(OpenMediaError::Unavailable);
+                    }
                     Ok(cache.prepare(owner, source, key)?)
                 }
                 result => Ok(result?),
@@ -214,7 +223,7 @@ impl MessengerSource {
             }
         };
         Ok(MediaFile {
-            sync,
+            auth: sync.auth().clone(),
             owner: owner.clone(),
             generation,
             reader,

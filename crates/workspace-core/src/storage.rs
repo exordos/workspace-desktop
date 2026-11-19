@@ -72,7 +72,7 @@ pub(crate) struct EventWrite<'a> {
     pub history: Option<&'a HistoryChange>,         // Правка или удаление.
     pub folder: Option<FolderChange>,               // Сверка состава папок или удаление связей.
     pub avatar: Option<AvatarEvent<'a>>,            // Изменение ссылки, сверка или удаление файла.
-    pub media_deleted: Option<Uuid>,                // UUID удалённого вложения мессенджера.
+    pub media_invalidated: Option<Uuid>,            // UUID изменённого или удалённого вложения.
 }
 
 /// Число непрочитанных и позиция журнала, до которой оно уже учитывает изменения.
@@ -501,9 +501,9 @@ impl Storage {
             }
         }
         if source == crate::messenger::SOURCE_ID
-            && let Some(file_id) = change.media_deleted
+            && let Some(file_id) = change.media_invalidated
         {
-            media::revoke_file(&transaction, owner, file_id)?;
+            media::invalidate_cached_file(&transaction, owner, file_id)?;
         }
 
         let mut folder_changed = false;

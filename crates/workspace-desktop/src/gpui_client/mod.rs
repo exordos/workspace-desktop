@@ -112,6 +112,7 @@ fn refresh_on_appearance(window: &Window) {
 
 /// Регистрирует системный ввод и общий порядок фокуса для всех частей окна.
 fn bind_keys(app: &mut App) {
+    conversation::Conversation::bind_attachment_keys(app);
     ui::TextInput::bind_keys(app);
     Sidebar::bind_keys(app);
     Editor::bind_keys(app);

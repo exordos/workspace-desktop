@@ -128,12 +128,18 @@ impl RuntimeClient {
                 .map_err(|_| StartupError::Database)?;
             let messenger =
                 MessengerSource::with_private_ca(&ca).map_err(|_| StartupError::Worker)?;
-            let mut parts = WorkerParts::with_sources(
-                auth,
-                Arc::new(storage),
-                Arc::new(messenger),
-                |services| Runtime::new(services.sync.clone(), vec![services.messenger.clone()]),
-            )?;
+            let storage = Arc::new(storage);
+            let sync = Sync::with_media_cache(
+                auth.clone(),
+                storage.clone(),
+                directory.join("messenger-media"),
+                MediaCachePolicy::default(),
+            )
+            .map_err(|_| StartupError::Profile)?;
+            let mut parts =
+                WorkerParts::with_sync(auth, storage, Arc::new(messenger), sync, |services| {
+                    Runtime::new(services.sync.clone(), vec![services.messenger.clone()])
+                })?;
             parts.services.folder_preferences = Arc::new(FolderPreferenceStore::open(&directory));
             Ok((parts, released))
         })

@@ -1,5 +1,6 @@
 //! Проверяет путь от окна через каталог и очередь до локального HTTPS/WSS-сервера.
 
+mod media;
 mod position;
 
 use std::{
@@ -339,6 +340,7 @@ impl DetailsFixture {
 /// Записывает наблюдения сервера о готовности подключений и принятой отправке.
 #[derive(Default)]
 struct Received {
+    media: Option<media::Fixture>, // Карточка фото из обычного сообщения и наблюдения HTTPS.
     history_position: Option<position::Fixture>, // Длинная личка и управляемая догрузка старой страницы.
     sent: Mutex<Vec<Uuid>>, // Публичные UUID реально принятых POST в порядке поступления.
     ready: AtomicUsize,     // Сколько подключений подтвердили готовность через WSS.
@@ -471,6 +473,9 @@ impl Drop for Server {
 /// Применяет реальные методы и заголовки протокола к синтетическому чату.
 async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Response<Full<Bytes>> {
     let path = request.uri().path();
+    if let Some(media) = &state.media {
+        media.observe();
+    }
     let two_accounts = state.delayed.is_some()
         || state.recovery.is_some()
         || state.topic.is_some()
@@ -513,6 +518,11 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
                 .and_then(|details| details.live.lock().unwrap().clone())
         {
             live = Some((sender.subscribe(), false));
+        }
+        if user == USER
+            && let Some(media) = &state.media
+        {
+            live = Some((media.live.subscribe(), false));
         }
         let key = request.headers().get(header::SEC_WEBSOCKET_KEY).unwrap();
         let accept = derive_accept_key(key.as_bytes());
@@ -565,6 +575,11 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         "Bearer local-peer" if two_accounts => (PEER, USER),
         _ => panic!("HTTPS должен использовать тестовый вход открытого профиля"),
     };
+    if let Some(media) = &state.media
+        && let Some(response) = media.response(&request, user, peer)
+    {
+        return response;
+    }
     if path == FOLDERS && request.method() == Method::POST {
         let bytes = request.into_body().collect().await.unwrap().to_bytes();
         let body: Value = serde_json::from_slice(&bytes).unwrap();

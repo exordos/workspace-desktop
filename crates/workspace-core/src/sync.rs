@@ -72,6 +72,9 @@ pub enum SyncChange {
         message_id: Uuid, // UUID исправленной или удалённой строки.
     },
     HistoryAccessRevoked(HistoryRevocation), // Область, которую больше нельзя показывать.
+    MediaFileInvalidated {
+        file_id: Uuid, // Файл изменился или удалён, прежнее превью нужно убрать.
+    },
     SidebarDetailsChanged {
         stream_id: Uuid, // Стрим, чья открытая панель должна получить обновление.
     },
@@ -138,6 +141,10 @@ pub enum Event {
         cursor: Cursor, // Позиция удаления в журнале Workspace.
         file_id: Uuid,  // UUID файла, на который мог ссылаться профиль.
     },
+    FileUpdated {
+        cursor: Cursor, // Позиция изменения метаданных в журнале Workspace.
+        file_id: Uuid,  // UUID файла, сохранённые сведения о котором устарели.
+    },
     UnreadChanged {
         cursor: Cursor, // Позиция события обновления папки в журнале.
         count: u32,     // Новый счётчик папки «Все чаты».
@@ -165,6 +172,7 @@ impl Event {
             | Self::SidebarChanged { cursor, .. }
             | Self::UserUpdated { cursor, .. }
             | Self::FileDeleted { cursor, .. }
+            | Self::FileUpdated { cursor, .. }
             | Self::UnreadChanged { cursor, .. }
             | Self::FolderChanged { cursor, .. }
             | Self::UnreadBaseline { cursor, .. }
@@ -228,6 +236,7 @@ pub struct Sync {
     storage: Arc<Storage>,                // Общая локальная база сообщений, позиций и счётчиков.
     updates: broadcast::Sender<SyncUpdate>, // Канал изменений. Оформление окна получает их после записи.
     media_cache: Option<MediaCache>,        // Дисковые копии вложений, если профиль указал каталог.
+    media_authority: Arc<()>,               // Отличает допуск этого экземпляра от другого профиля.
     media_updates: watch::Sender<()>,       // Сигнал повторно проверить незавершённое чтение.
     pub(crate) media_loads: MediaLoads,     // Одна работа на вложение и поколение сессии.
 }
@@ -243,6 +252,7 @@ impl Sync {
             avatar_loads: AvatarLoads::default(),
             updates: broadcast::channel(128).0,
             media_cache: None,
+            media_authority: Arc::new(()),
             media_updates: watch::channel(()).0,
             media_loads: MediaLoads::default(),
         }
@@ -265,6 +275,11 @@ impl Sync {
     /// Даёт файловому модулю доступ к копиям того же профиля.
     pub(crate) fn media_cache(&self) -> Option<&MediaCache> {
         self.media_cache.as_ref()
+    }
+
+    /// Возвращает идентичность профиля для непрозрачного допуска к медиа.
+    pub(crate) fn media_authority(&self) -> &Arc<()> {
+        &self.media_authority
     }
 
     /// Даёт выполняющимся загрузкам сигнал перечитать границы доступа после фиксации.
@@ -679,6 +694,13 @@ impl Sync {
                 }
                 _ => None,
             };
+            let media_invalidated = match (&event, source) {
+                (
+                    Event::FileDeleted { file_id, .. } | Event::FileUpdated { file_id, .. },
+                    crate::messenger::SOURCE_ID,
+                ) => Some(*file_id),
+                _ => None,
+            };
             let saved = self.storage.apply(
                 owner,
                 source,
@@ -692,17 +714,21 @@ impl Sync {
                     history,
                     folder,
                     avatar,
-                    media_deleted: match &event {
-                        Event::FileDeleted { file_id, .. } => Some(*file_id),
-                        _ => None,
-                    },
+                    media_invalidated,
                 },
             )?;
             if saved.outcome == ApplyOutcome::Applied
                 && source == crate::messenger::SOURCE_ID
-                && (history.is_some() || matches!(event, Event::FileDeleted { .. }))
+                && (history.is_some() || media_invalidated.is_some())
             {
                 self.note_media_change();
+                if let Some(file_id) = media_invalidated {
+                    self.publish(
+                        owner,
+                        generation,
+                        SyncChange::MediaFileInvalidated { file_id },
+                    );
+                }
             }
             if let Some(count) = unread.filter(|_| saved.unread_changed) {
                 self.publish(owner, generation, SyncChange::Unread(count));
