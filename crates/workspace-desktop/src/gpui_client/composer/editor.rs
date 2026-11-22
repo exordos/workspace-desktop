@@ -4,6 +4,13 @@ use std::{cell::RefCell, ops::Range, rc::Rc};
 
 use crate::gpui_client::ui::{Palette, ThemeMode};
 
+mod formatting;
+mod text_menu;
+
+pub(super) use formatting::Format;
+
+use text_menu::TextMenu;
+
 use gpui::{
     App, AvailableSpace, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Element,
     ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
@@ -33,6 +40,11 @@ mod keys {
             Copy,
             Cut,
             Paste,
+            OpenTextMenu,
+            FormatBold,
+            FormatItalic,
+            FormatStrike,
+            FormatInlineCode,
         ]
     );
 }
@@ -61,6 +73,7 @@ pub struct Editor {
     layout: Option<TextLayout>, // Последняя нарисованная геометрия для мыши и IME.
     layout_current: bool, // Геометрия относится к текущей версии текста.
     dragging: bool,      // Зажата кнопка мыши при выделении текста.
+    text_menu: TextMenu, // Доступность и фокус контекстных команд поля.
 }
 
 impl Editor {
@@ -78,6 +91,7 @@ impl Editor {
             layout: None,
             layout_current: false,
             dragging: false,
+            text_menu: TextMenu::new(cx),
         }
     }
 
@@ -149,12 +163,51 @@ impl Editor {
             KeyBinding::new("cmd-c", keys::Copy, Some("WorkspaceComposerEditor")),
             KeyBinding::new("cmd-x", keys::Cut, Some("WorkspaceComposerEditor")),
             KeyBinding::new("cmd-v", keys::Paste, Some("WorkspaceComposerEditor")),
+            KeyBinding::new("shift-f10", keys::OpenTextMenu, Some("ComposerSends")),
+            KeyBinding::new("menu", keys::OpenTextMenu, Some("ComposerSends")),
+            KeyBinding::new("cmd-b", keys::FormatBold, Some("ComposerSends")),
+            KeyBinding::new("cmd-i", keys::FormatItalic, Some("ComposerSends")),
+            KeyBinding::new("cmd-shift-x", keys::FormatStrike, Some("ComposerSends")),
+            KeyBinding::new("cmd-e", keys::FormatInlineCode, Some("ComposerSends")),
         ]);
     }
 
     /// Возвращает текущее содержимое, в том числе незавершённую композицию IME.
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// Проверяет, доступно ли форматирование текущего выделения.
+    pub(super) fn can_format(&self) -> bool {
+        !self.composing() && !self.text_menu.is_open()
+    }
+
+    /// Выполняет действие панели или сочетания клавиш тем же путём, что и обычный ввод.
+    pub(super) fn apply_format(&mut self, format: Format, cx: &mut Context<Self>) {
+        if !self.can_format() {
+            return;
+        }
+        let selection = self.selection();
+        let (text, relative_selection) = format.edit(&self.text[selection.clone()]);
+        let inserted = self.replace(selection, &text, cx);
+        self.anchor = inserted.start + relative_selection.start;
+        self.caret = inserted.start + relative_selection.end;
+    }
+
+    /// Продолжает список по Shift+Enter или вставляет обычный перевод строки.
+    fn insert_newline(&mut self, cx: &mut Context<Self>) {
+        if self.composing() {
+            return;
+        }
+        let selection = self.selection();
+        if self.send_on_enter
+            && selection.is_empty()
+            && let Some((range, text)) = formatting::list_newline(&self.text, self.caret)
+        {
+            self.replace(range, &text, cx);
+        } else {
+            self.replace(selection, "\n", cx);
+        }
     }
 
     /// Возвращает границы выделения независимо от направления.
@@ -235,6 +288,12 @@ impl Editor {
             .unwrap_or_else(|| self.selection())
     }
 
+    /// Выделяет весь текст, оставляя курсор у конца.
+    fn select_all(&mut self, cx: &mut Context<Self>) {
+        self.anchor = 0;
+        self.move_to(self.text.len(), true, cx);
+    }
+
     /// Копирует выделенный текст, при вырезании удаляет его после записи в буфер.
     fn copy(&mut self, cut: bool, cx: &mut Context<Self>) {
         let selection = self.selection();
@@ -279,7 +338,7 @@ impl Editor {
             return;
         }
         cx.stop_propagation();
-        if !event.is_held && !self.composing() {
+        if !event.is_held && !self.composing() && !self.text_menu.is_open() {
             cx.emit(SubmitRequested);
         }
     }
@@ -470,7 +529,9 @@ impl Render for Editor {
                     .text_color(rgb(0xf1f2f5))
             })
             .text_size(FONT_SIZE)
-            .key_context(if self.send_on_enter {
+            .key_context(if self.text_menu.is_open() {
+                ""
+            } else if self.send_on_enter {
                 "WorkspaceComposerEditor ComposerSends"
             } else {
                 "WorkspaceComposerEditor"
@@ -478,7 +539,27 @@ impl Render for Editor {
             .track_focus(&self.focus)
             .cursor(CursorStyle::IBeam)
             .when(self.send_on_enter, |field| {
-                field.on_key_down(cx.listener(Self::handle_enter))
+                field
+                    .on_key_down(cx.listener(Self::handle_enter))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(Self::open_text_menu_at_pointer),
+                    )
+                    .on_action(cx.listener(|editor, _: &keys::OpenTextMenu, window, cx| {
+                        editor.open_text_menu_from_keyboard(window, cx);
+                    }))
+                    .on_action(cx.listener(|editor, _: &keys::FormatBold, _, cx| {
+                        editor.apply_format(Format::Bold, cx)
+                    }))
+                    .on_action(cx.listener(|editor, _: &keys::FormatItalic, _, cx| {
+                        editor.apply_format(Format::Italic, cx)
+                    }))
+                    .on_action(cx.listener(|editor, _: &keys::FormatStrike, _, cx| {
+                        editor.apply_format(Format::Strike, cx)
+                    }))
+                    .on_action(cx.listener(|editor, _: &keys::FormatInlineCode, _, cx| {
+                        editor.apply_format(Format::InlineCode, cx)
+                    }))
             })
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_move(cx.listener(Self::mouse_move))
@@ -511,16 +592,16 @@ impl Render for Editor {
             .on_action(cx.listener(|editor, _: &keys::Backspace, _, cx| editor.delete(false, cx)))
             .on_action(cx.listener(|editor, _: &keys::Delete, _, cx| editor.delete(true, cx)))
             .on_action(cx.listener(|editor, _: &keys::Newline, _, cx| {
-                editor.replace(editor.input_range(None), "\n", cx);
+                editor.insert_newline(cx);
             }))
             .on_action(cx.listener(|editor, _: &keys::SelectAll, _, cx| {
-                editor.anchor = 0;
-                editor.move_to(editor.text.len(), true, cx);
+                editor.select_all(cx);
             }))
             .on_action(cx.listener(|editor, _: &keys::Copy, _, cx| editor.copy(false, cx)))
             .on_action(cx.listener(|editor, _: &keys::Cut, _, cx| editor.copy(true, cx)))
             .on_action(cx.listener(|editor, _: &keys::Paste, _, cx| editor.paste(cx)))
             .child(EditorSurface(cx.entity()))
+            .children(self.render_text_menu(window, cx))
     }
 }
 

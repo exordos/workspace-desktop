@@ -18,7 +18,7 @@ pub(super) const MESSAGE_BUBBLE_RADIUS: Pixels = px(18.);
 /// Радиус компактных кнопок и полей ввода UI-кита.
 pub(super) const CONTROL_RADIUS: Pixels = px(8.);
 /// Толщина обычной и резервной границы компонентов UI-кита.
-pub(super) const CONTROL_BORDER: Pixels = px(1.);
+pub(in crate::gpui_client) const CONTROL_BORDER: Pixels = px(1.);
 /// Высота стандартного компактного контрола и ширина кнопки с одной иконкой.
 pub(super) const COMPACT_CONTROL_SIZE: Pixels = px(32.);
 /// Горизонтальный отступ компактной кнопки и поля.

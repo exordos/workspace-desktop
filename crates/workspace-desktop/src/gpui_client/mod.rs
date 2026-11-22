@@ -74,6 +74,7 @@ fn run_in(
     application.on_reopen(WindowPlatform::show_window);
     application.run(move |app| {
         bind_keys(app);
+        composer::install_toolbar_preferences(&profile, app);
         let window_options = WindowPlatform::window_options(&profile, app);
         let window = app.open_window(window_options, |window, app| {
             refresh_on_appearance(window);

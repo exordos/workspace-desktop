@@ -6,8 +6,8 @@ use std::{
 };
 
 use gpui::{
-    ClipboardItem, EntityInputHandler, Focusable, KeyDownEvent, Keystroke, ListOffset, Modifiers,
-    TestAppContext, VisualTestContext, px, size,
+    ClipboardItem, EntityInputHandler, Focusable, KeyDownEvent, KeyUpEvent, Keystroke, ListOffset,
+    Modifiers, MouseButton, TestAppContext, VisualTestContext, px, size,
 };
 use workspace_core::{
     context::{AccountId, OwnerContext, SessionGeneration},
@@ -23,6 +23,9 @@ use super::*;
 
 #[path = "../history/stability.rs"]
 mod stability;
+
+#[path = "tests/toolbar.rs"]
+mod toolbar;
 
 const MESSAGE: Uuid = Uuid::from_u128(2001);
 const TOPIC: Uuid = Uuid::from_u128(2002);
@@ -162,7 +165,10 @@ fn conversation(
 
 /// Открывает тестовое окно на том же представлении разговора, что и приложение.
 fn start(cx: &mut TestAppContext) -> (Entity<Conversation>, &mut VisualTestContext, Requests) {
-    cx.update(Editor::bind_keys);
+    cx.update(|app| {
+        Editor::bind_keys(app);
+        crate::gpui_client::ui::TopBar::bind_keys(app);
+    });
     let mut requests = None;
     let (view, ui) = cx.add_window_view(|_, cx| {
         let (view, channels) = conversation("test-a", 5, cx);
@@ -336,6 +342,120 @@ fn accepts_only_valid_text_and_one_click_while_saving(cx: &mut TestAppContext) {
     publish(&requests, Load::Read(7), vec![], vec![], ui);
 }
 
+/// Читает актуальное состояние меню. В debug_bounds GPUI остаётся геометрия закрытых элементов.
+fn text_menu_open(view: &Entity<Conversation>, ui: &VisualTestContext) -> bool {
+    ui.read(|app| {
+        view.read(app)
+            .tested_composer()
+            .unwrap()
+            .read(app)
+            .editor()
+            .read(app)
+            .text_menu_is_open()
+    })
+}
+
+/// Отпускает Enter после его нажатия, как при выборе команды меню в приложении.
+fn confirm_text_menu(ui: &mut VisualTestContext) {
+    ui.simulate_keystrokes("enter");
+    ui.simulate_event(KeyUpEvent {
+        keystroke: Keystroke::parse("enter").unwrap(),
+    });
+    ui.run_until_parked();
+}
+
+/// Системное меню работает в нормальном разговоре, удерживает Enter и сохраняет выделение.
+#[gpui::test]
+fn composer_text_menu_edits_selection_without_sending(cx: &mut TestAppContext) {
+    let (view, ui, requests) = start(cx);
+    publish(&requests, Load::Open(ChatEntry::Latest), vec![], vec![], ui);
+    allow(&requests, Ok(TOPIC), ui);
+
+    click(ui, "workspace-composer-editor");
+    ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string("Ёж 🧪".into())));
+    let editor_bounds = ui.debug_bounds("workspace-composer-editor").unwrap();
+    ui.simulate_keystrokes("shift-f10");
+    let menu_bounds = ui
+        .debug_bounds("composer-text-menu")
+        .expect("Меню видно в рабочем окне");
+    assert_eq!(menu_bounds.size, size(px(180.), px(138.)));
+    assert_eq!(
+        ui.debug_bounds("workspace-composer-editor"),
+        Some(editor_bounds)
+    );
+    click(ui, "composer-text-cut");
+    click(ui, "composer-text-copy");
+    click(ui, "composer-text-select-all");
+    assert!(ui.debug_bounds("composer-text-menu").is_some());
+    confirm_text_menu(ui);
+    assert_eq!(draft(&view, ui), "Ёж 🧪");
+    assert!(!text_menu_open(&view, ui));
+
+    ui.simulate_keystrokes("menu end");
+    assert!(ui.debug_bounds("composer-text-menu").is_some());
+    confirm_text_menu(ui);
+    // Правый клик даже вне выделенного слова не меняет исходный диапазон.
+    let position = ui
+        .debug_bounds("workspace-composer-editor")
+        .unwrap()
+        .center();
+    ui.simulate_mouse_down(position, MouseButton::Right, Modifiers::none());
+    ui.simulate_mouse_up(position, MouseButton::Right, Modifiers::none());
+    ui.run_until_parked();
+    assert!(ui.debug_bounds("composer-text-menu").is_some());
+    click(ui, "composer-text-copy");
+    assert_eq!(draft(&view, ui), "Ёж 🧪");
+    assert!(!text_menu_open(&view, ui));
+    let copied = ui.update(|_, app| app.read_from_clipboard().and_then(|item| item.text()));
+    assert_eq!(copied.as_deref(), Some("Ёж 🧪"));
+
+    ui.simulate_keystrokes("right shift-left shift-f10 escape");
+    assert!(!text_menu_open(&view, ui));
+    ui.simulate_keystrokes("shift-f10");
+    confirm_text_menu(ui);
+    assert_eq!(draft(&view, ui), "Ёж ");
+    let selected = ui.update(|_, app| app.read_from_clipboard().and_then(|item| item.text()));
+    assert_eq!(selected.as_deref(), Some("🧪"));
+    assert!(
+        requests.save.try_recv().is_err(),
+        "Меню не отправляет черновик по Enter"
+    );
+}
+
+/// Меню закрывается снаружи, а сохранение снимка временно отключает его команды.
+#[gpui::test]
+fn composer_text_menu_dismisses_outside_and_disables_during_save(cx: &mut TestAppContext) {
+    let (view, ui, requests) = start(cx);
+    publish(&requests, Load::Open(ChatEntry::Latest), vec![], vec![], ui);
+    allow(&requests, Ok(TOPIC), ui);
+    paste(ui, "Черновик");
+
+    ui.simulate_keystrokes("enter cmd-a shift-f10");
+    let attempt = next(&requests.save, "сохранение черновика под открытым меню");
+    assert!(ui.debug_bounds("composer-text-menu").is_some());
+    click(ui, "composer-text-cut");
+    confirm_text_menu(ui);
+    assert_eq!(draft(&view, ui), "Черновик");
+    assert!(text_menu_open(&view, ui));
+
+    let exposed = ui.debug_bounds("conversation-send").unwrap().center();
+    ui.simulate_click(exposed, Modifiers::none());
+    ui.run_until_parked();
+    assert!(!text_menu_open(&view, ui));
+    saved(attempt, None, ui);
+    assert_eq!(draft(&view, ui), "Черновик");
+    assert!(requests.save.try_recv().is_err());
+
+    click(ui, "workspace-composer-editor");
+    ui.simulate_keystrokes("shift-f10");
+    assert!(text_menu_open(&view, ui));
+    click(ui, "conversation-send");
+    assert!(!text_menu_open(&view, ui));
+    let retry = next(&requests.save, "кнопка под немодальным меню");
+    assert_eq!(retry.input.markdown, "Черновик");
+    saved(retry, None, ui);
+}
+
 /// Рабочий редактор передаёт Enter один раз, а AppKit подтверждает композицию отдельно.
 #[gpui::test]
 fn editor_keyboard_and_ime_share_the_same_send_path(cx: &mut TestAppContext) {
@@ -362,7 +482,8 @@ fn editor_keyboard_and_ime_share_the_same_send_path(cx: &mut TestAppContext) {
         });
     });
     ui.run_until_parked();
-    ui.simulate_keystrokes("enter");
+    ui.simulate_keystrokes("shift-f10 enter");
+    assert!(!text_menu_open(&view, ui));
     assert!(requests.save.try_recv().is_err());
     assert_eq!(draft(&view, ui), "Строка 🧪\n仮");
 

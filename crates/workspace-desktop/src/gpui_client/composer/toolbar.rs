@@ -1,0 +1,295 @@
+//! Собирает раскрывающийся ряд команд редактора и показывает сфокусированную кнопку при прокрутке.
+
+use std::{cell::Cell, rc::Rc};
+
+use gpui::{
+    Context, Div, FocusHandle, Pixels, ScrollHandle, Stateful, Window, div, prelude::*, px,
+};
+
+use super::{COMPOSER_INSET, Composer, ToolbarPreferences, editor::Format};
+use crate::gpui_client::ui::{Button, ButtonAppearance, Icon, Palette, popup};
+
+/// Команда ряда с подписью и размерами иконки из референса.
+struct Command {
+    format: Format,      // Изменение Markdown в редакторе.
+    icon: Icon,          // Глиф для кнопки команды.
+    glyph: [f32; 2],     // Ширина и высота глифа в логических пикселях.
+    id: &'static str,    // Устойчивое имя кнопки для маршрута фокуса и тестов.
+    title: &'static str, // Название действия в подсказке.
+}
+
+impl Command {
+    /// Описывает вид одной команды без состояния редактора.
+    const fn new(
+        format: Format,
+        icon: Icon,
+        glyph: [f32; 2],
+        id: &'static str,
+        title: &'static str,
+    ) -> Self {
+        Self {
+            format,
+            icon,
+            glyph,
+            id,
+            title,
+        }
+    }
+}
+
+const COMMANDS: [Command; 10] = [
+    Command::new(
+        Format::Link,
+        Icon::ComposerLink,
+        [24., 14.769],
+        "composer-format-link",
+        "Вставить ссылку",
+    ),
+    Command::new(
+        Format::Bold,
+        Icon::ComposerBold,
+        [10.93, 16.667],
+        "composer-format-bold",
+        "Жирный",
+    ),
+    Command::new(
+        Format::Italic,
+        Icon::ComposerItalic,
+        [15.448, 16.747],
+        "composer-format-italic",
+        "Курсив",
+    ),
+    Command::new(
+        Format::Strike,
+        Icon::ComposerStrike,
+        [25.333, 19.79],
+        "composer-format-strike",
+        "Зачёркнутый",
+    ),
+    Command::new(
+        Format::NumberedList,
+        Icon::ComposerNumberedList,
+        [21.333, 24.],
+        "composer-format-numbered",
+        "Нумерованный список",
+    ),
+    Command::new(
+        Format::BulletedList,
+        Icon::ComposerBulletedList,
+        [21.328, 19.533],
+        "composer-format-bulleted",
+        "Маркированный список",
+    ),
+    Command::new(
+        Format::Quote,
+        Icon::ComposerQuote,
+        [24., 21.38],
+        "composer-format-quote",
+        "Цитата",
+    ),
+    Command::new(
+        Format::CodeBlock,
+        Icon::ComposerCodeBlock,
+        [21.333, 21.333],
+        "composer-format-block",
+        "Блок кода",
+    ),
+    Command::new(
+        Format::InlineCode,
+        Icon::ComposerInlineCode,
+        [22., 18.],
+        "composer-format-inline",
+        "Строка кода",
+    ),
+    Command::new(
+        Format::Spoiler,
+        Icon::ComposerSpoiler,
+        [25.834, 17.333],
+        "composer-format-spoiler",
+        "Спойлер",
+    ),
+];
+const STYLE_GROUP_END: usize = 4;
+const DIVIDERS: [usize; 3] = [0, STYLE_GROUP_END, 6];
+const TOOLBAR_GAP: Pixels = px(8.);
+
+/// Устойчивый фокус и позиция прокрутки команд одного редактора.
+pub(super) struct Toolbar {
+    toggle: FocusHandle,          // Кнопка раскрытия переезжает из поля в ряд.
+    commands: [FocusHandle; 10],  // Кнопки сохраняют фокус при перерисовке.
+    scroll: ScrollHandle,         // Показывает команды за правой границей узкого окна.
+    last_focused: Option<usize>,  // Дочерний элемент, который уже показан прокруткой.
+    last_width: Rc<Cell<Pixels>>, // Фактическая ширина ряда после расчёта размеров.
+}
+
+impl Toolbar {
+    /// Готовит устойчивые фокусы до первого кадра панели.
+    pub(super) fn new(cx: &mut Context<Composer>) -> Self {
+        Self {
+            toggle: cx.focus_handle(),
+            commands: std::array::from_fn(|_| cx.focus_handle()),
+            scroll: ScrollHandle::new(),
+            last_focused: None,
+            last_width: Rc::default(),
+        }
+    }
+
+    /// Возвращает кнопку раскрытия в поле или в начале панели.
+    pub(super) fn toggle(
+        &self,
+        expanded: bool,
+        palette: Palette,
+        cx: &Context<Composer>,
+    ) -> Stateful<Div> {
+        let (title, icon) = if expanded {
+            ("Скрыть инструменты форматирования", Icon::ComposerToolbar)
+        } else {
+            (
+                "Показать инструменты форматирования",
+                Icon::ComposerToolbarExpand,
+            )
+        };
+        let target = cx.entity().downgrade();
+        icon_button(
+            "composer-toolbar-toggle",
+            title,
+            (icon, [21.333; 2]),
+            palette,
+            &self.toggle,
+            false,
+            move |window, app| {
+                let _ = target.update(app, |composer, cx| {
+                    ToolbarPreferences::set_expanded(!expanded, cx);
+                    // У раскрытой и компактной кнопок разное место, поэтому ввод остаётся в поле.
+                    composer.focus_editor(window, cx);
+                    cx.notify();
+                });
+            },
+        )
+    }
+
+    /// Рисует одну горизонтальную полосу и делает скрытую команду видимой при Tab.
+    pub(super) fn row(
+        &mut self,
+        palette: Palette,
+        can_format: bool,
+        window: &Window,
+        cx: &Context<Composer>,
+    ) -> Stateful<Div> {
+        let focused = if self.toggle.is_focused(window) {
+            Some((0, self.toggle.clone()))
+        } else {
+            self.commands
+                .iter()
+                .enumerate()
+                .find(|(_, focus)| focus.is_focused(window))
+                .map(|(index, focus)| {
+                    // В ScrollHandle учитываются и дочерние элементы-разделители.
+                    let child = 1 + index + DIVIDERS.partition_point(|&divider| divider <= index);
+                    (child, focus.clone())
+                })
+        };
+        let focused_index = focused.as_ref().map(|(index, _)| *index);
+        if self.last_focused != focused_index {
+            self.last_focused = focused_index;
+            if let Some(index) = focused_index {
+                self.scroll.scroll_to_item(index);
+            }
+        }
+        let scroll = self.scroll.clone();
+        let last_width = self.last_width.clone();
+        let target = cx.entity().downgrade();
+        let mut row = div()
+            .on_children_prepainted(move |_, window, app| {
+                let width = scroll.bounds().size.width;
+                let resized = last_width.replace(width) != width;
+                if resized && let Some((index, focus)) = focused.clone() {
+                    let scroll = scroll.clone();
+                    // Размер ряда известен после размещения. Перепроверяем фокус следующим кадром,
+                    // в том числе если ширину изменило открытие боковой панели.
+                    window.defer(app, move |window, _| {
+                        if focus.is_focused(window) {
+                            scroll.scroll_to_item(index);
+                            window.refresh();
+                        }
+                    });
+                }
+            })
+            .id("composer-toolbar")
+            .debug_selector(|| "composer-toolbar".into())
+            .h(px(32.))
+            .w_full()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .pl(COMPOSER_INSET)
+            .overflow_x_scroll()
+            .track_scroll(&self.scroll)
+            .child(self.toggle(true, palette, cx));
+        for (index, command) in COMMANDS.iter().enumerate() {
+            if DIVIDERS.contains(&index) {
+                row = row.child(separator(palette).ml(TOOLBAR_GAP));
+            }
+            // Ссылка, жирный, курсив и зачёркивание стоят вплотную внутри одной группы.
+            let gap = if (1..STYLE_GROUP_END).contains(&index) {
+                px(0.)
+            } else {
+                TOOLBAR_GAP
+            };
+            let target = target.clone();
+            row = row.child(
+                icon_button(
+                    command.id,
+                    command.title,
+                    (command.icon, command.glyph),
+                    palette,
+                    &self.commands[index],
+                    !can_format,
+                    move |window, app| {
+                        let _ = target.update(app, |composer, cx| {
+                            composer
+                                .editor
+                                .update(cx, |editor, cx| editor.apply_format(command.format, cx));
+                            composer.focus_editor(window, cx);
+                        });
+                    },
+                )
+                .ml(gap),
+            );
+        }
+        row
+    }
+}
+
+/// Отделяет группы команд вертикальной линией по макету.
+fn separator(palette: Palette) -> Div {
+    div().w(px(1.)).h(px(28.)).flex_none().bg(palette.border)
+}
+
+/// Рисует доступную клавиатуре кнопку, используя общие состояния и подсказку.
+fn icon_button(
+    id: &'static str,
+    title: &'static str,
+    (icon, [width, height]): (Icon, [f32; 2]),
+    palette: Palette,
+    focus: &FocusHandle,
+    disabled: bool,
+    activate: impl Fn(&mut Window, &mut gpui::App) + 'static,
+) -> Stateful<Div> {
+    let mut button = Button::new(id, "");
+    button.appearance = ButtonAppearance::Ghost;
+    button.disabled = disabled;
+    let color = if disabled {
+        palette.disabled
+    } else {
+        palette.icon
+    };
+    button
+        .render(palette, Some(focus), activate)
+        .debug_selector(move || id.into())
+        .size(px(32.))
+        .flex_none()
+        .p(px(0.))
+        .child(icon.element(px(width), color).h(px(height)))
+        .tooltip(move |_, app| popup::tooltip(palette, title.into(), app))
+}

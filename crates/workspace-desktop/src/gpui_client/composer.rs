@@ -3,10 +3,12 @@
 
 mod editor;
 mod source;
+mod toolbar;
+mod toolbar_preferences;
 
 use gpui::{
-    App, Context, Entity, EventEmitter, Focusable, IntoElement, Render, SharedString, Subscription,
-    Window, div, prelude::*, px,
+    App, Context, Entity, EventEmitter, Focusable, IntoElement, Pixels, Render, SharedString,
+    Subscription, Window, div, prelude::*, px,
 };
 use uuid::Uuid;
 
@@ -16,12 +18,23 @@ pub(super) use self::source::{DestinationError, SendSource};
 use super::{
     contracts::{ConversationAddress, ConversationReply},
     ui::{
-        Button, ButtonAppearance, FieldAppearance, Icon, Palette, SURFACE_RADIUS, TextRole, field,
-        label,
+        Button, ButtonAppearance, CONTROL_BORDER, FieldAppearance, Icon, Palette, SURFACE_RADIUS,
+        TextRole, field, label,
     },
 };
 
+use toolbar::Toolbar;
+use toolbar_preferences::ToolbarPreferences;
+
+/// Загружает выбор панели для штатного приложения до построения редактора.
+pub(super) fn install_toolbar_preferences(profile: &std::path::Path, app: &mut App) {
+    ToolbarPreferences::install(profile, app);
+}
+
 const MAX_MESSAGE_CHARS: usize = 40_000;
+const SEND_SIZE: Pixels = px(40.);
+const FIELD_SEND_GAP: Pixels = px(12.);
+const COMPOSER_INSET: Pixels = px(8.);
 
 /// Точная тема, в которую сервер разрешил подготовить обычный текст.
 enum Destination {
@@ -58,6 +71,7 @@ pub(super) struct Composer {
     address: ConversationAddress, // Снимок адреса разговора на момент открытия.
     editor: Entity<Editor>,       // Многострочный ввод, выделение и версия текста.
     destination: Destination,     // Состояние проверки возможности отправки.
+    toolbar: Toolbar,             // Кнопка раскрытия, команды и их клавиатурный фокус.
     writing: Option<Attempt>,     // Текущая запись; None позволяет начать следующую.
     error_version: Option<u64>,   // Версия текста, для которой запись не удалась.
     _editor_observer: Subscription, // Обновляет доступность кнопки после редактирования.
@@ -81,6 +95,7 @@ impl Composer {
             address,
             editor,
             destination: Destination::Unchecked,
+            toolbar: Toolbar::new(cx),
             writing: None,
             error_version: None,
             _editor_observer: observer,
@@ -206,6 +221,8 @@ impl Composer {
             markdown: editor.text().to_owned(),
         };
         self.writing = Some(attempt);
+        self.editor
+            .update(cx, |editor, cx| editor.set_text_menu_busy(true, cx));
         self.error_version = None;
         log::debug!(
             "gpui_send op_id={} event=submit stream_id={} topic_id={topic} generation={} revision={}",
@@ -231,6 +248,8 @@ impl Composer {
             return;
         }
         self.writing = None;
+        self.editor
+            .update(cx, |editor, cx| editor.set_text_menu_busy(false, cx));
         let editor = self.editor.read(cx);
         let same_version = editor.version() == attempt.version && !editor.composing();
         if same_version {
@@ -255,6 +274,8 @@ impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::for_window(window, cx);
         let editor = self.editor.read(cx);
+        let expanded = ToolbarPreferences::expanded(cx);
+        let can_format = editor.can_format();
         let too_long = over_limit(editor.text());
         let save_failed = self.error_version == Some(editor.version());
         let explanation = match &self.destination {
@@ -291,6 +312,7 @@ impl Render for Composer {
         };
         let target = cx.entity().downgrade();
         let retry = target.clone();
+        let toolbar = expanded.then(|| self.toolbar.row(palette, can_format, window, cx));
         // Сетка сначала задаёт общую ширину поля и пояснения. От неё зависит высота переносов.
         div()
             .grid()
@@ -298,7 +320,7 @@ impl Render for Composer {
             .flex_none()
             .min_w_0()
             .gap(px(4.))
-            .p_2()
+            .p(COMPOSER_INSET)
             .rounded(SURFACE_RADIUS)
             .bg(palette.surface)
             .debug_selector(|| "conversation-composer".into())
@@ -307,12 +329,32 @@ impl Render for Composer {
                     .flex()
                     .min_w_0()
                     .items_end()
-                    .gap(px(12.))
+                    .gap(FIELD_SEND_GAP)
                     .child(
-                        field(palette, appearance, self.editor.clone())
-                            .flex_1()
-                            .debug_selector(|| "conversation-composer-field".into())
-                            .rounded(SURFACE_RADIUS),
+                        field(
+                            palette,
+                            appearance,
+                            div()
+                                .flex()
+                                .items_end()
+                                .w_full()
+                                .min_w_0()
+                                .gap(px(8.))
+                                // Кнопка слева от поля, но Tab из истории сначала возвращает в текст.
+                                .flex_row_reverse()
+                                .child(div().min_w_0().flex_1().child(self.editor.clone()))
+                                .children((!expanded).then(|| {
+                                    self.toolbar
+                                        .toggle(false, palette, cx)
+                                        .mb(px(4.) - CONTROL_BORDER)
+                                })),
+                        )
+                        // Рамка входит в отступ. Переключатель начинается на одной оси с панелью.
+                        .px(if expanded { px(20.) } else { COMPOSER_INSET } - CONTROL_BORDER)
+                        .min_h(SEND_SIZE)
+                        .flex_1()
+                        .debug_selector(|| "conversation-composer-field".into())
+                        .rounded(SURFACE_RADIUS),
                     )
                     .child(
                         send.render(palette, None, move |window, app| {
@@ -321,7 +363,7 @@ impl Render for Composer {
                                 composer.submit(cx);
                             });
                         })
-                        .size(px(40.))
+                        .size(SEND_SIZE)
                         .flex_none()
                         .p(px(0.))
                         .rounded(SURFACE_RADIUS)
@@ -342,6 +384,8 @@ impl Render for Composer {
                         .debug_selector(|| "conversation-send".into()),
                     ),
             )
+            // Панель прокручивается в пределах поля, оставляя справа место под отправку.
+            .children(toolbar.map(|row| div().min_w_0().pr(SEND_SIZE + FIELD_SEND_GAP).child(row)))
             .when_some(explanation, |view, (text, error)| {
                 view.child(
                     label(palette, TextRole::Caption, text)
