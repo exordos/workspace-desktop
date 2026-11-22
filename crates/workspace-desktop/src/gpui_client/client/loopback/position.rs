@@ -151,8 +151,7 @@ fn restores_same_message_and_y_after_switching_chats_and_prefetch(cx: &mut TestA
     });
     let before = message_y(ui, &client, anchor.id).expect("Опора A видна");
 
-    click(ui, CHANNEL_ROW);
-    ui.run_until_parked();
+    click(ui, CHANNEL_CHEVRON);
     click(ui, CHANNEL_TOPIC_ROW);
     until(
         ui,

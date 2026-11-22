@@ -6,9 +6,9 @@ use std::{collections::HashMap, sync::Arc};
 use uuid::Uuid;
 use workspace_core::{
     auth::{SessionSnapshot, SessionStatus},
-    bootstrap::ChatLists,
+    bootstrap::{ChatList, ChatLists},
     context::{OwnerContext, SessionGeneration},
-    messenger::FolderSnapshot,
+    messenger::{FolderSnapshot, catalog::Chat},
     notification_target::NotificationTargetError,
     storage::HistoryScope,
     sync::SyncUpdate,
@@ -29,6 +29,26 @@ impl AccountSession {
         Uuid::parse_str(&self.owner.user_id)
             .ok()
             .filter(|id| !id.is_nil())
+    }
+
+    /// Выбирает разговоры этого входа. Полный пустой каталог важнее кэша папок.
+    pub(super) fn catalog_chats<'a>(
+        &self,
+        catalog: Option<&'a ChatList>,
+        folders: Option<&'a FolderSnapshot>,
+    ) -> Option<&'a [Chat]> {
+        catalog
+            .filter(|catalog| catalog.generation == self.generation)
+            .and_then(|catalog| catalog.chats.as_deref())
+            .or_else(|| {
+                folders
+                    .filter(|snapshot| {
+                        snapshot.owner == self.owner
+                            && snapshot.generation == self.generation
+                            && snapshot.folders.is_some()
+                    })
+                    .map(|snapshot| snapshot.chats.as_slice())
+            })
     }
 }
 

@@ -4,12 +4,11 @@
 use gpui::{
     Context, Div, Entity, EventEmitter, Stateful, Subscription, Window, div, point, prelude::*, px,
 };
-use workspace_core::messenger::folders::FolderKind;
+use workspace_core::{context::OwnerContext, messenger::folders::FolderKind};
 
 use super::{
     AccountSession, Active, Arc, Chat, FolderCommand, FolderCommandError, FolderDialog, FolderItem,
-    FolderRail, FolderRailPreferences, FolderSnapshot, HashMap, HashSet, OwnerContext, Sidebar,
-    Uuid,
+    FolderRail, FolderRailPreferences, FolderSnapshot, HashMap, HashSet, Sidebar, Uuid,
     folder_rail::{RailAction, RailEntry, RailState},
 };
 
@@ -162,14 +161,14 @@ impl Sidebar {
     }
 
     /// Сбрасывает временные действия и подписки, когда каталог скрывается.
-    pub(in crate::gpui_client) fn dismiss_folders(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::gpui_client) fn on_hidden(&mut self, cx: &mut Context<Self>) {
         self.folders.reset(cx);
         if let Some(active) = &mut self.active {
             active.folder_pending = None;
             active.menu = None;
             active.avatars.clear();
             active.avatar_users.clear();
-            active.avatar_frame = active.avatar_frame.wrapping_add(1);
+            active.revision = active.revision.wrapping_add(1);
         }
         self.update_folder_rail(cx);
     }
@@ -225,6 +224,7 @@ impl Sidebar {
     /// Применяет снимок только к совпадающему владельцу и поколению.
     pub(super) fn update_folder_view(&mut self, cx: &mut Context<Self>) {
         if let Some(active) = &mut self.active {
+            let previous_view = active.folder_view.clone();
             active.folder_view = self
                 .folders
                 .snapshots
@@ -234,6 +234,12 @@ impl Sidebar {
                         && snapshot.owner == active.session.owner
                 })
                 .cloned();
+            if !matches!((&previous_view, &active.folder_view),
+                (Some(previous), Some(current)) if Arc::ptr_eq(previous, current))
+                && (previous_view.is_some() || active.folder_view.is_some())
+            {
+                active.revision = active.revision.wrapping_add(1);
+            }
             let complete = active
                 .folder_view
                 .as_ref()
@@ -253,14 +259,11 @@ impl Sidebar {
                 active.select_folder(Uuid::nil());
             }
             if let Some(menu) = &active.menu
-                && (active.menu_action(menu.key, cx).is_none()
-                    || (active.search.read(cx).text().trim().is_empty()
-                        && !active.folder_contains(match menu.key {
-                            super::RowKey::Chat(chat) | super::RowKey::Topic(chat, _) => chat,
-                        })))
+                && active.menu_action(menu.key, cx).is_none()
             {
                 active.menu = None;
             }
+            active.apply_route_reveal();
         }
         self.update_folder_rail(cx);
     }
@@ -478,6 +481,8 @@ impl Active {
     fn select_folder(&mut self, folder: Uuid) {
         if self.folder != folder {
             self.folder = folder;
+            self.revision = self.revision.wrapping_add(1);
+            self.pending_focus = None;
             self.scroll.set_offset(point(px(0.), px(0.)));
             self.menu = None;
             self.folder_error = None;
@@ -486,11 +491,8 @@ impl Active {
 
     /// Использует согласованный каталог Core. До него доступен обычный снимок сайдбара.
     pub(super) fn chats(&self) -> Option<&[Chat]> {
-        self.folder_view
-            .as_deref()
-            .filter(|view| view.folders.is_some())
-            .map(|view| view.chats.as_slice())
-            .or_else(|| self.catalog.as_ref()?.chats.as_deref())
+        self.session
+            .catalog_chats(self.catalog.as_ref(), self.folder_view.as_deref())
     }
 
     /// Проверяет, что чат всё ещё доступен в выбранной папке вне поиска.
@@ -522,7 +524,7 @@ pub(super) fn folder_rows<'a>(
         return catalog.iter().map(|chat| (chat, None, false)).collect();
     };
     let mut rows: Vec<_> = view
-        .rows(selected)
+        .rows_for_catalog(selected, catalog)
         .unwrap_or_default()
         .into_iter()
         .map(|row| (row.chat, row.item, false))
@@ -530,7 +532,7 @@ pub(super) fn folder_rows<'a>(
     if searching && !selected.is_nil() {
         let seen: HashSet<_> = rows.iter().map(|row| row.0.id).collect();
         rows.extend(
-            view.rows(Uuid::nil())
+            view.rows_for_catalog(Uuid::nil(), catalog)
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|row| !seen.contains(&row.chat.id))

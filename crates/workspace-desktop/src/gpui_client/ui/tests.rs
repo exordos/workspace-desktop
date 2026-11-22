@@ -5,7 +5,7 @@ use gpui::{
     size,
 };
 
-use super::*;
+use super::{theme::relative_luminance, *};
 
 gpui::actions!(ui_tests, [NextFocus]);
 
@@ -231,21 +231,4 @@ fn status_text_and_focus_keep_contrast_in_both_themes() {
             assert!(ratio >= minimum, "{mode:?}, {name}: {ratio:.2}:1");
         }
     }
-}
-
-/// Переводит цвет sRGB в относительную яркость для проверки контраста.
-fn relative_luminance(color: gpui::Hsla) -> f32 {
-    let color = color.to_rgb();
-    [color.r, color.g, color.b]
-        .into_iter()
-        .zip([0.2126, 0.7152, 0.0722])
-        .map(|(channel, weight)| {
-            let linear = if channel <= 0.04045 {
-                channel / 12.92
-            } else {
-                ((channel + 0.055) / 1.055).powf(2.4)
-            };
-            linear * weight
-        })
-        .sum()
 }

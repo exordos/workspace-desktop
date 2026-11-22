@@ -159,6 +159,23 @@ impl Palette {
     }
 }
 
+/// Переводит цвет sRGB в относительную яркость для расчёта контраста.
+pub(super) fn relative_luminance(color: Hsla) -> f32 {
+    let color = color.to_rgb();
+    [color.r, color.g, color.b]
+        .into_iter()
+        .zip([0.2126, 0.7152, 0.0722])
+        .map(|(channel, weight)| {
+            let linear = if channel <= 0.04045 {
+                channel / 12.92
+            } else {
+                ((channel + 0.055) / 1.055).powf(2.4)
+            };
+            linear * weight
+        })
+        .sum()
+}
+
 /// Размер, вес и базовый цвет текста по роли.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TextRole {

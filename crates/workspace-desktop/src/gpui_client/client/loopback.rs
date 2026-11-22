@@ -85,6 +85,7 @@ const TOPICS: &str = "/api/workspace/v1/messenger/stream_topics/";
 const FOLDERS: &str = "/api/workspace/v1/messenger/folders/";
 const CHAT_ROW: &str = "catalog-chat-10000000-0000-4000-8000-000000000005";
 const CHANNEL_ROW: &str = "catalog-chat-10000000-0000-4000-8000-000000000007";
+const CHANNEL_CHEVRON: &str = "catalog-stream-expand-10000000-0000-4000-8000-000000000007";
 const CHANNEL_TOPIC_ROW: &str =
     "catalog-topic-10000000-0000-4000-8000-000000000007-10000000-0000-4000-8000-000000000009";
 const CHANNEL_HISTORY: Uuid = Uuid::from_u128(84);
@@ -1902,7 +1903,7 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
     open_account_panel(&client, ui, "test-account-main");
     ui.simulate_resize(size(px(700.), px(600.)));
     ui.run_until_parked();
-    click(ui, CHANNEL_ROW);
+    click(ui, CHANNEL_CHEVRON);
     ui.run_until_parked();
     click(ui, CHANNEL_TOPIC_ROW);
     let _ = topic_ready(&client, ui, "в B открылась выбранная тема, панель закрыта");
@@ -2101,7 +2102,7 @@ fn sidebar_members_offer_only_allowed_actions_and_refresh_after_changes(cx: &mut
     until(ui, "сокеты A и B готовы", |ui| {
         server.state.ready.load(Ordering::SeqCst) >= 2 && ui.debug_bounds(CHANNEL_ROW).is_some()
     });
-    click(ui, CHANNEL_ROW);
+    click(ui, CHANNEL_CHEVRON);
     ui.run_until_parked();
     click(ui, CHANNEL_TOPIC_ROW);
     let _ = topic_ready(&client, ui, "владелец читает тему");
@@ -2179,7 +2180,7 @@ fn sidebar_members_offer_only_allowed_actions_and_refresh_after_changes(cx: &mut
 
     click_account(&client, ui, &b_id);
     ui.run_until_parked();
-    click(ui, CHANNEL_ROW);
+    click(ui, CHANNEL_CHEVRON);
     ui.run_until_parked();
     click(ui, CHANNEL_TOPIC_ROW);
     let _ = topic_ready(&client, ui, "участник B читает тему");
@@ -2254,7 +2255,7 @@ fn explicit_topic_accepts_mouse_and_keyboard_in_each_account(cx: &mut TestAppCon
     });
 
     click_account(&client, ui, &b_id);
-    click(ui, CHANNEL_ROW);
+    click(ui, CHANNEL_CHEVRON);
     ui.run_until_parked();
     click(ui, CHANNEL_TOPIC_ROW);
     let mouse_address = topic_ready(&client, ui, "мышь открыла историю темы и редактор B");
@@ -2393,7 +2394,7 @@ fn explicit_topic_is_rechecked_before_queue_and_before_post(cx: &mut TestAppCont
     until(ui, "WSS и каталог", |ui| {
         server.state.ready.load(Ordering::SeqCst) > 0 && ui.debug_bounds(CHANNEL_ROW).is_some()
     });
-    click(ui, CHANNEL_ROW);
+    click(ui, CHANNEL_CHEVRON);
     ui.run_until_parked();
     click(ui, CHANNEL_TOPIC_ROW);
     let address = topic_ready(&client, ui, "до закрытия видны история темы и редактор");

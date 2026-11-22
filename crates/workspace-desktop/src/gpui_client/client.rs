@@ -459,7 +459,7 @@ impl Client {
                 .all(|account| account.status == SessionStatus::ReauthenticationRequired);
         if show {
             if self.sign_in.is_none() {
-                self.sidebar.update(cx, |view, cx| view.dismiss_folders(cx));
+                self.sidebar.update(cx, |view, cx| view.on_hidden(cx));
                 let server = match accounts {
                     [account] => Some(account.session.owner.server.as_str()),
                     _ => None,

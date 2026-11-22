@@ -156,6 +156,10 @@ fn row(stream: u128, topic: Option<u128>) -> &'static str {
     }
 }
 
+const CHANNEL_CHEVRON: &str = "catalog-stream-expand-00000000-0000-0000-0000-000000000002";
+const CHANNEL_PREVIEW: &str = "catalog-stream-preview-00000000-0000-0000-0000-000000000002";
+const TOPICS_TOGGLE: &str = "catalog-topic-toggle-00000000-0000-0000-0000-000000000002";
+
 /// Адрес, который должен получить обработчик открытия разговора.
 fn open(owner: &AccountSession, stream: u128, topic: Option<u128>) -> Recorded {
     Recorded::Open(
@@ -212,7 +216,7 @@ fn opens_and_filters_only_the_catalog_of_the_selected_session(cx: &mut TestAppCo
     click(ui, row(1, None));
     assert_eq!(events.borrow().as_slice(), &[open(&a, 1, None)]);
 
-    click(ui, row(2, None));
+    click(ui, CHANNEL_CHEVRON);
     assert!(ui.debug_bounds(row(2, Some(3))).is_some());
     click(ui, "catalog-search");
     ui.simulate_input("ВАЖ");
@@ -238,7 +242,10 @@ fn opens_and_filters_only_the_catalog_of_the_selected_session(cx: &mut TestAppCo
     ui.read(|app| {
         let active = sidebar.read(app).active.as_ref().expect("аккаунт B");
         assert_eq!(active.search.read(app).text(), "", "B получил запрос A");
-        assert!(active.expanded.is_empty(), "B получил раскрытие A");
+        assert!(
+            active.presentation.expanded().is_empty(),
+            "B получил раскрытие A"
+        );
     });
     enter(ui);
     assert_eq!(events.borrow().len(), 2, "B получил фокус темы A");
@@ -251,7 +258,7 @@ fn opens_and_filters_only_the_catalog_of_the_selected_session(cx: &mut TestAppCo
             .as_ref()
             .expect("повторный выбор A");
         assert_eq!(active.search.read(app).text(), "ВАЖ");
-        assert!(active.expanded.contains(&Uuid::from_u128(2)));
+        assert!(active.presentation.is_expanded(Uuid::from_u128(2)));
     });
     click(ui, "catalog-clear");
     assert!(
@@ -383,12 +390,15 @@ fn fixture_catalog_keeps_metadata_inside_rows_at_both_reference_widths(cx: &mut 
         vec![chat(2, channel, false, &[(3, first)])],
     );
     publish(&sidebar, ui, &b, &catalog_b);
-    click(ui, row(2, None));
+    click(ui, CHANNEL_CHEVRON);
     ui.read(|app| {
         let active = sidebar.read(app).active.as_ref().unwrap();
         assert!(
             active
-                .row_details(RowKey::Topic(scope.stream_id, scope.topic_id.unwrap()))
+                .row_details(
+                    RowKey::Topic(scope.stream_id, scope.topic_id.unwrap()),
+                    RowDetails::default()
+                )
                 .unread
                 .is_none()
         );
@@ -675,6 +685,226 @@ fn row_menu_uses_navigation_and_ignores_click_through(cx: &mut TestAppContext) {
     assert_eq!(events.borrow().as_slice(), &[open(&a, 1, None)]);
 }
 
+/// Проверяет разные маршруты строки и превью, а также независимую стрелку канала.
+#[gpui::test]
+fn stream_header_preview_and_chevron_have_separate_actions(cx: &mut TestAppContext) {
+    use workspace_core::storage::HistoryTime;
+
+    let (sidebar, ui, events) = initialize(cx);
+    let a = session("a", 11);
+    let mut stream = chat(2, "Канал", false, &[(3, "Общая"), (4, "Обсуждение")]);
+    let message_id = Uuid::from_u128(90);
+    stream.metadata.default_topic_id = Some(Uuid::from_u128(3));
+    stream.metadata.last_message_id = Some(message_id);
+    stream.metadata.preview = Some(SidebarPreview {
+        message_id,
+        topic_id: Uuid::from_u128(4),
+        author_id: Uuid::from_u128(91),
+        author_name: Some("Собеседник".into()),
+        created_at: HistoryTime::parse("2026-11-17T12:30:00Z").unwrap(),
+        text: "Последнее сообщение".into(),
+    });
+    let snapshot = catalog(&a, ChatListStatus::Ready, vec![stream]);
+    ui.simulate_resize(size(px(280.), px(490.)));
+    publish(&sidebar, ui, &a, &snapshot);
+
+    click(ui, CHANNEL_CHEVRON);
+    assert!(events.borrow().is_empty(), "стрелка открыла разговор");
+    assert!(ui.debug_bounds(row(2, Some(3))).is_some());
+    click(ui, CHANNEL_CHEVRON);
+    assert!(
+        events.borrow().is_empty(),
+        "стрелка открыла разговор при сворачивании"
+    );
+
+    let header = ui.debug_bounds(row(2, None)).unwrap();
+    ui.simulate_click(
+        point(header.left() + px(70.), header.top() + px(13.)),
+        Modifiers::none(),
+    );
+    assert_eq!(events.borrow().as_slice(), &[open(&a, 2, Some(3))]);
+    click(ui, CHANNEL_PREVIEW);
+    assert_eq!(
+        events.borrow().as_slice(),
+        &[open(&a, 2, Some(3)), open(&a, 2, Some(4))]
+    );
+}
+
+/// Проверяет переход по результатам и возврат фокуса после показа и скрытия остальных тем.
+#[gpui::test]
+fn search_navigates_channel_topics_and_reveal_by_keyboard(cx: &mut TestAppContext) {
+    let (sidebar, ui, events) = initialize(cx);
+    let a = session("a", 11);
+    let mut stream = chat(2, "Канал", false, &[(3, "Общая"), (4, "Искомая")]);
+    let stream_id = stream.id;
+    let general_id = Uuid::from_u128(3);
+    stream.metadata.default_topic_id = Some(general_id);
+    let snapshot = catalog(&a, ChatListStatus::Ready, vec![stream]);
+    ui.simulate_resize(size(px(280.), px(430.)));
+    publish(&sidebar, ui, &a, &snapshot);
+
+    click(ui, "catalog-search");
+    ui.simulate_input("  ИСКОМАЯ  ");
+    ui.simulate_keystrokes("down");
+    enter(ui);
+    ui.simulate_keystrokes("down");
+    enter(ui);
+    assert_eq!(
+        events.borrow().as_slice(),
+        &[open(&a, 2, Some(3)), open(&a, 2, Some(4))]
+    );
+
+    ui.simulate_keystrokes("down");
+    enter(ui);
+    assert!(ui.debug_bounds("catalog-other-topics").is_some());
+    ui.update(|window, app| {
+        let active = sidebar.read(app).active.as_ref().unwrap();
+        assert!(active.focus[&RowKey::Topic(stream_id, general_id)].is_focused(window));
+    });
+    ui.simulate_keystrokes("down");
+    enter(ui);
+    ui.update(|window, app| {
+        let active = sidebar.read(app).active.as_ref().unwrap();
+        assert!(active.focus[&RowKey::TopicToggle(stream_id)].is_focused(window));
+        assert!(!active.presentation.is_expanded(stream_id));
+    });
+    assert_eq!(events.borrow().len(), 2);
+}
+
+/// Нажатие из старого кадра не раскрывает другой набор тем с тем же числом строк.
+#[gpui::test]
+fn ignores_reveal_click_across_catalog_replacement(cx: &mut TestAppContext) {
+    let (sidebar, ui, events) = initialize(cx);
+    let a = session("a", 11);
+    let base = [(3, "Первая"), (4, "Вторая"), (5, "Третья"), (6, "Старая")];
+    let next = [(3, "Первая"), (4, "Вторая"), (5, "Третья"), (7, "Новая")];
+    let stream_id = Uuid::from_u128(2);
+    ui.simulate_resize(size(px(280.), px(480.)));
+    publish(
+        &sidebar,
+        ui,
+        &a,
+        &catalog(
+            &a,
+            ChatListStatus::Ready,
+            vec![chat(2, "Канал", false, &base)],
+        ),
+    );
+    click(ui, CHANNEL_CHEVRON);
+    let location = ui.debug_bounds(TOPICS_TOGGLE).unwrap().center();
+    ui.simulate_mouse_down(location, MouseButton::Left, Modifiers::none());
+    publish(
+        &sidebar,
+        ui,
+        &a,
+        &catalog(
+            &a,
+            ChatListStatus::Ready,
+            vec![chat(2, "Канал", false, &next)],
+        ),
+    );
+    ui.simulate_mouse_up(location, MouseButton::Left, Modifiers::none());
+    ui.run_until_parked();
+    ui.read(|app| {
+        let active = sidebar.read(app).active.as_ref().unwrap();
+        let stream = active.chat(stream_id).unwrap();
+        assert_eq!(
+            active
+                .presentation
+                .group(stream, None)
+                .unwrap()
+                .topics
+                .len(),
+            3
+        );
+    });
+    assert!(events.borrow().is_empty());
+    click(ui, TOPICS_TOGGLE);
+    ui.read(|app| {
+        let active = sidebar.read(app).active.as_ref().unwrap();
+        let stream = active.chat(stream_id).unwrap();
+        let group = active.presentation.group(stream, None).unwrap();
+        assert_eq!(group.topics.last().unwrap().name, "Новая");
+    });
+}
+
+/// Внешняя тема раскрывается после загрузки каталога и при выходе из режима поиска.
+#[gpui::test]
+fn reveals_external_route_after_catalog_load_and_search_clear(cx: &mut TestAppContext) {
+    let (sidebar, ui, events) = initialize(cx);
+    let owner = session("a", 11);
+    let stream_id = Uuid::from_u128(2);
+    let loading = ChatList {
+        generation: owner.generation,
+        status: ChatListStatus::Loading,
+        chats: None,
+    };
+    let ready = catalog(
+        &owner,
+        ChatListStatus::Ready,
+        vec![chat(
+            2,
+            "Канал",
+            false,
+            &[
+                (3, "Первая"),
+                (4, "Вторая"),
+                (5, "Третья"),
+                (6, "Четвёртая"),
+                (7, "Пятая"),
+            ],
+        )],
+    );
+    let submit_route = |ui: &mut gpui::VisualTestContext, snapshot: &ChatList, id: u128| {
+        let route = ConversationAddress {
+            route: ChatRoute {
+                owner: owner.owner.clone(),
+                scope: HistoryScope {
+                    stream_id,
+                    topic_id: Some(Uuid::from_u128(id)),
+                },
+                entry: ChatEntry::Latest,
+            },
+            generation: owner.generation,
+            revision: Default::default(),
+        };
+        ui.update(|_, app| {
+            sidebar.update(app, |sidebar, cx| {
+                sidebar.update_snapshot(Some(&owner), Some(snapshot), Some(&route), cx);
+            });
+        });
+        ui.run_until_parked();
+    };
+    let target_is_visible = |ui: &mut gpui::VisualTestContext, id: u128| {
+        ui.read(|app| {
+            let active = sidebar.read(app).active.as_ref().unwrap();
+            let stream = active.chat(stream_id).unwrap();
+            let group = active.presentation.group(stream, active.selected).unwrap();
+            group
+                .topics
+                .iter()
+                .any(|topic| topic.id == Uuid::from_u128(id))
+        })
+    };
+
+    ui.simulate_resize(size(px(280.), px(490.)));
+    submit_route(ui, &loading, 6);
+    submit_route(ui, &ready, 6);
+    assert!(target_is_visible(ui, 6));
+    click(ui, CHANNEL_CHEVRON);
+    assert!(!target_is_visible(ui, 6));
+    submit_route(ui, &ready, 6);
+    assert!(!target_is_visible(ui, 6));
+
+    click(ui, "catalog-search");
+    ui.simulate_input("не совпадает");
+    submit_route(ui, &ready, 7);
+    assert!(ui.debug_bounds("catalog-empty").is_some());
+    click(ui, "catalog-clear");
+    assert!(target_is_visible(ui, 7));
+    assert!(events.borrow().is_empty());
+}
+
 /// Передаёт настоящий снимок Core с пользовательской папкой и двумя доступными чатами.
 fn publish_folders(
     sidebar: &Entity<Sidebar>,
@@ -751,7 +981,11 @@ fn folder_switch_search_and_remote_delete_use_the_core_snapshot(cx: &mut TestApp
     const CUSTOM: &str = "folder-rail-entry-00000000-0000-0000-0000-00000000000a";
     let (sidebar, ui, events) = initialize(cx);
     let owner = session("a", 1);
-    let chats = catalog(&owner, ChatListStatus::Ready, vec![]);
+    let chats = ChatList {
+        generation: owner.generation,
+        status: ChatListStatus::Ready,
+        chats: None,
+    };
     publish(&sidebar, ui, &owner, &chats);
     publish_folders(&sidebar, ui, &owner, &[10]);
     click(ui, CUSTOM);
@@ -786,6 +1020,51 @@ fn folder_switch_search_and_remote_delete_use_the_core_snapshot(cx: &mut TestApp
     assert!(ui.debug_bounds(row(2, None)).is_some());
 }
 
+/// Папка отвечает за закрепление. Маршруты и темы приходят из свежего каталога.
+#[gpui::test]
+fn folder_search_uses_live_catalog_without_restoring_removed_rows(cx: &mut TestAppContext) {
+    let (sidebar, ui, events) = initialize(cx);
+    let owner = session("a", 1);
+    let loading = ChatList {
+        generation: owner.generation,
+        status: ChatListStatus::Loading,
+        chats: None,
+    };
+    publish(&sidebar, ui, &owner, &loading);
+    publish_folders(&sidebar, ui, &owner, &[10]);
+    click(ui, "folder-rail-entry-00000000-0000-0000-0000-00000000000a");
+
+    let live = catalog(
+        &owner,
+        ChatListStatus::Ready,
+        vec![
+            chat(1, "Актуальная личка", true, &[]),
+            chat(2, "Новый канал", false, &[(3, "Актуальная тема")]),
+        ],
+    );
+    publish(&sidebar, ui, &owner, &live);
+    assert!(ui.debug_bounds("catalog-row-pinned").is_some());
+    click(ui, "catalog-search");
+    ui.simulate_input("АКТУАЛЬНАЯ");
+    ui.run_until_parked();
+    assert!(ui.debug_bounds("catalog-search-in-folder").is_some());
+    assert!(ui.debug_bounds("catalog-search-outside-folder").is_some());
+    assert!(ui.debug_bounds(row(2, Some(3))).is_some());
+    ui.simulate_keystrokes("up");
+    enter(ui);
+    assert_eq!(events.borrow().as_slice(), &[open(&owner, 2, Some(3))]);
+
+    let empty = catalog(&owner, ChatListStatus::Ready, vec![]);
+    publish(&sidebar, ui, &owner, &empty);
+    publish_folders(&sidebar, ui, &owner, &[10]);
+    ui.read(|app| {
+        let active = sidebar.read(app).active.as_ref().unwrap();
+        assert!(active.chats().is_some_and(<[_]>::is_empty));
+        assert!(active.focus.is_empty());
+    });
+    assert!(ui.debug_bounds("catalog-empty").is_some());
+}
+
 /// Проверяет UUID связи закрепления и игнорирует ошибку после смены каталога.
 #[gpui::test]
 fn pin_intent_uses_folder_item_and_ignores_an_old_account_reply(cx: &mut TestAppContext) {
@@ -804,7 +1083,11 @@ fn pin_intent_uses_folder_item_and_ignores_an_old_account_reply(cx: &mut TestApp
         &sidebar,
         ui,
         &owner,
-        &catalog(&owner, ChatListStatus::Ready, vec![]),
+        &ChatList {
+            generation: owner.generation,
+            status: ChatListStatus::Ready,
+            chats: None,
+        },
     );
     publish_folders(&sidebar, ui, &owner, &[10]);
     click(ui, "folder-rail-entry-00000000-0000-0000-0000-00000000000a");
@@ -875,7 +1158,11 @@ fn open_assignment_menu_keeps_the_folder_uuid_when_the_snapshot_reorders(cx: &mu
         &sidebar,
         ui,
         &owner,
-        &catalog(&owner, ChatListStatus::Ready, vec![]),
+        &ChatList {
+            generation: owner.generation,
+            status: ChatListStatus::Ready,
+            chats: None,
+        },
     );
     publish_folders(&sidebar, ui, &owner, &[10, 11]);
     let center = ui.debug_bounds(row(2, None)).unwrap().center();

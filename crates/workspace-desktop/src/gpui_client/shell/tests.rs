@@ -103,6 +103,81 @@ fn open_sidebar(shell: &mut Shell, session: &AccountSession) -> ConversationAddr
     }
 }
 
+/// При открытии темы оболочка использует тот же актуальный снимок, что и сайдбар.
+#[test]
+fn sidebar_route_uses_live_catalog_before_folder_cache() {
+    let (mut shell, a, _) = setup();
+    let session = &a.session;
+    let previous = Uuid::from_u128(3);
+    let fresh = Uuid::from_u128(4);
+    let channel = |id| Chat {
+        id: STREAM,
+        name: "Канал".into(),
+        direct: false,
+        topics: vec![Topic {
+            id,
+            name: "Тема".into(),
+            metadata: Default::default(),
+        }],
+        metadata: Default::default(),
+    };
+    let action = |id| {
+        ShellAction::Sidebar(SidebarAction::OpenChat {
+            route: ChatRoute {
+                scope: HistoryScope {
+                    stream_id: STREAM,
+                    topic_id: Some(id),
+                },
+                ..route(session, ChatEntry::Latest)
+            },
+            generation: session.generation,
+        })
+    };
+    let publish = |shell: &mut Shell, chats| {
+        shell.handle_runtime(RuntimeEvent::Catalog(HashMap::from([(
+            session.owner.clone(),
+            ChatList {
+                generation: session.generation,
+                chats,
+                status: ChatListStatus::Ready,
+            },
+        )])));
+    };
+    let publish_folders = |shell: &mut Shell, generation| {
+        shell.handle_runtime(RuntimeEvent::Folders(HashMap::from([(
+            session.owner.clone(),
+            Arc::new(FolderSnapshot {
+                owner: session.owner.clone(),
+                generation,
+                folders: Some(Vec::new()),
+                chats: vec![channel(previous)],
+                all_chats_unread: None,
+                needs_refresh: false,
+            }),
+        )])));
+    };
+
+    publish(&mut shell, None);
+    publish_folders(&mut shell, SessionGeneration(session.generation.0 + 1));
+    assert!(shell.handle_action(action(previous)).is_none());
+    publish_folders(&mut shell, session.generation);
+    assert!(matches!(
+        shell.handle_action(action(previous)),
+        Some(ShellEffect::OpenConversation(_))
+    ));
+
+    publish(&mut shell, Some(vec![channel(fresh)].into()));
+    assert!(shell.handle_action(action(previous)).is_none());
+    assert!(matches!(
+        shell.handle_action(action(fresh)),
+        Some(ShellEffect::OpenConversation(address)) if address.route.scope.topic_id == Some(fresh)
+    ));
+
+    publish(&mut shell, Some(Vec::<Chat>::new().into()));
+    assert!(shell.handle_action(action(previous)).is_none());
+    assert!(shell.handle_action(action(fresh)).is_none());
+}
+
 /// Передаёт событие синхронизации с владельцем и поколением соответствующего входа.
 fn sync(shell: &mut Shell, session: &AccountSession, change: SyncChange) -> Option<ShellEffect> {
     shell.handle_runtime(RuntimeEvent::Sync(SyncUpdate {

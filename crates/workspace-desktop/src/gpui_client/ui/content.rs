@@ -1,8 +1,8 @@
 //! Компоненты чатов: аватары, счётчики, строки каталога и пузыри сообщений.
 
 use gpui::{
-    App, Div, ElementId, FocusHandle, ImageSource, ObjectFit, SharedString, Stateful, Window, div,
-    img, prelude::*, px,
+    App, Div, ElementId, FocusHandle, Hsla, ImageSource, ObjectFit, SharedString, Stateful, Window,
+    div, img, prelude::*, px,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -53,11 +53,20 @@ impl Avatar {
 
     /// Рисует фиксированный круг. При загрузке изображения остаются инициалы.
     pub fn render(self, palette: Palette) -> Div {
+        self.render_with_background(palette, None)
+    }
+
+    /// Рисует тот же аватар с цветом разговора под инициалами.
+    pub(in crate::gpui_client) fn render_with_background(
+        self,
+        palette: Palette,
+        background: Option<Hsla>,
+    ) -> Div {
         let diameter = match self.size {
             AvatarSize::Small => 32.,
             AvatarSize::Medium => 40.,
         };
-        self.render_at(palette, px(diameter), palette.background)
+        self.render_at_with_background(palette, px(diameter), background)
     }
 
     /// Рисует аватар указанного размера и цвета для карточки профиля или канала.
@@ -67,6 +76,23 @@ impl Avatar {
         size: gpui::Pixels,
         background: gpui::Hsla,
     ) -> Div {
+        self.render_at_with_background(palette, size, Some(background))
+    }
+
+    /// Сохраняет стандартную палитру или подбирает контраст для заданного цвета.
+    fn render_at_with_background(
+        self,
+        palette: Palette,
+        size: gpui::Pixels,
+        background: Option<Hsla>,
+    ) -> Div {
+        let (foreground, placeholder) = background.map_or_else(
+            || (palette.text, palette.text_secondary),
+            |color| {
+                let foreground = avatar_foreground(color);
+                (foreground, foreground)
+            },
+        );
         let presence = match self.presence {
             AvatarPresence::Hidden => None,
             AvatarPresence::Online => Some(palette.presence_online),
@@ -82,20 +108,23 @@ impl Avatar {
             .justify_center()
             .rounded_full()
             .overflow_hidden()
-            .bg(background)
+            .bg(background.unwrap_or(palette.background))
             .when(initials.trim().is_empty(), |avatar| {
-                avatar.child(Icon::Account.element(px(20.), palette.text_secondary))
+                avatar.child(Icon::Account.element(px(20.), placeholder))
             })
             .when(!initials.trim().is_empty(), |avatar| {
-                avatar.child(label(
-                    palette,
-                    if size >= px(48.) {
-                        TextRole::ProfileHeading
-                    } else {
-                        TextRole::Initials
-                    },
-                    initials,
-                ))
+                avatar.child(
+                    label(
+                        palette,
+                        if size >= px(48.) {
+                            TextRole::ProfileHeading
+                        } else {
+                            TextRole::Initials
+                        },
+                        initials,
+                    )
+                    .text_color(foreground),
+                )
             })
             .children(self.image.map(|image| {
                 // В GPUI границу картинки скругляет сама картинка.
@@ -134,6 +163,18 @@ impl Avatar {
                     .border_color(palette.background)
                     .bg(color)
             }))
+    }
+}
+
+/// Выбирает чёрный или белый цвет инициалов по контрасту с цветным фоном.
+fn avatar_foreground(background: Hsla) -> Hsla {
+    let luminance = super::theme::relative_luminance(background);
+    let contrast_with_black = (luminance + 0.05) / 0.05;
+    let contrast_with_white = 1.05 / (luminance + 0.05);
+    if contrast_with_black >= contrast_with_white {
+        Hsla::black()
+    } else {
+        Hsla::white()
     }
 }
 
@@ -493,6 +534,25 @@ mod radius_tests {
                 ],
                 expected.map(|radius| Some(px(radius).into())),
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod contrast_tests {
+    use gpui::rgb;
+
+    use super::*;
+
+    /// Цвет канала может совпасть со штатным текстом любой палитры.
+    #[test]
+    fn channel_initials_keep_contrast_on_server_colors() {
+        for color in [0x1a2330, 0xf7fbff, 0x777777, 0x0000ff, 0xff0000, 0x00ff00] {
+            let background = rgb(color).into();
+            let a = super::super::theme::relative_luminance(background);
+            let b = super::super::theme::relative_luminance(avatar_foreground(background));
+            let ratio = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+            assert!(ratio >= 4.5, "#{color:06x}: {ratio:.2}:1");
         }
     }
 }

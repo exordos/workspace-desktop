@@ -242,16 +242,10 @@ impl Shell {
         {
             return None;
         }
-        let chats = self
-            .folders
-            .get(&route.owner)
-            .filter(|snapshot| {
-                snapshot.owner == route.owner
-                    && snapshot.generation == generation
-                    && snapshot.folders.is_some()
-            })
-            .map(|snapshot| snapshot.chats.as_slice())
-            .or_else(|| self.selected_catalog()?.chats.as_deref())?;
+        let chats = selected.catalog_chats(
+            self.selected_catalog(),
+            self.folders.get(&route.owner).map(Arc::as_ref),
+        )?;
         if !catalog_contains(chats, route.scope) {
             return None;
         }
