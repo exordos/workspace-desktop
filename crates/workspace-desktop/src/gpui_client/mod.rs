@@ -12,9 +12,10 @@ pub mod runtime;
 pub mod shell;
 pub mod sidebar;
 mod sign_in;
+mod test_profile;
 pub mod ui;
 
-use std::{cell::Cell, collections::HashMap, io, rc::Rc};
+use std::{cell::Cell, collections::HashMap, io, path::PathBuf, rc::Rc};
 
 use gpui::{App, AppContext, Application, KeyBinding, Window, actions};
 use workspace_core::context::AccountId;
@@ -24,7 +25,7 @@ use client::Client;
 use composer::Editor;
 use contracts::ShellAction;
 use platform_window::WindowPlatform;
-use runtime::{RuntimeClient, StartupError};
+use runtime::{RuntimeClient, RuntimeEvents, StartupError};
 use sidebar::Sidebar;
 use sign_in::SignIn;
 use ui::WorkspaceAssets;
@@ -40,10 +41,33 @@ pub struct Options {
 
 /// Открывает обычное окно с существующим профилем Workspace.
 pub fn run(options: Options) -> io::Result<()> {
-    platform_window::macos::disable_state_restoration();
     let profile = state_directory().map_err(|_| io::Error::other(StartupError::Profile))?;
     let (runtime, events) = RuntimeClient::start_in(profile.clone())
         .map_err(|_| io::Error::other(StartupError::Worker))?;
+    run_in(options, profile, runtime, events)
+}
+
+/// Входит тестовым аккаунтом в новый профиль с токенами в памяти и открывает окно.
+pub fn run_test_profile() -> io::Result<()> {
+    let login = test_profile::TestLogin::from_environment()?;
+    let temporary = tempfile::Builder::new()
+        .prefix("workspace-agent-")
+        .tempdir()?;
+    let profile = temporary.path().to_path_buf();
+    let (runtime, events) = RuntimeClient::start_test_profile(profile.clone(), login)?;
+    // Ошибки стенда видны в терминале. Окно открывается после успешного входа.
+    futures::executor::block_on(runtime.ready()).map_err(io::Error::other)?;
+    run_in(Options::default(), profile, runtime, events)
+}
+
+/// Подключает один и тот же клиент к уже выбранному профилю и фоновой работе.
+fn run_in(
+    options: Options,
+    profile: PathBuf,
+    runtime: RuntimeClient,
+    events: RuntimeEvents,
+) -> io::Result<()> {
+    platform_window::macos::disable_state_restoration();
     let failed = Rc::new(Cell::new(false));
     let startup_failure = Rc::clone(&failed);
     let application = Application::new().with_assets(WorkspaceAssets);

@@ -1,2 +1,2 @@
 [alias]
-dev = ["run", "--quiet", "--locked", "--manifest-path", "tools/workspace-dev/Cargo.toml", "--target-dir", "target/dev-launcher"]
+dev = ["run", "--quiet", "--locked", "--manifest-path", "tools/workspace-dev/Cargo.toml", "--target-dir", "target/dev-launcher", "--"]

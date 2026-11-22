@@ -6,17 +6,12 @@ fn main() -> std::process::ExitCode {
     use std::process::ExitCode;
     use workspace_desktop::gpui_client;
 
-    const USAGE: &str = "Usage: workspace-desktop [--active ACCOUNT_ID] [--label ACCOUNT_ID NAME]…";
+    const USAGE: &str = "Usage: workspace-desktop [--active ACCOUNT_ID] [--label ACCOUNT_ID NAME]… | --test-profile";
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     if matches!(arguments.as_slice(), [help] if help == "--help" || help == "-h") {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
-    let Some(options) = parse_options(&arguments) else {
-        eprintln!("{USAGE}");
-        return ExitCode::FAILURE;
-    };
-
     if log::set_logger(&DesktopLog).is_ok() {
         let level = if std::env::var_os("WORKSPACE_DESKTOP_DEBUG").is_some_and(|value| value == "1")
         {
@@ -26,7 +21,15 @@ fn main() -> std::process::ExitCode {
         };
         log::set_max_level(level);
     }
-    match gpui_client::run(options) {
+    let result = if matches!(arguments.as_slice(), [flag] if flag == "--test-profile") {
+        gpui_client::run_test_profile()
+    } else if let Some(options) = parse_options(&arguments) {
+        gpui_client::run(options)
+    } else {
+        eprintln!("{USAGE}");
+        return ExitCode::FAILURE;
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");

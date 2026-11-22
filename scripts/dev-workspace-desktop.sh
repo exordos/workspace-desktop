@@ -4,6 +4,18 @@ set -eu
 project_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$project_dir"
 
+case "${1-}:$#" in
+    :0|--test-profile:1) ;;
+    --help:1|-h:1)
+        printf '%s\n' 'cargo dev [--test-profile]'
+        exit 0
+        ;;
+    *)
+        printf '%s\n' 'Использование: cargo dev [--test-profile]' >&2
+        exit 2
+        ;;
+esac
+
 version=2.8.0
 case "$(uname -s)-$(uname -m)" in
     Darwin-arm64)
@@ -52,4 +64,4 @@ exec "$watcher" --restart --shell=none --project-origin "$project_dir" \
     --watch crates --watch-non-recursive . \
     --filter 'crates/**' --filter '/Cargo.toml' --filter '/Cargo.lock' \
     --filter '/rust-toolchain.toml' \
-    -- cargo run -p workspace-desktop --bin workspace-desktop
+    -- /bin/sh "$project_dir/scripts/run-workspace-desktop-dev.sh" "$@"

@@ -24,7 +24,9 @@ use gpui::{App, Context, Entity, Task};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use uuid::Uuid;
 use workspace_core::{
-    auth::{AccountRecord, AccountStore, Auth, SessionSnapshot, SessionStatus, StoreError},
+    auth::{
+        AccountRecord, AccountStore, Auth, SecretStore, SessionSnapshot, SessionStatus, StoreError,
+    },
     bootstrap::{self, CatalogStartup, ChatCatalog, ChatLists},
     context::{AccountId, OwnerContext, SessionGeneration},
     directory::{AvatarState, AvatarStore},
@@ -39,6 +41,7 @@ use super::contracts::{
     AccountSession, AccountSnapshot, ChatEntry, ChatRoute, ConversationAddress, ConversationReply,
     NotificationReply, NotificationRequest, NotificationRouteError, RuntimeEvent, RuntimeExit,
 };
+use super::test_profile::{MemorySecrets, TestLogin};
 use crate::platform::{JsonAccountStore, MacKeychain, state_directory};
 
 use folders::{FolderPreferenceStore, folder_snapshot, send_folder_state};
@@ -54,9 +57,10 @@ type Job = Box<dyn FnOnce(WorkerServices) -> JobFuture + Send>;
 /// Безопасное описание этапа, на котором остановился запуск.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StartupError {
-    Profile,  // Не удалось определить или открыть каталог профиля.
-    Database, // Не удалось открыть SQLite.
-    Worker,   // Не удалось настроить или запустить фонового исполнителя.
+    Profile,   // Не удалось определить или открыть каталог профиля.
+    Database,  // Не удалось открыть SQLite.
+    Worker,    // Не удалось настроить или запустить фонового исполнителя.
+    TestLogin, // Не удалось войти на тестовый стенд.
 }
 
 impl fmt::Display for StartupError {
@@ -66,6 +70,9 @@ impl fmt::Display for StartupError {
             Self::Profile => "Не удалось открыть профиль Workspace",
             Self::Database => "Не удалось открыть базу Workspace",
             Self::Worker => "Не удалось запустить фоновую работу Workspace",
+            Self::TestLogin => {
+                "Не удалось войти в тестовый Workspace. Причина указана в журнале запуска."
+            }
         })
     }
 }
@@ -101,13 +108,21 @@ impl RuntimeClient {
     pub fn start() -> io::Result<(Self, RuntimeEvents)> {
         Self::start_using(|| {
             let directory = state_directory().map_err(|_| StartupError::Profile)?;
-            WorkerParts::open(directory)
+            WorkerParts::open(directory, None)
         })
     }
 
     /// Запускает тот же цикл с явно выбранным каталогом, например для проверки на отдельном профиле.
     pub fn start_in(directory: PathBuf) -> io::Result<(Self, RuntimeEvents)> {
-        Self::start_using(move || WorkerParts::open(directory))
+        Self::start_using(move || WorkerParts::open(directory, None))
+    }
+
+    /// Запускает обычное окно после входа на стенд с секретами в памяти процесса.
+    pub(super) fn start_test_profile(
+        directory: PathBuf,
+        login: TestLogin,
+    ) -> io::Result<(Self, RuntimeEvents)> {
+        Self::start_using(move || WorkerParts::open(directory, Some(login)))
     }
 
     /// Собирает рабочую подписку с отдельной базой и тестовым центром сертификации.
@@ -488,18 +503,33 @@ impl From<RuntimeError> for BootstrapFailure {
 }
 
 impl WorkerParts {
-    /// Открывает тот же JSON, Keychain и SQLite, что окно Iced и CLI.
-    fn open(directory: PathBuf) -> Result<(Self, oneshot::Receiver<()>), StartupError> {
+    /// Открывает профиль и выбирает хранилище токенов для обычного или тестового запуска.
+    fn open(
+        directory: PathBuf,
+        test_login: Option<TestLogin>,
+    ) -> Result<(Self, oneshot::Receiver<()>), StartupError> {
         let (accounts, released) =
             ProfileAccounts::open(&directory).map_err(|_| StartupError::Profile)?;
+        let secrets: Arc<dyn SecretStore> = if test_login.is_some() {
+            Arc::new(MemorySecrets::default())
+        } else {
+            Arc::new(MacKeychain)
+        };
         let auth = Auth::new(
             Arc::new(WorkspaceIamHttp::new()),
             Arc::new(accounts),
-            Arc::new(MacKeychain),
+            secrets,
         );
         let storage = Storage::open(directory.join("messenger.sqlite3"))
             .map_err(|_| StartupError::Database)?;
         let messenger = MessengerSource::new().map_err(|_| StartupError::Worker)?;
+        if let Some(login) = test_login {
+            login.activate(&auth).map_err(|error| {
+                log::error!("event=workspace_test_login result=failed reason={error}");
+                StartupError::TestLogin
+            })?;
+            log::info!("event=workspace_test_login result=active");
+        }
         let storage = Arc::new(storage);
         let sync = Sync::with_media_cache(
             auth.clone(),
@@ -583,6 +613,7 @@ impl WorkerParts {
         started.send_replace(Some(Ok(())));
 
         let (stop, stopped) = oneshot::channel();
+        let auth = self.services.auth.clone();
         let background = bootstrap::run_with_wake(
             self.runtime,
             Some(self.catalog),
@@ -590,7 +621,19 @@ impl WorkerParts {
             async move {
                 let _ = stopped.await;
             },
-            |result| result.map_err(|_| BootstrapFailure::Restore),
+            |result| -> Result<(), BootstrapFailure> {
+                result.map_err(|_| BootstrapFailure::Restore)?;
+                let sessions = auth.snapshot();
+                let active = sessions
+                    .iter()
+                    .filter(|session| session.status == SessionStatus::Active)
+                    .count();
+                log::debug!(
+                    "event=workspace_auth_restored active={active} total={}",
+                    sessions.len()
+                );
+                Ok(())
+            },
         );
         tokio::pin!(background);
 

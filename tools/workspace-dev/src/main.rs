@@ -13,6 +13,7 @@ fn main() -> ExitCode {
             env!("CARGO_MANIFEST_DIR"),
             "/../../scripts/dev-workspace-desktop.sh"
         ))
+        .args(std::env::args_os().skip(1))
         .exec();
     eprintln!("Не удалось запустить dev-режим: {error}");
     ExitCode::FAILURE

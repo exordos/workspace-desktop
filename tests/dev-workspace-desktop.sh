@@ -21,8 +21,13 @@ cp "$project_dir/.cargo/config.toml" "$fixture/.cargo/"
 cp "$project_dir/tools/workspace-dev/Cargo.toml" "$project_dir/tools/workspace-dev/Cargo.lock" \
     "$fixture/tools/workspace-dev/"
 cp "$project_dir/tools/workspace-dev/src/main.rs" "$fixture/tools/workspace-dev/src/"
-cp "$project_dir/scripts/dev-workspace-desktop.sh" "$fixture/scripts/"
+cp "$project_dir/scripts/dev-workspace-desktop.sh" "$project_dir/scripts/run-workspace-desktop-dev.sh" \
+    "$fixture/scripts/"
 cp "$project_dir/rust-toolchain.toml" "$fixture/"
+# Берём уже загруженный проверенный наблюдатель, чтобы проверка не зависела от сети.
+if [ -d "$project_dir/target/dev-tools" ]; then
+    cp -R "$project_dir/target/dev-tools" "$fixture/target/"
+fi
 source_file="$fixture/crates/workspace-desktop/src/lib.rs"
 printf '// Исходная версия.\n' > "$source_file"
 printf '[workspace]\nmembers = ["crates/workspace-desktop"]\nresolver = "3"\n' > "$fixture/Cargo.toml"
@@ -33,19 +38,48 @@ version = "0.1.0"
 edition = "2024"
 EOF
 cat > "$fixture/crates/workspace-desktop/src/main.rs" <<'EOF'
-//! Сохраняет PID тестового приложения, чтобы проверить его перезапуск.
+//! Сохраняет PID и режим запуска, чтобы проверить перезапуск и изоляцию профиля.
 
 use std::fs::OpenOptions;
 use std::io::Write;
 
 /// Записывает PID и ждёт, пока наблюдатель завершит процесс.
 fn main() -> std::io::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--test-profile") {
+        assert_eq!(std::env::var("WORKSPACE_TEST_LOGIN_A").as_deref(), Ok("agent-fixture"));
+        let directory = std::env::temp_dir();
+        assert!(directory.file_name().unwrap().to_string_lossy().starts_with("workspace-dev-agent."));
+        std::fs::write("agent-profile", directory.as_os_str().as_encoded_bytes())?;
+    } else {
+        assert!(std::env::current_exe()?.ends_with("dev-run/workspace-desktop"));
+    }
     let mut launches = OpenOptions::new().create(true).append(true).open("launches")?;
     writeln!(launches, "{}", std::process::id())?;
     std::thread::sleep(std::time::Duration::from_secs(60));
     Ok(())
 }
 EOF
+cat > "$fixture/bin/codesign" <<'EOF'
+#!/bin/sh
+set -eu
+case "$1" in
+    --force)
+        [ "$2" = --timestamp=none ] && [ "$3" = --identifier ]
+        [ "$4" = com.exordos.workspace-desktop.dev ] && [ "$5" = --sign ]
+        [ "$6" = '0123456789ABCDEF0123456789ABCDEF01234567' ]
+        printf '%s\n' signed >> sign-operations
+        ;;
+    --verify) ;;
+    *) exit 1 ;;
+esac
+EOF
+cat > "$fixture/bin/security" <<'EOF'
+#!/bin/sh
+printf '%s\n' '  Valid identities only' \
+    '  1) 0123456789ABCDEF0123456789ABCDEF01234567 "Apple Development: Fixture"' \
+    '     1 valid identities found'
+EOF
+chmod +x "$fixture/bin/codesign" "$fixture/bin/security"
 "$cargo_bin" generate-lockfile --offline --manifest-path "$fixture/Cargo.toml"
 
 start_watcher() {
@@ -53,7 +87,9 @@ start_watcher() {
         cd "$fixture"
         export PATH="$fixture/bin:$(dirname -- "$cargo_bin"):/usr/bin:/bin:/usr/sbin:/sbin"
         export CARGO_TARGET_DIR="$fixture/target"
-        exec "$cargo_bin" dev
+        unset WORKSPACE_DEV_SIGN_IDENTITY WORKSPACE_DEV_SIGN_KEYCHAIN
+        unset WORKSPACE_TEST_URL WORKSPACE_TEST_LOGIN_A WORKSPACE_TEST_PASSWORD_A
+        exec "$cargo_bin" dev "$@"
     ) > "$fixture/watch.log" 2>&1 &
     watcher_pid=$!
 }
@@ -104,3 +140,24 @@ printf '#!/bin/sh\nexit 1\n' > "$fixture/bin/curl"
 chmod +x "$fixture/bin/curl"
 start_watcher
 wait_for_launch 4
+[ "$(wc -l < "$fixture/sign-operations")" -eq 4 ]
+kill -TERM "$watcher_pid"
+wait "$watcher_pid"
+watcher_pid=
+
+# Режим агента берёт окружение из файла и запускает бинарник без вызова codesign.
+printf 'WORKSPACE_TEST_LOGIN_A=agent-fixture\n' > "$fixture/.env.test.local"
+start_watcher --test-profile
+wait_for_launch 5
+[ "$(wc -l < "$fixture/sign-operations")" -eq 4 ]
+first_profile=$(cat "$fixture/agent-profile")
+[ -d "$first_profile" ]
+printf '// Вторая сборка режима агента.\n' > "$source_file"
+wait_for_launch 6
+last_profile=$(cat "$fixture/agent-profile")
+[ "$first_profile" != "$last_profile" ]
+[ ! -e "$first_profile" ]
+kill -TERM "$watcher_pid"
+wait "$watcher_pid"
+watcher_pid=
+[ ! -e "$last_profile" ]
