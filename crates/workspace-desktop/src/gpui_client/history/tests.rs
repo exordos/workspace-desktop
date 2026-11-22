@@ -274,10 +274,6 @@ fn heading_uses_direct_peer_from_current_catalog(cx: &mut TestAppContext) {
     }
     ui.run_until_parked();
     assert_eq!(
-        ui.read(|app| view.read(app).tested_chat_avatars(peer, app)),
-        (None, None)
-    );
-    assert_eq!(
         ui.debug_bounds("conversation-heading-avatar")
             .unwrap()
             .size

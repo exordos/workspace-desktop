@@ -25,5 +25,4 @@ pub(crate) use text_input::{TextInput, TextInputChanged, TextInputSubmitted};
 pub(in crate::gpui_client) use theme::ellipsized_label;
 pub(super) use theme::{PANEL_RADIUS, SURFACE_RADIUS};
 pub use theme::{Palette, TextRole, ThemeMode, label};
-pub(in crate::gpui_client) use top_bar::TopBarAction;
-pub use top_bar::{TopBar, TopBarAccount, TopBarSelection};
+pub use top_bar::{TopBar, TopBarAccount, TopBarAction, TopBarSection, TopBarSelection};

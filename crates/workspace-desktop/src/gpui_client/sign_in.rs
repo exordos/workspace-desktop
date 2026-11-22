@@ -2,10 +2,11 @@
 //! Сначала описаны состояние формы и переходы, затем её разметка и действия.
 
 use gpui::{
-    App, Context, Div, Entity, FocusHandle, KeyBinding, ScrollHandle, Stateful, Subscription, Task,
-    Window, div, prelude::*, px,
+    App, Context, Div, Entity, EventEmitter, FocusHandle, KeyBinding, ScrollHandle, Stateful,
+    Subscription, Task, Window, div, prelude::*, px,
 };
 use uuid::Uuid;
+use workspace_core::context::OwnerContext;
 
 use super::{
     runtime::{LoginAttempt, LoginError, RuntimeClient},
@@ -44,20 +45,29 @@ enum Registration {
     Available(String), // HTTPS-адрес регистрации из публичных настроек выбранного сервера.
 }
 
+/// Результат формы, который меняет маршрут окна.
+pub(super) enum SignInAction {
+    Cancel,              // Пользователь вернулся с первого шага добавления аккаунта.
+    Saved(OwnerContext), // Auth сохранил вход для этого сервера, пользователя и проекта.
+}
+
 /// Состояние одной формы. Аккаунты, токены и проверка доступа остаются в авторизации.
 pub(super) struct SignIn {
-    runtime: RuntimeClient,                  // Рабочий поток открытого профиля.
-    step: Step,                              // Видимая часть формы.
+    adding_account: bool, // Первый шаг дополнительного входа позволяет вернуться в мессенджер.
+    runtime: RuntimeClient, // Рабочий поток открытого профиля.
+    step: Step,           // Видимая часть формы.
     server: Entity<TextInput>, // Адрес Workspace, после проверки хранится в нормализованном виде.
-    login: Entity<TextInput>,  // Логин, сохраняется при возврате к полям учётных данных.
+    login: Entity<TextInput>, // Логин, сохраняется при возврате к полям учётных данных.
     password: Entity<TextInput>, // Пароль нужен до завершения проверки, включая шаг OTP.
-    otp: Entity<TextInput>,    // Одноразовый код, очищается после ответа и при возврате.
+    otp: Entity<TextInput>, // Одноразовый код, очищается после ответа и при возврате.
     request: Option<(Uuid, Task<()>)>, // Одно ожидание ответа. Удаление отменяет ожидание.
     registration: Registration, // Ссылка на регистрацию и её отдельный запрос.
     issue: Option<LoginError>, // Категория ошибки для сообщения и рамки проблемного поля.
-    focus_step: bool,          // Переместить фокус на поле нового шага в ближайшем кадре.
+    focus_step: bool,     // Переместить фокус на поле нового шага в ближайшем кадре.
     _input_subscriptions: Vec<Subscription>, // Обновляют кнопки при вводе и передают Enter.
 }
+
+impl EventEmitter<SignInAction> for SignIn {}
 
 impl SignIn {
     /// Создаёт форму с пустым адресом или адресом Workspace для повторного входа.
@@ -88,6 +98,7 @@ impl SignIn {
         }
 
         Self {
+            adding_account: false,
             runtime,
             step: Step::Server,
             server,
@@ -100,6 +111,13 @@ impl SignIn {
             focus_step: true,
             _input_subscriptions: subscriptions,
         }
+    }
+
+    /// Начинает дополнительный вход с пустым адресом и кнопкой возврата.
+    pub(super) fn add_account(runtime: RuntimeClient, cx: &mut Context<Self>) -> Self {
+        let mut form = Self::new(runtime, None, cx);
+        form.adding_account = true;
+        form
     }
 
     /// Привязывает Escape к возврату только внутри формы входа.
@@ -305,10 +323,7 @@ impl SignIn {
         let runtime = self.runtime.clone();
         let op_id = Uuid::new_v4();
         let task = cx.spawn(async move |view, cx| {
-            let result = runtime
-                .complete_login(attempt, project_id)
-                .await
-                .map(|_| ());
+            let result = runtime.complete_login(attempt, project_id).await;
             let _ = view.update(cx, |view, cx| view.project_confirmed(op_id, result, cx));
         });
         self.request = Some((op_id, task));
@@ -318,14 +333,17 @@ impl SignIn {
     fn project_confirmed(
         &mut self,
         op_id: Uuid,
-        result: Result<(), LoginError>,
+        result: Result<OwnerContext, LoginError>,
         cx: &mut Context<Self>,
     ) {
         if !self.finish_request(op_id) {
             return;
         }
         match result {
-            Ok(()) => self.step = Step::Finished,
+            Ok(owner) => {
+                self.step = Step::Finished;
+                cx.emit(SignInAction::Saved(owner));
+            }
             Err(error) => {
                 self.set_issue(Some(error), cx);
                 if !matches!(
@@ -345,7 +363,13 @@ impl SignIn {
     /// Возвращает к предыдущему шагу и очищает секреты закрытого шага.
     fn back(&mut self, cx: &mut Context<Self>) {
         let previous = match self.step {
-            Step::Server | Step::Finished => return,
+            Step::Server => {
+                if self.adding_account {
+                    cx.emit(SignInAction::Cancel);
+                }
+                return;
+            }
+            Step::Finished => return,
             Step::Credentials => Step::Server,
             Step::Otp => Step::Credentials,
             // Фиксация сессии уже могла начаться, поэтому ждём её итог.
@@ -554,14 +578,17 @@ impl SignIn {
                     .debug_selector(|| "sign-in-submit".into()),
             )
             .children(self.registration_action(palette, cx))
-            .when(!matches!(self.step, Step::Server), |actions| {
-                actions.child(
-                    back.render(palette, None, move |_, app| {
-                        let _ = back_target.update(app, SignIn::back);
-                    })
-                    .debug_selector(|| "sign-in-back".into()),
-                )
-            })
+            .when(
+                self.adding_account || !matches!(self.step, Step::Server),
+                |actions| {
+                    actions.child(
+                        back.render(palette, None, move |_, app| {
+                            let _ = back_target.update(app, SignIn::back);
+                        })
+                        .debug_selector(|| "sign-in-back".into()),
+                    )
+                },
+            )
     }
 }
 
@@ -572,6 +599,11 @@ impl Render for SignIn {
         self.keep_project_in_view(window);
         let palette = Palette::for_window(window, cx);
         let (hint, submit) = self.copy();
+        let title = if self.adding_account {
+            "Добавить аккаунт"
+        } else {
+            "Вход в Workspace"
+        };
         div()
             .id("workspace-sign-in")
             .debug_selector(|| "workspace-sign-in".into())
@@ -605,7 +637,7 @@ impl Render for SignIn {
                                 div()
                                     .text_center()
                                     .child(
-                                        label(palette, TextRole::Heading, "Вход в Workspace")
+                                        label(palette, TextRole::Heading, title)
                                             .text_size(px(20.))
                                             .line_height(px(28.)),
                                     )

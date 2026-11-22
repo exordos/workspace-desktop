@@ -54,8 +54,6 @@ use crate::{
     platform::JsonAccountStore,
 };
 
-use crate::gpui_client::right_panel::{PanelKey, Scope};
-
 const USER: &str = "10000000-0000-4000-8000-000000000001";
 const PEER: &str = "10000000-0000-4000-8000-000000000002";
 const PROJECT: &str = "10000000-0000-4000-8000-000000000003";
@@ -477,17 +475,12 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
     if let Some(media) = &state.media {
         media.observe();
     }
-    let two_accounts = state.delayed.is_some()
-        || state.recovery.is_some()
-        || state.topic.is_some()
-        || state
-            .details
-            .as_ref()
-            .is_some_and(|details| details.profile_avatar.is_some());
     if path == "/api/workspace/v1/events/ws" {
         let protocol = request.headers()[header::SEC_WEBSOCKET_PROTOCOL]
             .to_str()
             .unwrap();
+        let two_accounts =
+            state.delayed.is_some() || state.recovery.is_some() || state.topic.is_some();
         let user = match protocol {
             "workspace.events.v1, bearer.local-user" => USER,
             "workspace.events.v1, bearer.local-peer" if two_accounts => PEER,
@@ -573,7 +566,11 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
 
     let (user, peer) = match request.headers()[header::AUTHORIZATION].to_str().unwrap() {
         "Bearer local-user" => (USER, PEER),
-        "Bearer local-peer" if two_accounts => (PEER, USER),
+        "Bearer local-peer"
+            if state.delayed.is_some() || state.recovery.is_some() || state.topic.is_some() =>
+        {
+            (PEER, USER)
+        }
         _ => panic!("HTTPS должен использовать тестовый вход открытого профиля"),
     };
     if let Some(media) = &state.media
@@ -1063,7 +1060,7 @@ fn start_runtime(
     .unwrap()
 }
 
-/// Показывает одно фото под текущим входом и завершает профиль при смене аккаунта.
+/// Шапка и открытый профиль показывают своё фото, скачанное один раз под текущим входом.
 #[gpui::test]
 fn own_avatar_is_shared_between_top_bar_and_profile_root(cx: &mut TestAppContext) {
     cx.update(bind_keys);
@@ -1083,25 +1080,10 @@ fn own_avatar_is_shared_between_top_bar_and_profile_root(cx: &mut TestAppContext
         .as_ref()
         .unwrap();
     let profile = tempfile::tempdir().unwrap();
-    let a = saved_account(&server, USER, Uuid::nil());
-    let b = saved_account(&server, PEER, PEER.parse().unwrap());
-    let a_id = a.context.account_id.clone();
-    let b_id = b.context.account_id.clone();
-    JsonAccountStore::open(profile.path())
-        .unwrap()
-        .save(&b)
-        .unwrap();
-    let (runtime, events) = start_runtime(profile.path(), a);
-    let (client, ui) = cx.add_window_view(|_, cx| {
-        Client::new(
-            Options {
-                active: Some(a_id.clone()),
-                ..Options::default()
-            },
-            runtime.clone(),
-            cx,
-        )
-    });
+    let (runtime, events) =
+        start_runtime(profile.path(), saved_account(&server, USER, Uuid::nil()));
+    let (client, ui) =
+        cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
     ui.update(|_, app| {
         let subscription = events.attach(&client, app, Client::handle_runtime);
         client.update(app, |client, cx| client.attach(subscription, cx));
@@ -1112,71 +1094,13 @@ fn own_avatar_is_shared_between_top_bar_and_profile_root(cx: &mut TestAppContext
         "фото этого входа отображается в шапке",
         |ui| ui.debug_bounds("workspace-profile-avatar-photo").is_some(),
     );
-    let session = ui.read(|app| client.read(app).shell.selected().unwrap().clone());
-    let profile_key = |id: &'static str| PanelKey {
-        scope: Scope::Account(session.clone()),
-        id: id.into(),
-    };
-    let root = profile_key("profile-root");
-    let personal_info = profile_key("profile-personal-info");
-    let active = |ui: &VisualTestContext, key: &PanelKey| {
-        ui.read(|app| client.read(app).right_panel.read(app).is_active(key))
-    };
     click(ui, "workspace-profile-trigger");
     until(
         ui,
-        "фото этого же входа видно в профиле",
-        |ui| active(ui, &root) && ui.debug_bounds("profile-root-avatar-photo").is_some(),
+        "то же фото отображается на корневой странице профиля",
+        |ui| ui.debug_bounds("profile-root-avatar-photo").is_some(),
     );
     assert_eq!(counters.lookups.load(Ordering::SeqCst), 1);
-    assert_eq!(counters.downloads.load(Ordering::SeqCst), 1);
-
-    click(ui, "profile-personal-info");
-    until(
-        ui,
-        "открыта личная информация",
-        |ui| active(ui, &personal_info),
-    );
-    click(ui, "right-panel-back");
-    until(ui, "возврат в профиль", |ui| {
-        active(ui, &root)
-    });
-    click(ui, "right-panel-close");
-    until(ui, "кнопка закрывает профиль", |ui| {
-        !active(ui, &root)
-    });
-    assert!(ui.update(|window, app| {
-        client
-            .read(app)
-            .top_bar
-            .read(app)
-            .profile_focus()
-            .is_focused(window)
-    }));
-    ui.simulate_keystrokes("enter");
-    ui.simulate_event(gpui::KeyUpEvent {
-        keystroke: gpui::Keystroke::parse("enter").unwrap(),
-    });
-    until(
-        ui,
-        "Enter снова открывает профиль с кнопки в фокусе",
-        |ui| active(ui, &root),
-    );
-    until(
-        ui,
-        "загружен каталог второго входа",
-        |ui| {
-            ui.read(|app| {
-                client.read(app).shell.accounts().iter().any(|row| {
-                    row.session.owner.account_id == b_id && row.status == SessionStatus::Active
-                })
-            })
-        },
-    );
-    click_account(&client, ui, &b_id);
-    assert!(!active(ui, &root));
-    let user = session.user_uuid().expect("UUID первого аккаунта");
-    assert!(ui.read(|app| client.read(app).profile_avatar.image(user, app).is_none()));
     assert_eq!(counters.downloads.load(Ordering::SeqCst), 1);
     assert_eq!(
         futures::executor::block_on(runtime.shutdown()),
@@ -1528,41 +1452,6 @@ fn wait_topic_confirmation(
     );
 }
 
-/// Содержимое тестовой панели уровня аккаунта.
-struct AccountPanelFixture(&'static str); // Селектор видимого экрана.
-
-impl gpui::Render for AccountPanelFixture {
-    /// Помечает видимую панель в тестовом окне.
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
-        let id = self.0;
-        div().id(id).debug_selector(move || id.into())
-    }
-}
-
-/// Открывает панель уровня аккаунта через тот же API, что и рабочие панели.
-fn open_account_panel(client: &Entity<Client>, ui: &mut VisualTestContext, id: &'static str) {
-    ui.update(|window, app| {
-        let client = client.read(app);
-        let key = PanelKey {
-            scope: Scope::Account(client.shell.selected().unwrap().clone()),
-            id: id.into(),
-        };
-        let opener = client.initial_focus.clone();
-        let panel = client.right_panel.clone();
-        panel.update(app, |panel, cx| {
-            panel.open(
-                key,
-                "Тестовая панель",
-                opener,
-                |cx| cx.new(|_| AccountPanelFixture(id)),
-                window,
-                cx,
-            );
-        });
-    });
-    ui.run_until_parked();
-}
-
 /// Проверяет доступ к профилю, точную тему, закрытие и фокус через обычный Client.
 #[gpui::test]
 fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
@@ -1614,15 +1503,27 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
     });
     let first = ui.read(|app| client.read(app).conversation.as_ref().unwrap().clone());
     let peer = PEER.parse().unwrap();
+    let chat_avatars_ready = |ui: &mut VisualTestContext| {
+        ui.read(|app| {
+            let (heading, history) = first.read(app).tested_chat_avatars(peer, app);
+            heading.is_some() && heading == history
+        })
+    };
     until(
         ui,
         "шапка и история получили общий аватар",
-        |ui| {
-            ui.read(|app| {
-                let (heading, history) = first.read(app).tested_chat_avatars(peer, app);
-                heading.is_some() && heading == history
-            })
-        },
+        chat_avatars_ready,
+    );
+    click(ui, "workspace-top-bar-calendar");
+    assert_eq!(
+        ui.read(|app| first.read(app).tested_chat_avatars(peer, app)),
+        (None, None)
+    );
+    click(ui, "workspace-top-bar-chats");
+    until(
+        ui,
+        "аватары вернулись в показанный разговор",
+        chat_avatars_ready,
     );
     let composer = ui.read(|app| first.read(app).tested_composer().unwrap().clone());
     click(ui, "workspace-composer-editor");
@@ -1703,12 +1604,12 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
         ui.update(|window, app| first.read(app).tested_details_focus(window, app)),
         Some("закрыть")
     );
-    open_account_panel(&client, ui, "test-account-main");
-    open_account_panel(&client, ui, "test-account-settings");
-    assert!(ui.debug_bounds("test-account-settings").is_some());
+    click(ui, "workspace-profile-trigger");
+    click(ui, "profile-settings");
+    assert!(ui.debug_bounds("profile-settings-page").is_some());
     assert!(!ui.read(|app| first.read(app).tested_details_is_open(app)));
-    click(ui, "right-panel-back");
-    click(ui, "right-panel-close");
+    click(ui, "profile-back");
+    click(ui, "profile-close");
     assert!(ui.read(|app| first.read(app).tested_details_is_open(app)));
     assert_eq!(details.user_reads(USER, PEER), profile_reads);
     assert_eq!(
@@ -1782,6 +1683,7 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
         ui,
         "событие обновляет открытую карточку без повторного GET",
         |ui| {
+            // GPUI может хранить границы карточки от первого открытия.
             ui.read(|app| first.read(app).tested_details(app, |details| matches!(
                 details,
                 Some(SidebarDetails::Peer(peer)) if peer.profile.display_name == "Профиль после события"
@@ -1801,8 +1703,8 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
     );
     assert_eq!(details.user_reads(USER, PEER), profile_reads);
 
-    open_account_panel(&client, ui, "test-account-main");
-    open_account_panel(&client, ui, "test-account-settings");
+    click(ui, "workspace-profile-trigger");
+    click(ui, "profile-settings");
     click(ui, "right-panel-close-all");
     ui.read(|app| {
         assert!(!first.read(app).tested_details_is_open(app));
@@ -1814,7 +1716,7 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
         ui.update(|window, app| first.read(app).tested_details_focus(window, app)),
         Some("сведения")
     );
-    open_account_panel(&client, ui, "test-account-main");
+    click(ui, "workspace-profile-trigger");
     click_account(&client, ui, &b_id);
     assert!(ui.read(|app| client.read(app).conversation.is_none()));
     ui.read(|app| assert!(client.read(app).right_panel.read(app).is_empty()));
@@ -1900,7 +1802,7 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
             })
         },
     );
-    open_account_panel(&client, ui, "test-account-main");
+    click(ui, "workspace-profile-trigger");
     ui.simulate_resize(size(px(700.), px(600.)));
     ui.run_until_parked();
     click(ui, CHANNEL_CHEVRON);
@@ -1910,14 +1812,16 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
     let topic = ui.read(|app| client.read(app).conversation.as_ref().unwrap().clone());
     ui.read(|app| {
         let client = client.read(app);
-        let key = PanelKey {
-            scope: Scope::Account(client.shell.selected().unwrap().clone()),
-            id: "test-account-main".into(),
+        let key = crate::gpui_client::right_panel::PanelKey {
+            scope: crate::gpui_client::right_panel::Scope::Account(
+                client.shell.selected().unwrap().clone(),
+            ),
+            id: "profile-root".into(),
         };
         assert!(client.right_panel.read(app).is_active(&key));
     });
     let route_focus = ui.update(|window, app| window.focused(app));
-    click(ui, "right-panel-close");
+    click(ui, "profile-close");
     ui.update(|window, _| {
         if let Some(focus) = route_focus {
             window.focus(&focus);

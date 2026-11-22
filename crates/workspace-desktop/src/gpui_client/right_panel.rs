@@ -20,10 +20,6 @@ actions!(workspace_right_panel, [Back, CloseAll]);
 /// Ограничивает время жизни панели контекстом, из которого её открыли.
 #[derive(Clone, PartialEq, Eq)]
 pub(super) enum Scope {
-    #[allow(
-        dead_code,
-        reason = "Панели уровня аккаунта подключаются отдельной фичей"
-    )]
     Account(AccountSession), // Доступна при смене разговора внутри этого входа.
     Conversation(ConversationAddress), // Доступна только в этом открытии разговора.
 }
@@ -320,9 +316,9 @@ impl RightPanel {
                 .nth(1)
                 .is_some_and(|previous| entry.key.scope == previous.key.scope);
         let (close_id, close_label) = if account_back {
-            ("right-panel-back", "Назад")
+            ("profile-back", "Назад")
         } else if account_page {
-            ("right-panel-close", "Закрыть")
+            ("profile-close", "Закрыть")
         } else {
             ("conversation-details-close", "Закрыть")
         };

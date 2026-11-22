@@ -3,7 +3,6 @@
 
 mod history_positions;
 mod notification_banner;
-mod profile;
 
 use std::collections::HashMap;
 
@@ -17,7 +16,6 @@ use workspace_core::{
 
 use history_positions::HistoryPositions;
 use notification_banner::{NotificationBanner, NotificationBannerActions};
-use profile::Profile;
 
 use super::{
     Options,
@@ -33,9 +31,22 @@ use super::{
     runtime::{RuntimeClient, StartupError},
     shell::{Shell, ShellEffect},
     sidebar::{FolderIntent, Sidebar},
-    sign_in::SignIn,
-    ui::{Palette, TextRole, TopBar, TopBarAccount, TopBarAction, TopBarSelection, label},
+    sign_in::{SignIn, SignInAction},
+    ui::{
+        Palette, TextRole, TopBar, TopBarAccount, TopBarAction, TopBarSection, TopBarSelection,
+        label,
+    },
 };
+
+mod profile;
+use profile::Profile;
+
+/// Дополнительный вход в уже открытом окне.
+struct AddAccount {
+    previous: Vec<AccountSession>, // Ранее видимые поколения, чтобы дождаться нового входа.
+    saved: Option<OwnerContext>,   // Подтверждённый Auth владелец, None до сохранения.
+    select_on_success: bool, // Можно открыть этот вход, пока пользователь не запросил другой переход.
+}
 
 /// Проверяет, что позиции и черновики ещё принадлежат действующему поколению входа.
 fn keeps_session(
@@ -53,6 +64,12 @@ fn keeps_session(
     })
 }
 
+/// Куда вернуть клавиатурный фокус после закрытия текущего экрана.
+enum ReturnFocus {
+    Workspace,   // Общая точка входа в рабочую область.
+    AccountMenu, // Кнопка выбора аккаунта в шапке.
+}
+
 const SIDEBAR_PREFERRED_WIDTH: f32 = 299.;
 const SIDEBAR_MIN_WIDTH: f32 = 240.;
 const SIDEBAR_MAX_WIDTH: f32 = 720.;
@@ -68,22 +85,24 @@ fn sidebar_width(width: gpui::Pixels) -> gpui::Pixels {
 
 /// Корневое состояние одного окна. Долгие операции выполняет RuntimeClient.
 pub(super) struct Client {
-    shell: Shell,             // Выбор, адрес разговора и фильтр событий по входам.
-    runtime: RuntimeClient,   // Очередь команд рабочего потока этого профиля.
+    section: TopBarSection, // Видимый раздел окна, сохраняющий маршрут чатов при переходе.
+    shell: Shell,           // Выбор, адрес разговора и фильтр событий по входам.
+    runtime: RuntimeClient, // Очередь команд рабочего потока этого профиля.
     sidebar: Entity<Sidebar>, // Единственный каталог; хранит поиск каждого входа.
     conversation: Option<Entity<Conversation>>, // Экран актуального адреса, если он открыт.
     history_positions: HistoryPositions, // Опоры чтения недавних разговоров этого окна.
     details_navigation: Option<Subscription>, // Подписка на переход из правой панели текущего экрана.
     right_panel: Entity<RightPanel>,          // Общая история правых панелей рабочего окна.
-    sign_in: Option<Entity<SignIn>>,          // Форма нужна, пока в профиле нет доступного входа.
+    sign_in: Option<Entity<SignIn>>,          // Открытая форма первого или дополнительного входа.
+    add_account: Option<AddAccount>,          // Ход дополнительного входа, пока видна форма.
     profile_requested: Option<AccountSession>, // Нажатие профиля ждёт окно для передачи фокуса.
     profile_avatar: AvatarImages,             // Фото активного входа для верхней панели.
     labels: HashMap<AccountId, String>,       // Подписи для переключателя и баннеров.
     top_bar: Entity<TopBar>, // Шапка хранит локальный фокус и показывает снимок оболочки.
     notification_banner: Entity<NotificationBanner>, // Планка разрешения поверх рабочей области.
-    _top_bar_subscriptions: [Subscription; 2], // Выбор аккаунта и открытие профиля из шапки.
+    _top_bar_subscriptions: [Subscription; 2], // Выбор аккаунта и открытие экранов из шапки.
     initial_focus: FocusHandle, // Корневая точка обхода до выбора первого элемента.
-    restore_focus: bool,     // После закрытия формы вернуть фокус в рабочую область.
+    restore_focus: Option<ReturnFocus>, // После закрытия формы вернуть фокус в рабочую область.
     ready: bool,             // Рабочий поток открыл профиль и подготовил подписки.
     received_accounts: bool, // Пришёл первый снимок аккаунтов, может быть пустым.
     startup_error: Option<StartupError>, // Безопасная причина сбоя открытия профиля.
@@ -117,16 +136,19 @@ impl Client {
         let right_panel = cx.new(|cx| RightPanel::new(initial_focus.clone(), cx));
         cx.observe(&right_panel, |_, _, cx| cx.notify()).detach();
         let selection = cx.subscribe(&top_bar, |client, _, selection: &TopBarSelection, cx| {
+            client.open_section(TopBarSection::Chats, cx);
             client.handle_action(ShellAction::SelectAccount(selection.0.clone()), cx);
         });
-        let open_profile =
+        let top_bar_action =
             cx.subscribe(
                 &top_bar,
                 |client, _, action: &TopBarAction, cx| match action {
+                    TopBarAction::AddAccount => client.open_add_account(cx),
                     TopBarAction::OpenProfile => {
                         client.profile_requested = client.shell.selected().cloned();
                         cx.notify();
                     }
+                    TopBarAction::OpenSection(section) => client.open_section(*section, cx),
                 },
             );
         let subscription = cx.subscribe(&sidebar, |client, _, action: &SidebarAction, cx| {
@@ -143,6 +165,7 @@ impl Client {
         });
 
         Self {
+            section: TopBarSection::default(),
             shell: Shell::new(options.active),
             runtime,
             sidebar,
@@ -151,14 +174,15 @@ impl Client {
             right_panel,
             details_navigation: None,
             sign_in: None,
+            add_account: None,
             profile_requested: None,
             profile_avatar: AvatarImages::default(),
             labels: options.labels,
             top_bar,
             notification_banner,
-            _top_bar_subscriptions: [selection, open_profile],
+            _top_bar_subscriptions: [selection, top_bar_action],
             initial_focus,
-            restore_focus: false,
+            restore_focus: None,
             ready: false,
             received_accounts: false,
             startup_error: None,
@@ -198,6 +222,14 @@ impl Client {
 
     /// Применяет действие каталога, переключателя или системного окна.
     pub(super) fn handle_action(&mut self, action: ShellAction, cx: &mut Context<Self>) {
+        if let Some(add_account) = &mut self.add_account
+            && matches!(
+                &action,
+                ShellAction::SelectAccount(_) | ShellAction::NotificationClicked(_)
+            )
+        {
+            add_account.select_on_success = false;
+        }
         let effect = self.shell.handle_action(action);
         self.apply(effect, cx);
     }
@@ -287,7 +319,7 @@ impl Client {
                 operation,
                 command,
             } => {
-                if self.shell.selected() != Some(&session) {
+                if self.shell.selected() != Some(&session) || self.section != TopBarSection::Chats {
                     return;
                 }
                 cx.spawn(async move |_, cx| {
@@ -323,25 +355,12 @@ impl Client {
     /// Выполняет команду оболочки и обновляет связанные части того же окна.
     fn apply(&mut self, effect: Option<ShellEffect>, cx: &mut Context<Self>) {
         let effect = self.reconcile_sign_in(cx).or(effect);
-        let account = self
-            .status()
-            .is_none()
-            .then(|| self.shell.selected())
-            .flatten();
-        let conversation = self.shell.conversation();
-        self.right_panel.update(cx, |panel, cx| {
-            panel.set_context(account, conversation, cx);
-        });
-        if matches!(
-            &effect,
-            Some(ShellEffect::OpenConversation(_) | ShellEffect::CloseConversation)
-        ) && let Some(previous) = &self.conversation
-        {
-            previous.update(cx, |view, cx| view.set_avatars_visible(false, cx));
-        }
+        self.sync_right_panel_context(cx);
         match effect {
             Some(ShellEffect::OpenConversation(address)) => {
                 self.save_history_position(cx);
+                self.release_old_conversation_avatars(cx);
+                self.open_section(TopBarSection::Chats, cx);
                 let runtime = self.runtime.clone();
                 let panel = self.right_panel.clone();
                 let restore = self.history_positions.take(&address);
@@ -357,6 +376,7 @@ impl Client {
             }
             Some(ShellEffect::CloseConversation) => {
                 self.save_history_position(cx);
+                self.release_old_conversation_avatars(cx);
                 self.details_navigation = None;
                 self.conversation = None;
             }
@@ -400,12 +420,11 @@ impl Client {
         let catalog = self.shell.selected_catalog();
         let conversation = self.shell.conversation();
         if let Some(view) = &self.conversation {
-            let visible = self.sign_in.is_none() && self.status().is_none();
             view.update(cx, |view, cx| {
-                view.set_catalog(self.shell.selected(), catalog, cx);
-                view.set_avatars_visible(visible, cx);
+                view.set_catalog(self.shell.selected(), catalog, cx)
             });
         }
+        self.sync_conversation_avatar_visibility(cx);
         self.sidebar.update(cx, |view, cx| {
             view.update_snapshot(self.shell.selected(), catalog, conversation, cx);
             view.set_folder_online(
@@ -418,6 +437,75 @@ impl Client {
             );
         });
         cx.notify();
+    }
+
+    /// Начинает дополнительный вход через тот же RuntimeClient, сохраняя маршрут мессенджера.
+    fn open_add_account(&mut self, cx: &mut Context<Self>) {
+        if self.sign_in.is_some() || self.status().is_some() {
+            return;
+        }
+        self.sidebar.update(cx, |view, cx| view.on_hidden(cx));
+        let form = cx.new(|cx| SignIn::add_account(self.runtime.clone(), cx));
+        cx.subscribe(&form, |client, _, action: &SignInAction, cx| {
+            match action {
+                SignInAction::Cancel => {
+                    client.add_account = None;
+                    client.sign_in = None;
+                    client.restore_focus = Some(ReturnFocus::AccountMenu);
+                    log::debug!("event=workspace_add_account_cancelled");
+                }
+                SignInAction::Saved(owner) => {
+                    if let Some(add_account) = &mut client.add_account {
+                        add_account.saved = Some(owner.clone());
+                    }
+                }
+            }
+            client.apply(None, cx);
+        })
+        .detach();
+        self.add_account = Some(AddAccount {
+            previous: self
+                .shell
+                .accounts()
+                .iter()
+                .map(|account| account.session.clone())
+                .collect(),
+            saved: None,
+            select_on_success: true,
+        });
+        self.sign_in = Some(form);
+        self.sync_conversation_avatar_visibility(cx);
+        log::debug!("event=workspace_add_account_opened");
+        cx.notify();
+    }
+
+    /// Меняет показанный раздел, сохраняя открытый разговор до возврата в мессенджер.
+    fn open_section(&mut self, section: TopBarSection, cx: &mut Context<Self>) {
+        if self.section != section && self.status().is_none() {
+            self.section = section;
+            if section != TopBarSection::Chats {
+                self.sidebar.update(cx, |view, cx| view.on_hidden(cx));
+            }
+            self.sync_conversation_avatar_visibility(cx);
+            self.sync_right_panel_context(cx);
+            self.top_bar
+                .update(cx, |bar, cx| bar.set_section(section, cx));
+            log::debug!("event=workspace_section_opened section={}", section.id());
+            cx.notify();
+        }
+    }
+
+    /// Выключает подписки на фото при уходе из рабочей области, сохраняя состояние разговора.
+    fn sync_conversation_avatar_visibility(&self, cx: &mut Context<Self>) {
+        if let Some(conversation) = &self.conversation {
+            let visible = self.section == TopBarSection::Chats
+                && self.sign_in.is_none()
+                && self.status().is_none();
+            let address = self.shell.conversation();
+            conversation.update(cx, |view, cx| {
+                view.set_avatars_visible(visible && address == Some(view.address()), cx);
+            });
+        }
     }
 
     /// Запоминает опору старого экрана перед тем, как заменить его новым адресом.
@@ -437,6 +525,65 @@ impl Client {
         }
     }
 
+    /// Снимает подписки со старого разговора до замены его маршрута или входа.
+    fn release_old_conversation_avatars(&self, cx: &mut Context<Self>) {
+        if let Some(conversation) = &self.conversation {
+            conversation.update(cx, |view, cx| view.set_avatars_visible(false, cx));
+        }
+    }
+
+    /// Привязывает стек к входу и открытому разговору в видимом разделе.
+    fn sync_right_panel_context(&self, cx: &mut Context<Self>) {
+        let account = self
+            .status()
+            .is_none()
+            .then(|| self.shell.selected())
+            .flatten();
+        let conversation = (self.section == TopBarSection::Chats)
+            .then(|| self.shell.conversation())
+            .flatten();
+        self.right_panel.update(cx, |panel, cx| {
+            panel.set_context(account, conversation, cx);
+        });
+    }
+
+    /// Передаёт запрос профиля общему стеку с фокусом кнопки в шапке.
+    fn open_requested_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(session) = self.profile_requested.take()
+            && self.shell.selected() == Some(&session)
+            && self.sign_in.is_none()
+            && self.status().is_none()
+        {
+            let opener = self.top_bar.read(cx).profile_focus();
+            self.right_panel.update(cx, |panel, cx| {
+                Profile::toggle(panel, session, opener, &self.runtime, window, cx);
+            });
+        }
+    }
+
+    /// Передаёт шапке изображение активного входа из общей подписки аватара.
+    fn sync_profile_avatar(&mut self, cx: &mut Context<Self>) {
+        let active = self
+            .shell
+            .selected()
+            .filter(|_| self.sign_in.is_none() && self.status().is_none());
+        let avatar = if let Some((session, id)) =
+            active.and_then(|session| Some((session, session.user_uuid()?)))
+        {
+            self.profile_avatar
+                .refresh([id], &self.runtime, session, cx);
+            match self.profile_avatar.image(id, cx) {
+                Some(gpui::ImageSource::Render(image)) => Some((session.clone(), image)),
+                _ => None,
+            }
+        } else {
+            self.profile_avatar.clear();
+            None
+        };
+        self.top_bar
+            .update(cx, |bar, cx| bar.set_profile_avatar(avatar, cx));
+    }
+
     /// Переключает тему из открытой панели и оставляет панель на новом адресе.
     fn open_details_topic(&mut self, target: &OpenDetailsTopic, cx: &mut Context<Self>) {
         if let Some(effect) = self
@@ -453,13 +600,41 @@ impl Client {
     /// Показывает вход после чтения профиля и передаёт окно первой готовой сессии после входа.
     fn reconcile_sign_in(&mut self, cx: &mut Context<Self>) -> Option<ShellEffect> {
         let accounts = self.shell.accounts();
+        if let Some(add_account) = &self.add_account {
+            if self.status().is_none() {
+                let owner = add_account.saved.as_ref()?;
+                let session = accounts
+                    .iter()
+                    .find(|account| {
+                        account.status == SessionStatus::Active
+                            && account.session.owner == *owner
+                            && !add_account.previous.contains(&account.session)
+                    })?
+                    .session
+                    .clone();
+                let select = add_account.select_on_success;
+                self.add_account = None;
+                self.sign_in = None;
+                self.restore_focus = Some(ReturnFocus::AccountMenu);
+                log::debug!("event=workspace_add_account_finished select={select}");
+                return if select {
+                    self.open_section(TopBarSection::Chats, cx);
+                    self.shell
+                        .handle_action(ShellAction::SelectAccount(session))
+                } else {
+                    None
+                };
+            }
+            self.add_account = None;
+            self.sign_in = None;
+            self.restore_focus = Some(ReturnFocus::Workspace);
+        }
         let show = self.status().is_none()
             && accounts
                 .iter()
                 .all(|account| account.status == SessionStatus::ReauthenticationRequired);
         if show {
             if self.sign_in.is_none() {
-                self.sidebar.update(cx, |view, cx| view.on_hidden(cx));
                 let server = match accounts {
                     [account] => Some(account.session.owner.server.as_str()),
                     _ => None,
@@ -470,7 +645,7 @@ impl Client {
         }
 
         self.sign_in.take()?;
-        self.restore_focus = true;
+        self.restore_focus = Some(ReturnFocus::Workspace);
         let session = accounts
             .iter()
             .find(|account| account.status == SessionStatus::Active)?
@@ -525,47 +700,13 @@ impl Client {
         None
     }
 
-    /// Передаёт запрос профиля общему стеку с фокусом кнопки в шапке.
-    fn open_requested_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(session) = self.profile_requested.take()
-            && self.shell.selected() == Some(&session)
-            && self.sign_in.is_none()
-            && self.status().is_none()
-        {
-            let opener = self.top_bar.read(cx).profile_focus();
-            self.right_panel.update(cx, |panel, cx| {
-                Profile::toggle(panel, session, opener, &self.runtime, window, cx);
-            });
-        }
-    }
-
-    /// Передаёт шапке изображение активного входа из общей подписки аватара.
-    fn sync_profile_avatar(&mut self, cx: &mut Context<Self>) {
-        let active = self
-            .shell
-            .selected()
-            .filter(|_| self.sign_in.is_none() && self.status().is_none());
-        let avatar = if let Some((session, id)) =
-            active.and_then(|session| Some((session, session.user_uuid()?)))
-        {
-            self.profile_avatar
-                .refresh([id], &self.runtime, session, cx);
-            match self.profile_avatar.image(id, cx) {
-                Some(gpui::ImageSource::Render(image)) => Some((session.clone(), image)),
-                _ => None,
-            }
-        } else {
-            self.profile_avatar.clear();
-            None
-        };
-        self.top_bar
-            .update(cx, |bar, cx| bar.set_profile_avatar(avatar, cx));
-    }
-
     /// Устанавливает фокус внутри окна, чтобы Tab работал до первого клика.
     fn focus_workspace(&mut self, window: &mut Window, cx: &Context<Self>) {
-        if std::mem::take(&mut self.restore_focus) || window.focused(cx).is_none() {
-            window.focus(&self.initial_focus);
+        match self.restore_focus.take() {
+            Some(ReturnFocus::AccountMenu) => self.top_bar.read(cx).focus_account_menu(window),
+            Some(_) => window.focus(&self.initial_focus),
+            None if window.focused(cx).is_none() => window.focus(&self.initial_focus),
+            None => {}
         }
     }
 }
@@ -613,6 +754,25 @@ impl Render for Client {
                 .justify_center()
                 .p_4()
                 .child(label(palette, TextRole::Label, status))
+                .into_any_element()
+        } else if self.section != TopBarSection::Chats {
+            let section = self.section;
+            div()
+                .relative()
+                .flex()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .child(
+                    label(palette, TextRole::Heading, section.title())
+                        .id("workspace-section")
+                        .debug_selector(move || format!("workspace-section-{}", section.id()))
+                        .flex_1()
+                        .min_w_0()
+                        .p_4(),
+                )
+                .children(RightPanel::frame(&self.right_panel, palette, window, cx))
+                .into_any_element()
         } else {
             let empty = div()
                 .size_full()
@@ -660,6 +820,7 @@ impl Render for Client {
                         })
                         .children(RightPanel::frame(&self.right_panel, palette, window, cx)),
                 )
+                .into_any_element()
         };
 
         root.child(self.top_bar.clone())
@@ -867,6 +1028,185 @@ mod tests {
         );
     }
 
+    /// Добавляет второй аккаунт из меню и проверяет отмену и сохранение обеих сессий.
+    #[gpui::test]
+    fn account_menu_adds_another_login_and_keeps_the_first(cx: &mut TestAppContext) {
+        use crate::platform::JsonAccountStore;
+        use workspace_core::auth::AccountStore;
+
+        let wait_for = |ui: &mut gpui::VisualTestContext, selector: &'static str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                ui.run_until_parked();
+                if ui.debug_bounds(selector).is_some() {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "Пункт не виден: {selector}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let (runtime, events) = RuntimeClient::start_sign_in_for_test(directory.path().into());
+        let first = futures::executor::block_on(async {
+            runtime.ready().await.unwrap();
+            let attempt = runtime
+                .begin_login(
+                    "https://127.0.0.1:1".into(),
+                    "login-test-user".into(),
+                    "test-password".into(),
+                    Some("123456".into()),
+                )
+                .await
+                .unwrap();
+            runtime
+                .complete_login(attempt.id(), "test-project".into())
+                .await
+                .unwrap()
+        });
+
+        cx.update(bind_keys);
+        let (client, ui) =
+            cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
+        ui.simulate_resize(size(px(700.), px(600.)));
+        ui.update(|_, app| {
+            let subscription = events.attach(&client, app, Client::handle_runtime);
+            client.update(app, |client, cx| client.attach(subscription, cx));
+        });
+        wait_for(ui, "workspace-account-menu-trigger");
+        let trigger = ui.debug_bounds("workspace-account-menu-trigger").unwrap();
+        ui.simulate_click(trigger.center(), Modifiers::none());
+        wait_for(ui, "workspace-add-account");
+        let row = ui.debug_bounds("workspace-add-account").unwrap();
+        ui.simulate_click(row.center(), Modifiers::none());
+        wait_for(ui, "sign-in-back");
+        ui.simulate_keystrokes("escape");
+        ui.run_until_parked();
+
+        // После отмены клавиатура снова открывает меню, а End выбирает действие под аккаунтами.
+        assert!(ui.read(|app| client.read(app).sign_in.is_none()));
+        assert_eq!(
+            ui.read(|app| client.read(app).shell.selected().unwrap().owner.clone()),
+            first
+        );
+        press_key(ui, "enter");
+        ui.simulate_keystrokes("end");
+        press_key(ui, "enter");
+        assert!(ui.read(|app| client.read(app).sign_in.is_some()));
+        ui.simulate_input("https://127.0.0.1:1");
+        ui.simulate_keystrokes("enter");
+        wait_for(ui, "sign-in-login");
+        ui.simulate_input("second-login-test-user");
+        ui.simulate_keystrokes("tab");
+        ui.simulate_input("test-password");
+        ui.simulate_keystrokes("enter");
+        wait_for(ui, "sign-in-otp");
+        ui.simulate_input("123456");
+        ui.simulate_keystrokes("enter");
+        wait_for(ui, "sign-in-project-1");
+        let submit = ui.debug_bounds("sign-in-submit").unwrap();
+        ui.simulate_click(submit.center(), Modifiers::none());
+        wait_for(ui, "workspace-account-1");
+        assert!(ui.read(|app| client.read(app).sign_in.is_none()));
+        assert_eq!(
+            ui.read(|app| client
+                .read(app)
+                .shell
+                .selected()
+                .unwrap()
+                .owner
+                .user_id
+                .clone()),
+            "second-login-test-user",
+        );
+
+        assert_eq!(
+            futures::executor::block_on(runtime.shutdown()),
+            RuntimeExit::Clean,
+        );
+        let saved = JsonAccountStore::open(directory.path())
+            .unwrap()
+            .load()
+            .unwrap();
+        assert_eq!(saved.len(), 2);
+        assert!(saved.iter().any(|account| account.context == first));
+        assert!(
+            saved
+                .iter()
+                .any(|account| account.context.user_id == "second-login-test-user")
+        );
+    }
+
+    /// Открывает отдельные страницы из профиля и возвращает фокус в шапку.
+    #[gpui::test]
+    fn profile_opens_personal_info_and_settings_pages(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        let directory = tempfile::tempdir().unwrap();
+        let (runtime, _events) = RuntimeClient::start_in(directory.path().into()).unwrap();
+        let (client, ui) =
+            cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
+        ui.simulate_resize(size(px(700.), px(640.)));
+        ui.update(|_, app| {
+            client.update(app, |view, cx| {
+                view.handle_ready(Ok(()), cx);
+                view.handle_runtime(RuntimeEvent::Accounts(vec![account("A")]), cx);
+            });
+        });
+        ui.run_until_parked();
+        let click = |ui: &mut gpui::VisualTestContext, id: &'static str| {
+            let item = ui
+                .debug_bounds(id)
+                .unwrap_or_else(|| panic!("Пункт не виден: {id}"));
+            ui.simulate_click(item.center(), Modifiers::none());
+            ui.run_until_parked();
+        };
+        let root_profile = ui.read(|app| {
+            let session = client.read(app).shell.selected().unwrap().clone();
+            crate::gpui_client::right_panel::PanelKey {
+                scope: crate::gpui_client::right_panel::Scope::Account(session),
+                id: "profile-root".into(),
+            }
+        });
+        click(ui, "workspace-profile-trigger");
+        assert!(ui.debug_bounds("profile-root-page").is_some());
+        click(ui, "profile-personal-info");
+        assert!(ui.debug_bounds("profile-personal-info-page").is_some());
+        click(ui, "profile-back");
+        click(ui, "profile-settings");
+        assert!(ui.debug_bounds("profile-settings-page").is_some());
+        click(ui, "profile-language");
+        assert!(ui.debug_bounds("profile-language-page").is_some());
+        press_key(ui, "escape");
+        click(ui, "profile-hotkeys");
+        assert!(ui.debug_bounds("profile-hotkeys-page").is_some());
+        click(ui, "right-panel-close-all");
+        let active_profile = |ui: &mut gpui::VisualTestContext| {
+            ui.read(|app| {
+                let panel = client.read(app).right_panel.read(app);
+                panel.is_active(&root_profile)
+            })
+        };
+        assert!(!active_profile(ui));
+        press_key(ui, "enter");
+        assert!(active_profile(ui));
+
+        ui.update(|_, app| {
+            client.update(app, |view, cx| {
+                view.handle_runtime(RuntimeEvent::Accounts(vec![account("B")]), cx);
+            });
+        });
+        ui.run_until_parked();
+        assert!(!active_profile(ui));
+        assert!(ui.update(|window, app| client.read(app).initial_focus.is_focused(window)));
+        assert_eq!(
+            futures::executor::block_on(runtime.shutdown()),
+            RuntimeExit::Clean
+        );
+    }
+
     /// Проверяет, что форма ждёт готовности профиля и отдаёт окно активному входу.
     #[gpui::test]
     fn sign_in_routes_only_after_profile_ready_and_session_changes(cx: &mut TestAppContext) {
@@ -962,8 +1302,8 @@ mod tests {
                             id: Uuid::from_u128(row),
                             name: "Тестовый чат".to_owned(),
                             direct: true,
-                            metadata: Default::default(),
                             topics: vec![],
+                            metadata: Default::default(),
                         }]);
                         (
                             account.session.owner.clone(),
@@ -1001,6 +1341,47 @@ mod tests {
                 .map(|rows| rows[0].id)),
             Some(Uuid::from_u128(12))
         );
+        let chat = ui.debug_bounds(b_row).unwrap();
+        ui.simulate_click(chat.center(), Modifiers::none());
+        ui.run_until_parked();
+        let conversation = ui
+            .read(|app| client.read(app).conversation.clone())
+            .unwrap();
+        for (section, button_id, page_id) in [
+            (
+                TopBarSection::Calendar,
+                "workspace-top-bar-calendar",
+                "workspace-section-calendar",
+            ),
+            (
+                TopBarSection::Mail,
+                "workspace-top-bar-mail",
+                "workspace-section-mail",
+            ),
+            (
+                TopBarSection::Contacts,
+                "workspace-top-bar-contacts",
+                "workspace-section-contacts",
+            ),
+            (
+                TopBarSection::Calls,
+                "workspace-top-bar-calls",
+                "workspace-section-calls",
+            ),
+        ] {
+            let button = ui.debug_bounds(button_id).unwrap();
+            ui.simulate_click(button.center(), Modifiers::none());
+            ui.run_until_parked();
+            assert!(ui.debug_bounds(page_id).is_some());
+            assert_eq!(ui.read(|app| client.read(app).section), section);
+        }
+        let chats = ui.debug_bounds("workspace-top-bar-chats").unwrap();
+        ui.simulate_click(chats.center(), Modifiers::none());
+        ui.run_until_parked();
+        ui.read(|app| {
+            assert_eq!(client.read(app).section, TopBarSection::Chats);
+            assert!(client.read(app).conversation.as_ref() == Some(&conversation));
+        });
         assert_eq!(
             futures::executor::block_on(runtime.shutdown()),
             RuntimeExit::Clean
@@ -1042,8 +1423,8 @@ mod tests {
         let bar = ui.debug_bounds("workspace-top-bar").unwrap();
         let sidebar = ui.debug_bounds("workspace-sidebar-panel").unwrap();
         assert_eq!(sidebar.top() - bar.bottom(), px(PANEL_GAP));
-        let chats = ui.debug_bounds("workspace-top-bar-chats").unwrap();
-        assert_eq!(bar.center().x, chats.center().x);
+        let sections = ui.debug_bounds("workspace-top-bar-sections").unwrap();
+        assert_eq!(bar.center().x, sections.center().x);
         assert!(ui.debug_bounds("workspace-account-dot-1").is_some());
         assert!(ui.debug_bounds("workspace-account-3").is_none());
         assert!(ui.debug_bounds("workspace-account-overflow").is_some());
@@ -1066,7 +1447,7 @@ mod tests {
 
         press_key(ui, "enter");
         assert!(ui.read(|app| client.read(app).top_bar.read(app).menu_is_open()));
-        ui.simulate_keystrokes("tab shift-tab end");
+        ui.simulate_keystrokes("tab shift-tab end up");
         ui.run_until_parked();
         let last = ui.debug_bounds("workspace-account-menu-row-19").unwrap();
         assert!(

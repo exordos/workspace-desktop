@@ -3,6 +3,7 @@
 use super::*;
 
 const USER: &str = "login-test-user";
+const OTHER_USER: &str = "second-login-test-user";
 const PROJECT: &str = "test-project";
 
 /// Даёт тесту остановить запрос выбора проекта до получения ответа IAM.
@@ -31,13 +32,13 @@ impl IamClient for LoginIam {
         otp: Option<&str>,
     ) -> Result<IamToken, IamError> {
         assert_eq!(server, PROFILE_SERVER);
-        if login != USER || password != "test-password" {
+        if ![USER, OTHER_USER].contains(&login) || password != "test-password" {
             return Err(IamError::InvalidCredentials);
         }
         if otp != Some("123456") {
             return Err(IamError::OtpRequired);
         }
-        Ok(token_for(None))
+        Ok(token_for(login, None))
     }
 
     /// Возвращает проекты, доступные после первого шага входа.
@@ -56,7 +57,12 @@ impl IamClient for LoginIam {
     }
 
     /// Возвращает токен выбранного проекта, по запросу ждёт разрешения теста.
-    fn select_project(&self, _: &str, _: &str, project_id: &str) -> Result<IamToken, IamError> {
+    fn select_project(
+        &self,
+        _: &str,
+        refresh_token: &str,
+        project_id: &str,
+    ) -> Result<IamToken, IamError> {
         if let Some(gate) = &self.project_gate {
             let _ = gate.started.lock().unwrap().take().unwrap().send(());
             gate.release
@@ -65,7 +71,7 @@ impl IamClient for LoginIam {
                 .recv_timeout(TIMEOUT)
                 .map_err(|_| IamError::Temporary)?;
         }
-        Ok(token_for(Some(project_id)))
+        Ok(token_for(refresh_token, Some(project_id)))
     }
 
     /// В этих сценариях нет сохранённой сессии для восстановления.
@@ -75,12 +81,12 @@ impl IamClient for LoginIam {
 }
 
 /// Готовит тестовый токен для первого шага или подтверждённого проекта.
-fn token_for(project_id: Option<&str>) -> IamToken {
+fn token_for(user: &str, project_id: Option<&str>) -> IamToken {
     IamToken {
         access_token: "test-access".into(),
-        refresh_token: Some("test-refresh".into()),
+        refresh_token: Some(user.into()),
         expires_in: Duration::from_secs(3600),
-        user_id: USER.into(),
+        user_id: user.into(),
         project_id: project_id.map(str::to_owned),
         organization_id: Some("test-organization".into()),
     }

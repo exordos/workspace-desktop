@@ -71,7 +71,7 @@ workspace_icons! {
     BellOff => ("bell_off.svg", "Уведомления выключены."),
     Check => ("check.svg", "Сервер принял сообщение."),
     BusinessCenter => ("business_center.svg", "Команда или должность."),
-    Calendar => ("calendar.svg", "Дата в профиле."),
+    Calendar => ("calendar.svg", "Календарь или дата в профиле."),
     Celebration => ("celebration.svg", "День рождения."),
     Chat => ("chat_bubble_outline.svg", "Мессенджер или личный разговор."),
     Channels => ("channels.svg", "Системная папка каналов."),

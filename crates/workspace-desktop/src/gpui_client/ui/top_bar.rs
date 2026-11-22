@@ -20,7 +20,8 @@ use super::{
 use crate::gpui_client::contracts::AccountSession;
 
 const HEIGHT: f32 = 77.;
-const CHAT_SIZE: f32 = 48.;
+const SECTION_SIZE: f32 = 44.;
+const SECTION_GAP: f32 = 4.;
 const QUICK_SIZE: f32 = 40.;
 const TRIGGER_SIZE: f32 = 32.;
 const GAP: f32 = 6.;
@@ -40,21 +41,85 @@ pub struct TopBarAccount {
 /// Пользователь попросил открыть конкретный вход.
 pub struct TopBarSelection(pub AccountSession); // Вход, видимый на момент действия.
 
-/// Действие верхней панели для текущего входа.
-pub(in crate::gpui_client) enum TopBarAction {
-    OpenProfile, // Открывает или закрывает корневую страницу профиля.
+/// Раздел, который открывает кнопка верхней панели.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TopBarSection {
+    #[default]
+    Chats, // Мессенджер с текущим разговором.
+    Calendar, // Календарь.
+    Mail,     // Почта.
+    Contacts, // Контакты.
+    Calls,    // Звонки.
+}
+
+impl TopBarSection {
+    const ALL: [Self; 5] = [
+        Self::Chats,
+        Self::Calendar,
+        Self::Mail,
+        Self::Contacts,
+        Self::Calls,
+    ];
+
+    /// Даёт разделу подпись для подсказки и заголовка.
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Chats => "Чаты",
+            Self::Calendar => "Календарь",
+            Self::Mail => "Почта",
+            Self::Contacts => "Контакты",
+            Self::Calls => "Звонки",
+        }
+    }
+
+    /// Часть идентификатора кнопки и страницы раздела.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Chats => "chats",
+            Self::Calendar => "calendar",
+            Self::Mail => "mail",
+            Self::Contacts => "contacts",
+            Self::Calls => "calls",
+        }
+    }
+
+    /// Выбирает иконку раздела из набора Workspace.
+    fn icon(self) -> Icon {
+        match self {
+            Self::Chats => Icon::Chat,
+            Self::Calendar => Icon::Calendar,
+            Self::Mail => Icon::Mail,
+            Self::Contacts => Icon::Group,
+            Self::Calls => Icon::Phone,
+        }
+    }
+}
+
+/// Действие шапки, которое открывает отдельный экран.
+pub enum TopBarAction {
+    AddAccount,                 // Начать вход в ещё один аккаунт.
+    OpenProfile,                // Открыть панель выбранного аккаунта.
+    OpenSection(TopBarSection), // Открыть указанный раздел текущего аккаунта.
+}
+
+/// Строка, на которой остановилась клавиатурная навигация.
+#[derive(Clone, PartialEq)]
+enum MenuRow {
+    Account(AccountSession), // Существующий вход.
+    AddAccount,              // Последняя строка под списком входов.
 }
 
 /// Самостоятельный компонент верхней панели; меню живёт вместе с окном.
 pub struct TopBar {
+    section: TopBarSection,       // Выбранный раздел из состояния окна.
     accounts: Vec<TopBarAccount>, // Последний снимок из оболочки.
-    profile_avatar: Option<(AccountSession, Arc<RenderImage>)>, // Готовое фото входа, переданное окном.
     quick_focus: Vec<(AccountSession, FocusHandle)>, // Фокус быстрых кнопок закреплён за входом.
-    profile_focus: FocusHandle,                      // Кнопка профиля и точка возврата из панели.
-    trigger_focus: FocusHandle,                      // Сюда возвращается фокус после закрытия меню.
+    trigger_focus: FocusHandle,   // Сюда возвращается фокус после закрытия меню.
+    profile_focus: FocusHandle,   // Кнопка профиля и точка возврата из панели.
+    profile_avatar: Option<(AccountSession, Arc<RenderImage>)>, // Готовое фото входа, переданное окном.
     menu_focus: FocusHandle, // Одна точка клавиатурного ввода для всего меню.
     menu_scroll: ScrollHandle, // Удерживает активную строку в видимой части меню.
-    highlight: Option<AccountSession>, // Подсвеченная строка. None означает закрытое меню.
+    highlight: Option<MenuRow>, // Подсвеченная строка. None означает закрытое меню.
 }
 
 impl EventEmitter<TopBarSelection> for TopBar {}
@@ -64,11 +129,12 @@ impl TopBar {
     /// Создаёт закрытое меню и независимые точки фокуса.
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
+            section: TopBarSection::default(),
             accounts: Vec::new(),
-            profile_avatar: None,
-            profile_focus: cx.focus_handle(),
             quick_focus: Vec::new(),
             trigger_focus: cx.focus_handle(),
+            profile_focus: cx.focus_handle(),
+            profile_avatar: None,
             menu_focus: cx.focus_handle(),
             menu_scroll: ScrollHandle::new(),
             highlight: None,
@@ -87,9 +153,10 @@ impl TopBar {
         }
     }
 
-    /// Возвращает точку фокуса, из которой открыли профиль.
-    pub(in crate::gpui_client) fn profile_focus(&self) -> FocusHandle {
-        self.profile_focus.clone()
+    /// Подсвечивает раздел, который показало окно.
+    pub(crate) fn set_section(&mut self, section: TopBarSection, cx: &mut Context<Self>) {
+        self.section = section;
+        cx.notify();
     }
 
     /// Ограничивает обработку клавиш открытым списком, не меняя обход остальных полей окна.
@@ -111,10 +178,10 @@ impl TopBar {
                     .push((account.session.clone(), cx.focus_handle()));
             }
         }
-        if self
-            .highlight
-            .as_ref()
-            .is_some_and(|highlight| !accounts.iter().any(|account| account.session == *highlight))
+        if accounts.is_empty() {
+            self.highlight = None;
+        } else if let Some(MenuRow::Account(highlight)) = &self.highlight
+            && !accounts.iter().any(|account| account.session == *highlight)
         {
             self.highlight = Self::first_account(&accounts);
         }
@@ -135,12 +202,12 @@ impl TopBar {
     }
 
     /// Находит вход, с которого следует начать обход меню.
-    fn first_account(accounts: &[TopBarAccount]) -> Option<AccountSession> {
+    fn first_account(accounts: &[TopBarAccount]) -> Option<MenuRow> {
         accounts
             .iter()
             .find(|account| account.selected)
             .or_else(|| accounts.first())
-            .map(|account| account.session.clone())
+            .map(|account| MenuRow::Account(account.session.clone()))
     }
 
     /// Открывает список и передаёт ему фокус или закрывает уже открытый список.
@@ -160,24 +227,47 @@ impl TopBar {
     /// Закрывает меню и возвращает фокус кнопке раскрытия.
     fn dismiss_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.highlight = None;
-        window.focus(&self.trigger_focus);
+        self.focus_account_menu(window);
         cx.notify();
     }
 
-    /// Находит подсвеченный вход в актуальном снимке.
-    fn highlight_index(&self) -> Option<usize> {
-        self.accounts
-            .iter()
-            .position(|account| self.highlight.as_ref() == Some(&account.session))
+    /// Возвращает фокус к закрытому меню аккаунтов.
+    pub(crate) fn focus_account_menu(&self, window: &mut Window) {
+        window.focus(&self.trigger_focus);
     }
 
-    /// Выбирает соседнюю строку или край списка и показывает её при прокрутке.
-    fn highlight_at(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let Some(account) = self.accounts.get(index) {
-            self.highlight = Some(account.session.clone());
-            self.menu_scroll.scroll_to_item(index);
-            cx.notify();
+    /// Даёт правой панели точку возврата к кнопке профиля.
+    pub(crate) fn profile_focus(&self) -> FocusHandle {
+        self.profile_focus.clone()
+    }
+
+    /// Находит подсвеченную строку, включая действие под списком входов.
+    fn highlight_index(&self) -> Option<usize> {
+        match self.highlight.as_ref()? {
+            MenuRow::Account(session) => {
+                self.accounts.iter().position(|row| row.session == *session)
+            }
+            MenuRow::AddAccount => Some(self.accounts.len()),
         }
+    }
+
+    /// Перемещает подсветку и прокручивает список к новой строке.
+    fn highlight_at(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.highlight = Some(
+            self.accounts
+                .get(index)
+                .map_or(MenuRow::AddAccount, |account| {
+                    MenuRow::Account(account.session.clone())
+                }),
+        );
+        self.menu_scroll.scroll_to_item(index);
+        cx.notify();
+    }
+
+    /// Закрывает меню и просит оболочку открыть форму входа.
+    fn add_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_menu(window, cx);
+        cx.emit(TopBarAction::AddAccount);
     }
 
     /// Передаёт актуальный вход оболочке, которая повторно проверяет выбор.
@@ -259,7 +349,7 @@ impl TopBar {
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         let session = account.session.clone();
-        let highlighted = self.highlight.as_ref() == Some(&session);
+        let highlighted = self.highlight.as_ref() == Some(&MenuRow::Account(session.clone()));
         let description: SharedString = format!("{} · {}", account.label, account.detail).into();
         div()
             .id(account_element_id("menu", &session))
@@ -319,6 +409,34 @@ impl TopBar {
             )
     }
 
+    /// Показывает действие входа последней строкой того же меню.
+    fn add_account_row(&self, palette: Palette, cx: &Context<Self>) -> Stateful<Div> {
+        div()
+            .id("workspace-add-account")
+            .debug_selector(|| "workspace-add-account".into())
+            .min_h(px(36.))
+            .px_2()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .when(self.highlight == Some(MenuRow::AddAccount), |row| {
+                row.border_color(palette.accent).bg(palette.card_selected)
+            })
+            .hover(|row| row.bg(palette.card_hover))
+            .cursor_pointer()
+            .on_click(cx.listener(|view, _, window, cx| view.add_account(window, cx)))
+            .child(Icon::Add.element(px(16.), palette.text_secondary))
+            .child(ellipsized_label(
+                palette,
+                TextRole::Label,
+                "Добавить аккаунт",
+            ))
+    }
+
     /// Собирает прокручиваемый список и перехватывает нажатие вне его границ.
     fn menu(
         &self,
@@ -352,7 +470,8 @@ impl TopBar {
                         .iter()
                         .enumerate()
                         .map(|(index, account)| self.menu_row(index, account, palette, cx)),
-                ),
+                )
+                .child(self.add_account_row(palette, cx)),
         )
     }
 
@@ -366,18 +485,61 @@ impl TopBar {
             }
             MenuInput::Next => {
                 if let Some(index) = self.highlight_index() {
-                    self.highlight_at((index + 1).min(self.accounts.len() - 1), cx);
+                    self.highlight_at((index + 1).min(self.accounts.len()), cx);
                 }
             }
             MenuInput::First => self.highlight_at(0, cx),
-            MenuInput::Last => self.highlight_at(self.accounts.len().saturating_sub(1), cx),
-            MenuInput::Select => {
-                if let Some(session) = self.highlight.clone() {
-                    self.choose(&session, window, cx);
-                }
-            }
+            MenuInput::Last => self.highlight_at(self.accounts.len(), cx),
+            MenuInput::Select => match self.highlight.clone() {
+                Some(MenuRow::Account(session)) => self.choose(&session, window, cx),
+                Some(MenuRow::AddAccount) => self.add_account(window, cx),
+                None => {}
+            },
             MenuInput::Close => self.dismiss_menu(window, cx),
         }
+    }
+    /// Рисует компактную кнопку раздела с подсказкой и клавиатурной активацией.
+    fn section_button(
+        &self,
+        section: TopBarSection,
+        size: f32,
+        palette: Palette,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let target = cx.weak_entity();
+        let active = self.section == section;
+        let id: SharedString = format!("workspace-top-bar-{}", section.id()).into();
+        let selector = id.clone();
+        let button = div()
+            .id(id)
+            .debug_selector(move || selector.to_string())
+            .size(px(size))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .overflow_hidden()
+            .rounded(NAVIGATION_CHIP_RADIUS)
+            .border_1()
+            .border_color(if active {
+                palette.border
+            } else {
+                gpui::transparent_black()
+            })
+            .when(active, |button| button.bg(palette.card_selected))
+            .child(section.icon().element(px(size.min(24.)), palette.text));
+        if self.accounts.is_empty() {
+            return button;
+        }
+        activate(
+            button.hover(|button| button.bg(palette.card_hover)),
+            None,
+            palette,
+            move |_, app| {
+                let _ = target.update(app, |_, cx| cx.emit(TopBarAction::OpenSection(section)));
+            },
+        )
+        .tooltip(move |_, app| tooltip(palette, section.title().into(), app))
     }
 
     /// Показывает активный аккаунт и открывает его панель профиля.
@@ -414,7 +576,7 @@ impl TopBar {
                         .h(px(40.))
                         .min_w_0()
                         .px_1()
-                        .rounded(px(6.))
+                        .rounded(PANEL_RADIUS)
                         .border_1()
                         .border_color(gpui::transparent_black())
                         .flex()
@@ -454,13 +616,17 @@ impl TopBar {
 }
 
 impl Render for TopBar {
-    /// Ставит «Чаты» в геометрический центр окна и оставляет меню доступным при сужении.
+    /// Центрирует разделы и оставляет меню аккаунтов доступным при сужении.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::for_window(window, cx);
         let viewport = window.viewport_size();
         let width = f32::from(viewport.width);
-        let chat = CHAT_SIZE.min((width - 2. * TRIGGER_SIZE).max(0.));
-        let side = (width - chat) / 2.;
+        let count = TopBarSection::ALL.len() as f32;
+        let available = (width - 2. * TRIGGER_SIZE).max(0.);
+        let section_gap = SECTION_GAP.min(available / (count * 2.));
+        let gaps = (count - 1.) * section_gap;
+        let section_size = SECTION_SIZE.min((available - gaps) / count);
+        let side = (width - (section_size * count + gaps)) / 2.;
         let inset = (side - TRIGGER_SIZE).clamp(0., START_INSET);
         let quick = quick_count(self.accounts.len(), side - inset);
         let hidden = self.accounts.len() - quick;
@@ -527,21 +693,15 @@ impl Render for TopBar {
             )
             .child(
                 div()
-                    .id("workspace-top-bar-chats")
-                    .debug_selector(|| "workspace-top-bar-chats".to_owned())
-                    .w(px(chat))
-                    .h(px(CHAT_SIZE))
+                    .id("workspace-top-bar-sections")
+                    .debug_selector(|| "workspace-top-bar-sections".into())
                     .flex_none()
                     .flex()
-                    .items_center()
-                    .justify_center()
-                    .overflow_hidden()
-                    .rounded(NAVIGATION_CHIP_RADIUS)
-                    .border_1()
-                    .border_color(palette.border)
-                    .bg(palette.card_selected)
-                    .child(Icon::Chat.element(px(chat.min(24.)), palette.text))
-                    .tooltip(move |_, app| tooltip(palette, "Чаты".into(), app)),
+                    .gap(px(section_gap))
+                    .children(
+                        TopBarSection::ALL
+                            .map(|section| self.section_button(section, section_size, palette, cx)),
+                    ),
             )
             .children(
                 self.accounts
