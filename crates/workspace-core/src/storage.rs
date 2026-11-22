@@ -2,6 +2,7 @@
 //! Сначала описаны данные и таблицы, затем чтение и запись.
 
 mod avatars;
+mod catalog_counts;
 mod drafts;
 mod folders;
 mod history;
@@ -26,7 +27,11 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{context::OwnerContext, notification_target::NotificationTarget};
+use crate::{
+    context::OwnerContext,
+    messenger::catalog::{CatalogCounts, Chat},
+    notification_target::NotificationTarget,
+};
 
 /// Позиция в журнале событий, с которой можно продолжить чтение.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,8 +76,10 @@ pub(crate) struct EventWrite<'a> {
     pub notification_conversation: Option<&'a str>, // Разговор для цели баннера.
     pub history: Option<&'a HistoryChange>,         // Правка или удаление.
     pub folder: Option<FolderChange>,               // Сверка состава папок или удаление связей.
+    pub catalog_counts: Option<&'a CatalogCounts>,  // Абсолютные счётчики строки каталога.
     pub avatar: Option<AvatarEvent<'a>>,            // Изменение ссылки, сверка или удаление файла.
     pub media_invalidated: Option<Uuid>,            // UUID изменённого или удалённого вложения.
+    pub checkpoint: bool, // Событие может задать начальную позицию журнала.
 }
 
 /// Число непрочитанных и позиция журнала, до которой оно уже учитывает изменения.
@@ -111,6 +118,8 @@ pub enum StorageError {
     InvalidHistoryPage, // Страница не подходит по области, направлению или формату.
     #[error("the catalog changed while the request was in flight")]
     StaleCatalog, // После начала запроса доступ к каналу изменился.
+    #[error("the catalog was requested before the first event cursor")]
+    CatalogBeforeCheckpoint, // Журнал начал чтение позже, чем началась загрузка списка.
     #[error("the local draft version must be a positive SQLite integer")]
     InvalidDraftVersion, // Версия черновика вышла за диапазон.
     #[error("invalid messenger draft record")]
@@ -132,6 +141,7 @@ pub struct Storage {
     connection: Mutex<Connection>, // Соединение с SQLite. Блокировка выдаёт его по одному запросу за раз.
     catalog_changes: tokio::sync::watch::Sender<u64>, // Сигнал об изменении каталога или запросе его сверки.
     folder_changes: tokio::sync::watch::Sender<u64>, // Сигнал об изменении данных папок после записи.
+    catalog_checkpoints: tokio::sync::watch::Sender<u64>, // Сигнал о начальной позиции журнала.
 }
 
 impl Storage {
@@ -139,9 +149,9 @@ impl Storage {
     pub(crate) fn chat_catalog(
         &self,
         owner: &OwnerContext,
-    ) -> Result<Option<String>, StorageError> {
+    ) -> Result<Option<Vec<Chat>>, StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
-        read_chat_catalog(&connection, owner)
+        catalog_counts::read_catalog(&connection, owner)
     }
 
     /// Возвращает версию каталога перед началом сетевого запроса.
@@ -155,16 +165,30 @@ impl Storage {
         self.catalog_changes.subscribe()
     }
 
+    /// Будит загрузку каталога при появлении исходной позиции журнала.
+    pub(crate) fn catalog_checkpoints(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.catalog_checkpoints.subscribe()
+    }
+
+    /// Проверяет, мог ли журнал пропустить данные после начала загрузки списка.
+    pub(crate) fn needs_catalog_reconciliation(
+        &self,
+        owner: &OwnerContext,
+    ) -> Result<bool, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        catalog_counts::needs_reconciliation(&connection, owner)
+    }
+
     /// Читает все нужные снимки и публикует их до освобождения блокировки базы.
     pub(crate) fn with_catalog_snapshots<T>(
         &self,
         owners: &[OwnerContext],
-        publish: impl FnOnce(Vec<Option<String>>) -> T,
+        publish: impl FnOnce(Vec<Option<Vec<Chat>>>) -> T,
     ) -> Result<T, StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let snapshots = owners
             .iter()
-            .map(|owner| read_chat_catalog(&connection, owner))
+            .map(|owner| catalog_counts::read_catalog(&connection, owner))
             .collect::<Result<_, _>>()?;
         Ok(publish(snapshots))
     }
@@ -175,11 +199,15 @@ impl Storage {
         owner: &OwnerContext,
         snapshot: &str,
         revision: i64,
+        fence: Option<&Cursor>,
     ) -> Result<(), StorageError> {
         let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if read_catalog_revision(&transaction, owner)? != revision {
             return Err(StorageError::StaleCatalog);
+        }
+        if catalog_counts::precedes_checkpoint(&transaction, owner, fence)? {
+            return Err(StorageError::CatalogBeforeCheckpoint);
         }
         transaction.execute(
             "INSERT INTO messenger_catalog (account_id, server, organization_id, project_id, user_id, snapshot)
@@ -188,6 +216,9 @@ impl Storage {
              DO UPDATE SET snapshot = excluded.snapshot",
             params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id, snapshot],
         )?;
+        if let Some(fence) = fence {
+            catalog_counts::save_fence(&transaction, owner, fence)?;
+        }
         bump_catalog_revision(&transaction, owner)?;
         folders::finish_catalog_refresh(&transaction, owner)?;
         transaction.commit()?;
@@ -277,6 +308,7 @@ impl Storage {
                 PRIMARY KEY (account_id, server, organization_id, project_id, user_id)
             );",
         )?;
+        catalog_counts::initialize(&transaction)?;
         // Старый кэш хранит только текст. У таких записей адрес остаётся неизвестным.
         let has_placement: bool = transaction.query_row(
             "SELECT EXISTS (SELECT 1 FROM pragma_table_info('sync_messages') WHERE name = 'stream_id')",
@@ -301,6 +333,7 @@ impl Storage {
             connection: Mutex::new(connection),
             catalog_changes: tokio::sync::watch::channel(0).0,
             folder_changes: tokio::sync::watch::channel(0).0,
+            catalog_checkpoints: tokio::sync::watch::channel(0).0,
         })
     }
 
@@ -418,6 +451,9 @@ impl Storage {
                 "messenger_notification_targets",
                 "messenger_unread",
                 "messenger_catalog",
+                "messenger_catalog_fence",
+                "messenger_catalog_counts",
+                "messenger_catalog_checkpoint",
             ] {
                 transaction.execute(
                     &format!(
@@ -477,7 +513,8 @@ impl Storage {
         let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        if let Some(previous) = read_cursor(&transaction, owner, source)? {
+        let previous = read_cursor(&transaction, owner, source)?;
+        if let Some(previous) = &previous {
             if previous.epoch_generation != cursor.epoch_generation {
                 return Err(StorageError::EpochChanged);
             }
@@ -490,6 +527,12 @@ impl Storage {
                     avatar_changed: Vec::new(),
                 });
             }
+        }
+
+        let initial_checkpoint =
+            source == crate::messenger::SOURCE_ID && change.checkpoint && previous.is_none();
+        if initial_checkpoint {
+            catalog_counts::record_checkpoint(&transaction, owner, cursor)?;
         }
 
         if let Some(history) = change.history
@@ -518,6 +561,13 @@ impl Storage {
                     catalog_changed = true;
                 }
                 Some(HistoryChange::RemoveTopic(address)) => {
+                    remove_catalog_topic(&transaction, owner, address)?;
+                    catalog_counts::remove_scope(
+                        &transaction,
+                        owner,
+                        &address.stream_id,
+                        Some(&address.topic_id),
+                    )?;
                     outbox::reject_revoked(
                         &transaction,
                         owner,
@@ -530,6 +580,10 @@ impl Storage {
                         &address.stream_id,
                         Some(&address.topic_id),
                     )?;
+                    catalog_changed = true;
+                }
+                Some(HistoryChange::RemoveMessage(message)) => {
+                    catalog_changed |= remove_catalog_last_message(&transaction, owner, message)?;
                 }
                 _ => {}
             }
@@ -540,6 +594,13 @@ impl Storage {
             }
         }
 
+        let counts_changed = if source == crate::messenger::SOURCE_ID
+            && let Some(counts) = change.catalog_counts
+        {
+            catalog_counts::apply(&transaction, owner, cursor, counts)?
+        } else {
+            false
+        };
         let message_inserted = if let Some(message) = change.message
             && history::can_create(&transaction, owner, &message.id)?
         {
@@ -654,7 +715,11 @@ impl Storage {
         )?;
         transaction.commit()?;
         drop(connection);
-        if catalog_changed {
+        if initial_checkpoint {
+            self.catalog_checkpoints
+                .send_modify(|version| *version = version.wrapping_add(1));
+        }
+        if catalog_changed || counts_changed {
             self.notify_catalog_change();
         } else if folder_changed || unread_changed {
             self.notify_folder_change();
@@ -718,24 +783,111 @@ fn remove_catalog_stream(
     owner: &OwnerContext,
     stream: &str,
 ) -> Result<(), StorageError> {
+    catalog_counts::remove_scope(connection, owner, stream, None)?;
+    update_catalog_after_removal(connection, owner, true, |chats| {
+        chats.retain(|chat| chat.id.to_string() != stream);
+        true
+    })?;
+    Ok(())
+}
+
+/// Убирает удалённую тему, её маршрут по умолчанию и превью канала из этой темы.
+fn remove_catalog_topic(
+    connection: &Connection,
+    owner: &OwnerContext,
+    address: &MessagePlacement,
+) -> Result<(), StorageError> {
+    update_catalog_after_removal(connection, owner, true, |chats| {
+        let Some(chat) = chats
+            .iter_mut()
+            .find(|chat| chat.id.to_string() == address.stream_id)
+        else {
+            return false;
+        };
+        let mut changed = false;
+        if let Some(index) = chat
+            .topics
+            .iter()
+            .position(|topic| topic.id.to_string() == address.topic_id)
+        {
+            let topic = chat.topics.remove(index);
+            if chat.metadata.last_message_id == topic.metadata.last_message_id {
+                chat.metadata.last_message_id = None;
+            }
+            changed = true;
+        }
+        if chat
+            .metadata
+            .default_topic_id
+            .is_some_and(|id| id.to_string() == address.topic_id)
+        {
+            chat.metadata.default_topic_id = None;
+            changed = true;
+        }
+        changed
+    })?;
+    Ok(())
+}
+
+/// Сбрасывает указатели на удалённое последнее сообщение до следующего снимка сервера.
+fn remove_catalog_last_message(
+    connection: &Connection,
+    owner: &OwnerContext,
+    message: &str,
+) -> Result<bool, StorageError> {
+    let Ok(message) = message.parse::<uuid::Uuid>() else {
+        return Ok(false);
+    };
+    update_catalog_after_removal(connection, owner, false, |chats| {
+        let mut changed = false;
+        for chat in chats {
+            if chat.metadata.last_message_id == Some(message) {
+                chat.metadata.last_message_id = None;
+                changed = true;
+            }
+            for topic in &mut chat.topics {
+                if topic.metadata.last_message_id == Some(message) {
+                    topic.metadata.last_message_id = None;
+                    changed = true;
+                }
+            }
+        }
+        changed
+    })
+}
+
+/// Сохраняет изменение каталога и меняет ревизию, чтобы старый HTTP-запрос его не отменил.
+fn update_catalog_after_removal(
+    connection: &Connection,
+    owner: &OwnerContext,
+    revoked_scope: bool,
+    update: impl FnOnce(&mut Vec<crate::messenger::catalog::Chat>) -> bool,
+) -> Result<bool, StorageError> {
+    let mut changed = false;
     if let Some(snapshot) = read_chat_catalog(connection, owner)? {
         let mut chats: Vec<crate::messenger::catalog::Chat> = serde_json::from_str(&snapshot)?;
-        chats.retain(|chat| chat.id.to_string() != stream);
-        let snapshot = serde_json::to_string(&chats)?;
-        connection.execute(
-            "UPDATE messenger_catalog SET snapshot = ?6 WHERE account_id = ?1 AND server = ?2
+        changed = update(&mut chats);
+        if changed {
+            let snapshot = serde_json::to_string(&chats)?;
+            connection.execute(
+                "UPDATE messenger_catalog SET snapshot = ?6 WHERE account_id = ?1 AND server = ?2
              AND organization_id = ?3 AND project_id = ?4 AND user_id = ?5",
-            params![
-                owner.account_id.0,
-                owner.server,
-                owner.organization_id,
-                owner.project_id,
-                owner.user_id,
-                snapshot
-            ],
-        )?;
+                params![
+                    owner.account_id.0,
+                    owner.server,
+                    owner.organization_id,
+                    owner.project_id,
+                    owner.user_id,
+                    snapshot
+                ],
+            )?;
+        }
     }
-    bump_catalog_revision(connection, owner)
+    if !changed && !revoked_scope {
+        return Ok(false);
+    }
+    bump_catalog_revision(connection, owner)?;
+    Ok(changed)
 }
 
 /// Увеличивает версию, чтобы более ранний запрос каталога нельзя было сохранить.

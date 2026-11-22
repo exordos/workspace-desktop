@@ -239,6 +239,7 @@ fn heading_uses_direct_peer_from_current_catalog(cx: &mut TestAppContext) {
             topics: Vec::new(),
             metadata: workspace_core::messenger::catalog::ChatMetadata {
                 direct_peer_id: Some(peer),
+                ..Default::default()
             },
         }])),
         status: ChatListStatus::Ready,
@@ -453,6 +454,7 @@ fn fixed_topic_groups_and_wraps_at_both_panel_sizes(cx: &mut TestAppContext) {
             topics: vec![Topic {
                 id: topic_id,
                 name: topic_name.to_owned(),
+                metadata: Default::default(),
             }],
             metadata: Default::default(),
         }])),

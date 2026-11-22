@@ -44,6 +44,7 @@ fn chat(id: u128, name: &str, direct: bool, topics: &[(u128, &str)]) -> Chat {
             .map(|(id, name)| Topic {
                 id: Uuid::from_u128(*id),
                 name: (*name).into(),
+                metadata: Default::default(),
             })
             .collect(),
         metadata: Default::default(),

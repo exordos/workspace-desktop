@@ -152,7 +152,13 @@ pub enum Event {
     FolderChanged {
         cursor: Cursor,                      // Позиция изменения в журнале.
         change: FolderChange,                // Удаление или область, которую нужно сверить.
-        sidebar: Option<Box<SidebarChange>>, // Сведения того же события о стриме, если они есть.
+        sidebar: Option<Box<SidebarChange>>, // Сведения сайдбара из снимка стрима, если он полный.
+    },
+    CatalogCountsChanged {
+        cursor: Cursor, // Позиция события со снимком счётчиков.
+        counts: crate::messenger::catalog::CatalogCounts, // Абсолютные значения канала или темы.
+        folder: Option<FolderChange>, // Проверка появления или восстановления канала из того же события.
+        sidebar: Option<Box<SidebarChange>>, // Сведения сайдбара из того же серверного снимка.
     },
     UnreadBaseline {
         cursor: Cursor, // Позиция сервера перед чтением счётчика. Курсор сообщений не меняется.
@@ -175,6 +181,7 @@ impl Event {
             | Self::FileUpdated { cursor, .. }
             | Self::UnreadChanged { cursor, .. }
             | Self::FolderChanged { cursor, .. }
+            | Self::CatalogCountsChanged { cursor, .. }
             | Self::UnreadBaseline { cursor, .. }
             | Self::SourceReady(cursor)
             | Self::Checkpoint(cursor) => cursor,
@@ -673,7 +680,12 @@ impl Sync {
             };
             let folder = match &event {
                 Event::FolderChanged { change, .. } => Some(*change),
+                Event::CatalogCountsChanged { folder, .. } => *folder,
                 Event::UnreadChanged { .. } => Some(FolderChange::Refresh(Some(Uuid::nil()))),
+                _ => None,
+            };
+            let catalog_counts = match &event {
+                Event::CatalogCountsChanged { counts, .. } => Some(counts),
                 _ => None,
             };
             let avatar = match (&event, source) {
@@ -713,8 +725,10 @@ impl Sync {
                     metadata,
                     history,
                     folder,
+                    catalog_counts,
                     avatar,
                     media_invalidated,
+                    checkpoint: matches!(event, Event::Checkpoint(_)),
                 },
             )?;
             if saved.outcome == ApplyOutcome::Applied
@@ -763,9 +777,9 @@ impl Sync {
                 }
                 let sidebar = match &event {
                     Event::SidebarChanged { change, .. } => Some(change),
-                    Event::FolderChanged { sidebar, .. } | Event::UserUpdated { sidebar, .. } => {
-                        sidebar.as_deref()
-                    }
+                    Event::FolderChanged { sidebar, .. }
+                    | Event::UserUpdated { sidebar, .. }
+                    | Event::CatalogCountsChanged { sidebar, .. } => sidebar.as_deref(),
                     _ => None,
                 };
                 if let Some(change) = sidebar {

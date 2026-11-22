@@ -53,11 +53,20 @@ impl FolderSnapshot {
 
     /// Возвращает строки доступной папки. «Все чаты» дополняет активным каталогом.
     pub fn rows(&self, folder_id: Uuid) -> Option<Vec<FolderRow<'_>>> {
+        self.rows_for_catalog(folder_id, &self.chats)
+    }
+
+    /// Применяет состав, закрепление и порядок папки к актуальному каталогу того же входа.
+    pub fn rows_for_catalog<'a>(
+        &'a self,
+        folder_id: Uuid,
+        catalog: &'a [Chat],
+    ) -> Option<Vec<FolderRow<'a>>> {
         let folder = self.folder(folder_id);
         if folder.is_none() && !folder_id.is_nil() {
             return None;
         }
-        let mut chats: HashMap<_, _> = self.chats.iter().map(|chat| (chat.id, chat)).collect();
+        let mut chats: HashMap<_, _> = catalog.iter().map(|chat| (chat.id, chat)).collect();
         let mut rows: Vec<_> = folder
             .into_iter()
             .flat_map(|folder| &folder.items)
@@ -72,7 +81,7 @@ impl FolderSnapshot {
         rows.sort_by_key(|row| row.item.is_none_or(|item| item.pinned_at.is_none()));
         if folder_id.is_nil() {
             rows.extend(
-                self.chats
+                catalog
                     .iter()
                     .filter(|chat| chats.contains_key(&chat.id))
                     .map(|chat| FolderRow { chat, item: None }),

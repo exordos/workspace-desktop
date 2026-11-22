@@ -9,8 +9,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::{
     auth::{Auth, AuthError, SessionSnapshot, SessionStatus},
     context::{OwnerContext, SessionGeneration},
-    messenger::catalog::{Catalog, CatalogError, Chat},
+    messenger::catalog::{Catalog, CatalogError, Chat, SidebarPreviews, attach_previews},
     runtime::{Runtime, RuntimeError},
+    storage::StorageError,
 };
 
 /// Последнее состояние каталога для одного входа в Workspace.
@@ -81,8 +82,11 @@ impl CatalogStartup {
         } = self;
         let mut sessions = Box::pin(auth.subscribe());
         let mut pending = FuturesUnordered::new();
+        let mut pending_previews = FuturesUnordered::new();
         let mut current = HashMap::<OwnerContext, ChatList>::new();
+        let mut previews = HashMap::<OwnerContext, SidebarPreviews>::new();
         let mut catalog_changes = catalog.changes();
+        let mut catalog_checkpoints = catalog.checkpoints();
 
         loop {
             tokio::select! {
@@ -96,21 +100,26 @@ impl CatalogStartup {
                         session.generation == list.generation && matches!(
                             session.status, SessionStatus::Active | SessionStatus::TemporarilyUnavailable
                         )));
+                    previews.retain(|owner, _| current.contains_key(owner));
                     for (owner, session) in sessions.into_iter()
                         .filter(|(_, session)| session.status == SessionStatus::Active)
                     {
-                        current.entry(owner).or_insert_with(|| {
-                            let cached = catalog.cached(&session.context)
-                                .inspect_err(|error| log::warn!("Не удалось прочитать список чатов: {error}"))
-                                .ok().flatten().map(Arc::from);
-                            let list = ChatList {
-                                generation: session.generation,
-                                chats: cached,
-                                status: ChatListStatus::Loading,
-                            };
-                            pending.push(load(&catalog, auth, session));
-                            list
+                        if let Some(list) = current.get_mut(&owner) {
+                            // Курсор мог появиться, пока сессия не могла выполнять запросы.
+                            if begin_reconciliation(&catalog, &session, list) {
+                                pending.push(load(&catalog, auth, session));
+                            }
+                            continue;
+                        }
+                        let cached = catalog.cached(&owner)
+                            .inspect_err(|error| log::warn!("Не удалось прочитать список чатов: {error}"))
+                            .ok().flatten().map(Arc::from);
+                        current.insert(owner, ChatList {
+                            generation: session.generation,
+                            chats: cached,
+                            status: ChatListStatus::Loading,
                         });
+                        pending.push(load(&catalog, auth, session));
                     }
                 }
                 request = retry.recv() => {
@@ -129,14 +138,42 @@ impl CatalogStartup {
                     if changed.is_err() { return; }
                     // Публикация ниже перечитает снимки, зафиксированные вместе с событием.
                 }
+                checkpoint = catalog_checkpoints.changed() => {
+                    if checkpoint.is_err() { return; }
+                    for session in auth.snapshot().into_iter()
+                        .filter(|session| session.status == SessionStatus::Active)
+                    {
+                        if let Some(list) = current.get_mut(&session.context)
+                            && begin_reconciliation(&catalog, &session, list)
+                        {
+                            pending.push(load(&catalog, auth, session));
+                        }
+                    }
+                }
                 Some((session, result)) = pending.next(), if !pending.is_empty() => {
                     if let Some(list) = current.get_mut(&session.context)
                         && list.generation == session.generation
                     {
                         list.status = match result {
+                            Ok(_) if needs_reconciliation(&catalog, &session) => {
+                                // Первый курсор мог появиться между сохранением и обработкой ответа.
+                                pending.push(load(&catalog, auth, session));
+                                ChatListStatus::Loading
+                            }
                             Ok(chats) => {
-                                list.chats = Some(Arc::from(chats));
+                                previews.remove(&session.context);
+                                pending_previews.push(load_previews(&catalog, auth, session, chats));
                                 ChatListStatus::Ready
+                            }
+                            Err(CatalogError::Storage(StorageError::CatalogBeforeCheckpoint)) => {
+                                pending.push(load(&catalog, auth, session));
+                                ChatListStatus::Loading
+                            }
+                            Err(CatalogError::Storage(StorageError::StaleCatalog))
+                                if needs_reconciliation(&catalog, &session) =>
+                            {
+                                pending.push(load(&catalog, auth, session));
+                                ChatListStatus::Loading
                             }
                             Err(error) => {
                                 log::warn!("Не удалось обновить список чатов: {error}");
@@ -145,27 +182,63 @@ impl CatalogStartup {
                         };
                     }
                 }
+                Some((session, result)) = pending_previews.next(), if !pending_previews.is_empty() => {
+                    if current.get(&session.context).is_some_and(|list| list.generation == session.generation)
+                        && let Ok(loaded) = result
+                    {
+                        previews.insert(session.context, loaded);
+                    }
+                }
             }
-            if let Err(error) = publish_catalog(&catalog, &mut current, &lists) {
+            if let Err(error) = publish_catalog(&catalog, &mut current, &previews, &lists) {
                 log::warn!("Не удалось опубликовать список чатов: {error}");
             }
         }
     }
 }
 
+/// Начинает сверку для текущего входа, если список уже загружался и REST отстал от журнала.
+fn begin_reconciliation(catalog: &Catalog, session: &SessionSnapshot, list: &mut ChatList) -> bool {
+    if list.generation == session.generation
+        && list.status != ChatListStatus::Loading
+        && needs_reconciliation(catalog, session)
+    {
+        list.status = ChatListStatus::Loading;
+        return true;
+    }
+    false
+}
+
+/// Проверяет, нужно ли один раз получить список после появления первого курсора.
+fn needs_reconciliation(catalog: &Catalog, session: &SessionSnapshot) -> bool {
+    catalog
+        .needs_reconciliation(&session.context)
+        .inspect_err(|error| log::warn!("Не удалось сверить позицию каталога: {error}"))
+        .unwrap_or(false)
+}
+
 /// Публикует снимки, перечитанные под общей с записью отзыва блокировкой базы.
 pub(crate) fn publish_catalog(
     catalog: &Catalog,
     current: &mut ChatLists,
+    previews: &HashMap<OwnerContext, SidebarPreviews>,
     lists: &watch::Sender<ChatLists>,
 ) -> Result<(), crate::storage::StorageError> {
     let owners: Vec<_> = current.keys().cloned().collect();
     catalog.with_snapshots(&owners, |snapshots| {
         for (owner, chats) in owners.iter().zip(snapshots) {
-            current
+            let list = current
                 .get_mut(owner)
-                .expect("владелец взят из текущего снимка")
-                .chats = chats.map(Arc::from);
+                .expect("владелец взят из текущего снимка");
+            let chats = chats.map(|mut chats| {
+                if let Some(previews) = previews.get(owner) {
+                    attach_previews(owner, &mut chats, previews);
+                }
+                chats
+            });
+            if list.chats.as_deref() != chats.as_deref() {
+                list.chats = chats.map(Arc::from);
+            }
         }
         lists.send_replace(current.clone());
     })
@@ -179,6 +252,17 @@ async fn load(
 ) -> (SessionSnapshot, Result<Vec<Chat>, CatalogError>) {
     let result = catalog.refresh(auth, &session).await;
     (session, result)
+}
+
+/// Загружает превью отдельно от списка и возвращает их только для исходного входа.
+async fn load_previews(
+    catalog: &Catalog,
+    auth: &Auth,
+    session: SessionSnapshot,
+    chats: Vec<Chat>,
+) -> (SessionSnapshot, Result<SidebarPreviews, CatalogError>) {
+    let previews = catalog.load_previews(auth, &session, chats).await;
+    (session, previews)
 }
 
 /// Запускает фоновую работу и восстановление сохранённых сессий до сигнала остановки.

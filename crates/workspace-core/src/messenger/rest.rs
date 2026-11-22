@@ -26,6 +26,7 @@ use crate::{
     sync::{AvatarUpdate, Event},
 };
 
+use super::catalog::CatalogCounts;
 use super::details::{DetailsError, StreamNotificationMode, TopicNotificationMode};
 use super::history::OpenHistoryError;
 use super::read::ReadError;
@@ -297,6 +298,21 @@ impl RestClient {
                 return Err(SourceError::InvalidResponse);
             }
         }
+    }
+
+    /// Читает один пакет последних сообщений по повторяющимся параметрам uuid.
+    pub(super) async fn sidebar_messages(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        ids: &[Uuid],
+    ) -> Result<Vec<Value>, SourceError> {
+        let mut query = vec![
+            ("project_id", owner.project_id.clone()),
+            ("page_limit", ids.len().to_string()),
+        ];
+        query.extend(ids.iter().map(|id| ("uuid", id.to_string())));
+        get_json(self.request(owner, token, MESSAGES_PATH)?.query(&query)).await
     }
 
     /// Проверяет принадлежность к личному разговору и применяет настройки его уведомлений.
@@ -885,8 +901,8 @@ struct WireEnvelope {
 /// Вложенные данные события из JSON.
 #[derive(Deserialize)]
 struct WirePayload {
-    kind: String,                // Название события, например `message.created`.
-    uuid: Option<String>,        // Идентификатор объекта. Для нового сообщения обязателен.
+    kind: String,                      // Название события, например `message.created`.
+    uuid: Option<String>,              // Идентификатор объекта. Для нового сообщения обязателен.
     project_id: Option<String>, // Идентификатор проекта, если сервер повторил его во вложенных данных.
     user_uuid: Option<String>, // Идентификатор пользователя, если сервер повторил его во вложенных данных.
     payload: Option<Value>, // Тело объекта. Для нового сообщения здесь лежат формат и содержимое.
@@ -894,6 +910,8 @@ struct WirePayload {
     is_archived: Option<bool>, // Признак архива в снимке разговора.
     folder_uuid: Option<Uuid>, // Папка, если событие элемента называет её.
     folder: Option<Uuid>,   // Имя того же поля в системной проекции.
+    active_unread_count: Option<u32>, // Активные непрочитанные для канала или темы.
+    passive_unread_count: Option<u32>, // Пассивные непрочитанные для канала или темы.
     source_name: Option<String>, // Источник сообщения. Первый срез показывает баннеры Workspace.
     is_own: Option<bool>,   // Признак, что владелец сам отправил сообщение.
     read: Option<bool>,     // Признак, что владелец уже прочитал сообщение.
@@ -1301,15 +1319,80 @@ pub(super) fn wire_event(
             None,
         ));
     }
-    if let Some(mut event) = folder_event(&wire, owner, &cursor)? {
-        // Один снимок стрима может обновить и папки, и открытые сведения.
-        if let Event::FolderChanged {
-            sidebar: details, ..
-        } = &mut event
+    // Стрим и тема могут одним снимком обновить папки, счётчики и правый сайдбар.
+    let sidebar_change = sidebar::wire_sidebar_change(&wire, &value["payload"], owner);
+    let mut folder_event = folder_event(&wire, owner, &cursor)?;
+    if let Some(Event::FolderChanged { sidebar, .. }) = &mut folder_event {
+        *sidebar = sidebar_change.clone().map(Box::new);
+    }
+    let fallback_event = || {
+        folder_event
+            .clone()
+            .unwrap_or_else(|| match &sidebar_change {
+                Some(change) => Event::SidebarChanged {
+                    cursor: cursor.clone(),
+                    change: change.clone(),
+                },
+                None => Event::Checkpoint(cursor.clone()),
+            })
+    };
+    let folder = match &folder_event {
+        Some(Event::FolderChanged {
+            change:
+                change @ FolderChange::StreamChanged {
+                    archived: false, ..
+                },
+            ..
+        }) => Some(*change),
+        Some(event) => return Ok((event.clone(), None)),
+        None => None,
+    };
+    if matches!(wire.object_type.as_str(), "stream" | "topic")
+        && matches!(wire.action.as_str(), "created" | "updated" | "read")
+    {
+        let payload = &wire.payload;
+        let (Some(total), Some(active), Some(passive)) = (
+            payload.unread_count,
+            payload.active_unread_count,
+            payload.passive_unread_count,
+        ) else {
+            return Ok((fallback_event(), None));
+        };
+        let Some(id) = payload.uuid.as_deref().and_then(parse_uuid) else {
+            return Ok((fallback_event(), None));
+        };
+        let (stream_id, topic_id) = if wire.object_type == "topic" {
+            let Some(stream_id) = payload.stream_uuid.as_deref().and_then(parse_uuid) else {
+                return Ok((fallback_event(), None));
+            };
+            (stream_id, Some(id))
+        } else {
+            (id, None)
+        };
+        if payload.kind.split_once('.') != Some((wire.object_type.as_str(), wire.action.as_str()))
+            || !matches_owner(
+                owner,
+                payload.project_id.as_deref(),
+                payload.user_uuid.as_deref(),
+            )
         {
-            *details = sidebar::wire_sidebar_change(&wire, &value["payload"], owner).map(Box::new);
+            return Err(SourceError::InvalidResponse);
         }
-        return Ok((event, None));
+        return Ok((
+            Event::CatalogCountsChanged {
+                cursor,
+                counts: CatalogCounts {
+                    stream_id,
+                    topic_id,
+                    total,
+                    active,
+                    passive,
+                },
+                folder,
+                sidebar: sidebar_change.map(Box::new),
+            },
+            None,
+        ));
     }
     let message_updated = wire.object_type == "message" && wire.action == "updated";
     let history = match (wire.object_type.as_str(), wire.action.as_str()) {
@@ -1353,14 +1436,7 @@ pub(super) fn wire_event(
         return Ok((Event::HistoryChanged { cursor, change }, None));
     }
     if !message_created && !message_updated {
-        let event = sidebar::wire_sidebar_change(&wire, &value["payload"], owner).map_or_else(
-            || Event::Checkpoint(cursor.clone()),
-            |change| Event::SidebarChanged {
-                cursor: cursor.clone(),
-                change,
-            },
-        );
-        return Ok((event, None));
+        return Ok((fallback_event(), None));
     }
     if message_updated && wire.payload.kind != "message.updated" {
         return Err(SourceError::InvalidResponse);
@@ -1750,8 +1826,8 @@ mod tests {
             decode_page(vec![event.clone()], &owner, &cursor(14)).unwrap(),
             [Event::FolderChanged {
                 cursor: cursor(15),
-                sidebar: None,
                 change: FolderChange::Refresh(Some(personal)),
+                sidebar: None,
             }]
         );
         event["action"] = json!("deleted");
@@ -1760,8 +1836,8 @@ mod tests {
             decode_page(vec![event.clone()], &owner, &cursor(14)).unwrap(),
             [Event::FolderChanged {
                 cursor: cursor(15),
-                sidebar: None,
                 change: FolderChange::DeleteFolder(personal),
+                sidebar: None,
             }]
         );
         event["object_type"] = json!("folder_item");
@@ -1770,8 +1846,8 @@ mod tests {
             decode_page(vec![event.clone()], &owner, &cursor(14)).unwrap(),
             [Event::FolderChanged {
                 cursor: cursor(15),
-                sidebar: None,
                 change: FolderChange::DeleteItem(personal),
+                sidebar: None,
             }]
         );
         event["object_type"] = json!("stream");
@@ -1781,11 +1857,11 @@ mod tests {
             decode_page(vec![event], &owner, &cursor(14)).unwrap(),
             [Event::FolderChanged {
                 cursor: cursor(15),
-                sidebar: None,
                 change: FolderChange::StreamChanged {
                     stream_id: personal,
                     archived: true
                 },
+                sidebar: None,
             }]
         );
     }

@@ -25,7 +25,7 @@ use workspace_core::{
     bootstrap::{self, ChatListStatus},
     messenger::MessengerSource,
     runtime::Runtime,
-    storage::{ApplyOutcome, Cursor, HistoryChange, Storage},
+    storage::{ApplyOutcome, Cursor, HistoryChange, MessagePlacement, Storage},
     sync::{Event, Sync},
 };
 
@@ -37,6 +37,7 @@ const B: &str = "00000000-0000-0000-0000-000000000003";
 const STREAM: &str = "00000000-0000-0000-0000-000000000004";
 const OTHER: &str = "00000000-0000-0000-0000-000000000005";
 const TOPIC: &str = "00000000-0000-0000-0000-000000000006";
+const MESSAGE: &str = "00000000-0000-0000-0000-000000000007";
 const CA: &[u8] = include_bytes!("../../../../tests/fixtures/tls/ca.pem");
 const CERT: &[u8] = include_bytes!("../../../../tests/fixtures/tls/localhost.pem");
 const KEY: &[u8] = include_bytes!("../../../../tests/fixtures/tls/localhost-key.pem");
@@ -87,10 +88,12 @@ impl IamClient for TestIam {
 /// Барьеры задерживают старый ответ B до фиксации отзыва.
 #[derive(Default)]
 struct Api {
-    delayed: Notify,     // Сервер получил старый запрос B.
-    release: Notify,     // Тест разрешает вернуть его после отзыва.
-    first_b: AtomicBool, // Задерживаем только первый запрос списка каналов B.
-    revoked: AtomicBool, // Новые ответы B уже учитывают отзыв.
+    delayed: Notify,           // Сервер получил старый запрос B.
+    release: Notify,           // Тест разрешает вернуть его после отзыва.
+    first_b: AtomicBool,       // Задерживаем только первый запрос списка каналов B.
+    revoked: AtomicBool,       // Новые ответы B уже учитывают отзыв.
+    preview_requested: Notify, // Сервер получил запрос превью для уже готового списка.
+    preview_release: Notify,   // Разрешает вернуть превью после проверки готового списка.
 }
 
 /// Запускает локальный HTTPS для списка каналов и тем.
@@ -139,12 +142,49 @@ async fn server(api: Arc<Api>) -> (String, tokio::task::JoinHandle<()>) {
                     api.delayed.notify_one();
                     api.release.notified().await;
                 }
-                let body = if path.contains("/stream_topics/") {
-                    json!([{ "uuid": TOPIC, "project_id": PROJECT, "user_uuid": user, "stream_uuid": STREAM, "name": "topic" }])
-                } else {
-                    let streams = if user == B && !old_request && api.revoked.load(Ordering::SeqCst) { vec![OTHER] } else { vec![STREAM, OTHER] };
-                    json!(streams.into_iter().map(|id| json!({ "uuid": id, "project_id": PROJECT, "user_uuid": user, "name": id, "private": false, "direct_user_uuid": null, "is_archived": false })).collect::<Vec<_>>())
-                }.to_string();
+                let body =
+                    if path.contains("/epoch/") {
+                        json!({"epoch_generation": "epoch", "epoch_version": 0})
+                    } else if path.contains("/messages/") {
+                        assert_eq!(user, A);
+                        assert!(path.contains(&format!("project_id={PROJECT}")));
+                        assert!(path.contains(&format!("uuid={MESSAGE}")));
+                        api.preview_requested.notify_one();
+                        api.preview_release.notified().await;
+                        json!([{
+                            "uuid": MESSAGE, "project_id": PROJECT, "user_uuid": A,
+                            "stream_uuid": STREAM, "topic_uuid": TOPIC, "author_uuid": A,
+                            "created_at": "2026-11-17T12:13:14Z",
+                            "payload": {
+                                "kind": "markdown",
+                                "content": "**hello**\n[world](https://example.invalid/a(b)c)"
+                            }
+                        }, {
+                            "uuid": MESSAGE, "project_id": PROJECT, "user_uuid": B,
+                            "stream_uuid": STREAM, "topic_uuid": TOPIC, "author_uuid": B,
+                            "created_at": "2026-11-17T12:13:14Z",
+                            "payload": { "kind": "markdown", "content": "other account" }
+                        }])
+                    } else if path.contains("/stream_topics/") {
+                        json!([{
+                            "uuid": TOPIC, "project_id": PROJECT, "user_uuid": user,
+                            "stream_uuid": STREAM, "name": "topic", "is_done": true,
+                            "last_message_uuid": MESSAGE, "unread_count": 0, "color": 0xAA_BBCCu32
+                        }])
+                    } else {
+                        let streams =
+                            if user == B && !old_request && api.revoked.load(Ordering::SeqCst) {
+                                vec![OTHER]
+                            } else {
+                                vec![STREAM, OTHER]
+                            };
+                        json!(streams.into_iter().map(|id| json!({
+                        "uuid": id, "project_id": PROJECT, "user_uuid": user, "name": id,
+                        "private": false, "is_archived": false, "default_topic_uuid": TOPIC,
+                        "color": 0xBB_CCDDu32, "active_unread_count": 2
+                    })).collect::<Vec<_>>())
+                    }
+                    .to_string();
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -253,6 +293,123 @@ async fn revoke_stream_updates_catalog_and_rejects_old_response() {
     })
     .await
     .expect("исходные каталоги не появились");
+    {
+        let lists = lists.borrow();
+        let fresh = lists[&a].chats.as_ref().unwrap();
+        let stream = fresh
+            .iter()
+            .find(|chat| chat.id.to_string() == STREAM)
+            .unwrap();
+        let topic = &stream.topics[0];
+        assert_eq!(stream.metadata.default_topic_id, Some(topic.id));
+        assert_eq!(stream.metadata.color, Some(0xBB_CCDD));
+        assert_eq!(stream.metadata.active_unread_count, Some(2));
+        assert_eq!(
+            topic.metadata.last_message_id,
+            Some(MESSAGE.parse().unwrap())
+        );
+        assert!(topic.metadata.is_done && topic.metadata.is_default);
+        assert_eq!(topic.metadata.unread_count, Some(0));
+        assert_eq!(topic.metadata.color, Some(0xAA_BBCC));
+        assert!(topic.metadata.preview.is_none());
+        // Сервер сослался на тему чужого канала. Она не становится целью перехода.
+        let other = fresh
+            .iter()
+            .find(|chat| chat.id.to_string() == OTHER)
+            .unwrap();
+        assert_eq!(other.metadata.default_topic_id, None);
+        // Старый снимок B читается, пока свежий ответ ещё в пути.
+        let cached = lists[&b].chats.as_ref().unwrap();
+        assert!(
+            cached
+                .iter()
+                .all(|chat| chat.metadata.active_unread_count.is_none())
+        );
+    }
+    timeout(DEADLINE, api.preview_requested.notified())
+        .await
+        .expect("запрос превью не дошёл до сервера");
+    api.preview_release.notify_one();
+    timeout(DEADLINE, async {
+        loop {
+            {
+                let lists = lists.borrow();
+                let preview = lists[&a]
+                    .chats
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .find_map(|chat| chat.topics.first()?.metadata.preview.as_ref());
+                if let Some(preview) = preview {
+                    assert_eq!(preview.text, "hello world");
+                    assert_eq!(preview.author_name.as_deref(), Some("Вы"));
+                    break;
+                }
+            }
+            lists.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("превью не появилось после готового каталога");
+    let generation_a = lists.borrow()[&a].generation;
+    let apply_a = |version, change| {
+        sync.apply(
+            &a,
+            generation_a,
+            "messenger",
+            Event::HistoryChanged {
+                cursor: Cursor {
+                    epoch_generation: "epoch".into(),
+                    epoch_version: version,
+                },
+                change,
+            },
+        )
+        .unwrap();
+    };
+    apply_a(1, HistoryChange::RemoveMessage(MESSAGE.into()));
+    timeout(DEADLINE, async {
+        loop {
+            let hidden = lists.borrow()[&a]
+                .chats
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter_map(|chat| chat.topics.first())
+                .any(|topic| {
+                    topic.metadata.last_message_id.is_none() && topic.metadata.preview.is_none()
+                });
+            if hidden {
+                break;
+            }
+            lists.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("превью удалённого сообщения осталось в каталоге");
+    apply_a(
+        2,
+        HistoryChange::RemoveTopic(MessagePlacement {
+            stream_id: STREAM.into(),
+            topic_id: TOPIC.into(),
+        }),
+    );
+    timeout(DEADLINE, async {
+        loop {
+            let hidden = lists.borrow()[&a]
+                .chats
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|chat| chat.topics.is_empty() && chat.metadata.default_topic_id.is_none());
+            if hidden {
+                break;
+            }
+            lists.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("удалённая тема осталась в каталоге");
     db.execute_batch("CREATE TRIGGER fail_revoke BEFORE UPDATE ON messenger_catalog BEGIN SELECT RAISE(FAIL, 'test failure'); END;").unwrap();
     lists.borrow_and_update();
     assert!(sync.apply(&b, generation, "messenger", revoke(1)).is_err());
@@ -351,6 +508,7 @@ async fn revoke_stream_updates_catalog_and_rejects_old_response() {
         )
         .unwrap();
     assert!(saved_a.contains(STREAM));
-    assert!(saved_a.contains(TOPIC));
+    assert!(!saved_a.contains(TOPIC));
+    assert!(!saved_a.contains(MESSAGE));
     server_task.abort();
 }

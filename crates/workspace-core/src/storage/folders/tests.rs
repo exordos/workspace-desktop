@@ -98,7 +98,7 @@ fn save_catalog(storage: &Storage, owner: &OwnerContext) {
     .unwrap();
     let revision = storage.catalog_revision(owner).unwrap();
     storage
-        .save_chat_catalog(owner, &payload, revision)
+        .save_chat_catalog(owner, &payload, revision, None)
         .unwrap();
 }
 
@@ -286,7 +286,7 @@ fn revocation_and_reset_invalidate_pending_responses_for_their_owner() {
             .unwrap()
     );
     assert!(matches!(
-        storage.save_chat_catalog(&alice, "[]", catalog_in_flight),
+        storage.save_chat_catalog(&alice, "[]", catalog_in_flight, None),
         Err(StorageError::StaleCatalog)
     ));
     let view = storage.folder_view(&alice).unwrap();
@@ -303,7 +303,7 @@ fn revocation_and_reset_invalidate_pending_responses_for_their_owner() {
             .unwrap()
     );
     assert!(matches!(
-        storage.save_chat_catalog(&alice, "[]", catalog_in_flight),
+        storage.save_chat_catalog(&alice, "[]", catalog_in_flight, None),
         Err(StorageError::StaleCatalog)
     ));
     let view = storage.folder_view(&alice).unwrap();
@@ -322,7 +322,7 @@ fn revocation_and_reset_invalidate_pending_responses_for_their_owner() {
 fn new_streams_refresh_catalog_without_repeating_for_known_links() {
     let storage = Storage::in_memory().unwrap();
     let owner = owner("alice");
-    storage.save_chat_catalog(&owner, "[]", 0).unwrap();
+    storage.save_chat_catalog(&owner, "[]", 0, None).unwrap();
     assert!(
         storage
             .save_folder_refresh(&owner, &plan(&storage, &owner), vec![folder(1)])
@@ -331,7 +331,9 @@ fn new_streams_refresh_catalog_without_repeating_for_known_links() {
     assert!(storage.catalog_needs_refresh(&owner).unwrap());
     let revision = storage.catalog_revision(&owner).unwrap();
     // Пустой успешный ответ оставляет связь ждать события о доступности разговора.
-    storage.save_chat_catalog(&owner, "[]", revision).unwrap();
+    storage
+        .save_chat_catalog(&owner, "[]", revision, None)
+        .unwrap();
     apply(&storage, &owner, 1, FolderChange::Refresh(Some(FOLDER)));
     assert!(
         storage
@@ -372,7 +374,7 @@ fn new_streams_refresh_catalog_without_repeating_for_known_links() {
     assert!(storage.catalog_needs_refresh(&owner).unwrap());
     let archive_revision = storage.catalog_revision(&owner).unwrap();
     storage
-        .save_chat_catalog(&owner, "[]", archive_revision)
+        .save_chat_catalog(&owner, "[]", archive_revision, None)
         .unwrap();
     assert!(!storage.catalog_needs_refresh(&owner).unwrap());
     apply(

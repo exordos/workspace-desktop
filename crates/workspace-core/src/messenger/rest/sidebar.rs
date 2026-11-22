@@ -577,18 +577,28 @@ mod topic_tests {
                 },
             });
             let (event, _) = wire_event(event, &owner, "generation").unwrap();
-            let Event::SidebarChanged {
-                change:
-                    SidebarChange::Topic {
-                        stream_id: actual_stream,
-                        topic,
-                    },
+            let Event::CatalogCountsChanged {
+                counts,
+                sidebar: Some(sidebar),
                 ..
             } = event
+            else {
+                panic!("expected catalog counts and a topic snapshot");
+            };
+            let SidebarChange::Topic {
+                stream_id: actual_stream,
+                topic,
+            } = *sidebar
             else {
                 panic!("expected a topic snapshot");
             };
             assert_eq!(actual_stream, stream_id);
+            assert_eq!(counts.stream_id, stream_id);
+            assert_eq!(counts.topic_id, Some(topic_id));
+            assert_eq!(
+                (counts.total, counts.active, counts.passive),
+                (raw, active, passive)
+            );
             assert_eq!(topic.id, topic_id);
             assert_eq!(topic.unread_count, raw);
             assert_eq!(topic.active_unread_count, active);

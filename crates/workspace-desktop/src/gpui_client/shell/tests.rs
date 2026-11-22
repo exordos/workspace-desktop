@@ -79,6 +79,7 @@ fn setup() -> (Shell, AccountSnapshot, AccountSnapshot) {
                             topics: vec![Topic {
                                 id: Uuid::from_u128(9),
                                 name: "Другая тема".into(),
+                                metadata: Default::default(),
                             }],
                             metadata: Default::default(),
                         }])),
