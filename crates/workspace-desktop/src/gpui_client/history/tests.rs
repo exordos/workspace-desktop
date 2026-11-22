@@ -725,6 +725,42 @@ fn cached_tail_refreshes_and_deduplicates_outbox(cx: &mut TestAppContext) {
     });
 }
 
+/// Заполняет короткий хвост без жеста и удерживает последнее сообщение у нижнего края.
+#[gpui::test]
+fn short_tail_prefetch_fills_the_conversation_without_moving_the_last_row(cx: &mut TestAppContext) {
+    let address = address(ChatEntry::Latest);
+    let (view, ui, requests) = scenario(cx, &address);
+    let scope = address.route.scope;
+    answer(
+        request(&requests, Load::Open(ChatEntry::Latest)),
+        window(
+            scope,
+            80..83,
+            HistoryEdge::More("older".into()),
+            HistoryEdge::End,
+        ),
+        ui,
+    );
+    let last = Uuid::from_u128(82);
+    let before = ui.read(|app| view.read(app).tested_message_window_y(last).unwrap());
+    answer(
+        request(&requests, Load::Extend(41, HistoryDirection::Older)),
+        window(
+            scope,
+            30..83,
+            HistoryEdge::More("older-again".into()),
+            HistoryEdge::End,
+        ),
+        ui,
+    );
+    let after = ui.read(|app| view.read(app).tested_message_window_y(last).unwrap());
+    assert!(
+        (after - before).abs() <= px(1.),
+        "Хвост: {before:?} → {after:?}"
+    );
+    assert!(requests.try_recv().is_err(), "Окно уже заполнено");
+}
+
 /// Потеря подтверждённого хвоста не перемещает того, кто читает старые сообщения.
 #[gpui::test]
 fn losing_latest_edge_does_not_move_a_history_reader(cx: &mut TestAppContext) {
@@ -790,5 +826,161 @@ impl Conversation {
     /// Проверяет, была ли строка измерена в последнем кадре тестового окна.
     pub(in crate::gpui_client) fn message_visible_for_test(&self, id: Uuid) -> bool {
         self.viewport.y(id).is_some()
+    }
+}
+
+/// Измеряет первую отрисовку опоры, когда синхронизация приносит короткую версию её текста.
+#[gpui::test]
+fn edit_keeps_a_surviving_text_line_on_the_first_frame(cx: &mut TestAppContext) {
+    use std::{cell::Cell, rc::Rc};
+
+    let anchor = Uuid::from_u128(52);
+    let address = address(ChatEntry::Around(anchor));
+    let intro = "Короткое вступление";
+    let setup: String = (0..15).map(|i| format!("Предисловие {i}\n")).collect();
+    let previous = "Предыдущая строка";
+    let visible = "Читаемая строка";
+    let next = "Соседняя строка";
+    let body = format!("{intro}\n{setup}{previous}\n{visible}\n{next}\nЗаключение");
+    let paragraph = format!(
+        "{}Середина абзаца {}.",
+        "Начало длинного абзаца. ".repeat(12),
+        "Продолжение длинного абзаца. ".repeat(4)
+    );
+    let wrapped = format!("{intro}\n{setup}{paragraph}");
+    let cases = [
+        (
+            "удалили строки выше",
+            body.clone(),
+            visible,
+            format!("{intro}\n{visible}\n{next}"),
+            visible,
+        ),
+        (
+            "сосед ниже",
+            body.clone(),
+            visible,
+            format!("{intro}\n{next}\nЗаключение"),
+            next,
+        ),
+        (
+            "при равном расстоянии сосед ниже",
+            body.clone(),
+            visible,
+            format!("{intro}\n{previous}\n{next}"),
+            next,
+        ),
+        (
+            "сосед выше",
+            body,
+            visible,
+            format!("{intro}\n{previous}\nЗаключение"),
+            previous,
+        ),
+        (
+            "перенос по ширине",
+            wrapped,
+            "Середина абзаца",
+            format!("{intro}\n{paragraph}"),
+            "Середина абзаца",
+        ),
+    ];
+    for (step, body, marker, shortened, expected) in cases {
+        let (view, ui, requests) = scenario(cx, &address);
+        let mut original = window(
+            address.route.scope,
+            52..80,
+            HistoryEdge::End,
+            HistoryEdge::End,
+        );
+        let before_byte = body.find(marker).unwrap() + marker.chars().next().unwrap().len_utf8();
+        let after_byte =
+            shortened.find(expected).unwrap() + expected.chars().next().unwrap().len_utf8();
+        original.messages[0].text.clone_from(&body);
+        answer(
+            request(&requests, Load::Open(ChatEntry::Around(anchor))),
+            original.clone(),
+            ui,
+        );
+
+        let (line_y, top) = ui.read(|app| {
+            let viewport = &view.read(app).viewport;
+            (
+                viewport.tested_text_y(anchor, before_byte).unwrap(),
+                viewport.list().viewport_bounds().top(),
+            )
+        });
+        // Начинаем читать чуть ниже верхней границы строки, которую потом может удалить правка.
+        let (before, old_offset) = ui.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.viewport.list().scroll_by(line_y - top + px(3.));
+                cx.notify();
+            });
+            window.refresh();
+            window.draw(app).clear();
+            let viewport = &view.read(app).viewport;
+            (
+                viewport.tested_text_y(anchor, before_byte).unwrap(),
+                viewport.list().logical_scroll_top().offset_in_item,
+            )
+        });
+        assert!((before - top + px(3.)).abs() <= px(1.));
+        assert_eq!(
+            ui.read(|app| view.read(app).viewport.saved_anchor().unwrap().id),
+            anchor
+        );
+
+        original.messages[0].text.clone_from(&shortened);
+        sync(
+            &view,
+            ui,
+            &address,
+            SyncChange::HistoryMessageChanged { message_id: anchor },
+        );
+        let response = request(&requests, Load::Read(original.id));
+
+        let captured = Rc::new(Cell::new(None));
+        let capture = captured.clone();
+        let subscription = ui.update(|window, app| {
+            window.observe(&view, app, move |view, window, app| {
+                if capture.get().is_none()
+                    && matches!(&view.read(app).state, State::Ready(history)
+                        if history.messages[0].text == shortened)
+                {
+                    window.refresh();
+                    window.draw(app).clear();
+                    let viewport = &view.read(app).viewport;
+                    capture.set(Some((
+                        viewport.tested_text_y(anchor, after_byte),
+                        viewport.tested_bounds(anchor),
+                    )));
+                }
+            })
+        });
+        answer(response, original, ui);
+        drop(subscription);
+
+        let (first, bounds) = captured.get().expect("Рабочий экран принял правку");
+        let delta = first.map(|y| f32::from(y - before));
+        eprintln!(
+            "history_edit anchor_uuid={anchor} step={step} before_y_px={} first_frame_y_px={:?} delta_px={delta:?}",
+            f32::from(before),
+            first.map(f32::from)
+        );
+        let first = first.expect("Строка текста должна быть в первом кадре");
+        assert!(
+            (first - before).abs() <= px(1.),
+            "{expected}: {before:?} → {first:?}"
+        );
+        let bounds = bounds.unwrap();
+        assert!(bounds.bottom() > top);
+        assert!(bounds.size.height < old_offset);
+        let settled = ui.read(|app| {
+            view.read(app)
+                .viewport
+                .tested_text_y(anchor, after_byte)
+                .unwrap()
+        });
+        assert!((settled - first).abs() <= px(1.));
     }
 }

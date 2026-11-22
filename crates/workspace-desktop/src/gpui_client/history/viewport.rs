@@ -9,7 +9,7 @@ use std::{
 
 use gpui::{
     AnyElement, App, Bounds, Div, ImageSource, IntoElement, ListAlignment, ListOffset, ListState,
-    Pixels, WeakEntity, canvas, div, list, prelude::*, px,
+    Pixels, StyledText, TextLayout, WeakEntity, canvas, div, list, prelude::*, px,
 };
 use uuid::Uuid;
 use workspace_core::{
@@ -30,7 +30,13 @@ use super::{
 mod paging;
 pub(super) use paging::PageNeed;
 
-use crate::gpui_client::ui::{Avatar, DeliveryMark, MessageBubble, Palette, TextRole, label};
+#[path = "text_anchor.rs"]
+mod text_anchor;
+use text_anchor::{LineTarget, ReadingLine};
+
+use crate::gpui_client::ui::{
+    Avatar, DeliveryMark, MessageBubble, Palette, TextRole, label, text_role,
+};
 
 const DATE_SPACE: Pixels = px(32.);
 const BOTTOM_PADDING: Pixels = px(12.);
@@ -89,6 +95,14 @@ struct Measurement {
     anchor: ReadingAnchor, // Положение той же строки до замены снимка.
 }
 
+/// Поправка ожидает ширину списка в первом кадре после правки.
+struct EditAnchor {
+    id: Uuid,            // Опорное сообщение.
+    op_id: Uuid,         // Запрос, который принёс правку.
+    scroll: ListOffset,  // Положение до поправки. Новый жест может его изменить.
+    source: ReadingLine, // Та же строка в последнем показанном кадре.
+}
+
 /// Снимок виртуального списка и реально нарисованные границы последнего кадра.
 pub(super) struct Viewport {
     rows: Rc<Vec<Row>>, // Состав списка для отложенного построения видимых элементов.
@@ -96,8 +110,10 @@ pub(super) struct Viewport {
     selection: Rc<RefCell<Selection>>, // Выделенный фрагмент в виртуальном списке.
     list: ListState,    // Позиция и размеры строк в GPUI.
     painted: Rc<RefCell<HashMap<Uuid, Bounds<Pixels>>>>, // Фактические прямоугольники строк.
+    painted_text: Rc<RefCell<HashMap<Uuid, TextLayout>>>, // Разметка простого текста последнего кадра.
     painted_offset: Rc<Cell<Option<ListOffset>>>, // Смещение, для которого измерены прямоугольники.
-    measure: Option<Measurement>, // Следующее измерение после замены снимка.
+    measure: Option<Measurement>,                 // Следующее измерение после замены снимка.
+    edit_anchor: Option<EditAnchor>, // Поправка внутри текста опоры для следующего кадра.
 }
 
 impl Viewport {
@@ -109,8 +125,10 @@ impl Viewport {
             selection: Rc::default(),
             list: ListState::new(0, ListAlignment::Bottom, overdraw),
             painted: Rc::default(),
+            painted_text: Rc::default(),
             painted_offset: Rc::default(),
             measure: None,
+            edit_anchor: None,
         }
     }
 
@@ -140,15 +158,17 @@ impl Viewport {
         *self.selection.borrow_mut() = Selection::default();
         self.list.reset(0);
         self.painted.borrow_mut().clear();
+        self.painted_text.borrow_mut().clear();
         self.painted_offset.set(None);
         self.measure = None;
+        self.edit_anchor = None;
     }
 
     /// Сверяет последний отрисованный кадр с текущим смещением списка.
     fn paint_matches(&self, offset: ListOffset) -> bool {
-        self.painted_offset.get().is_some_and(|painted| {
-            painted.item_ix == offset.item_ix && painted.offset_in_item == offset.offset_in_item
-        })
+        self.painted_offset
+            .get()
+            .is_some_and(|painted| same_offset(painted, offset))
     }
 
     /// Берёт верхнюю видимую строку и сохраняет её смещение до замены данных.
@@ -210,6 +230,12 @@ impl Viewport {
             Position::Restore(anchor) => index.contains_key(&anchor.id).then_some(anchor),
             Position::Tail | Position::Around(_) => None,
         };
+        let source = if let (Position::Reading, Some(anchor)) = (&position, anchor) {
+            self.reading_line(anchor.id, &rows[index[&anchor.id]])
+        } else {
+            None
+        };
+        self.edit_anchor = None;
         let prefix = self
             .rows
             .iter()
@@ -267,9 +293,32 @@ impl Viewport {
                         item_ix,
                         offset_in_item: self.rows[item_ix].inset() - anchor.y,
                     });
+                    self.edit_anchor = source.map(|source| EditAnchor {
+                        id: anchor.id,
+                        op_id,
+                        scroll: self.list.logical_scroll_top(),
+                        source,
+                    });
                 }
             }
         }
+    }
+
+    /// Берёт строку из показанного кадра или держит её до кадра при нескольких быстрых ответах.
+    fn reading_line(&mut self, id: Uuid, next: &Row) -> Option<ReadingLine> {
+        let offset = self.list.logical_scroll_top();
+        if let Some(edit) = self.edit_anchor.take()
+            && edit.id == id
+            && same_offset(edit.scroll, offset)
+        {
+            return Some(edit.source);
+        }
+        let current = &self.rows[*self.index.get(&id)?];
+        if current.body == next.body || !self.paint_matches(offset) {
+            return None;
+        }
+        let layout = self.painted_text.borrow().get(&id)?.clone();
+        ReadingLine::at_top(layout, self.list.viewport_bounds().top())
     }
 
     /// Возвращает общий диапазон для мыши, меню и клавиатуры.
@@ -346,10 +395,12 @@ impl Viewport {
         accessory: impl Fn(Uuid) -> Option<AnyElement> + 'static,
     ) -> impl IntoElement {
         self.painted.borrow_mut().clear();
+        self.painted_text.borrow_mut().clear();
         self.painted_offset.set(None);
         let rows = self.rows.clone();
         let row_index = self.index.clone();
         let painted = self.painted.clone();
+        let painted_text = self.painted_text.clone();
         let painted_offset = self.painted_offset.clone();
         let measurement = Rc::new(RefCell::new(self.measure.take()));
         let list_state = self.list.clone();
@@ -368,18 +419,67 @@ impl Viewport {
                 },
             )
         });
+        let measured_line = Rc::new(Cell::new(None::<(Uuid, Uuid, LineTarget)>));
+        let correction = self.edit_anchor.take().map(|edit| {
+            let list = list_state.clone();
+            let rows = self.rows.clone();
+            let message = message.clone();
+            let measured_line = measured_line.clone();
+            canvas(
+                move |bounds, window, app| {
+                    if !same_offset(list.logical_scroll_top(), edit.scroll) {
+                        return;
+                    }
+                    let row = &rows[edit.scroll.item_ix];
+                    let target = edit.source.target(&row.body);
+                    let offset = target.and_then(|target| {
+                        target.measure(bounds.size.width, window, app, |app| {
+                            let (message, text) = message(row, app);
+                            (row_container(row, palette).child(message), text)
+                        })
+                    });
+                    if let (Some(target), Some(_)) = (target, offset) {
+                        measured_line.set(Some((edit.id, edit.op_id, target)));
+                    }
+                    list.scroll_to(ListOffset {
+                        item_ix: edit.scroll.item_ix,
+                        offset_in_item: offset.unwrap_or_else(|| row.inset()),
+                    });
+                    log::debug!(
+                        "gpui_history op_id={} event=text_anchor_positioned anchor_uuid={} old_offset_px={} new_offset_px={}",
+                        edit.op_id, edit.id, f32::from(edit.scroll.offset_in_item),
+                        f32::from(list.logical_scroll_top().offset_in_item)
+                    );
+                },
+                |_, (), _, _| (),
+            )
+            .absolute()
+            .inset_0()
+        });
         let rows = self.rows.clone();
-        list(self.list.clone(), move |index, _, app| {
+        let items = list(self.list.clone(), move |index, _, app| {
             let row = &rows[index];
             let id = row.id;
             let painted = painted.clone();
+            let painted_text = painted_text.clone();
             let painted_offset = painted_offset.clone();
             let measurement = measurement.clone();
+            let measured_line = measured_line.clone();
             let list_state = list_state.clone();
-            let message = message(row, app);
+            let (message, text_layout) = message(row, app);
             row_container(row, palette)
                 .child(message.relative().child(canvas(|_, _, _| (), move |bounds, (), _, _| {
                     painted.borrow_mut().insert(id, bounds);
+                    if let Some(layout) = text_layout {
+                        if let Some((_, op_id, target)) = measured_line.get().filter(|(anchor, _, _)| *anchor == id)
+                            && let Some(point) = layout.position_for_index(target.byte)
+                        {
+                            let y_after = point.y - list_state.viewport_bounds().top();
+                            log::debug!("gpui_history op_id={op_id} event=text_anchor_measured anchor_uuid={id} y_before_px={} y_after_px={} delta_px={}",
+                                f32::from(target.y), f32::from(y_after), f32::from(y_after - target.y));
+                        }
+                        painted_text.borrow_mut().insert(id, layout);
+                    }
                     painted_offset.set(Some(list_state.logical_scroll_top()));
                     let mut measurement = measurement.borrow_mut();
                     if measurement.as_ref().is_some_and(|m| m.anchor.id == id)
@@ -391,7 +491,18 @@ impl Viewport {
                     }
                 }).absolute().inset_0()))
                 .into_any_element()
-        }).flex_1().min_h_0().w_full().pb(BOTTOM_PADDING)
+        }).flex_1().min_h_0().w_full().pb(BOTTOM_PADDING);
+        // GPUI подготавливает детей по порядку. Сначала измеряем и выставляем опору,
+        // затем сам список строит видимую область для уже исправленного смещения.
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .children(correction)
+            .child(items)
     }
 
     /// После отрисовки строк собирает аватары тех групп, что действительно пересекли область списка.
@@ -444,6 +555,16 @@ impl Viewport {
         self.painted.borrow().get(&id).copied()
     }
 
+    /// Возвращает координату строки текста в окне для проверки первого кадра.
+    #[cfg(all(test, feature = "gpui-test"))]
+    pub(super) fn tested_text_y(&self, id: Uuid, byte: usize) -> Option<Pixels> {
+        self.painted_text
+            .borrow()
+            .get(&id)?
+            .position_for_index(byte)
+            .map(|point| point.y)
+    }
+
     /// Возвращает опору чтения после показанного кадра для проверки вставки.
     #[cfg(all(test, feature = "gpui-test"))]
     pub(super) fn tested_reading_anchor(&self) -> Option<(Uuid, f32)> {
@@ -487,7 +608,12 @@ fn visible_avatar_users(
     users
 }
 
-/// Задаёт отступы для строки списка.
+/// Сверяет индекс и смещение, чтобы не потерять новый жест между кадрами.
+fn same_offset(a: ListOffset, b: ListOffset) -> bool {
+    a.item_ix == b.item_ix && a.offset_in_item == b.offset_in_item
+}
+
+/// Задаёт отступы для строки списка и для её пробного измерения.
 fn row_container(row: &Row, palette: Palette) -> Div {
     div().relative().w_full().px_3().pt(row.inset()).children(
         row.date
@@ -533,7 +659,7 @@ fn message_row(
     reply: Option<&ReplyControls>,
     photo: Option<ImageSource>,
     extras: RowBodyExtras<'_>,
-) -> Div {
+) -> (Div, Option<TextLayout>) {
     let author = peer.unwrap_or("Участник");
     let id = row.id;
     // Время и пояснения должны читаться и на более тёмной подложке исходящего.
@@ -558,6 +684,7 @@ fn message_row(
         delivery: row.delivery,
     };
     let (rows, index) = history;
+    let mut text_layout = None;
     let content = if let Some((cards, app)) = extras.media.filter(|_| !row.media.is_empty()) {
         let caption = div().flex().flex_col().min_w_0().max_w_full().gap_1();
         let caption = if let Some(reply) =
@@ -596,9 +723,24 @@ fn message_row(
         )
     } else {
         let blocks = quote::blocks(&row.body);
-        if let Some(controls) = reply.filter(|_| matches!(blocks.as_slice(), [Block::Text(_)])) {
-            let (body, _) = controls.selectable(id, &row.body, bubble_palette);
-            Some(body.min_w_0().max_w_full().into_any_element())
+        if matches!(blocks.as_slice(), [Block::Text(_)]) && !row.body.trim().is_empty() {
+            let (body, layout) = if let Some(controls) = reply {
+                let (body, layout) = controls.selectable(id, &row.body, bubble_palette);
+                (body.min_w_0().max_w_full().into_any_element(), layout)
+            } else {
+                let text = StyledText::new(row.body.clone());
+                let layout = text.layout().clone();
+                (
+                    text_role(bubble_palette, TextRole::Body)
+                        .min_w_0()
+                        .max_w_full()
+                        .child(text)
+                        .into_any_element(),
+                    layout,
+                )
+            };
+            text_layout = Some(layout);
+            Some(body)
         } else {
             quote_content(row, blocks, bubble_palette, peer, rows, index)
         }
@@ -618,7 +760,7 @@ fn message_row(
         Some(controls) => controls.row(id, bubble, palette).into_any_element(),
         None => bubble.into_any_element(),
     };
-    div()
+    let message = div()
         .w_full()
         .flex()
         .items_end()
@@ -638,7 +780,8 @@ fn message_row(
                 )
             }))
         })
-        .child(div().flex_1().min_w_0().child(bubble))
+        .child(div().flex_1().min_w_0().child(bubble));
+    (message, text_layout)
 }
 
 /// Выбирает подписанного автора, не выдавая имя собеседника за участника канала.
