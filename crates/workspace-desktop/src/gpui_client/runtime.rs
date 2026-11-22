@@ -95,6 +95,7 @@ pub(super) enum AvatarSubscription {
 /// Вход в фоновые службы для истории, редактора и системных действий.
 #[derive(Clone)]
 pub struct RuntimeClient {
+    pub(super) drafts: Arc<super::composer::DraftBuffer>, // Последний ввод тем, ожидающих диска.
     avatar_runtime_id: u64, // Отделяет изображения разных запусков рабочего профиля в одном App.
     commands: mpsc::Sender<Job>, // Ограниченная очередь запросов экрана.
     wake: mpsc::Sender<()>, // Несколько сигналов пробуждения можно объединить.
@@ -173,6 +174,8 @@ impl RuntimeClient {
         let (publish_start, started) = watch::channel(None);
         let (publish_exit, ended) = watch::channel(None);
 
+        let drafts = Arc::new(super::composer::DraftBuffer::default());
+        let worker_drafts = drafts.clone();
         thread::Builder::new()
             .name("workspace-gpui-sync".into())
             .spawn(move || {
@@ -181,7 +184,8 @@ impl RuntimeClient {
                         .enable_all()
                         .build()
                         .map_err(|_| StartupError::Worker)?;
-                    let (parts, profile_released) = setup()?;
+                    let (mut parts, profile_released) = setup()?;
+                    parts.services.drafts = worker_drafts;
                     // Поздние ответы ещё должны уметь отменить попытку, пока Tokio ждёт
                     // окончания начатых блокирующих запросов.
                     let login_auth = Arc::clone(&parts.services.auth);
@@ -211,6 +215,7 @@ impl RuntimeClient {
 
         Ok((
             Self {
+                drafts,
                 avatar_runtime_id: NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed),
                 commands,
                 wake,
@@ -440,6 +445,7 @@ impl RuntimeEvents {
 /// Службы одного профиля, которые запрос получает на выделенном потоке.
 #[derive(Clone)]
 pub struct WorkerServices {
+    pub(super) drafts: Arc<super::composer::DraftBuffer>, // Локальный ввод, не привязанный к Entity окна.
     pub auth: Arc<Auth>, // Сессии и проверка поколения; окно держит только слабую ссылку для отмены входа.
     pub sync: Arc<Sync>, // История, счётчики, проверка целей и запись отправок.
     pub messenger: Arc<MessengerSource>, // Сетевые запросы к истории и разрешение адреса отправки.
@@ -571,6 +577,7 @@ impl WorkerParts {
         let (catalog, startup) = bootstrap::chat_catalog(messenger.catalog(storage.clone()));
         let folders = messenger.folders(storage.clone());
         let services = WorkerServices {
+            drafts: Arc::default(),
             sync: Arc::new(sync),
             auth: Arc::new(auth),
             messenger,
@@ -650,6 +657,7 @@ impl WorkerParts {
         let result = tokio::select! {
             result = &mut background => result,
             () = transport => {
+                self.services.drafts.flush(&self.services.sync);
                 let _ = stop.send(());
                 background.await
             }

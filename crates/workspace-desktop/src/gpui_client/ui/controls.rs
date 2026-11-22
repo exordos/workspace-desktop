@@ -49,6 +49,18 @@ impl Button {
         focus: Option<&FocusHandle>,
         on_activate: impl Fn(&mut Window, &mut App) + 'static,
     ) -> Stateful<Div> {
+        self.render_event(palette, focus, move |_, window, app| {
+            on_activate(window, app)
+        })
+    }
+
+    /// Передаёт источнику клавиатурный или мышиный клик, если для фокуса они различаются.
+    pub(in crate::gpui_client) fn render_event(
+        self,
+        palette: Palette,
+        focus: Option<&FocusHandle>,
+        on_activate: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Stateful<Div> {
         let background = match self.appearance {
             ButtonAppearance::Neutral => palette.card,
             ButtonAppearance::Primary => palette.accent,
@@ -105,7 +117,7 @@ impl Button {
         if self.disabled {
             button
         } else {
-            activate(
+            activate_click(
                 button
                     .hover(|style| style.bg(hover))
                     .active(|style| style.bg(pressed)),
@@ -124,6 +136,18 @@ pub(in crate::gpui_client) fn activate(
     palette: Palette,
     on_activate: impl Fn(&mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
+    activate_click(element, focus, palette, move |_, window, app| {
+        on_activate(window, app)
+    })
+}
+
+/// Сохраняет тип клика у тех элементов, которые управляют переходом фокуса.
+fn activate_click(
+    element: Stateful<Div>,
+    focus: Option<&FocusHandle>,
+    palette: Palette,
+    on_activate: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
     // GPUI преобразует Enter и пробел у сфокусированного элемента в событие клика.
     element
         .map(|element| match focus {
@@ -135,7 +159,7 @@ pub(in crate::gpui_client) fn activate(
             element.focus(|style| style.border_color(palette.focus))
         })
         .cursor_pointer()
-        .on_click(move |_, window, cx| on_activate(window, cx))
+        .on_click(on_activate)
 }
 
 /// Визуальное состояние оболочки поля.

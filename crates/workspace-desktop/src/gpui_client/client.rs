@@ -253,8 +253,10 @@ impl Client {
         };
         match &event {
             RuntimeEvent::Accounts(accounts) => {
-                self.history_positions
-                    .keep_sessions(|owner, generation| keeps_session(accounts, owner, generation));
+                let keep =
+                    |owner: &OwnerContext, generation| keeps_session(accounts, owner, generation);
+                self.runtime.drafts.keep_sessions(keep);
+                self.history_positions.keep_sessions(keep);
                 self.received_accounts = true;
                 let active = accounts
                     .iter()
@@ -281,6 +283,12 @@ impl Client {
                 use workspace_core::sync::{HistoryRevocation, SyncChange};
                 match update.change {
                     SyncChange::HistoryAccessRevoked(HistoryRevocation::Stream(stream)) => {
+                        self.runtime.drafts.revoke(
+                            &update.context,
+                            update.generation,
+                            stream,
+                            None,
+                        );
                         self.history_positions.revoke(
                             &update.context,
                             update.generation,
@@ -292,6 +300,12 @@ impl Client {
                         stream_id,
                         topic_id,
                     }) => {
+                        self.runtime.drafts.revoke(
+                            &update.context,
+                            update.generation,
+                            stream_id,
+                            Some(topic_id),
+                        );
                         self.history_positions.revoke(
                             &update.context,
                             update.generation,

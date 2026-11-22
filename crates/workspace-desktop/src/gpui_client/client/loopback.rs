@@ -1,5 +1,6 @@
 //! Проверяет путь от окна через каталог и очередь до локального HTTPS/WSS-сервера.
 
+mod drafts;
 mod media;
 mod position;
 
@@ -67,6 +68,7 @@ const CHANNEL_BINDING: &str = "10000000-0000-4000-8000-000000000010";
 const INVITEE: &str = "10000000-0000-4000-8000-000000000011";
 const CHANNEL_OWNER_BINDING: &str = "10000000-0000-4000-8000-000000000012";
 const INVITEE_BINDING: &str = "10000000-0000-4000-8000-000000000013";
+const NEXT_DIRECT_TOPIC: &str = "10000000-0000-4000-8000-000000000014";
 const PICK_INVITEE: &str = "details-member-picker-user-10000000-0000-4000-8000-000000000011";
 const REMOVE_INVITEE: &str = "details-remove-member-10000000-0000-4000-8000-000000000013";
 const LEAVE_CHANNEL: &str = "details-remove-member-10000000-0000-4000-8000-000000000010";
@@ -340,16 +342,31 @@ impl DetailsFixture {
 #[derive(Default)]
 struct Received {
     media: Option<media::Fixture>, // Карточка фото из обычного сообщения и наблюдения HTTPS.
+    drafting: Option<drafts::Fixture>, // Сообщения и задержка проверки цитаты для черновиков.
     history_position: Option<position::Fixture>, // Длинная личка и управляемая догрузка старой страницы.
-    sent: Mutex<Vec<Uuid>>, // Публичные UUID реально принятых POST в порядке поступления.
-    ready: AtomicUsize,     // Сколько подключений подтвердили готовность через WSS.
-    targets: AtomicUsize,   // Сколько проверок доступа к стриму вернул HTTPS.
+    sent: Mutex<Vec<(Uuid, &'static str)>>, // Публичный UUID и тема принятого POST в порядке поступления.
+    ready: AtomicUsize,                     // Сколько подключений подтвердили готовность через WSS.
+    targets: AtomicUsize,                   // Сколько проверок доступа к стриму вернул HTTPS.
+    direct_topic_changed: AtomicBool,       // Стрим лички объявляет другую тему по умолчанию.
+    direct_encrypted: AtomicBool, // После открытия редактора обычный текст может стать недоступен.
+    direct_unavailable: AtomicBool, // Проверка стрима лички временно отвечает 503.
     delayed: Option<DelayedHistory>, // Сценарий позднего ответа, если тест его включил.
-    recovery: Option<Recovery>, // Сценарий сброса курсора, если тест его включил.
+    recovery: Option<Recovery>,   // Сценарий сброса курсора, если тест его включил.
     topic: Option<TopicAcceptance>, // Канал с явной темой для UI-12.
     details: Option<DetailsFixture>, // Ответы для правой панели UI-13.
     folders: Mutex<HashMap<(&'static str, Uuid), Value>>, // Папки, созданные в тестовых входах.
-    folder_posts: AtomicUsize, // Число запросов создания, дошедших через HTTPS.
+    folder_posts: AtomicUsize,    // Число запросов создания, дошедших через HTTPS.
+}
+
+impl Received {
+    /// Выбирает UUID, который сервер объявляет для новой отправки в личку.
+    fn direct_topic(&self) -> &'static str {
+        if self.direct_topic_changed.load(Ordering::SeqCst) {
+            NEXT_DIRECT_TOPIC
+        } else {
+            TOPIC
+        }
+    }
 }
 
 /// Держит локальный сервер, пока существует сценарий.
@@ -595,6 +612,9 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
     if path == MESSAGES && request.method() == Method::POST {
         let bytes = request.into_body().collect().await.unwrap().to_bytes();
         let post: Value = serde_json::from_slice(&bytes).unwrap();
+        if let Some(drafting) = &state.drafting {
+            return drafting.accept(user, post);
+        }
         if let Some(acceptance) = &state.topic {
             acceptance.attempts.fetch_add(1, Ordering::SeqCst);
             assert_eq!(post["stream_uuid"], CHANNEL);
@@ -616,19 +636,18 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
             );
         }
         assert_eq!(post["stream_uuid"], STREAM);
-        assert_eq!(post["topic_uuid"], TOPIC);
+        let topic = match post["topic_uuid"].as_str() {
+            Some(TOPIC) => TOPIC,
+            Some(NEXT_DIRECT_TOPIC) => NEXT_DIRECT_TOPIC,
+            _ => panic!("Отправка в неожиданную тему лички"),
+        };
         assert_eq!(post["payload"]["content"], MARKER);
         let canonical = post["uuid"].as_str().unwrap();
-        let id = Uuid::new_v5(&Uuid::parse_str(TOPIC).unwrap(), canonical.as_bytes());
-        state.sent.lock().unwrap().push(id);
-        return json_response(
-            StatusCode::CREATED,
-            json!({
-                "uuid": id, "stream_uuid": STREAM, "topic_uuid": TOPIC, "user_uuid": USER,
-                "project_id": PROJECT, "author_uuid": USER, "created_at": "2026-11-17T10:00:00Z",
-                "payload": {"kind": "markdown", "content": MARKER},
-            }),
-        );
+        let id = Uuid::new_v5(&Uuid::parse_str(topic).unwrap(), canonical.as_bytes());
+        let mut sent = state.sent.lock().unwrap();
+        let row = direct_message(id, topic, sent.len());
+        sent.push((id, topic));
+        return json_response(StatusCode::CREATED, row);
     }
 
     if let Some(details) = &state.details {
@@ -766,7 +785,8 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
     let mut stream = json!({
         "uuid": STREAM, "project_id": PROJECT, "user_uuid": user, "name":"Тестовый чат",
         "private": true, "direct_user_uuid": peer, "is_archived": false,
-        "default_topic_uuid": TOPIC, "encryption": false, "notification_mode":"all_messages",
+        "default_topic_uuid": state.direct_topic(),
+        "encryption": state.direct_encrypted.load(Ordering::SeqCst), "notification_mode":"all_messages",
     });
     if state.details.as_ref().is_some_and(|details| {
         details.omit_stream_user.load(Ordering::SeqCst) && path == format!("{STREAMS}{STREAM}")
@@ -816,6 +836,12 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         path if state.history_position.is_some() && path.starts_with(MESSAGES) => {
             return state.history_position.as_ref().unwrap().anchor(path, user, peer);
         }
+        MESSAGES if state.drafting.is_some() => {
+            draft_rows(user, peer)
+        }
+        path if state.drafting.is_some() && path.starts_with(MESSAGES) => {
+            return state.drafting.as_ref().unwrap().anchor(path, user, peer).await;
+        }
         MESSAGES if state.details.is_some() => json!(
             (DETAILS_FIRST_ROW..DETAILS_LAST_ROW)
                 .rev()
@@ -851,11 +877,9 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
                 "payload": {"kind":"markdown", "content":"Строка тестовой истории"},
             }])
         }
-        MESSAGES => json!(state.sent.lock().unwrap().iter().map(|id| json!({
-            "uuid": id, "stream_uuid": STREAM, "topic_uuid": TOPIC, "user_uuid": USER,
-            "project_id": PROJECT, "author_uuid": USER, "created_at": "2026-11-17T10:00:00Z",
-            "payload": {"kind": "markdown", "content": MARKER},
-        })).collect::<Vec<_>>()),
+        MESSAGES => json!(state.sent.lock().unwrap().iter().enumerate().rev()
+            .map(|(position, (id, topic))| direct_message(*id, topic, position))
+            .collect::<Vec<_>>()),
         "/api/workspace/v1/events/" if state.recovery.is_some() => {
             let cursor =
                 query_value(&request, "epoch_version%3E").and_then(|v| v.parse::<u64>().ok());
@@ -892,10 +916,17 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         }
         path if path.ends_with(STREAM) => {
             state.targets.fetch_add(1, Ordering::SeqCst);
+            if let Some(drafting) = &state.drafting {
+                drafting.wait_destination().await;
+            }
+            if state.direct_unavailable.load(Ordering::SeqCst) {
+                return json_response(StatusCode::SERVICE_UNAVAILABLE, Value::Null);
+            }
             stream
         }
-        path if path.ends_with(TOPIC) => {
-            json!({"uuid": TOPIC, "stream_uuid": STREAM, "project_id": PROJECT, "user_uuid": user, "notification_mode":"default"})
+        path if path.ends_with(TOPIC) || path.ends_with(NEXT_DIRECT_TOPIC) => {
+            let topic = path.rsplit('/').next().unwrap();
+            json!({"uuid": topic, "stream_uuid": STREAM, "project_id": PROJECT, "user_uuid": user, "notification_mode":"default"})
         }
         FOLDERS => {
             let mut rows = vec![folder_row(Uuid::nil(), "Все чаты", "all", unread)];
@@ -917,6 +948,14 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         _ => return json_response(StatusCode::NOT_FOUND, Value::Null),
     };
     json_response(StatusCode::OK, result)
+}
+
+/// Возвращает две разные строки подтверждённой истории лички.
+fn draft_rows(user: &str, peer: &str) -> Value {
+    json!([
+        drafts::row(user, peer, drafts::SECOND, "Второй источник", "01"),
+        drafts::row(user, peer, drafts::FIRST, "Первый источник 🦊", "00")
+    ])
 }
 
 /// Готовит схему ответа папки, которую читает настоящий Core.
@@ -969,6 +1008,16 @@ fn query_value<'a>(request: &'a Request<Incoming>, name: &str) -> Option<&'a str
     request.uri().query()?.split('&').find_map(|pair| {
         let (key, value) = pair.split_once('=')?;
         (key == name).then_some(value)
+    })
+}
+
+/// Возвращает одну метку времени для POST и истории. Следующий POST всегда новее.
+fn direct_message(id: Uuid, topic: &str, position: usize) -> Value {
+    json!({
+        "uuid": id, "stream_uuid": STREAM, "topic_uuid": topic, "user_uuid": USER,
+        "project_id": PROJECT, "author_uuid": USER,
+        "created_at": format!("2026-11-17T10:00:00.{position:06}Z"),
+        "payload": {"kind": "markdown", "content": MARKER},
     })
 }
 
@@ -1320,7 +1369,8 @@ fn catalog_click_and_submission_reach_https_queue(cx: &mut TestAppContext) {
     until(ui, "одна отправка по HTTPS", |_| {
         !server.state.sent.lock().unwrap().is_empty()
     });
-    let accepted = server.state.sent.lock().unwrap()[0];
+    let (accepted, topic) = server.state.sent.lock().unwrap()[0];
+    assert_eq!(topic, TOPIC);
     let address = ui.read(|app| client.read(app).shell.conversation().unwrap().clone());
     until(
         ui,
@@ -1349,6 +1399,169 @@ fn catalog_click_and_submission_reach_https_queue(cx: &mut TestAppContext) {
         RuntimeExit::Clean
     );
     assert!(JsonAccountStore::open(profile.path()).is_ok());
+}
+
+/// Проверяет смену правил и темы лички между открытием редактора и постановкой сообщения.
+#[gpui::test]
+fn direct_destination_change_requires_manual_recheck_before_enqueue(cx: &mut TestAppContext) {
+    cx.update(bind_keys);
+    let server = Server::start();
+    let profile = tempfile::tempdir().unwrap();
+    let (runtime, events) =
+        start_runtime(profile.path(), saved_account(&server, USER, Uuid::nil()));
+    let (client, ui) =
+        cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
+    ui.update(|_, app| {
+        let subscription = events.attach(&client, app, Client::handle_runtime);
+        client.update(app, |client, cx| client.attach(subscription, cx));
+    });
+    ui.simulate_resize(size(px(700.), px(600.)));
+    until(
+        ui,
+        "готовы каталог и WSS для лички",
+        |ui| ui.debug_bounds(CHAT_ROW).is_some() && server.state.ready.load(Ordering::SeqCst) > 0,
+    );
+    click(ui, CHAT_ROW);
+
+    let topic = |ui: &VisualTestContext| {
+        ui.read(|app| {
+            client.read(app).conversation.as_ref().and_then(|view| {
+                view.read(app)
+                    .tested_composer()?
+                    .read(app)
+                    .tested_send_state(app)
+                    .0
+            })
+        })
+    };
+    until(
+        ui,
+        "проверена исходная тема лички",
+        |ui| topic(ui) == Some(TOPIC.parse().unwrap()),
+    );
+    let address = ui.read(|app| client.read(app).shell.conversation().unwrap().clone());
+    let composer = ui.read(|app| {
+        client
+            .read(app)
+            .conversation
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .tested_composer()
+            .unwrap()
+            .clone()
+    });
+    let refocus = |ui: &mut VisualTestContext| click(ui, "workspace-composer-editor");
+    refocus(ui);
+    ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(MARKER.into())));
+    ui.simulate_keystrokes("cmd-v");
+
+    for direct_gate in [
+        &server.state.direct_encrypted,
+        &server.state.direct_topic_changed,
+    ] {
+        direct_gate.store(true, Ordering::SeqCst);
+        refocus(ui);
+        press_enter(ui);
+        until(
+            ui,
+            "редактор требует ручной сверки цели",
+            |ui| topic(ui).is_none() && ui.debug_bounds("conversation-send-retry").is_some(),
+        );
+
+        // Пока цель не перепроверена, даже следующий Enter не пишет снимок.
+        refocus(ui);
+        press_enter(ui);
+        assert_eq!(
+            ui.read(|app| composer.read(app).draft(app).to_owned()),
+            MARKER
+        );
+        let route = address.clone();
+        let pending = futures::executor::block_on(runtime.request(move |services| async move {
+            services
+                .sync
+                .outbox(&route.route.owner, route.generation, route.route.scope)
+        }))
+        .unwrap()
+        .unwrap();
+        assert!(pending.is_empty());
+        assert!(server.state.sent.lock().unwrap().is_empty());
+
+        server.state.direct_encrypted.store(false, Ordering::SeqCst);
+        click(ui, "conversation-send-retry");
+        until(
+            ui,
+            "ручная сверка подтвердила текущую тему",
+            |ui| topic(ui) == Some(server.state.direct_topic().parse().unwrap()),
+        );
+        assert!(server.state.sent.lock().unwrap().is_empty());
+    }
+
+    refocus(ui);
+    press_enter(ui);
+    until(
+        ui,
+        "новое нажатие отправило исходный текст в новую тему",
+        |_| !server.state.sent.lock().unwrap().is_empty(),
+    );
+    let (public_id, accepted_topic) = server.state.sent.lock().unwrap()[0];
+    assert_eq!(accepted_topic, NEXT_DIRECT_TOPIC);
+    wait_topic_confirmation(&runtime, ui, &address, public_id);
+    assert_eq!(server.state.sent.lock().unwrap().len(), 1);
+
+    // Временный сбой после подтверждения лички оставляет снимок для фоновой отправки.
+    server
+        .state
+        .direct_unavailable
+        .store(true, Ordering::SeqCst);
+    refocus(ui);
+    ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(MARKER.into())));
+    ui.simulate_keystrokes("cmd-v");
+    press_enter(ui);
+    until(
+        ui,
+        "черновик записан в очередь при временном сбое",
+        |ui| {
+            let route = address.clone();
+            let waiting =
+                futures::executor::block_on(runtime.request(move |services| async move {
+                    services
+                        .sync
+                        .outbox(&route.route.owner, route.generation, route.route.scope)
+                }))
+                .unwrap()
+                .unwrap();
+            waiting.len() == 1
+                && waiting[0].status == workspace_core::storage::DeliveryStatus::Waiting
+                && waiting[0].snapshot.topic_id.to_string() == NEXT_DIRECT_TOPIC
+                && waiting[0].snapshot.markdown == MARKER
+                && ui.read(|app| composer.read(app).draft(app).is_empty())
+        },
+    );
+    assert_eq!(server.state.sent.lock().unwrap().len(), 1);
+
+    // Возвращаем доступ, одновременно меняя тему по умолчанию для будущих сообщений.
+    server
+        .state
+        .direct_topic_changed
+        .store(false, Ordering::SeqCst);
+    server
+        .state
+        .direct_unavailable
+        .store(false, Ordering::SeqCst);
+    until(
+        ui,
+        "сохранённый снимок отправлен в исходную тему",
+        |_| server.state.sent.lock().unwrap().len() == 2,
+    );
+    let (offline_public_id, offline_topic) = server.state.sent.lock().unwrap()[1];
+    assert_ne!(offline_public_id, public_id);
+    assert_eq!(offline_topic, NEXT_DIRECT_TOPIC);
+    wait_topic_confirmation(&runtime, ui, &address, offline_public_id);
+    assert_eq!(
+        futures::executor::block_on(runtime.shutdown()),
+        RuntimeExit::Clean
+    );
 }
 
 /// Находит реальную кнопку по текущему снимку аккаунтов, без предположения об их порядке.
@@ -2314,8 +2527,8 @@ fn explicit_topic_is_rechecked_before_queue_and_before_post(cx: &mut TestAppCont
             ui.read(|app| {
                 let screen = client.read(app).conversation.as_ref().unwrap().read(app);
                 let composer = screen.tested_composer().unwrap().read(app);
-                composer.tested_send_state(app).1 && composer.draft(app) == MARKER
-            }) && ui.debug_bounds("conversation-send-explanation").is_some()
+                composer.tested_send_state(app).0.is_none() && composer.draft(app) == MARKER
+            }) && ui.debug_bounds("conversation-send-retry").is_some()
         },
     );
     let route = address.clone();

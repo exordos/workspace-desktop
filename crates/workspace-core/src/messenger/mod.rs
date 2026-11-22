@@ -9,6 +9,7 @@ pub mod folders;
 pub mod history;
 pub mod message_actions;
 mod outbox;
+pub mod quote;
 pub mod read;
 pub mod references;
 mod rest;

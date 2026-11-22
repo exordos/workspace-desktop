@@ -4,7 +4,8 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use uuid::Uuid;
 
 use super::{
-    HistoryMessage, HistoryScope, Message, MessagePlacement, Storage, StorageError, history,
+    DraftAccess, DraftVersion, HistoryMessage, HistoryScope, Message, MessagePlacement, Storage,
+    StorageError, drafts, history,
 };
 use crate::context::OwnerContext;
 
@@ -231,9 +232,20 @@ impl Storage {
         owner: &OwnerContext,
         message: &PreparedSend,
     ) -> Result<bool, StorageError> {
-        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        self.save_prepared_send_with_draft(owner, message, None)
+    }
+
+    /// Передаёт ответственность за снимок поля очереди в той же транзакции.
+    pub(crate) fn save_prepared_send_with_draft(
+        &self,
+        owner: &OwnerContext,
+        message: &PreparedSend,
+        draft: Option<(&DraftAccess, DraftVersion)>,
+    ) -> Result<bool, StorageError> {
+        let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Первый вариант остаётся в очереди даже при повторе с другим содержимым.
-        let inserted = connection.execute(
+        let inserted = transaction.execute(
             "INSERT INTO messenger_outbox (
                 account_id, server, organization_id, project_id, user_id,
                 canonical_id, public_id, stream_id, topic_id, markdown, state
@@ -253,6 +265,18 @@ impl Storage {
                 message.markdown
             ],
         )?;
+        if inserted == 1
+            && let Some((access, version)) = draft
+        {
+            if !access.belongs_to(owner)
+                || access.scope().stream_id != message.stream_id
+                || access.scope().topic_id != message.topic_id
+            {
+                return Err(StorageError::StaleDraftAccess);
+            }
+            drafts::consume(&transaction, access, version)?;
+        }
+        transaction.commit()?;
         Ok(inserted == 1)
     }
 

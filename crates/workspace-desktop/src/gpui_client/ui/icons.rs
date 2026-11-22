@@ -99,6 +99,7 @@ workspace_icons! {
     Mail => ("mail_outline.svg", "Адрес электронной почты."),
     PersonAdd => ("person_add.svg", "Добавление участника."),
     Phone => ("phone.svg", "Телефон или звонок."),
+    Reply => ("reply.svg", "Ответить на сообщение."),
     Search => ("search.svg", "Поиск."),
     Send => ("send.svg", "Отправка сообщения."),
     Settings => ("settings.svg", "Настройки."),

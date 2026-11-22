@@ -35,6 +35,7 @@ fn draft(id: u128, version: u64, markdown: &str) -> PlaintextDraft {
         id: Uuid::from_u128(id),
         version,
         markdown: markdown.into(),
+        replies: None,
     }
 }
 
@@ -348,4 +349,154 @@ fn local_draft_source_reset_preserves_input_and_invalidates_held_access() {
     ));
     let checked_again = storage.prepare_draft_access(&owner, scope).unwrap();
     assert!(storage.read_plaintext_draft(&checked_again, None).unwrap() == Some(snapshot));
+}
+
+/// Создаёт локальную версию с двумя независимыми ответами и исходным вводом.
+fn reply_draft(version: u64) -> PlaintextDraft {
+    let mut draft = draft(41, version, "До ответов");
+    draft.replies = Some(DraftReplies {
+        active: Uuid::from_u128(9),
+        tabs: vec![
+            DraftReply {
+                id: Uuid::from_u128(12),
+                message_id: Uuid::from_u128(52),
+                fragment: Some("фрагмент 🦊".into()),
+                answer: "Второй ответ".into(),
+                creation: 20,
+            },
+            DraftReply {
+                id: Uuid::from_u128(9),
+                message_id: Uuid::from_u128(50),
+                fragment: None,
+                answer: "Первый ответ\nすし".into(),
+                creation: 1,
+            },
+        ],
+    });
+    draft
+}
+
+/// Старые версии, завершившиеся после очереди, не возвращают отправленный ответ в редактор.
+#[test]
+fn outbox_recovers_consumed_reply_version_without_losing_newer_input() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("drafts.sqlite3");
+    let owner = owner();
+    let scope = scope(15, 16);
+    let message = crate::storage::PreparedSend {
+        canonical_id: Uuid::from_u128(73),
+        public_id: Uuid::from_u128(75),
+        stream_id: scope.stream_id,
+        topic_id: scope.topic_id,
+        markdown: "Сообщение очереди".into(),
+    };
+    let version = |draft: &PlaintextDraft| DraftVersion {
+        id: draft.id,
+        version: draft.version,
+    };
+    let sent = reply_draft(1);
+    let unsent = reply_draft(2);
+    {
+        let storage = Storage::open(&path).unwrap();
+        let access = storage.prepare_draft_access(&owner, scope).unwrap();
+        assert!(
+            storage
+                .save_prepared_send_with_draft(&owner, &message, Some((&access, version(&sent))))
+                .unwrap()
+        );
+        assert_eq!(
+            storage.save_plaintext_draft(&access, &sent).unwrap(),
+            DraftWriteOutcome::VersionConflict,
+        );
+    }
+    {
+        let storage = Storage::open(&path).unwrap();
+        let access = storage.prepare_draft_access(&owner, scope).unwrap();
+        let restored = storage
+            .read_plaintext_draft(&access, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.id, sent.id);
+        assert_eq!(restored.version, sent.version);
+        assert!(restored.markdown.is_empty() && restored.replies.is_none());
+        let queued = storage.pending_sends(&owner).unwrap();
+        assert_eq!(queued, vec![message.clone()]);
+
+        assert_eq!(
+            storage.save_plaintext_draft(&access, &unsent).unwrap(),
+            DraftWriteOutcome::Saved
+        );
+        let old_submission = crate::storage::PreparedSend {
+            canonical_id: Uuid::from_u128(83),
+            ..message.clone()
+        };
+        assert!(
+            storage
+                .save_prepared_send_with_draft(
+                    &owner,
+                    &old_submission,
+                    Some((&access, version(&sent)))
+                )
+                .unwrap()
+        );
+        assert!(
+            storage
+                .read_plaintext_draft(&access, None)
+                .unwrap()
+                .is_some_and(|saved| saved == unsent)
+        );
+    }
+    let storage = Storage::open(&path).unwrap();
+    let access = storage.prepare_draft_access(&owner, scope).unwrap();
+    assert!(
+        storage
+            .read_plaintext_draft(&access, None)
+            .unwrap()
+            .is_some_and(|saved| saved == unsent)
+    );
+}
+
+/// При конфликте адреса снимка обе записи откатываются.
+#[test]
+fn outbox_rejects_reply_version_from_another_topic() {
+    let storage = Storage::in_memory().unwrap();
+    let owner = owner();
+    let original_scope = scope(1, 2);
+    let neighbor_scope = scope(1, 3);
+    let original = storage
+        .prepare_draft_access(&owner, original_scope)
+        .unwrap();
+    let wrong = storage
+        .prepare_draft_access(&owner, neighbor_scope)
+        .unwrap();
+    let saved = reply_draft(1);
+    storage.save_plaintext_draft(&original, &saved).unwrap();
+    let message = crate::storage::PreparedSend {
+        canonical_id: Uuid::from_u128(101),
+        public_id: Uuid::from_u128(102),
+        stream_id: neighbor_scope.stream_id,
+        topic_id: neighbor_scope.topic_id,
+        markdown: "Сообщение из соседней темы".into(),
+    };
+    assert!(matches!(
+        storage.save_prepared_send_with_draft(
+            &owner,
+            &message,
+            Some((
+                &wrong,
+                DraftVersion {
+                    id: saved.id,
+                    version: saved.version
+                }
+            ))
+        ),
+        Err(StorageError::StaleDraftAccess),
+    ));
+    assert!(storage.pending_sends(&owner).unwrap().is_empty());
+    assert!(
+        storage
+            .read_plaintext_draft(&original, None)
+            .unwrap()
+            .is_some_and(|draft| draft == saved)
+    );
 }

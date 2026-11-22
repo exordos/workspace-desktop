@@ -7,6 +7,8 @@ mod details;
 mod history_fixtures;
 #[path = "history/lab.rs"]
 pub mod history_lab;
+#[path = "history/reply.rs"]
+mod reply;
 #[path = "history/source.rs"]
 mod source;
 #[path = "history/viewport.rs"]
@@ -29,12 +31,13 @@ use workspace_core::{
 use self::{
     attachments::Attachments,
     details::Panel,
+    reply::{ReplyControls, ReplyMenu},
     source::{Failure, Load, LoadResult, Snapshot, Source, runtime_source},
     viewport::{Position, Viewport},
 };
 use super::{
     avatars::AvatarImages,
-    composer::{Composer, ComposerEvent, SendSource, Submission},
+    composer::{Composer, ComposerEvent, QueueWriteOutcome, SendSource, Submission},
     contracts::{AccountSession, ChatEntry, ConversationAddress},
     right_panel::RightPanel,
     runtime::RuntimeClient,
@@ -108,6 +111,7 @@ pub struct Conversation {
     attachments: Attachments, // Карточки и одиночный просмотр вложений этого разговора.
     screen_focus: FocusHandle, // Запасной фокус при исчезновении истории и панели.
     history_focus: FocusHandle, // Точка клавиатурной прокрутки в открытом разговоре.
+    reply_menu: ReplyMenu,    // Меню выбранного подтверждённого сообщения.
     sending: Option<Sending>, // Рабочий редактор; изолированные тесты истории могут его не подключать.
     heading: Heading,         // Отображаемые названия из текущего каталога.
     avatar_runtime: Option<RuntimeClient>, // Рабочий поток аватаров. Отсутствует в тестах истории без Core.
@@ -136,6 +140,11 @@ impl Conversation {
         view.attach_composer(SendSource::runtime(runtime.clone()), cx);
         view.attachments.runtime = Some(runtime.clone());
         view.avatar_runtime = Some(runtime.clone());
+        if let Some(sending) = &view.sending {
+            sending
+                .view
+                .update(cx, |composer, _| composer.attach_drafts(runtime.clone()));
+        }
         view.details = Some(Panel::new(right_panel, view.address.clone(), runtime, cx));
         view
     }
@@ -163,6 +172,7 @@ impl Conversation {
             attachments: Attachments::new(cx),
             screen_focus: cx.focus_handle(),
             history_focus: cx.focus_handle().tab_stop(true),
+            reply_menu: ReplyMenu::new(cx.focus_handle()),
             sending: None,
             heading: Heading::default(),
             avatar_runtime: None,
@@ -213,6 +223,15 @@ impl Conversation {
                             });
                         }
                     }
+                    ComposerEvent::ReplyAvailabilityChanged => cx.notify(),
+                    ComposerEvent::DraftRestored => {
+                        sender.update(cx, |composer, cx| {
+                            composer.refresh_draft_quotes(
+                                |id, fragment| conversation.restored_reply_quote(id, fragment),
+                                cx,
+                            );
+                        });
+                    }
                     ComposerEvent::RetryDestination(_) => {}
                 },
             );
@@ -242,7 +261,7 @@ impl Conversation {
         }
         if !self.has_access() || !sender.read(cx).accepts(submission) {
             sender.update(cx, |editor, cx| {
-                editor.finish(submission.attempt, false, cx)
+                editor.finish(submission.attempt, QueueWriteOutcome::WriteFailed, cx)
             });
             return;
         }
@@ -255,16 +274,16 @@ impl Conversation {
             // Рабочая запись остаётся привязана к старому адресу и при закрытии разговора.
             let reply = save(submission).await;
             let _ = conversation.update(cx, |view, cx| {
-                let Some(public_id) = reply.for_current(Some(&view.address)) else {
+                let Some(outcome) = reply.for_current(Some(&view.address)) else {
                     return;
                 };
-                let saved = public_id.is_some();
+                let saved = matches!(outcome, QueueWriteOutcome::Saved(_));
                 if view
                     .sending
                     .as_ref()
                     .is_some_and(|sending| sending.view.downgrade() == editor)
                 {
-                    let _ = editor.update(cx, |editor, cx| editor.finish(attempt, saved, cx));
+                    let _ = editor.update(cx, |editor, cx| editor.finish(attempt, outcome, cx));
                 }
                 if saved {
                     view.refresh_outbox(cx);
@@ -420,7 +439,14 @@ impl Conversation {
                 topic_id,
             }) if scope.stream_id == stream_id => match scope.topic_id {
                 Some(current) if current == topic_id => self.fail(Failure::AccessLost, cx),
-                None => self.restart(cx),
+                None => {
+                    if let Some(sending) = &self.sending {
+                        sending
+                            .view
+                            .update(cx, |composer, cx| composer.revoke_draft_topic(topic_id, cx));
+                    }
+                    self.restart(cx);
+                }
                 _ => {}
             },
             SyncChange::HistoryMessageCreated { scope: changed, .. }
@@ -460,6 +486,7 @@ impl Conversation {
         self.viewport.clear();
         self.attachments.reset(cx);
         self.clear_history_avatars();
+        self.reply_menu.clear();
         self.start(Load::Open(self.opening_entry()), cx);
     }
 
@@ -468,6 +495,11 @@ impl Conversation {
         if let Some(details) = &mut self.details {
             let fallback = matches!(error, Failure::AccessLost).then_some(&self.screen_focus);
             details.clear(&self.address, fallback, cx);
+        }
+        if matches!(error, Failure::AccessLost)
+            && let Some(sending) = &self.sending
+        {
+            sending.view.update(cx, Composer::revoke_draft);
         }
         self.invalidate_send_destination(cx);
         self.state = State::Failed(error);
@@ -481,6 +513,7 @@ impl Conversation {
         self.viewport.clear();
         self.attachments.reset(cx);
         self.clear_history_avatars();
+        self.reply_menu.clear();
         cx.notify();
     }
 
@@ -696,6 +729,10 @@ impl Conversation {
         }
         if let Some(sending) = &self.sending {
             sending.view.update(cx, |editor, cx| {
+                editor.refresh_draft_quotes(
+                    |id, fragment| self.restored_reply_quote(id, fragment),
+                    cx,
+                );
                 editor.check_destination(&sending.source, cx)
             });
         }
@@ -1170,6 +1207,15 @@ impl Conversation {
                         .debug_selector(|| "history-empty".into())
                         .into_any_element()
                 } else {
+                    let reply = self
+                        .sending
+                        .as_ref()
+                        .filter(|sending| sending.view.read(cx).reply_available())
+                        .map(|_| ReplyControls {
+                            conversation: cx.entity().downgrade(),
+                            focus: self.history_focus.clone(),
+                            selection: self.viewport.selection(),
+                        });
                     let images: HashMap<_, _> = self
                         .history_avatar_users
                         .iter()
@@ -1178,7 +1224,7 @@ impl Conversation {
                         .collect();
                     let cards = self.attachments.cards(cx);
                     self.viewport
-                        .render(palette, peer, images, Some(cards))
+                        .render(palette, peer, reply, images, Some(cards))
                         .into_any_element()
                 };
                 root.child(
@@ -1222,6 +1268,7 @@ impl Render for Conversation {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::for_window(window, cx);
         self.restore_details_for_verified_history(window, cx);
+        let menu = self.render_reply_menu(window, palette, cx);
         if let Some((key, focus)) = self.attachments.take_restore() {
             if self.viewport.has_visible_attachment(key) {
                 window.focus(&focus);
@@ -1240,12 +1287,15 @@ impl Render for Conversation {
             .min_h_0()
             .min_w_0()
             .track_focus(&self.screen_focus)
-            .on_key_down(cx.listener(|view, _: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
                 if view.attachments.is_open() {
                     cx.stop_propagation();
+                } else {
+                    view.reply_hotkey(event, window, cx);
                 }
             }))
             .child(self.render_chat(palette, cx))
+            .children(menu.into_iter().flatten())
             .children(photo)
     }
 }

@@ -206,13 +206,17 @@ impl TextRole {
 
 /// Рисует текст системным шрифтом GPUI в заданной роли.
 pub fn label(palette: Palette, role: TextRole, text: impl Into<SharedString>) -> Div {
+    text_role(palette, role).child(text.into())
+}
+
+/// Задаёт общую роль текста для надписей и выделяемого тела сообщения.
+pub(in crate::gpui_client) fn text_role(palette: Palette, role: TextRole) -> Div {
     let (size, height, weight, color) = role.style(palette);
     div()
         .text_size(size)
         .line_height(height)
         .font_weight(weight)
         .text_color(color)
-        .child(text.into())
 }
 
 /// Рисует одну строку уже после того, как GPUI выделил ширину под текст.

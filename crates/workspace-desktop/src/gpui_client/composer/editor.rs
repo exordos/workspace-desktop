@@ -126,6 +126,11 @@ impl Editor {
         self.replace(0..self.text.len(), "", cx);
     }
 
+    /// Показывает снимок выбранной вкладки ответа.
+    pub(super) fn show_reply(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.replace(0..self.text.len(), text, cx);
+    }
+
     /// Подключает клавиши редактора. Регистрируется один раз при запуске приложения.
     pub fn bind_keys(cx: &mut App) {
         cx.bind_keys([

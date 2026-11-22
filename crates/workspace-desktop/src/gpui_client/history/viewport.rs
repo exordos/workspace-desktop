@@ -3,6 +3,7 @@
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
+    ops::Range,
     rc::Rc,
 };
 
@@ -12,13 +13,17 @@ use gpui::{
 };
 use uuid::Uuid;
 use workspace_core::{
-    messenger::references::{MediaReference, media_references},
+    messenger::{
+        quote::{self, Block},
+        references::{MediaReference, media_references},
+    },
     storage::{DeliveryStatus, HistoryWindow, OutboxEntry, SendBlock},
 };
 
 use super::{
     Conversation, ReadingAnchor,
     attachments::{AttachmentKey, Cards},
+    reply::{ReplyControls, Selection, excerpt, history_quote},
 };
 
 #[path = "paging.rs"]
@@ -87,7 +92,8 @@ struct Measurement {
 /// Снимок виртуального списка и реально нарисованные границы последнего кадра.
 pub(super) struct Viewport {
     rows: Rc<Vec<Row>>, // Состав списка для отложенного построения видимых элементов.
-    index: Rc<HashMap<Uuid, usize>>, // Индекс строк истории по UUID сообщения.
+    index: Rc<HashMap<Uuid, usize>>, // Позиции источников для цитат в текущем окне.
+    selection: Rc<RefCell<Selection>>, // Выделенный фрагмент в виртуальном списке.
     list: ListState,    // Позиция и размеры строк в GPUI.
     painted: Rc<RefCell<HashMap<Uuid, Bounds<Pixels>>>>, // Фактические прямоугольники строк.
     painted_offset: Rc<Cell<Option<ListOffset>>>, // Смещение, для которого измерены прямоугольники.
@@ -100,6 +106,7 @@ impl Viewport {
         Self {
             rows: Rc::default(),
             index: Rc::default(),
+            selection: Rc::default(),
             list: ListState::new(0, ListAlignment::Bottom, overdraw),
             painted: Rc::default(),
             painted_offset: Rc::default(),
@@ -130,6 +137,7 @@ impl Viewport {
     pub(super) fn clear(&mut self) {
         self.rows = Rc::default();
         self.index = Rc::default();
+        *self.selection.borrow_mut() = Selection::default();
         self.list.reset(0);
         self.painted.borrow_mut().clear();
         self.painted_offset.set(None);
@@ -221,6 +229,10 @@ impl Viewport {
             );
             self.rows = Rc::new(rows);
         }
+        self.selection.borrow_mut().retain_current(|id| {
+            let row = self.rows.get(*index.get(&id)?)?;
+            (row.date.is_some() && !row.body.trim().is_empty()).then_some(row.body.as_str())
+        });
         self.index = Rc::new(index);
         self.measure = anchor.map(|anchor| Measurement { op_id, anchor });
         log::debug!(
@@ -260,7 +272,19 @@ impl Viewport {
         }
     }
 
-    /// Проверяет присутствие прямой ссылки в текущем окне разговора.
+    /// Возвращает общий диапазон для мыши, меню и клавиатуры.
+    pub(super) fn selection(&self) -> Rc<RefCell<Selection>> {
+        self.selection.clone()
+    }
+
+    /// Даёт имя известного автора из окна и каталога обычной лички.
+    pub(super) fn source_author(&self, id: Uuid, peer: Option<&str>) -> Option<String> {
+        self.index
+            .get(&id)
+            .and_then(|&index| row_author(&self.rows[index], peer))
+    }
+
+    /// Проверяет присутствие той же ссылки в текущем окне разговора.
     pub(super) fn has_attachment(&self, key: AttachmentKey) -> bool {
         self.index.get(&key.message).is_some_and(|&index| {
             self.rows[index]
@@ -296,7 +320,7 @@ impl Viewport {
         peer: String,
         accessory: impl Fn(Uuid) -> Option<AnyElement> + 'static,
     ) -> impl IntoElement {
-        self.render_rows(palette, Some(peer), HashMap::new(), None, accessory)
+        self.render_rows(palette, Some(peer), None, HashMap::new(), None, accessory)
     }
 
     /// Рисует список и пишет фактическую координату опоры, когда GPUI дойдёт до её строки.
@@ -304,10 +328,11 @@ impl Viewport {
         &mut self,
         palette: Palette,
         peer: Option<String>,
+        reply: Option<ReplyControls>,
         images: HashMap<Uuid, ImageSource>,
         cards: Option<Cards>,
     ) -> impl IntoElement {
-        self.render_rows(palette, peer, images, cards, |_| None)
+        self.render_rows(palette, peer, reply, images, cards, |_| None)
     }
 
     /// Собирает один виртуальный список для рабочего чата и окна стенда.
@@ -315,6 +340,7 @@ impl Viewport {
         &mut self,
         palette: Palette,
         peer: Option<String>,
+        reply: Option<ReplyControls>,
         images: HashMap<Uuid, ImageSource>,
         cards: Option<Cards>,
         accessory: impl Fn(Uuid) -> Option<AnyElement> + 'static,
@@ -322,21 +348,37 @@ impl Viewport {
         self.painted.borrow_mut().clear();
         self.painted_offset.set(None);
         let rows = self.rows.clone();
+        let row_index = self.index.clone();
         let painted = self.painted.clone();
         let painted_offset = self.painted_offset.clone();
         let measurement = Rc::new(RefCell::new(self.measure.take()));
         let list_state = self.list.clone();
+        let message = Rc::new(move |row: &Row, app: &mut App| {
+            let photo = row.avatar_author().and_then(|id| images.get(&id).cloned());
+            message_row(
+                row,
+                palette,
+                peer.as_deref(),
+                (&rows, &row_index),
+                reply.as_ref(),
+                photo,
+                RowBodyExtras {
+                    media: cards.as_ref().map(|cards| (cards, app)),
+                    accessory: accessory(row.id),
+                },
+            )
+        });
+        let rows = self.rows.clone();
         list(self.list.clone(), move |index, _, app| {
             let row = &rows[index];
             let id = row.id;
-            let photo = row.avatar_author().and_then(|id| images.get(&id).cloned());
             let painted = painted.clone();
             let painted_offset = painted_offset.clone();
             let measurement = measurement.clone();
             let list_state = list_state.clone();
-            div().relative().w_full().px_3().pt(row.inset())
-                .children(row.date.as_deref().filter(|_| row.starts_day).map(|date| date_separator(palette, date, id)))
-                .child(message_row(row, palette, peer.as_deref(), photo, RowBodyExtras { media: cards.as_ref().map(|cards| (cards, app)), accessory: accessory(id) }).relative().child(canvas(|_, _, _| (), move |bounds, (), _, _| {
+            let message = message(row, app);
+            row_container(row, palette)
+                .child(message.relative().child(canvas(|_, _, _| (), move |bounds, (), _, _| {
                     painted.borrow_mut().insert(id, bounds);
                     painted_offset.set(Some(list_state.logical_scroll_top()));
                     let mut measurement = measurement.borrow_mut();
@@ -445,6 +487,16 @@ fn visible_avatar_users(
     users
 }
 
+/// Задаёт отступы для строки списка.
+fn row_container(row: &Row, palette: Palette) -> Div {
+    div().relative().w_full().px_3().pt(row.inset()).children(
+        row.date
+            .as_deref()
+            .filter(|_| row.starts_day)
+            .map(|date| date_separator(palette, date, row.id)),
+    )
+}
+
 /// Рисует дату перед первым сообщением дня, не добавляя отдельный адрес в список.
 fn date_separator(palette: Palette, date: &str, id: Uuid) -> Div {
     div()
@@ -466,10 +518,10 @@ fn date_separator(palette: Palette, date: &str, id: Uuid) -> Div {
         )
 }
 
-/// Данные для необязательных блоков внутри бабла.
+/// Передаёт дополнительные элементы содержимого при отрисовке одного бабла.
 struct RowBodyExtras<'a> {
-    media: Option<(&'a Cards, &'a mut App)>, // Файлы рабочего чата и контекст их отрисовки.
-    accessory: Option<AnyElement>,           // Управляемый блок внутри бабла на стенде.
+    media: Option<(&'a Cards, &'a mut App)>, // Карточки вложений рабочего чата.
+    accessory: Option<AnyElement>, // Управляемый блок, который появляется внутри бабла на стенде.
 }
 
 /// Рисует сообщение с общим пузырём и оставляет место аватару в группе собеседника.
@@ -477,6 +529,8 @@ fn message_row(
     row: &Row,
     palette: Palette,
     peer: Option<&str>,
+    history: (&[Row], &HashMap<Uuid, usize>),
+    reply: Option<&ReplyControls>,
     photo: Option<ImageSource>,
     extras: RowBodyExtras<'_>,
 ) -> Div {
@@ -495,6 +549,7 @@ fn message_row(
             ..palette
         }
     };
+    let reply = reply.filter(|_| row.date.is_some() && !row.body.trim().is_empty());
     let bubble = MessageBubble {
         author: (!row.own && row.starts_group).then(|| author.to_owned().into()),
         body: row.body.clone().into(),
@@ -502,20 +557,29 @@ fn message_row(
         own: row.own,
         delivery: row.delivery,
     };
-    let content = extras
-        .media
-        .filter(|_| !row.media.is_empty())
-        .map(|(cards, app)| {
-            div()
-                .flex()
-                .flex_col()
-                .min_w_0()
-                .max_w_full()
-                .gap_1()
-                .children(attachment_caption(row).map(|caption| {
-                    label(bubble_palette, TextRole::Body, caption)
-                        .debug_selector(move || format!("history-media-caption-{id}"))
-                }))
+    let (rows, index) = history;
+    let content = if let Some((cards, app)) = extras.media.filter(|_| !row.media.is_empty()) {
+        let caption = div().flex().flex_col().min_w_0().max_w_full().gap_1();
+        let caption = if let Some(reply) =
+            reply.filter(|_| matches!(quote::blocks(&row.body).as_slice(), [Block::Text(_)]))
+        {
+            caption.children(
+                media_caption_spans(row)
+                    .into_iter()
+                    .map(|span| reply.selectable_span(id, &row.body, span, bubble_palette)),
+            )
+        } else {
+            let body = caption_without_media(row);
+            let content =
+                quote_content(row, quote::blocks(&body), bubble_palette, peer, rows, index)
+                    .or_else(|| {
+                        (!body.trim().is_empty())
+                            .then(|| label(bubble_palette, TextRole::Body, body).into_any_element())
+                    });
+            caption.children(content)
+        };
+        Some(
+            caption
                 .children(row.media.iter().enumerate().map(|(position, reference)| {
                     cards.render(
                         AttachmentKey {
@@ -528,14 +592,31 @@ fn message_row(
                         app,
                     )
                 }))
-                .into_any_element()
-        });
-    let bubble = match (content, extras.accessory) {
+                .into_any_element(),
+        )
+    } else {
+        let blocks = quote::blocks(&row.body);
+        if let Some(controls) = reply.filter(|_| matches!(blocks.as_slice(), [Block::Text(_)])) {
+            let (body, _) = controls.selectable(id, &row.body, bubble_palette);
+            Some(body.min_w_0().max_w_full().into_any_element())
+        } else {
+            quote_content(row, blocks, bubble_palette, peer, rows, index)
+        }
+    };
+    let mut bubble = match (content, extras.accessory) {
         (content, Some(accessory)) => {
             bubble.render_with_accessory(bubble_palette, content, row.ends_group, accessory)
         }
         (Some(content), None) => bubble.render_with_body(bubble_palette, content, row.ends_group),
         (None, None) => bubble.render_in_group(bubble_palette, row.ends_group),
+    }
+    .debug_selector(move || format!("history-message-{id}"));
+    if row.delivery == Some(DeliveryMark::Unknown) {
+        bubble = bubble.debug_selector(|| "history-delivery-unknown".into());
+    }
+    let bubble = match reply {
+        Some(controls) => controls.row(id, bubble, palette).into_any_element(),
+        None => bubble.into_any_element(),
     };
     div()
         .w_full()
@@ -557,28 +638,98 @@ fn message_row(
                 )
             }))
         })
-        .child(
-            div().flex_1().min_w_0().child(
-                bubble
-                    .debug_selector(move || format!("history-message-{id}"))
-                    .when(row.delivery == Some(DeliveryMark::Unknown), |bubble| {
-                        bubble.debug_selector(|| "history-delivery-unknown".into())
-                    }),
-            ),
-        )
+        .child(div().flex_1().min_w_0().child(bubble))
 }
 
-/// Убирает из подписи ссылки, которые уже показаны карточками.
-fn attachment_caption(row: &Row) -> Option<String> {
+/// Выбирает подписанного автора, не выдавая имя собеседника за участника канала.
+fn row_author(row: &Row, peer: Option<&str>) -> Option<String> {
+    if row.own {
+        Some("Вы".into())
+    } else {
+        peer.map(str::to_owned)
+    }
+}
+
+/// Возвращает фрагменты подписи с исходными координатами для точного цитирования.
+fn media_caption_spans(row: &Row) -> Vec<Range<usize>> {
+    let mut previous = 0;
+    row.media
+        .iter()
+        .map(|reference| reference.range.clone())
+        .chain(std::iter::once(row.body.len()..row.body.len()))
+        .filter_map(|range| {
+            let start = previous;
+            previous = range.end;
+            let text = row.body.get(start..range.start)?;
+            let trimmed_start = text.trim_start();
+            let visible = trimmed_start.trim_end();
+            let start = start + text.len() - trimmed_start.len();
+            (!visible.is_empty()).then_some(start..start + visible.len())
+        })
+        .collect()
+}
+
+/// Скрывает в подписи только ссылки, которые уже отображены отдельными карточками.
+fn caption_without_media(row: &Row) -> String {
     let mut caption = String::new();
     let mut offset = 0;
     for reference in &row.media {
-        caption.push_str(&row.body[offset..reference.range.start]);
-        offset = reference.range.end;
+        if let Some(text) = row.body.get(offset..reference.range.start) {
+            caption.push_str(text);
+            offset = reference.range.end;
+        }
     }
     caption.push_str(&row.body[offset..]);
-    let caption = caption.trim();
-    (!caption.is_empty()).then(|| caption.to_owned())
+    caption
+}
+
+/// Показывает отдельные цитаты по контракту, сохраняя обычный пузырь для прочего текста.
+fn quote_content(
+    row: &Row,
+    blocks: Vec<Block<'_>>,
+    palette: Palette,
+    peer: Option<&str>,
+    rows: &[Row],
+    index: &HashMap<Uuid, usize>,
+) -> Option<gpui::AnyElement> {
+    if matches!(blocks.as_slice(), [Block::Text(_)]) {
+        return None;
+    }
+    Some(
+        div()
+            .flex()
+            .flex_col()
+            .min_w_0()
+            // Заголовок цитаты рисуется внутри canvas и не задаёт собственную ширину.
+            // Даём ему место даже рядом с коротким ответом или фрагментом.
+            .w(px(312.))
+            .max_w_full()
+            .gap_1()
+            .children(
+                blocks
+                    .into_iter()
+                    .enumerate()
+                    .map(|(position, block)| match block {
+                        Block::Text(text) => label(palette, TextRole::Body, text.to_owned()),
+                        Block::Quote(reference) => {
+                            let source = index
+                                .get(&reference.message_id)
+                                .map(|&index| &rows[index])
+                                .filter(|source| source.id != row.id && source.date.is_some());
+                            let author = source
+                                .and_then(|source| row_author(source, peer))
+                                .unwrap_or(reference.author);
+                            let snippet = reference.fragment.unwrap_or_else(|| {
+                                source.map_or_else(String::new, |source| excerpt(&source.body))
+                            });
+                            let id = row.id;
+                            history_quote(palette, row.own, author, snippet, source.is_some())
+                                .debug_selector(move || format!("history-quote-{id}-{position}"))
+                        }
+                    }),
+            )
+            .into_any_element(),
+    )
 }
 
 /// Готовит историю и добавляет уникальные строки очереди только после подтверждённого хвоста.

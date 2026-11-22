@@ -1,7 +1,9 @@
 //! Собирает редактор сообщения, состояние проверки темы и типизированные действия отправки.
 //! Экран разговора передаёт эти действия в рабочий поток; здесь остаются текст и его версия.
 
+mod draft;
 mod editor;
+mod replies;
 mod source;
 mod toolbar;
 mod toolbar_preferences;
@@ -11,12 +13,22 @@ use gpui::{
     Subscription, Window, div, prelude::*, px,
 };
 use uuid::Uuid;
+use workspace_core::messenger::quote::{Source as QuoteSource, SourceCheckError};
 
+pub(super) use self::draft::DraftBuffer;
 pub use self::editor::Editor;
-use self::editor::SubmitRequested;
-pub(super) use self::source::{DestinationError, SendSource};
+pub(super) use self::replies::{ReplyAction, ReplyQuote};
+pub(super) use self::source::{
+    DestinationError, QueueWriteOutcome, ResolvedDestination, SendSource,
+};
+use self::{
+    draft::{DraftSend, DraftSession},
+    editor::SubmitRequested,
+    replies::Replies,
+};
 use super::{
     contracts::{ConversationAddress, ConversationReply},
+    runtime::RuntimeClient,
     ui::{
         Button, ButtonAppearance, CONTROL_BORDER, FieldAppearance, Icon, Palette, SURFACE_RADIUS,
         TextRole, field, label,
@@ -38,17 +50,22 @@ const COMPOSER_INSET: Pixels = px(8.);
 
 /// Точная тема, в которую сервер разрешил подготовить обычный текст.
 enum Destination {
-    Unchecked,                     // Проверка ещё не запущена или доступ к истории изменился.
-    Checking(Uuid),                // Идентификатор текущей проверки темы.
-    Ready(Uuid),                   // UUID подтверждённой темы отправки.
+    Unchecked,      // Проверка ещё не запущена или доступ к истории изменился.
+    Checking(Uuid), // Идентификатор текущей проверки темы.
+    Ready {
+        topic: Uuid,    // UUID подтверждённой темы отправки.
+        check_id: Uuid, // Идентификатор проверки, которая подтвердила тему.
+    },
     Unavailable(DestinationError), // Причина, по которой сообщение нельзя поставить в очередь.
 }
 
-/// Идентификатор записи и версии черновика на момент нажатия.
+/// Идентификатор записи, версии черновика и подтверждения цели на момент нажатия.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct Attempt {
-    pub op_id: Uuid, // Связывает нажатие, работу с очередью и ответ редактору.
-    version: u64,    // Версия текста, которую пользователь отправил.
+    pub op_id: Uuid,         // Связывает нажатие, работу с очередью и ответ редактору.
+    version: u64,            // Версия текста, которую пользователь отправил.
+    replies_version: u64,    // Версия выбранных цитат в снимке.
+    destination_check: Uuid, // Подтверждение цели, с которым начата отправка.
 }
 
 /// Снимок одного намерения отправить текст.
@@ -58,22 +75,55 @@ pub(super) struct Submission {
     pub attempt: Attempt,             // Идентификатор операции и версия исходного черновика.
     pub topic: Uuid,                  // Отдельная тема для отправки, подтверждённая сервером.
     pub markdown: String,             // Текст на момент нажатия; не попадает в журнал.
+    pub quote_sources: Vec<QuoteSource>, // Исходники структурированных ответов.
+    draft: Option<std::sync::Arc<DraftSend>>, // Локальная версия, которую получит исходящая очередь.
 }
 
 /// Намерение, которое редактор передаёт экрану разговора.
 pub(super) enum ComposerEvent {
     Send(Submission), // Просьба сохранить подготовленный текст в очереди.
     RetryDestination(ConversationAddress), // Повторная проверка разрешения для того же экрана.
+    ReplyAvailabilityChanged, // Истории нужно обновить доступность действий ответа.
+    DraftRestored,    // Истории нужно заполнить доступные предпросмотры восстановленных цитат.
+}
+
+/// Пояснение к той попытке, которая не попала в очередь.
+#[derive(Clone, Copy)]
+enum WriteFailure {
+    Queue,                   // Запись в хранилище не подтверждена.
+    Quote(SourceCheckError), // Сервер не подтвердил источники.
+}
+
+impl WriteFailure {
+    /// Подсказывает, нужно ли восстановить цитату или повторить попытку.
+    fn text(self) -> &'static str {
+        match self {
+            Self::Queue => "Не удалось сохранить сообщение. Повторите отправку",
+            Self::Quote(SourceCheckError::Missing) => {
+                "Источник цитаты недоступен. Уберите цитату или выберите сообщение заново"
+            }
+            Self::Quote(SourceCheckError::Changed) => {
+                "Выделенный текст цитаты изменился. Выберите фрагмент заново"
+            }
+            Self::Quote(SourceCheckError::Unavailable) => {
+                "Не удалось проверить цитаты. Повторите отправку"
+            }
+        }
+    }
 }
 
 /// Редактор одного открытого разговора. Текст живёт в дочернем поле.
 pub(super) struct Composer {
     address: ConversationAddress, // Снимок адреса разговора на момент открытия.
     editor: Entity<Editor>,       // Многострочный ввод, выделение и версия текста.
+    replies: Replies,             // Отдельные ответы и цитаты текущего разговора.
+    draft_runtime: Option<RuntimeClient>, // Рабочая запись есть у редактора штатного окна.
+    draft_session: Option<DraftSession>, // Точная локальная версия открытого поля.
+    draft_topic: Option<Uuid>,    // Последняя точная тема, к которой относился показанный ввод.
     destination: Destination,     // Состояние проверки возможности отправки.
     toolbar: Toolbar,             // Кнопка раскрытия, команды и их клавиатурный фокус.
     writing: Option<Attempt>,     // Текущая запись; None позволяет начать следующую.
-    error_version: Option<u64>,   // Версия текста, для которой запись не удалась.
+    write_failure: Option<(u64, u64, WriteFailure)>, // Версии ввода и вкладок при отказе записи.
     _editor_observer: Subscription, // Обновляет доступность кнопки после редактирования.
     _editor_submit: Subscription, // Связывает Enter с тем же действием, что и кнопку отправки.
 }
@@ -87,20 +137,32 @@ impl Composer {
     /// Создаёт редактор привязанного к открытому разговору черновика.
     pub fn new(address: ConversationAddress, cx: &mut Context<Self>) -> Self {
         let editor = cx.new(Editor::for_composer);
-        let observer = cx.observe(&editor, |_, _, cx| cx.notify());
+        let observer = cx.observe(&editor, |composer, _, cx| {
+            composer.persist_draft(cx);
+            cx.notify();
+        });
         let submit = cx.subscribe(&editor, |composer, _, _: &SubmitRequested, cx| {
             composer.submit(cx);
         });
         Self {
             address,
             editor,
+            replies: Replies::default(),
+            draft_runtime: None,
+            draft_session: None,
+            draft_topic: None,
             destination: Destination::Unchecked,
             toolbar: Toolbar::new(cx),
             writing: None,
-            error_version: None,
+            write_failure: None,
             _editor_observer: observer,
             _editor_submit: submit,
         }
+    }
+
+    /// Передаёт редактору доступ к локальным черновикам штатного профиля.
+    pub(super) fn attach_drafts(&mut self, runtime: RuntimeClient) {
+        self.draft_runtime = Some(runtime);
     }
 
     /// Читает содержимое поля для проверок интеграции через окно.
@@ -113,13 +175,10 @@ impl Composer {
     #[cfg(all(test, feature = "gpui-test"))]
     pub fn tested_send_state(&self, app: &App) -> (Option<Uuid>, bool) {
         let topic = match self.destination {
-            Destination::Ready(topic) => Some(topic),
+            Destination::Ready { topic, .. } => Some(topic),
             _ => None,
         };
-        (
-            topic,
-            self.error_version == Some(self.editor.read(app).version()),
-        )
+        (topic, self.current_write_failure(app).is_some())
     }
 
     /// Даёт тесту доступ к системному обработчику ввода рабочего поля.
@@ -130,7 +189,14 @@ impl Composer {
 
     /// Убирает разрешение на отправку, пока история проходит повторную проверку.
     pub fn invalidate_destination(&mut self, cx: &mut Context<Self>) {
+        let was_available = self.reply_available();
+        // При временной проверке уже подтверждённая версия продолжает принимать ввод.
+        // Отзыв доступа к прежней области проверяется в Core при каждой записи.
+        self.persist_draft(cx);
         self.destination = Destination::Unchecked;
+        if was_available {
+            cx.emit(ComposerEvent::ReplyAvailabilityChanged);
+        }
         cx.notify();
     }
 
@@ -143,6 +209,8 @@ impl Composer {
         self.destination = Destination::Checking(op_id);
         let address = self.address.clone();
         let resolve = source.resolve.clone();
+        let editor = self.editor.read(cx);
+        let stamp = (editor.version(), self.replies.revision);
         log::debug!(
             "gpui_send op_id={op_id} event=destination_requested stream_id={} generation={} revision={}",
             address.route.scope.stream_id,
@@ -152,7 +220,7 @@ impl Composer {
         cx.spawn(async move |editor, cx| {
             let reply = resolve(address, op_id).await;
             let _ = editor.update(cx, |editor, cx| {
-                editor.finish_destination(op_id, reply, cx);
+                editor.finish_destination(op_id, stamp, reply, cx);
             });
         })
         .detach();
@@ -163,7 +231,8 @@ impl Composer {
     fn finish_destination(
         &mut self,
         op_id: Uuid,
-        reply: ConversationReply<Result<Uuid, DestinationError>>,
+        stamp: (u64, u64),
+        reply: ConversationReply<Result<ResolvedDestination, DestinationError>>,
         cx: &mut Context<Self>,
     ) {
         if !matches!(self.destination, Destination::Checking(current) if current == op_id)
@@ -173,12 +242,38 @@ impl Composer {
             return;
         }
         self.destination = match reply.value {
-            Ok(topic) => Destination::Ready(topic),
-            Err(error) => Destination::Unavailable(error),
+            Ok(resolved) => {
+                let topic = resolved.topic;
+                if let Some((access, saved)) = resolved.draft {
+                    self.draft_topic = Some(topic);
+                    self.hydrate_draft(access, saved, stamp, cx);
+                }
+                if resolved.closed {
+                    Destination::Unavailable(DestinationError::TopicClosed)
+                } else {
+                    Destination::Ready {
+                        topic,
+                        check_id: op_id,
+                    }
+                }
+            }
+            Err(error) => {
+                if matches!(
+                    error,
+                    DestinationError::EncryptionUnavailable | DestinationError::AccessLost
+                ) && self.draft_topic.is_some()
+                {
+                    self.revoke_draft(cx);
+                }
+                Destination::Unavailable(error)
+            }
         };
+        if self.reply_available() {
+            cx.emit(ComposerEvent::ReplyAvailabilityChanged);
+        }
         log::debug!(
             "gpui_send op_id={op_id} event=destination_finished available={}",
-            matches!(self.destination, Destination::Ready(_)),
+            matches!(self.destination, Destination::Ready { .. }),
         );
         cx.notify();
     }
@@ -194,16 +289,16 @@ impl Composer {
     /// Проверяет, доступно ли действие для показанного текста.
     fn can_send(&self, app: &App) -> bool {
         let editor = self.editor.read(app);
-        matches!(self.destination, Destination::Ready(_))
+        matches!(self.destination, Destination::Ready { .. })
             && self.writing.is_none()
             && !editor.composing()
-            && !editor.text().trim().is_empty()
-            && !over_limit(editor.text())
+            && self.replies.has_answer(editor.text())
+            && !over_limit(&self.replies.markdown(editor.text()))
     }
 
     /// Блокирует повторное нажатие и передаёт экрану прежний текст и адрес.
     fn submit(&mut self, cx: &mut Context<Self>) {
-        let Destination::Ready(topic) = self.destination else {
+        let Destination::Ready { topic, check_id } = self.destination else {
             return;
         };
         if !self.can_send(cx) {
@@ -213,17 +308,23 @@ impl Composer {
         let attempt = Attempt {
             op_id: Uuid::new_v4(),
             version: editor.version(),
+            replies_version: self.replies.revision,
+            destination_check: check_id,
         };
+        let draft = self.prepare_draft_send(attempt.op_id, cx);
+        let editor = self.editor.read(cx);
         let submission = Submission {
+            draft,
             address: self.address.clone(),
             attempt,
             topic,
-            markdown: editor.text().to_owned(),
+            markdown: self.replies.markdown(editor.text()).into_owned(),
+            quote_sources: self.replies.sources(),
         };
         self.writing = Some(attempt);
         self.editor
             .update(cx, |editor, cx| editor.set_text_menu_busy(true, cx));
-        self.error_version = None;
+        self.write_failure = None;
         log::debug!(
             "gpui_send op_id={} event=submit stream_id={} topic_id={topic} generation={} revision={}",
             attempt.op_id,
@@ -239,11 +340,15 @@ impl Composer {
     pub fn accepts(&self, submission: &Submission) -> bool {
         self.address == submission.address
             && self.writing == Some(submission.attempt)
-            && matches!(self.destination, Destination::Ready(topic) if topic == submission.topic)
+            && matches!(
+                self.destination,
+                Destination::Ready { topic, check_id }
+                    if topic == submission.topic && check_id == submission.attempt.destination_check
+            )
     }
 
-    /// Завершает запись, очищая только неизменившийся черновик этого редактора.
-    pub fn finish(&mut self, attempt: Attempt, saved: bool, cx: &mut Context<Self>) {
+    /// Завершает запись, сохраняя черновик и причину, если проверка цели не прошла.
+    pub fn finish(&mut self, attempt: Attempt, outcome: QueueWriteOutcome, cx: &mut Context<Self>) {
         if self.writing != Some(attempt) {
             return;
         }
@@ -251,12 +356,39 @@ impl Composer {
         self.editor
             .update(cx, |editor, cx| editor.set_text_menu_busy(false, cx));
         let editor = self.editor.read(cx);
-        let same_version = editor.version() == attempt.version && !editor.composing();
-        if same_version {
-            self.error_version = (!saved).then_some(attempt.version);
-            if saved {
+        let same_version = editor.version() == attempt.version
+            && self.replies.revision == attempt.replies_version
+            && !editor.composing();
+        let saved = matches!(outcome, QueueWriteOutcome::Saved(_));
+        match outcome {
+            QueueWriteOutcome::Saved(_) if same_version => {
+                self.replies.clear();
                 self.editor.update(cx, Editor::clear);
             }
+            QueueWriteOutcome::WriteFailed if same_version => {
+                self.write_failure = Some((
+                    attempt.version,
+                    attempt.replies_version,
+                    WriteFailure::Queue,
+                ));
+            }
+            QueueWriteOutcome::QuoteUnavailable(error) if same_version => {
+                self.write_failure = Some((
+                    attempt.version,
+                    attempt.replies_version,
+                    WriteFailure::Quote(error),
+                ));
+            }
+            QueueWriteOutcome::DestinationUnavailable(error)
+                if matches!(
+                    self.destination,
+                    Destination::Ready { check_id, .. } if check_id == attempt.destination_check
+                ) =>
+            {
+                self.destination = Destination::Unavailable(error);
+                cx.emit(ComposerEvent::ReplyAvailabilityChanged);
+            }
+            _ => {}
         }
         log::debug!(
             "gpui_send op_id={} event=draft_finished saved={saved} cleared={}",
@@ -264,6 +396,13 @@ impl Composer {
             saved && same_version,
         );
         cx.notify();
+    }
+
+    /// Показывает ошибку только пока текст и сессия ответа соответствуют отклонённой попытке.
+    fn current_write_failure(&self, app: &App) -> Option<WriteFailure> {
+        let (version, replies_version, failure) = self.write_failure?;
+        (version == self.editor.read(app).version() && replies_version == self.replies.revision)
+            .then_some(failure)
     }
 }
 
@@ -276,20 +415,17 @@ impl Render for Composer {
         let editor = self.editor.read(cx);
         let expanded = ToolbarPreferences::expanded(cx);
         let can_format = editor.can_format();
-        let too_long = over_limit(editor.text());
-        let save_failed = self.error_version == Some(editor.version());
+        let too_long = over_limit(&self.replies.markdown(editor.text()));
+        let write_failure = self.current_write_failure(cx);
         let explanation = match &self.destination {
             Destination::Unchecked | Destination::Checking(_) => {
                 Some(("Проверяем возможность отправки…", false))
             }
             Destination::Unavailable(error) => Some((error.text(), false)),
-            Destination::Ready(_) if too_long => Some(("Текст длиннее 40 000 символов", true)),
-            Destination::Ready(_) if save_failed => {
-                Some(("Не удалось сохранить сообщение. Повторите отправку", true))
-            }
-            Destination::Ready(_) => None,
+            Destination::Ready { .. } if too_long => Some(("Текст длиннее 40 000 символов", true)),
+            Destination::Ready { .. } => write_failure.map(|failure| (failure.text(), true)),
         };
-        let appearance = if too_long || save_failed {
+        let appearance = if too_long || write_failure.is_some() {
             FieldAppearance::Invalid
         } else if self.editor.focus_handle(cx).is_focused(window) {
             FieldAppearance::Focused
@@ -324,6 +460,7 @@ impl Render for Composer {
             .rounded(SURFACE_RADIUS)
             .bg(palette.surface)
             .debug_selector(|| "conversation-composer".into())
+            .children(self.render_replies(palette, window, cx))
             .child(
                 div()
                     .flex()

@@ -21,6 +21,9 @@ use crate::gpui_client::{
 
 use super::*;
 
+#[path = "quote_tests.rs"]
+mod quote_tests;
+
 #[path = "../history/stability.rs"]
 mod stability;
 
@@ -70,7 +73,7 @@ impl Conversation {
                 Box::pin(async move {
                     ConversationReply {
                         address: submission.address,
-                        value: None,
+                        value: QueueWriteOutcome::WriteFailed,
                     }
                 })
             }),
@@ -94,7 +97,7 @@ struct Requests {
     resolve: mpsc::Receiver<
         Request<ConversationAddress, ConversationReply<Result<Uuid, DestinationError>>>,
     >, // Проверка темы.
-    save: mpsc::Receiver<Request<Submission, ConversationReply<Option<Uuid>>>>, // Сохранение снимка.
+    save: mpsc::Receiver<Request<Submission, ConversationReply<QueueWriteOutcome>>>, // Сохранение снимка.
 }
 
 /// Создаёт поток запросов с задержанным ответом.
@@ -148,7 +151,22 @@ fn conversation(
     let mut view = Conversation::with_source(address, source, None, cx);
     view.attach_composer(
         SendSource {
-            resolve: Arc::new(move |address, _| send_request(&resolve, address)),
+            resolve: Arc::new(move |address, _| {
+                let future = send_request(&resolve, address);
+                Box::pin(async move {
+                    let reply: ConversationReply<Result<Uuid, DestinationError>> = future.await;
+                    ConversationReply {
+                        address: reply.address,
+                        value: reply.value.map(|topic| {
+                            crate::gpui_client::composer::ResolvedDestination {
+                                topic,
+                                closed: false,
+                                draft: None,
+                            }
+                        }),
+                    }
+                })
+            }),
             save: Arc::new(move |submission| send_request(&save, submission)),
         },
         cx,
@@ -272,7 +290,7 @@ fn draft(view: &Entity<Conversation>, ui: &VisualTestContext) -> String {
 
 /// Завершает задержанную запись с тем адресом, который был передан в исходный запрос.
 fn saved(
-    request: Request<Submission, ConversationReply<Option<Uuid>>>,
+    request: Request<Submission, ConversationReply<QueueWriteOutcome>>,
     value: Option<Uuid>,
     ui: &mut VisualTestContext,
 ) {
@@ -281,7 +299,7 @@ fn saved(
             .reply
             .send(ConversationReply {
                 address: request.input.address,
-                value
+                value: value.map_or(QueueWriteOutcome::WriteFailed, QueueWriteOutcome::Saved),
             })
             .is_ok()
     );
@@ -454,6 +472,56 @@ fn composer_text_menu_dismisses_outside_and_disables_during_save(cx: &mut TestAp
     let retry = next(&requests.save, "кнопка под немодальным меню");
     assert_eq!(retry.input.markdown, "Черновик");
     saved(retry, None, ui);
+}
+
+/// Старый отказ записи не меняет более новую успешную проверку той же темы.
+#[gpui::test]
+fn stale_write_rejection_keeps_the_latest_destination_confirmation(cx: &mut TestAppContext) {
+    let (view, ui, requests) = start(cx);
+    publish(&requests, Load::Open(ChatEntry::Latest), vec![], vec![], ui);
+    allow(&requests, Ok(TOPIC), ui);
+    paste(ui, "Черновик при сбросе");
+    click(ui, "conversation-send");
+    let late = next(&requests.save, "задержанная проверка перед записью");
+
+    let address = late.input.address.clone();
+    ui.update(|_, app| {
+        view.update(app, |view, cx| {
+            view.apply_sync(
+                &address,
+                SyncUpdate {
+                    context: address.route.owner.clone(),
+                    generation: address.generation,
+                    change: SyncChange::MessengerReset,
+                },
+                cx,
+            );
+        })
+    });
+    ui.run_until_parked();
+    publish(&requests, Load::Open(ChatEntry::Latest), vec![], vec![], ui);
+    allow(&requests, Ok(TOPIC), ui);
+
+    assert!(
+        late.reply
+            .send(ConversationReply {
+                address,
+                value: QueueWriteOutcome::DestinationUnavailable(
+                    DestinationError::EncryptionUnavailable,
+                ),
+            })
+            .is_ok()
+    );
+    ui.run_until_parked();
+    assert_eq!(draft(&view, ui), "Черновик при сбросе");
+    assert!(ui.debug_bounds("conversation-send-retry").is_none());
+    click(ui, "conversation-send");
+    let fresh = next(&requests.save, "запись после новой проверки");
+    assert_eq!(fresh.input.topic, TOPIC);
+    assert_eq!(fresh.input.markdown, "Черновик при сбросе");
+    saved(fresh, Some(MESSAGE), ui);
+    assert!(draft(&view, ui).is_empty());
+    publish(&requests, Load::Read(7), vec![], vec![], ui);
 }
 
 /// Рабочий редактор передаёт Enter один раз, а AppKit подтверждает композицию отдельно.

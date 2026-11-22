@@ -1,5 +1,7 @@
 //! Собирает две палитры из общих компонентов и показывает переходы фокуса, выбор и ввод.
 
+mod quotes;
+
 use gpui::{
     App, Application, Bounds, Context, Div, Entity, Focusable, KeyBinding, SharedString,
     Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
@@ -101,6 +103,7 @@ impl Panel {
             )
             .child(delivery(palette, "Посмотрел, спасибо!", DeliveryMark::Read))
             .child(delivery(palette, "Повторю после проверки связи", DeliveryMark::Failed))
+            .child(quotes::messages(palette))
             .child(field(
                 palette,
                 FieldAppearance::Invalid,
@@ -166,6 +169,7 @@ impl Render for Panel {
         } else {
             FieldAppearance::Normal
         };
+        let panel_id = self.id;
         div()
             .id(self.id)
             .flex()
@@ -182,11 +186,22 @@ impl Render for Panel {
                     .overflow_y_scroll()
                     .child(self.body(palette, cx)),
             )
-            .child(div().p_4().bg(palette.surface).child(field(
-                palette,
-                appearance,
-                self.draft.clone(),
-            )))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_4()
+                    .bg(palette.surface)
+                    .child(
+                        quotes::composer_preview(palette)
+                            .debug_selector(move || format!("{panel_id}-reply-preview")),
+                    )
+                    .child(
+                        field(palette, appearance, self.draft.clone())
+                            .debug_selector(move || format!("{panel_id}-reply-field")),
+                    ),
+            )
     }
 }
 
@@ -355,5 +370,26 @@ mod tests {
             assert_eq!(gallery.dark.read(app).selected, 1);
             assert_eq!(gallery.light.read(app).selected, 0);
         });
+    }
+
+    /// Проверяет отступы и ограничение длинного фрагмента над полем в узком окне.
+    #[gpui::test]
+    fn reply_preview_fits_above_editor_in_both_themes(cx: &mut TestAppContext) {
+        let (_, ui) = cx.add_window_view(Gallery::new);
+        ui.simulate_resize(size(px(600.), px(680.)));
+        ui.run_until_parked();
+
+        for (preview_id, field_id) in [
+            ("light-reply-preview", "light-reply-field"),
+            ("dark-reply-preview", "dark-reply-field"),
+        ] {
+            let preview = ui.debug_bounds(preview_id).expect("цитата над полем");
+            let field = ui.debug_bounds(field_id).expect("поле ответа");
+
+            assert_eq!(preview.origin.x, field.origin.x);
+            assert_eq!(preview.size.width, field.size.width);
+            assert_eq!(preview.bottom() + px(4.), field.origin.y);
+            assert_eq!(preview.size.height, px(80.));
+        }
     }
 }

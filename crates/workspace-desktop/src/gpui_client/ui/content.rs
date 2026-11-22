@@ -405,7 +405,7 @@ impl MessageBubble {
         self.render_with_body(palette, body, ends_group)
     }
 
-    /// Рисует тот же пузырь с подготовленным содержимым сообщения.
+    /// Рисует тот же пузырь с выделяемым текстом или блоками цитат.
     pub(in crate::gpui_client) fn render_with_body(
         self,
         palette: Palette,

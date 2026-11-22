@@ -10,7 +10,10 @@ pub mod media;
 mod outbox;
 
 pub(crate) use avatars::{AvatarEvent, AvatarFence, AvatarSnapshot};
-pub use drafts::{DraftAccess, DraftScope, DraftWriteOutcome, PlaintextDraft};
+pub use drafts::{
+    DraftAccess, DraftOpening, DraftReplies, DraftReply, DraftScope, DraftVersion,
+    DraftWriteOutcome, PlaintextDraft,
+};
 pub use folders::FolderChange;
 pub(crate) use history::HistoryPageGuard;
 pub use history::{

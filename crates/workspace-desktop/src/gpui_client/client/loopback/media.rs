@@ -7,7 +7,7 @@ use super::*;
 const FILE: Uuid = Uuid::from_u128(90);
 const CARD: &str = "history-attachment-00000000-0000-0000-0000-000000000048-0";
 const ROW: &str = "history-message-00000000-0000-0000-0000-000000000048";
-const CAPTION: &str = "history-media-caption-00000000-0000-0000-0000-000000000048";
+const CAPTION: &str = "history-reply-body-00000000-0000-0000-0000-000000000048";
 
 /// Возвращает тестовое вложение и считает запросы всего HTTPS-сервера.
 pub(super) struct Fixture {
@@ -135,7 +135,7 @@ fn photo_attachment_reopens_through_core_cache(cx: &mut TestAppContext) {
     };
     assert!(
         ui.debug_bounds(CAPTION).is_some(),
-        "подпись осталась видимой рядом с карточкой"
+        "подпись сохранила выделяемый текст"
     );
     assert_eq!(
         counts.downloads.load(Ordering::SeqCst),

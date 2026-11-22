@@ -4,6 +4,7 @@
 use std::cmp::Ordering;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::context::OwnerContext;
@@ -23,16 +24,42 @@ pub struct DraftScope {
 /// Версия обычного ввода, подготовленная к локальному сохранению.
 #[derive(Clone, Eq, PartialEq)]
 pub struct PlaintextDraft {
-    pub id: Uuid,         // Постоянный UUID черновика в пределах владельца.
-    pub version: u64,     // Положительная локальная версия одного черновика.
-    pub markdown: String, // Обычный текст точно в том виде, в каком его ввели.
+    pub id: Uuid,                      // Постоянный UUID черновика в пределах владельца.
+    pub version: u64,                  // Положительная локальная версия одного черновика.
+    pub markdown: String,              // Обычный текст до ответа или текущий ввод без вкладок.
+    pub replies: Option<DraftReplies>, // Отдельные ответы для обычной цитаты, если открыты вкладки.
+}
+
+/// Вкладки ответа в том порядке, в котором их показывает редактор.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DraftReplies {
+    pub active: Uuid,          // Идентификатор вкладки, открытой в поле.
+    pub tabs: Vec<DraftReply>, // Ответы в порядке показа и отправки.
+}
+
+/// Набранный ответ с ссылкой на обычное сообщение. Превью заново берётся из истории.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DraftReply {
+    pub id: Uuid,                 // Стабильный идентификатор вкладки.
+    pub message_id: Uuid,         // Публичный UUID процитированного сообщения.
+    pub fragment: Option<String>, // Выделение для ссылки, показываемое только после проверки источника.
+    pub answer: String,           // Ввод пользователя на этой вкладке.
+    pub creation: u64,            // Исходный порядок, нужный при отмене ответов.
 }
 
 /// Условия, при которых можно читать или записывать черновики одной области.
+#[derive(Clone, Eq, PartialEq)]
 pub struct DraftAccess {
     owner: OwnerContext, // Владелец этих данных, включая аккаунт, сервер и проект.
     scope: DraftScope,   // Точная тема, захваченная до проверки доступа.
     revision: i64,       // Сумма версий сброса, отзыва стрима и отзыва темы.
+}
+
+/// Ревизия доступа до запроса маршрута, пока точная тема лички ещё неизвестна.
+pub struct DraftOpening {
+    owner: OwnerContext, // Владелец проверяемого разговора.
+    stream_id: Uuid,     // Стрим, в котором сервер подтвердит тему.
+    revision: i64,       // Снимок изменений доступа владельца и этого стрима.
 }
 
 /// Результат сохранения введённого снимка.
@@ -55,7 +82,7 @@ pub(super) fn initialize(connection: &Connection) -> Result<(), StorageError> {
             project_id TEXT NOT NULL, user_id TEXT NOT NULL, draft_id TEXT NOT NULL,
             stream_id TEXT NOT NULL, topic_id TEXT NOT NULL,
             local_version INTEGER NOT NULL CHECK (typeof(local_version) = 'integer' AND local_version > 0),
-            markdown TEXT,
+            markdown TEXT, reply_context TEXT,
             UNIQUE (account_id, server, organization_id, project_id, user_id, draft_id)
          );
          CREATE INDEX IF NOT EXISTS messenger_drafts_by_scope
@@ -68,10 +95,53 @@ pub(super) fn initialize(connection: &Connection) -> Result<(), StorageError> {
             PRIMARY KEY (account_id, server, organization_id, project_id, user_id, stream_id, topic_id)
          );",
     )?;
+    let has_replies: bool = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('messenger_drafts') WHERE name = 'reply_context')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_replies {
+        connection.execute_batch("ALTER TABLE messenger_drafts ADD COLUMN reply_context TEXT;")?;
+    }
     Ok(())
 }
 
 impl Storage {
+    /// Запоминает ревизию до разрешения точной темы на сервере.
+    pub(crate) fn prepare_draft_opening(
+        &self,
+        owner: &OwnerContext,
+        stream_id: Uuid,
+    ) -> Result<DraftOpening, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        Ok(DraftOpening {
+            owner: owner.clone(),
+            stream_id,
+            revision: stream_access_revision(&connection, owner, stream_id)?,
+        })
+    }
+
+    /// Проверяет, что запрос доступа не был обогнан отзывом или сбросом.
+    pub(crate) fn finish_draft_opening(
+        &self,
+        owner: &OwnerContext,
+        opening: DraftOpening,
+        scope: DraftScope,
+    ) -> Result<DraftAccess, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        if &opening.owner != owner
+            || opening.stream_id != scope.stream_id
+            || stream_access_revision(&connection, owner, scope.stream_id)? != opening.revision
+        {
+            return Err(StorageError::StaleDraftAccess);
+        }
+        Ok(DraftAccess {
+            owner: opening.owner,
+            scope,
+            revision: access_revision(&connection, owner, scope)?,
+        })
+    }
+
     /// Захватывает локальную версию доступа до проверки разрешений в мессенджере.
     /// Вызывающий проверяет участие и поколение входа до использования снимка.
     pub fn prepare_draft_access(
@@ -99,7 +169,7 @@ impl Storage {
         let owner = &access.owner;
         let row = transaction
             .query_row(
-                "SELECT draft_id, local_version, markdown FROM messenger_drafts
+                "SELECT draft_id, local_version, markdown, reply_context FROM messenger_drafts
                  WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
                  AND project_id = ?4 AND user_id = ?5 AND stream_id = ?6 AND topic_id = ?7
                  AND markdown IS NOT NULL AND (?8 IS NULL OR draft_id = ?8)
@@ -119,16 +189,22 @@ impl Storage {
                         row.get::<_, String>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
             .optional()?;
         transaction.commit()?;
-        row.map(|(id, version, markdown)| {
+        row.map(|(id, version, markdown, replies)| {
             Ok(PlaintextDraft {
                 id: Uuid::parse_str(&id).map_err(|_| StorageError::InvalidDraftRecord)?,
                 version: u64::try_from(version).map_err(|_| StorageError::InvalidDraftRecord)?,
                 markdown,
+                replies: replies
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|_| StorageError::InvalidDraftRecord)?,
             })
         })
         .transpose()
@@ -149,13 +225,19 @@ impl Storage {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         access.verify(&transaction)?;
 
+        let replies = draft
+            .replies
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|_| StorageError::InvalidDraftRecord)?;
         let owner = &access.owner;
         let id = draft.id.to_string();
         let stream = access.scope.stream_id.to_string();
         let topic = access.scope.topic_id.to_string();
         let previous = transaction
             .query_row(
-                "SELECT stream_id, topic_id, local_version, markdown FROM messenger_drafts
+                "SELECT stream_id, topic_id, local_version, markdown, reply_context FROM messenger_drafts
                  WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
                  AND project_id = ?4 AND user_id = ?5 AND draft_id = ?6",
                 params![
@@ -172,11 +254,12 @@ impl Storage {
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 },
             )
             .optional()?;
-        if let Some((old_stream, old_topic, old_version, text)) = previous {
+        if let Some((old_stream, old_topic, old_version, text, old_replies)) = previous {
             if old_stream != stream || old_topic != topic {
                 return Ok(DraftWriteOutcome::ScopeConflict);
             }
@@ -185,7 +268,7 @@ impl Storage {
             };
             match version.cmp(&old_version) {
                 Ordering::Less => return Ok(DraftWriteOutcome::StaleVersion),
-                Ordering::Equal if text == draft.markdown => {
+                Ordering::Equal if text == draft.markdown && old_replies == replies => {
                     return Ok(DraftWriteOutcome::Unchanged);
                 }
                 Ordering::Equal => return Ok(DraftWriteOutcome::VersionConflict),
@@ -194,10 +277,11 @@ impl Storage {
         }
         transaction.execute(
             "INSERT INTO messenger_drafts (account_id, server, organization_id, project_id,
-             user_id, draft_id, stream_id, topic_id, local_version, markdown)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             user_id, draft_id, stream_id, topic_id, local_version, markdown, reply_context)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT (account_id, server, organization_id, project_id, user_id, draft_id)
-             DO UPDATE SET local_version = excluded.local_version, markdown = excluded.markdown",
+             DO UPDATE SET local_version = excluded.local_version, markdown = excluded.markdown,
+                           reply_context = excluded.reply_context",
             params![
                 owner.account_id.0,
                 owner.server,
@@ -208,7 +292,8 @@ impl Storage {
                 stream,
                 topic,
                 version,
-                draft.markdown
+                draft.markdown,
+                replies
             ],
         )?;
         transaction.commit()?;
@@ -217,13 +302,45 @@ impl Storage {
 }
 
 impl DraftAccess {
+    /// Тема, для которой подтверждён доступ к черновику.
+    pub fn scope(&self) -> DraftScope {
+        self.scope
+    }
+
+    /// Сверяет полное владение при открытии или при записи очереди.
+    pub(crate) fn belongs_to(&self, owner: &OwnerContext) -> bool {
+        self.owner == *owner
+    }
+
     /// Проверяет, что область не отзывалась и журнал не сбрасывался после захвата.
-    fn verify(&self, connection: &Connection) -> Result<(), StorageError> {
+    pub(super) fn verify(&self, connection: &Connection) -> Result<(), StorageError> {
         if access_revision(connection, &self.owner, self.scope)? != self.revision {
             return Err(StorageError::StaleDraftAccess);
         }
         Ok(())
     }
+}
+
+/// Учитывает отзыв любой темы, пока точный адрес ещё отвечает на сетевую проверку.
+fn stream_access_revision(
+    connection: &Connection,
+    owner: &OwnerContext,
+    stream_id: Uuid,
+) -> Result<i64, StorageError> {
+    Ok(connection.query_row(
+        "SELECT COALESCE(SUM(revision), 0) FROM messenger_draft_access
+         WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
+         AND project_id = ?4 AND user_id = ?5 AND (stream_id = '' OR stream_id = ?6)",
+        params![
+            owner.account_id.0,
+            owner.server,
+            owner.organization_id,
+            owner.project_id,
+            owner.user_id,
+            stream_id.to_string(),
+        ],
+        |row| row.get(0),
+    )?)
 }
 
 /// Суммирует счётчики только для владельца и вложенных областей этого черновика.
@@ -277,7 +394,7 @@ pub(super) fn revoke(
     advance_access(connection, owner, &stream, &topic)?;
     connection.execute(
         // Оставляем только идентичность записи, чтобы новый вход не восстановил отозванный текст под старым UUID.
-        "UPDATE messenger_drafts SET markdown = NULL WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
+        "UPDATE messenger_drafts SET markdown = NULL, reply_context = NULL WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
          AND project_id = ?4 AND user_id = ?5 AND stream_id = ?6 AND (?7 = '' OR topic_id = ?7)",
         params![
             owner.account_id.0,
@@ -312,6 +429,75 @@ fn advance_access(
             owner.user_id,
             stream,
             topic
+        ],
+    )?;
+    Ok(())
+}
+
+/// Версия поля, за доставку которой принимает ответственность исходящая очередь.
+#[derive(Clone, Copy)]
+pub struct DraftVersion {
+    pub id: Uuid,     // UUID текущего локального черновика.
+    pub version: u64, // Версия принятого текста и порядка ответов.
+}
+
+/// Скрывает переданный снимок из поля вместе с записью очереди, сохраняя новые версии.
+pub(super) fn consume(
+    transaction: &Connection,
+    access: &DraftAccess,
+    version: DraftVersion,
+) -> Result<(), StorageError> {
+    access.verify(transaction)?;
+    let owner = &access.owner;
+    let local_version = i64::try_from(version.version)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or(StorageError::InvalidDraftVersion)?;
+    let other_scope: bool = transaction.query_row(
+        "SELECT EXISTS (
+            SELECT 1 FROM messenger_drafts
+            WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
+              AND project_id = ?4 AND user_id = ?5 AND draft_id = ?6
+              AND (stream_id != ?7 OR topic_id != ?8 OR markdown IS NULL)
+        )",
+        params![
+            owner.account_id.0,
+            owner.server,
+            owner.organization_id,
+            owner.project_id,
+            owner.user_id,
+            version.id.to_string(),
+            access.scope.stream_id.to_string(),
+            access.scope.topic_id.to_string(),
+        ],
+        |row| row.get(0),
+    )?;
+    if other_scope {
+        return Err(StorageError::StaleDraftAccess);
+    }
+    // Пустая строка сохраняет версию после перезапуска. Запись той же версии с прежним
+    // вводом получит конфликт, а уже сохранённая новая версия останется в поле.
+    transaction.execute(
+        "INSERT INTO messenger_drafts (account_id, server, organization_id, project_id,
+         user_id, draft_id, stream_id, topic_id, local_version, markdown, reply_context)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, '', NULL)
+         ON CONFLICT (account_id, server, organization_id, project_id, user_id, draft_id)
+         DO UPDATE SET local_version = excluded.local_version, markdown = '',
+                       reply_context = NULL
+         WHERE messenger_drafts.stream_id = excluded.stream_id
+           AND messenger_drafts.topic_id = excluded.topic_id
+           AND messenger_drafts.local_version <= excluded.local_version
+           AND messenger_drafts.markdown IS NOT NULL",
+        params![
+            owner.account_id.0,
+            owner.server,
+            owner.organization_id,
+            owner.project_id,
+            owner.user_id,
+            version.id.to_string(),
+            access.scope.stream_id.to_string(),
+            access.scope.topic_id.to_string(),
+            local_version
         ],
     )?;
     Ok(())

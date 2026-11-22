@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
     },
     time::Duration,
 };
@@ -25,7 +25,11 @@ use uuid::Uuid;
 use workspace_core::{
     auth::SessionSnapshot,
     context::OwnerContext,
-    messenger::{MessengerSource, send::DirectSendError},
+    messenger::{
+        MessengerSource,
+        quote::{Source as QuoteSource, SourceCheckError},
+        send::DirectSendError,
+    },
     runtime::{Runtime, SourceError},
     storage::{
         Cursor, DeliveryStatus, HistoryChange, HistoryScope, MessagePlacement, PreparedSend,
@@ -74,6 +78,8 @@ pub(super) struct Api {
     events: broadcast::Sender<Value>, // События, отправляемые только B.
     posts: mpsc::UnboundedSender<Post>, // Все полученные POST доступны тесту.
     lookups: Mutex<HashMap<Uuid, Value>>, // Подтверждения, которые сервер возвращает через GET.
+    lookup_count: AtomicUsize,  // Число GET адресных сообщений.
+    lookup_failure: AtomicBool, // Возвращает временный сбой в GET сообщения.
     history: Mutex<Vec<Value>>, // Строки, которые сервер возвращает в актуальной истории B.
 }
 
@@ -176,7 +182,10 @@ impl Api {
             ("200 OK", json!(messages))
         } else if let Some((_, id)) = path.split_once("/messages/") {
             let id: Uuid = id.parse().unwrap();
-            if let Some(message) = self.lookups.lock().unwrap().get(&id) {
+            self.lookup_count.fetch_add(1, Relaxed);
+            if self.lookup_failure.load(Relaxed) {
+                ("503 Service Unavailable", Value::Null)
+            } else if let Some(message) = self.lookups.lock().unwrap().get(&id) {
                 ("200 OK", message.clone())
             } else {
                 ("404 Not Found", Value::Null)
@@ -286,6 +295,8 @@ impl Test {
             events: broadcast::channel(8).0,
             posts,
             lookups: Mutex::new(HashMap::new()),
+            lookup_count: AtomicUsize::new(0),
+            lookup_failure: AtomicBool::new(false),
             history: Mutex::new(Vec::new()),
         });
         let (address, server) = serve(Arc::new(HistoryApi {
@@ -470,6 +481,61 @@ async fn direct_send_requires_explicit_unencrypted_destination() {
     assert!(opening.refresh().await.unwrap().messages.is_empty());
     test.fixture.auth.logout(&test.b.account_id).unwrap();
     assert!(matches!(resolve().await, Err(DirectSendError::Auth(_))));
+}
+
+/// Проверяет живой источник и точный фрагмент по HTTPS до любых записей очереди.
+#[tokio::test]
+async fn validates_reply_sources_by_account_and_topic_once_per_message() {
+    let test = Test::new().await;
+    let (_, sync) = test.open();
+    let generation = test.session().generation;
+    let id = Uuid::from_u128(0x777);
+    let quote = |fragment: &str| QuoteSource {
+        message_id: id,
+        fragment: Some(fragment.to_owned()),
+    };
+    let sources = [quote("строка"), quote("😀")];
+    let verify = |scope| {
+        test.source
+            .verify_reply_sources(&sync, &test.b, generation, scope, &sources)
+    };
+    let valid = json!({
+        "uuid": id, "stream_uuid": CHAT, "topic_uuid": TOPIC,
+        "project_id": "project", "user_uuid": B, "author_uuid": A,
+        "created_at":"2026-01-01T12:00:00Z",
+        "payload":{"kind":"markdown","content":"Первая строка 😀"}
+    });
+
+    test.api.lookups.lock().unwrap().insert(id, valid.clone());
+    let topic = HistoryScope {
+        stream_id: CHAT,
+        topic_id: Some(TOPIC),
+    };
+    assert_eq!(verify(topic).await, Ok(()));
+    assert_eq!(test.api.lookup_count.load(Relaxed), 1);
+
+    let wrong_topic = HistoryScope {
+        stream_id: CHAT,
+        topic_id: Some(OTHER_TOPIC),
+    };
+    assert_eq!(verify(wrong_topic).await, Err(SourceCheckError::Missing));
+
+    let mut wrong_owner = valid.clone();
+    wrong_owner["user_uuid"] = json!(A);
+    test.api.lookups.lock().unwrap().insert(id, wrong_owner);
+    assert_eq!(verify(topic).await, Err(SourceCheckError::Unavailable));
+
+    let mut replaced = valid;
+    replaced["payload"]["content"] = json!("Другая строка");
+    test.api.lookups.lock().unwrap().insert(id, replaced);
+    assert_eq!(verify(topic).await, Err(SourceCheckError::Changed));
+
+    test.api.lookup_failure.store(true, Relaxed);
+    assert_eq!(verify(topic).await, Err(SourceCheckError::Unavailable));
+    test.api.lookup_failure.store(false, Relaxed);
+    test.api.lookups.lock().unwrap().remove(&id);
+    assert_eq!(verify(topic).await, Err(SourceCheckError::Missing));
+    assert!(sync.outbox(&test.b, generation, topic).unwrap().is_empty());
 }
 
 /// Проверяет запуск сохранённой очереди и единственную строку при обоих порядках подтверждения.

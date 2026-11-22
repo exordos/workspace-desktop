@@ -17,9 +17,10 @@ use crate::{
     },
     notification_target::{NotificationTarget, NotificationTargetError},
     storage::{
-        AvatarEvent, Cursor, DeliveryStatus, EventWrite, FolderChange, HistoryChange,
-        HistoryMessage, HistoryMetadata, HistoryPageEdges, HistoryPageGuard, HistoryPageOutcome,
-        HistoryPageTarget, HistoryScope, HistoryWindow, Message, MessagePlacement, OutboxEntry,
+        AvatarEvent, Cursor, DeliveryStatus, DraftAccess, DraftOpening, DraftScope, DraftVersion,
+        DraftWriteOutcome, EventWrite, FolderChange, HistoryChange, HistoryMessage,
+        HistoryMetadata, HistoryPageEdges, HistoryPageGuard, HistoryPageOutcome, HistoryPageTarget,
+        HistoryScope, HistoryWindow, Message, MessagePlacement, OutboxEntry, PlaintextDraft,
         PreparedSend, Storage, StorageError,
         media::{
             MediaCache, MediaCacheError, MediaCachePolicy, MediaClearReport, MediaCopyPage,
@@ -576,6 +577,51 @@ impl Sync {
         })?
     }
 
+    /// Захватывает ревизию доступа до запроса обычной темы.
+    pub fn prepare_draft_opening(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        stream_id: Uuid,
+    ) -> Result<DraftOpening, SyncError> {
+        Ok(self.auth.with_active_generation(owner, generation, || {
+            self.storage.prepare_draft_opening(owner, stream_id)
+        })??)
+    }
+
+    /// Открывает черновик после сетевой проверки точной темы и разрешения обычного текста.
+    pub fn open_draft(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        opening: DraftOpening,
+        scope: DraftScope,
+    ) -> Result<(DraftAccess, Option<PlaintextDraft>), SyncError> {
+        self.auth.with_active_generation(owner, generation, || {
+            let access = self.storage.finish_draft_opening(owner, opening, scope)?;
+            let draft = self.storage.read_plaintext_draft(&access, None)?;
+            Ok((access, draft))
+        })?
+    }
+
+    /// Пишет ввод в ранее подтверждённую тему, включая временную потерю сети.
+    pub fn save_draft(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        access: &DraftAccess,
+        draft: &PlaintextDraft,
+    ) -> Result<DraftWriteOutcome, SyncError> {
+        if !access.belongs_to(owner) {
+            return Err(StorageError::StaleDraftAccess.into());
+        }
+        Ok(self
+            .auth
+            .with_confirmed_generation(owner, generation, || {
+                self.storage.save_plaintext_draft(access, draft)
+            })??)
+    }
+
     /// Создаёт снимок отправки и возвращает его только после записи для действующего входа.
     pub fn prepare_send(
         &self,
@@ -584,6 +630,19 @@ impl Sync {
         stream_id: uuid::Uuid,
         topic_id: uuid::Uuid,
         markdown: String,
+    ) -> Result<PreparedSend, PrepareSendError> {
+        self.prepare_send_with_draft(owner, generation, stream_id, topic_id, markdown, None)
+    }
+
+    /// Готовит очередь вместе с передачей ответственности за конкретную версию черновика.
+    pub fn prepare_send_with_draft(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        stream_id: Uuid,
+        topic_id: Uuid,
+        markdown: String,
+        draft: Option<(&DraftAccess, DraftVersion)>,
     ) -> Result<PreparedSend, PrepareSendError> {
         if markdown.trim().is_empty() || markdown.chars().count() > MAX_MESSAGE_CHARACTERS {
             return Err(PrepareSendError::InvalidText);
@@ -600,7 +659,7 @@ impl Sync {
                 };
                 if !self
                     .storage
-                    .save_prepared_send(owner, &message)
+                    .save_prepared_send_with_draft(owner, &message, draft)
                     .map_err(SyncError::from)?
                 {
                     return Err(PrepareSendError::IdCollision);
