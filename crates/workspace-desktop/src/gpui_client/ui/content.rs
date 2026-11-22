@@ -360,9 +360,7 @@ impl MessageBubble {
 
     /// Рисует текстовый пузырь с учётом положения сообщения в группе.
     pub(in crate::gpui_client) fn render_in_group(self, palette: Palette, ends_group: bool) -> Div {
-        let body = label(palette, TextRole::Body, self.body.clone())
-            .min_w_0()
-            .max_w_full();
+        let body = self.plain_body(palette);
         self.render_with_body(palette, body, ends_group)
     }
 
@@ -372,6 +370,36 @@ impl MessageBubble {
         palette: Palette,
         content: impl gpui::IntoElement,
         ends_group: bool,
+    ) -> Div {
+        self.render_body(palette, content, ends_group, None)
+    }
+
+    /// Показывает дополнительный блок под текстом и временем уже отрисованного сообщения.
+    pub(in crate::gpui_client) fn render_with_accessory(
+        self,
+        palette: Palette,
+        content: Option<gpui::AnyElement>,
+        ends_group: bool,
+        accessory: gpui::AnyElement,
+    ) -> Div {
+        let content = content.unwrap_or_else(|| self.plain_body(palette).into_any_element());
+        self.render_body(palette, content, ends_group, Some(accessory))
+    }
+
+    /// Готовит одинаковый текстовый элемент для обычного и раскрытого пузыря.
+    fn plain_body(&self, palette: Palette) -> Div {
+        label(palette, TextRole::Body, self.body.clone())
+            .min_w_0()
+            .max_w_full()
+    }
+
+    /// Собирает общую разметку пузыря с дополнительным блоком под основным содержимым.
+    fn render_body(
+        self,
+        palette: Palette,
+        content: impl gpui::IntoElement,
+        ends_group: bool,
+        accessory: Option<gpui::AnyElement>,
     ) -> Div {
         let status = self.delivery.filter(|_| self.own).map(|state| match state {
             DeliveryMark::Pending | DeliveryMark::Unknown => {
@@ -419,7 +447,8 @@ impl MessageBubble {
                     .whitespace_nowrap()
                     .overflow_hidden()
             }))
-            .child(body);
+            .child(body)
+            .children(accessory);
         div()
             .w_full()
             .min_w_0()

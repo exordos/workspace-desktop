@@ -1,6 +1,6 @@
-//! Проверяет ранний запрос страницы и геометрию рабочего списка с задержанным ответом.
+//! Проверяет ранний запрос страницы и геометрию первого кадра после изменения истории или бабла.
 
-use gpui::{Modifiers, ScrollDelta, TestAppContext, VisualTestContext, point};
+use gpui::{Entity, ListOffset, Modifiers, ScrollDelta, TestAppContext, VisualTestContext, point};
 
 use super::*;
 
@@ -110,4 +110,138 @@ fn fills_short_tail_upwards_and_stops(cx: &mut TestAppContext) {
         let after = lab.viewport.y(id).unwrap();
         assert!((after - before).abs() <= 1., "Хвост: {before} → {after} px");
     });
+}
+
+/// Рисует именно первый кадр после изменения, пока отложенные задачи ещё не выполнились.
+fn first_resize_frame<T>(
+    ui: &mut VisualTestContext,
+    view: &Entity<HistoryLab>,
+    id: Uuid,
+    sample: impl FnOnce(&HistoryLab) -> T,
+) -> T {
+    ui.update(|window, app| {
+        view.update(app, |lab, cx| lab.toggle_bubble(id, cx));
+        window.refresh();
+        window.draw(app).clear();
+        sample(view.read(app))
+    })
+}
+
+/// Ставит верх списка внутрь нужной строки. Вызывается только при подготовке сцены.
+fn scroll_to(
+    ui: &mut VisualTestContext,
+    view: &Entity<HistoryLab>,
+    item_ix: usize,
+    offset: Pixels,
+) {
+    ui.update(|_, app| {
+        view.update(app, |lab, cx| {
+            lab.viewport.list().scroll_to(ListOffset {
+                item_ix,
+                offset_in_item: offset,
+            });
+            cx.notify();
+        });
+    });
+    ui.run_until_parked();
+}
+
+/// Сверяет фактическую координату с допуском в один логический пиксель.
+fn same_position(before: Pixels, after: Pixels, step: &str) {
+    assert!(
+        (after - before).abs() <= px(1.),
+        "{step}: {before:?} → {after:?}"
+    );
+}
+
+/// Проверяет изменение высоты и опору в первом и установившемся кадрах каждого перехода.
+fn check_resize(
+    ui: &mut VisualTestContext,
+    view: &Entity<HistoryLab>,
+    id: Uuid,
+    step: &str,
+    sample: impl Fn(&HistoryLab) -> (Pixels, Pixels),
+) {
+    let (before, short) = ui.read(|app| sample(view.read(app)));
+
+    let (grown, tall) = first_resize_frame(ui, view, id, &sample);
+    same_position(PREVIEW_HEIGHT, tall - short, "рост бабла");
+    same_position(before, grown, step);
+    ui.run_until_parked();
+    same_position(before, ui.read(|app| sample(view.read(app)).0), step);
+
+    let (shrunk, height) = first_resize_frame(ui, view, id, &sample);
+    same_position(short, height, "высота после сжатия");
+    same_position(before, shrunk, step);
+    ui.run_until_parked();
+    same_position(before, ui.read(|app| sample(view.read(app)).0), step);
+    eprintln!(
+        "history_bubble message={id} target={step} first_frame_growth_delta_px={} first_frame_shrink_delta_px={} height_change_px={}",
+        f32::from(grown - before),
+        f32::from(shrunk - before),
+        f32::from(tall - short)
+    );
+}
+
+/// Проверяет рост и сжатие баблов выше, ниже и на частично видимой опоре.
+#[gpui::test]
+fn resized_bubbles_keep_reading_anchor_on_first_frame(cx: &mut TestAppContext) {
+    let (view, ui) = cx.add_window_view(|_, _| HistoryLab::new());
+    ui.simulate_resize(size(px(760.), px(560.)));
+    ui.run_until_parked();
+
+    let anchor = Uuid::from_u128(FIRST + 22);
+    let above = Uuid::from_u128(FIRST + 21);
+    scroll_to(ui, &view, 21, px(0.));
+    assert!(ui.read(|app| view.read(app).viewport.tested_bounds(above).is_some()));
+    scroll_to(ui, &view, 22, px(17.));
+    assert!(ui.read(|app| view.read(app).viewport.y(anchor).unwrap()) < 0.);
+
+    for (target, step) in [
+        (BubbleTarget::Above, "выше"),
+        (BubbleTarget::Anchor, "опора"),
+        (BubbleTarget::Below, "ниже"),
+    ] {
+        let id = ui.read(|app| view.read(app).bubble_id(target).unwrap());
+        let sample = |lab: &HistoryLab| {
+            assert_eq!(lab.viewport.saved_anchor().unwrap().id, anchor);
+            let y = lab.viewport.tested_bounds(anchor).unwrap().top();
+            let height = if id == above {
+                // Строка над областью уже измерялась. Суммарная высота доказывает,
+                // что её пересчитали, хотя список больше не рисует сам бабл.
+                lab.viewport.list().max_offset_for_scrollbar().height
+            } else {
+                lab.viewport.tested_bounds(id).unwrap().size.height
+            };
+            (y, height)
+        };
+        check_resize(ui, &view, id, step, sample);
+    }
+}
+
+/// Проверяет нижнюю привязку, пока растёт и сжимается последнее или предпоследнее сообщение.
+#[gpui::test]
+fn resized_bubbles_keep_tail_on_first_frame(cx: &mut TestAppContext) {
+    let clock = cx.background_executor.clone();
+    let (view, ui) = cx.add_window_view(|_, _| HistoryLab::new());
+    ui.simulate_resize(size(px(760.), px(560.)));
+    ui.run_until_parked();
+    select(ui, "history-short");
+    clock.advance_clock(PAGE_DELAY);
+    ui.run_until_parked();
+
+    let last = Uuid::from_u128(HISTORY_SIZE);
+    for (id, step) in [
+        (Uuid::from_u128(HISTORY_SIZE - 1), "выше хвоста"),
+        (last, "хвост"),
+    ] {
+        let sample = |lab: &HistoryLab| {
+            assert!(lab.viewport.at_tail());
+            let bottom = lab.viewport.list().viewport_bounds().bottom();
+            let gap = bottom - lab.viewport.tested_bounds(last).unwrap().bottom();
+            same_position(px(12.), gap, "нижний отступ списка");
+            (gap, lab.viewport.tested_bounds(id).unwrap().size.height)
+        };
+        check_resize(ui, &view, id, step, sample);
+    }
 }

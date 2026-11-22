@@ -7,8 +7,8 @@ use std::{
 };
 
 use gpui::{
-    App, Bounds, Div, ImageSource, IntoElement, ListAlignment, ListOffset, ListState, Pixels,
-    WeakEntity, canvas, div, list, prelude::*, px,
+    AnyElement, App, Bounds, Div, ImageSource, IntoElement, ListAlignment, ListOffset, ListState,
+    Pixels, WeakEntity, canvas, div, list, prelude::*, px,
 };
 use uuid::Uuid;
 use workspace_core::{
@@ -280,9 +280,23 @@ impl Viewport {
                 .is_some_and(|bounds| bounds.intersects(&self.list.viewport_bounds()))
     }
 
-    /// Показывает список с локальными строками в отдельном окне.
-    pub(super) fn render_standalone(&mut self, palette: Palette, peer: String) -> impl IntoElement {
-        self.render(palette, Some(peer), HashMap::new(), None)
+    /// Просит GPUI заново измерить строку, сохраняя текущий индекс и смещение внутри него.
+    pub(super) fn invalidate_row_height(&self, id: Uuid) {
+        if let Some(&index) = self.index.get(&id) {
+            let position = self.list.logical_scroll_top();
+            self.list.splice(index..index + 1, 1);
+            self.list.scroll_to(position);
+        }
+    }
+
+    /// Показывает локальные строки с управляемым содержимым отдельных баблов.
+    pub(super) fn render_standalone(
+        &mut self,
+        palette: Palette,
+        peer: String,
+        accessory: impl Fn(Uuid) -> Option<AnyElement> + 'static,
+    ) -> impl IntoElement {
+        self.render_rows(palette, Some(peer), HashMap::new(), None, accessory)
     }
 
     /// Рисует список и пишет фактическую координату опоры, когда GPUI дойдёт до её строки.
@@ -292,6 +306,18 @@ impl Viewport {
         peer: Option<String>,
         images: HashMap<Uuid, ImageSource>,
         cards: Option<Cards>,
+    ) -> impl IntoElement {
+        self.render_rows(palette, peer, images, cards, |_| None)
+    }
+
+    /// Собирает один виртуальный список для рабочего чата и окна стенда.
+    fn render_rows(
+        &mut self,
+        palette: Palette,
+        peer: Option<String>,
+        images: HashMap<Uuid, ImageSource>,
+        cards: Option<Cards>,
+        accessory: impl Fn(Uuid) -> Option<AnyElement> + 'static,
     ) -> impl IntoElement {
         self.painted.borrow_mut().clear();
         self.painted_offset.set(None);
@@ -310,7 +336,7 @@ impl Viewport {
             let list_state = list_state.clone();
             div().relative().w_full().px_3().pt(row.inset())
                 .children(row.date.as_deref().filter(|_| row.starts_day).map(|date| date_separator(palette, date, id)))
-                .child(message_row(row, palette, peer.as_deref(), photo, cards.as_ref().map(|cards| (cards, app))).relative().child(canvas(|_, _, _| (), move |bounds, (), _, _| {
+                .child(message_row(row, palette, peer.as_deref(), photo, RowBodyExtras { media: cards.as_ref().map(|cards| (cards, app)), accessory: accessory(id) }).relative().child(canvas(|_, _, _| (), move |bounds, (), _, _| {
                     painted.borrow_mut().insert(id, bounds);
                     painted_offset.set(Some(list_state.logical_scroll_top()));
                     let mut measurement = measurement.borrow_mut();
@@ -366,10 +392,14 @@ impl Viewport {
     /// Возвращает координату реально показанной строки для теста геометрии.
     #[cfg(all(test, feature = "gpui-test"))]
     pub(super) fn y(&self, id: Uuid) -> Option<f32> {
-        self.painted
-            .borrow()
-            .get(&id)
+        self.tested_bounds(id)
             .map(|bounds| f32::from(bounds.top() - self.list.viewport_bounds().top()))
+    }
+
+    /// Возвращает фактические размеры строки, полученные при последней отрисовке.
+    #[cfg(all(test, feature = "gpui-test"))]
+    pub(super) fn tested_bounds(&self, id: Uuid) -> Option<Bounds<Pixels>> {
+        self.painted.borrow().get(&id).copied()
     }
 
     /// Возвращает опору чтения после показанного кадра для проверки вставки.
@@ -436,13 +466,19 @@ fn date_separator(palette: Palette, date: &str, id: Uuid) -> Div {
         )
 }
 
+/// Данные для необязательных блоков внутри бабла.
+struct RowBodyExtras<'a> {
+    media: Option<(&'a Cards, &'a mut App)>, // Файлы рабочего чата и контекст их отрисовки.
+    accessory: Option<AnyElement>,           // Управляемый блок внутри бабла на стенде.
+}
+
 /// Рисует сообщение с общим пузырём и оставляет место аватару в группе собеседника.
 fn message_row(
     row: &Row,
     palette: Palette,
     peer: Option<&str>,
     photo: Option<ImageSource>,
-    cards: Option<(&Cards, &mut App)>,
+    extras: RowBodyExtras<'_>,
 ) -> Div {
     let author = peer.unwrap_or("Участник");
     let id = row.id;
@@ -466,9 +502,10 @@ fn message_row(
         own: row.own,
         delivery: row.delivery,
     };
-    let bubble = match cards.filter(|_| !row.media.is_empty()) {
-        Some((cards, app)) => bubble.render_with_body(
-            bubble_palette,
+    let content = extras
+        .media
+        .filter(|_| !row.media.is_empty())
+        .map(|(cards, app)| {
             div()
                 .flex()
                 .flex_col()
@@ -490,10 +527,15 @@ fn message_row(
                         bubble_palette,
                         app,
                     )
-                })),
-            row.ends_group,
-        ),
-        None => bubble.render_in_group(bubble_palette, row.ends_group),
+                }))
+                .into_any_element()
+        });
+    let bubble = match (content, extras.accessory) {
+        (content, Some(accessory)) => {
+            bubble.render_with_accessory(bubble_palette, content, row.ends_group, accessory)
+        }
+        (Some(content), None) => bubble.render_with_body(bubble_palette, content, row.ends_group),
+        (None, None) => bubble.render_in_group(bubble_palette, row.ends_group),
     };
     div()
         .w_full()

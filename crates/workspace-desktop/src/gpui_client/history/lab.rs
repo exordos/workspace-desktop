@@ -1,6 +1,6 @@
-//! Открывает рабочий список в отдельном окне с синтетической историей и задержкой страниц.
+//! Открывает рабочий список с задержкой страниц и изменяемыми блоками внутри сообщений.
 
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use gpui::{
     App, AppContext, Application, Bounds, Context, IntoElement, Pixels, Render, ScrollWheelEvent,
@@ -22,6 +22,7 @@ const FIRST: u128 = 201;
 const LAST: u128 = 800;
 const PAGE_DELAY: Duration = Duration::from_millis(240);
 const MAX_AHEAD: Pixels = px(1200.);
+const PREVIEW_HEIGHT: Pixels = px(112.);
 const SCOPE: HistoryScope = HistoryScope {
     stream_id: Uuid::from_u128(2001),
     topic_id: Some(Uuid::from_u128(2002)),
@@ -33,6 +34,15 @@ enum Scene {
     Older,     // 600 строк, старт в нескольких жестах от старого края.
     Newer,     // Те же строки, старт недалеко от нового края.
     ShortTail, // Намеренно короткое первое окно у подтверждённого хвоста.
+}
+
+/// Выбирает сообщение для раскрытия или сворачивания блока внутри бабла.
+#[derive(Clone, Copy)]
+enum BubbleTarget {
+    Above,  // Предыдущее сообщение относительно опоры чтения.
+    Anchor, // Сообщение, которое удерживает список при чтении.
+    Below,  // Следующее сообщение относительно опоры чтения.
+    Last,   // Последнее загруженное сообщение для проверки хвоста.
 }
 
 /// Запрос, пока источник имитирует сетевую задержку.
@@ -49,6 +59,7 @@ struct HistoryLab {
     direction: Option<HistoryDirection>, // Последнее направление жеста. До жеста заполняем окно.
     flight: Option<Flight>,              // Единственная страница, которую ждёт открытое окно.
     last_page: Option<Flight>,           // Параметры последней вставки для строки состояния.
+    expanded: HashSet<Uuid>,             // Сообщения с раскрытым блоком превью.
 }
 
 impl HistoryLab {
@@ -63,6 +74,7 @@ impl HistoryLab {
             direction: None,
             flight: None,
             last_page: None,
+            expanded: HashSet::new(),
         }
     }
 
@@ -73,9 +85,39 @@ impl HistoryLab {
         self.direction = None;
         self.flight = None;
         self.last_page = None;
+        self.expanded.clear();
         self.viewport.clear();
         self.viewport
             .replace(&self.history, &[], None, position, Uuid::new_v4());
+        cx.notify();
+    }
+
+    /// Находит сообщение относительно опоры по текущему порядку истории.
+    fn bubble_id(&self, target: BubbleTarget) -> Option<Uuid> {
+        if matches!(target, BubbleTarget::Last) {
+            return self.history.messages.last().map(|row| row.id);
+        }
+        let anchor = self.viewport.saved_anchor()?.id;
+        let index = self
+            .history
+            .messages
+            .iter()
+            .position(|row| row.id == anchor)?;
+        let index = match target {
+            BubbleTarget::Above => index.checked_sub(1)?,
+            BubbleTarget::Anchor => index,
+            BubbleTarget::Below => index + 1,
+            BubbleTarget::Last => return None,
+        };
+        self.history.messages.get(index).map(|row| row.id)
+    }
+
+    /// Меняет только блок отрисовки. UUID и снимок сообщений остаются прежними.
+    fn toggle_bubble(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if !self.expanded.remove(&id) {
+            self.expanded.insert(id);
+        }
+        self.viewport.invalidate_row_height(id);
         cx.notify();
     }
 
@@ -176,6 +218,7 @@ impl Render for HistoryLab {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::for_mode(ThemeMode::Light);
         let target = cx.entity().downgrade();
+        let expanded = self.expanded.clone();
         div()
             .size_full()
             .flex()
@@ -197,6 +240,36 @@ impl Render for HistoryLab {
                             cx,
                         ),
                     ]))
+                    .child(div().flex().flex_wrap().gap_2().mt_2().children([
+                        Self::bubble_button(
+                            "bubble-above",
+                            "Выше опоры",
+                            BubbleTarget::Above,
+                            palette,
+                            cx,
+                        ),
+                        Self::bubble_button(
+                            "bubble-anchor",
+                            "Опора",
+                            BubbleTarget::Anchor,
+                            palette,
+                            cx,
+                        ),
+                        Self::bubble_button(
+                            "bubble-below",
+                            "Ниже опоры",
+                            BubbleTarget::Below,
+                            palette,
+                            cx,
+                        ),
+                        Self::bubble_button(
+                            "bubble-last",
+                            "Последний бабл",
+                            BubbleTarget::Last,
+                            palette,
+                            cx,
+                        ),
+                    ]))
                     .child(
                         label(palette, TextRole::Body, self.status())
                             .mt_2()
@@ -210,7 +283,24 @@ impl Render for HistoryLab {
                     .flex_1()
                     .min_h_0()
                     .on_scroll_wheel(cx.listener(Self::wheel))
-                    .child(self.viewport.render_standalone(palette, "Собеседник".into()))
+                    .child(self.viewport.render_standalone(
+                        palette,
+                        "Собеседник".into(),
+                        move |id| {
+                            expanded.contains(&id).then(|| {
+                                div()
+                                    .h(PREVIEW_HEIGHT)
+                                    .flex_none()
+                                    .p_2()
+                                    .rounded(px(8.))
+                                    .bg(palette.surface)
+                                    .border_1()
+                                    .border_color(palette.border)
+                                    .child(label(palette, TextRole::Caption, "Превью"))
+                                    .into_any_element()
+                            })
+                        },
+                    ))
                     .child(
                         canvas(
                             |_, _, _| (),
@@ -225,6 +315,28 @@ impl Render for HistoryLab {
                         .inset_0(),
                     ),
             )
+    }
+}
+
+impl HistoryLab {
+    /// Направляет нажатие на имеющийся бабл по его месту в списке.
+    fn bubble_button(
+        id: &'static str,
+        text: &'static str,
+        bubble: BubbleTarget,
+        palette: Palette,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let target = cx.entity().downgrade();
+        Button::new(id, text)
+            .render(palette, None, move |_, app| {
+                let _ = target.update(app, |lab, cx| {
+                    if let Some(id) = lab.bubble_id(bubble) {
+                        lab.toggle_bubble(id, cx);
+                    }
+                });
+            })
+            .debug_selector(move || id.to_owned())
     }
 }
 
