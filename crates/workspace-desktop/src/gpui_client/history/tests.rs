@@ -1017,3 +1017,170 @@ fn edit_keeps_a_surviving_text_line_on_the_first_frame(cx: &mut TestAppContext) 
         assert!((settled - first).abs() <= px(1.));
     }
 }
+
+/// Проверяет разворот, когда порог нового края достигнут до прихода старого ответа.
+#[gpui::test]
+fn reversed_scroll_prefetches_after_the_pending_page(cx: &mut TestAppContext) {
+    check_reversed_scroll(cx, true);
+}
+
+/// Проверяет разворот, когда до порога ещё далеко в момент вставки старой страницы.
+#[gpui::test]
+fn reversed_scroll_waits_until_the_new_edge_is_near(cx: &mut TestAppContext) {
+    check_reversed_scroll(cx, false);
+}
+
+/// Удерживает старый ответ и сверяет опору в первом кадре после разворота.
+fn check_reversed_scroll(cx: &mut TestAppContext, near_newer: bool) {
+    use std::{cell::Cell, rc::Rc};
+
+    use gpui::{ScrollDelta, ScrollWheelEvent, point};
+
+    let address = address(ChatEntry::Around(Uuid::from_u128(80)));
+    let (view, ui, requests) = scenario(cx, &address);
+    answer(
+        request(&requests, Load::Open(address.route.entry)),
+        reading(&address, 51..111),
+        ui,
+    );
+    assert!(
+        requests.try_recv().is_err(),
+        "Длинное окно заполняет список"
+    );
+    let distance = |ui: &VisualTestContext, direction| {
+        ui.read(|app| {
+            let viewport = &view.read(app).viewport;
+            (
+                viewport.distance_to_edge(direction),
+                viewport.list().viewport_bounds().size.height,
+            )
+        })
+    };
+    let scroll = |ui: &mut VisualTestContext, delta| {
+        let center = ui
+            .debug_bounds("conversation-history-focus")
+            .unwrap()
+            .center();
+        ui.simulate_event(ScrollWheelEvent {
+            position: center,
+            delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
+            ..Default::default()
+        });
+    };
+    let approach = |ui: &mut VisualTestContext, direction, delta| {
+        (0..100)
+            .find_map(|_| {
+                let (ahead, height) = distance(ui, direction);
+                if ahead <= height {
+                    Some(ahead)
+                } else {
+                    scroll(ui, delta);
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("Не дошли до порога {direction:?}"))
+    };
+    let older_ahead = approach(ui, HistoryDirection::Older, 80.);
+    assert!(older_ahead > px(0.), "Старые сообщения запрошены до края");
+    let old_page = request(&requests, Load::Extend(41, HistoryDirection::Older));
+
+    let old_anchor = ui.read(|app| view.read(app).viewport.saved_anchor().unwrap().id);
+    assert!(distance(ui, HistoryDirection::Newer).0 > distance(ui, HistoryDirection::Newer).1);
+    if near_newer {
+        assert!(
+            approach(ui, HistoryDirection::Newer, -80.) > px(0.),
+            "Нижний край ещё не достигнут"
+        );
+    } else {
+        scroll(ui, -240.);
+        let (ahead, height) = distance(ui, HistoryDirection::Newer);
+        assert!(ahead > height, "Развернулись вдали от нижнего края");
+    }
+    assert!(
+        requests.try_recv().is_err(),
+        "Пока старый запрос в пути, второй запрос не запускается"
+    );
+    let (anchor, y_before, op_id) = ui.read(|app| {
+        let chat = view.read(app);
+        let id = chat.viewport.saved_anchor().unwrap().id;
+        (
+            id,
+            chat.tested_message_window_y(id).unwrap(),
+            chat.active.unwrap().id,
+        )
+    });
+    assert_ne!(old_anchor, anchor, "Разворот действительно сменил опору");
+
+    let captured = Rc::new(Cell::new(None));
+    let frame = captured.clone();
+    let subscription = ui.update(|window, app| {
+        window.observe(&view, app, move |chat, window, app| {
+            if frame.get().is_none()
+                && matches!(&chat.read(app).state, State::Ready(history)
+                    if history.messages.first().is_some_and(|row| row.id == Uuid::from_u128(1)))
+            {
+                window.refresh();
+                window.draw(app).clear();
+                let chat = chat.read(app);
+                frame.set(Some((
+                    chat.viewport.saved_anchor().map(|anchor| anchor.id),
+                    chat.tested_message_window_y(anchor),
+                )));
+            }
+        })
+    });
+    let mut extended = reading(&address, 1..111);
+    extended.older = HistoryEdge::More("older-next".into());
+    answer(old_page, extended, ui);
+    drop(subscription);
+
+    let (first_anchor, first_y) = captured.get().expect("Снимок старой страницы отрисован");
+    assert_eq!(first_anchor, Some(anchor));
+    let first_y = first_y.expect("Текущая опора видна в первом кадре");
+    assert!(
+        (first_y - y_before).abs() <= px(1.),
+        "Опора {anchor}: {y_before:?} → {first_y:?}"
+    );
+    let settled_y = ui.read(|app| view.read(app).tested_message_window_y(anchor).unwrap());
+    assert!((settled_y - y_before).abs() <= px(1.));
+    if !near_newer {
+        let (ahead, height) = distance(ui, HistoryDirection::Newer);
+        assert!(ahead > height, "После вставки порог ещё не достигнут");
+        assert!(
+            requests.try_recv().is_err(),
+            "Смена направления вдали от края не запускает запрос"
+        );
+        approach(ui, HistoryDirection::Newer, -80.);
+    }
+    let (ahead, height) = distance(ui, HistoryDirection::Newer);
+    assert!(
+        ahead > px(0.) && ahead <= height,
+        "Новый запрос ушёл заранее"
+    );
+    let new_page = request(&requests, Load::Extend(41, HistoryDirection::Newer));
+    assert!(
+        requests.try_recv().is_err(),
+        "Запрос вниз отправлен один раз"
+    );
+    eprintln!(
+        "history_reverse op_id={op_id} anchor_uuid={anchor} near_newer={near_newer} older_ahead_px={} newer_ahead_px={} y_before_px={} y_first_frame_px={} delta_px={}",
+        f32::from(older_ahead),
+        f32::from(ahead),
+        f32::from(y_before),
+        f32::from(first_y),
+        f32::from(first_y - y_before),
+    );
+
+    let (next_anchor, before_new_page) = ui.read(|app| {
+        let chat = view.read(app);
+        let id = chat.viewport.saved_anchor().unwrap().id;
+        (id, chat.tested_message_window_y(id).unwrap())
+    });
+    let mut final_page = reading(&address, 1..161);
+    final_page.older = HistoryEdge::More("older-next".into());
+    final_page.newer = HistoryEdge::End;
+    answer(new_page, final_page, ui);
+    assert!(requests.try_recv().is_err());
+    let after = ui.read(|app| view.read(app).tested_message_window_y(next_anchor).unwrap());
+    assert!((after - before_new_page).abs() <= px(1.));
+}
