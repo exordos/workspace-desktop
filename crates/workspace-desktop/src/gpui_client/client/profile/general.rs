@@ -1,0 +1,626 @@
+//! Показывает общие настройки и раскрывает их варианты прямо в сайдбаре.
+//! Выбор сохраняется в профиле. Горячие клавиши открываются поверх окна.
+
+use std::collections::HashMap;
+
+use gpui::{
+    AnyElement, Context, Div, FocusHandle, ScrollHandle, Stateful, WeakEntity, Window, div,
+    prelude::*, px, rgb,
+};
+
+use crate::gpui_client::{
+    contracts::AccountSession,
+    notification_audio,
+    preferences::{
+        ChatClick, IdleTimeout, Language, NotificationSound, PreferenceValues, Preferences,
+    },
+    right_panel::RightPanel,
+    runtime::RuntimeClient,
+    ui::{Icon, Palette, activate},
+};
+
+#[path = "hotkeys.rs"]
+mod hotkeys;
+pub(in crate::gpui_client::client) use hotkeys::Hotkeys;
+
+/// Разделы, которые пользователь может оставить открытыми одновременно.
+#[derive(Clone, Copy)]
+enum Section {
+    ChatClick, // Маршрут строки канала.
+    Sound,     // Звук уведомлений.
+    Language,  // Язык приложения.
+    Timeout,   // Автоматический выход.
+}
+
+/// Страница общих настроек для активного входа.
+pub(super) struct General {
+    host: WeakEntity<RightPanel>, // Стек, который показывает окно горячих клавиш.
+    session: AccountSession,      // Владелец страницы и её модалки.
+    expanded: [bool; 4],          // Видимость каждого списка вариантов.
+    focus: HashMap<&'static str, FocusHandle>, // Устойчивый фокус кнопок этого показа.
+    scroll: ScrollHandle,         // Положение страницы, пока открыта модалка.
+    storage_error: bool,          // Последнее изменение не удалось сохранить.
+}
+
+/// Текст и правая сторона строки рабочей панели.
+struct Row {
+    id: &'static str,               // Идентификатор действия и его фокуса.
+    label: &'static str,            // Основная подпись.
+    subtitle: Option<&'static str>, // Вторая строка или None.
+    icon: Icon,                     // Иконка в квадрате 32 px.
+    tail: AnyElement,               // Стрелка, выбранное значение или переключатель.
+}
+
+/// Вариант раскрытого списка, связанный с сохранением значения.
+struct OptionRow {
+    id: &'static str,                   // Устойчивый ID строки.
+    label: &'static str,                // Имя значения.
+    subtitle: Option<&'static str>,     // Подсказка при наличии.
+    active: bool,                       // Показывает галочку выбора.
+    choose: fn(&mut PreferenceValues),  // Записывает значение в снимок профиля.
+    preview: Option<NotificationSound>, // Звук для предпрослушивания у варианта выбора.
+}
+
+impl General {
+    /// Создаёт свёрнутую страницу настроек для выбранного аккаунта.
+    pub(super) fn new(
+        host: WeakEntity<RightPanel>,
+        session: AccountSession,
+        _runtime: RuntimeClient,
+        _: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            host,
+            session,
+            expanded: [false; 4],
+            focus: HashMap::new(),
+            scroll: ScrollHandle::new(),
+            storage_error: false,
+        }
+    }
+
+    /// Возвращает фокус одного элемента при повторной отрисовке.
+    fn focus(&mut self, id: &'static str, cx: &mut Context<Self>) -> FocusHandle {
+        self.focus
+            .entry(id)
+            .or_insert_with(|| cx.focus_handle().tab_stop(true))
+            .clone()
+    }
+
+    /// Рисует строку референса с отступом 8 px и общим активным фокусом.
+    fn row(
+        &mut self,
+        row: Row,
+        palette: Palette,
+        cx: &mut Context<Self>,
+        action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        let handle = self.focus(row.id, cx);
+        let id = row.id;
+        let weak = cx.weak_entity();
+        activate(
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .w_full()
+                .flex()
+                .justify_between()
+                .items_center()
+                .gap(px(8.))
+                .px(px(8.))
+                .py(px(6.))
+                .hover(|style| style.bg(palette.card_hover))
+                .child(
+                    div()
+                        .flex()
+                        .min_w_0()
+                        .min_h(px(32.))
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .size(px(32.))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(row.icon.element(px(22.), palette.text_secondary)),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .text_size(px(14.))
+                                .line_height(px(20.))
+                                .text_color(palette.text)
+                                .child(row.label)
+                                .children(row.subtitle.map(|subtitle| {
+                                    div()
+                                        .mt(px(4.))
+                                        .text_size(px(12.))
+                                        .line_height(px(20.))
+                                        .text_color(palette.text_muted)
+                                        .child(subtitle)
+                                })),
+                        ),
+                )
+                .child(row.tail),
+            Some(&handle),
+            palette,
+            move |window, app| {
+                let _ = weak.update(app, |view, cx| action(view, window, cx));
+            },
+        )
+    }
+
+    /// Рисует раскрываемую строку со стрелкой и её текущим значением.
+    fn section(
+        &mut self,
+        section: Section,
+        id: &'static str,
+        text: (&'static str, Option<&'static str>, Option<&'static str>),
+        icon: Icon,
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let (label, subtitle, value) = text;
+        let arrow = if self.expanded[section as usize] {
+            Icon::ChevronUp
+        } else {
+            Icon::ChevronRight
+        };
+        let color = value.map_or(palette.text, |_| palette.text_secondary);
+        let tail = div()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .min_w_0()
+            .text_size(px(14.))
+            .line_height(px(20.))
+            .text_color(color)
+            .children(value.map(|value| div().min_w_0().child(value)))
+            .child(arrow.element(px(16.), color))
+            .into_any_element();
+        self.row(
+            Row {
+                id,
+                label,
+                subtitle,
+                icon,
+                tail,
+            },
+            palette,
+            cx,
+            move |view, _, cx| {
+                let item = &mut view.expanded[section as usize];
+                *item = !*item;
+                cx.notify();
+            },
+        )
+    }
+
+    /// Показывает открытый список вариантов с разделителями и галочкой.
+    fn options(
+        &mut self,
+        section: Section,
+        rows: impl IntoIterator<Item = OptionRow>,
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        if !self.expanded[section as usize] {
+            return None;
+        }
+        let mut list = div()
+            .mx(px(8.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(palette.border)
+            .bg(palette.surface.opacity(0.6))
+            .overflow_hidden();
+        let weak = cx.weak_entity();
+        for (index, row) in rows.into_iter().enumerate() {
+            if index != 0 {
+                list = list.child(div().mx(px(8.)).h(px(1.)).bg(palette.border));
+            }
+            let focus = self.focus(row.id, cx);
+            let weak = weak.clone();
+            let id = row.id;
+            let choose = row.choose;
+            let preview = row.preview;
+            list = list.child(activate(
+                div()
+                    .id(id)
+                    .debug_selector(move || id.into())
+                    .flex()
+                    .justify_between()
+                    .items_start()
+                    .gap(px(12.))
+                    .p(px(8.))
+                    .hover(|style| style.bg(palette.card_hover))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(14.))
+                            .line_height(px(16.))
+                            .when(row.active, |label| {
+                                label.font_weight(gpui::FontWeight::MEDIUM)
+                            })
+                            .child(row.label)
+                            .children(row.subtitle.map(|subtitle| {
+                                div()
+                                    .mt(px(4.))
+                                    .text_size(px(12.))
+                                    .line_height(px(20.))
+                                    .text_color(palette.text_secondary)
+                                    .child(subtitle)
+                            })),
+                    )
+                    .when(row.active, |element| {
+                        element.child(Icon::Check.element(px(16.), palette.accent))
+                    }),
+                Some(&focus),
+                palette,
+                move |window, app| {
+                    let _ = weak.update(app, |view, cx| {
+                        if view.save(window, cx, choose)
+                            && let Some(sound) = preview
+                        {
+                            notification_audio::preview(sound);
+                        }
+                    });
+                },
+            ));
+        }
+        Some(list)
+    }
+
+    /// Сохраняет выбор и обновляет заинтересованные области окна.
+    fn save(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        choose: impl FnOnce(&mut PreferenceValues),
+    ) -> bool {
+        if !Preferences::is_selected(cx, &self.session.owner) {
+            return false;
+        }
+        self.storage_error = Preferences::update(cx, choose).is_err();
+        cx.notify();
+        window.refresh();
+        !self.storage_error
+    }
+
+    /// Рисует переключатель 36 × 20 px для локального параметра.
+    fn switch(
+        &mut self,
+        (id, label, icon): (&'static str, &'static str, Icon),
+        checked: bool,
+        palette: Palette,
+        cx: &mut Context<Self>,
+        toggle: fn(&mut PreferenceValues),
+    ) -> Stateful<Div> {
+        let tail = div()
+            .w(px(36.))
+            .h(px(20.))
+            .p(px(2.))
+            .rounded_full()
+            .flex_none()
+            .flex()
+            .justify_between()
+            .bg(if checked {
+                palette.accent
+            } else {
+                palette.border
+            })
+            .when(checked, |element| element.child(div()))
+            .child(div().size(px(16.)).rounded_full().bg(rgb(0xffffff)))
+            .into_any_element();
+        self.row(
+            Row {
+                id,
+                label,
+                icon,
+                subtitle: None,
+                tail,
+            },
+            palette,
+            cx,
+            move |view, window, cx| {
+                view.save(window, cx, toggle);
+            },
+        )
+    }
+
+    /// Открывает диалог над всем окном и возвращает фокус в эту строку при закрытии.
+    fn open_hotkeys(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let opener = self.focus("profile-hotkeys", cx);
+        Self::open_dialog(self.host.clone(), &self.session, opener, window, cx);
+    }
+
+    /// Использует тот же диалог из кнопки страницы или из сочетания помощи.
+    pub(super) fn open_dialog(
+        host: WeakEntity<RightPanel>,
+        session: &AccountSession,
+        opener: FocusHandle,
+        window: &mut Window,
+        app: &mut gpui::App,
+    ) {
+        let modal_host = host.clone();
+        let _ = host.update(app, |panel, cx| {
+            panel.open_modal(session, opener, window, cx, |_, cx| {
+                cx.new(|cx| hotkeys::Hotkeys::new(modal_host, session.owner.clone(), cx))
+            });
+        });
+    }
+}
+
+impl Render for General {
+    /// Показывает настройки в порядке Electron и раскрывает только выбранные группы.
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = Palette::for_window(window, cx);
+        let settings = Preferences::read(cx);
+        let (lang, chat_click, sound, dock_bounce, separate_call_window, idle_timeout) = (
+            settings.language,
+            settings.chat_click,
+            settings.notification_sound,
+            settings.dock_bounce,
+            settings.separate_call_window,
+            settings.idle_timeout,
+        );
+        let t = |ru, en| lang.text(ru, en);
+        let shortcuts = self.row(
+            Row {
+                id: "profile-hotkeys",
+                label: t("Горячие клавиши", "Keyboard shortcuts"),
+                subtitle: None,
+                icon: Icon::Command,
+                tail: Icon::ChevronRight
+                    .element(px(16.), palette.text)
+                    .into_any_element(),
+            },
+            palette,
+            cx,
+            Self::open_hotkeys,
+        );
+        div()
+            .id("profile-settings-page")
+            .debug_selector(|| "profile-settings-page".into())
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .pt(px(12.))
+            .pb(px(20.))
+            .text_color(palette.text)
+            .child(shortcuts)
+            .child(self.section(
+                Section::ChatClick,
+                "profile-chat-click",
+                (
+                    t("Клик по чату", "Chat click"),
+                    Some(t(
+                        "Что открывать при клике на чат",
+                        "What to open when clicking a chat",
+                    )),
+                    None,
+                ),
+                Icon::ChatBubble,
+                palette,
+                cx,
+            ))
+            .children(self.options(
+                Section::ChatClick,
+                [
+                    OptionRow {
+                        id: "profile-chat-click-general",
+                        label: t("Общий чат и топики", "General chat and topics"),
+                        subtitle: None,
+                        active: chat_click == ChatClick::General,
+                        choose: |value| value.chat_click = ChatClick::General,
+                        preview: None,
+                    },
+                    OptionRow {
+                        id: "profile-chat-click-latest",
+                        label: t("Последний топик", "Latest topic"),
+                        subtitle: Some(t(
+                            "Клик по аватару откроет общий чат",
+                            "Click the avatar to open the general chat",
+                        )),
+                        active: chat_click == ChatClick::LatestTopic,
+                        choose: |value| value.chat_click = ChatClick::LatestTopic,
+                        preview: None,
+                    },
+                ],
+                palette,
+                cx,
+            ))
+            .child(self.section(
+                Section::Sound,
+                "profile-sound",
+                (
+                    t("Звуки уведомлений", "Notification sound"),
+                    None,
+                    Some(sound_name(lang, sound)),
+                ),
+                Icon::VolumeUp,
+                palette,
+                cx,
+            ))
+            .children(self.options(Section::Sound, sound_options(lang, sound), palette, cx))
+            .child(self.switch(
+                (
+                    "profile-dock-bounce",
+                    t("Прыжок значка в Dock", "Bounce Dock icon"),
+                    Icon::DesktopWindows,
+                ),
+                dock_bounce,
+                palette,
+                cx,
+                |value| value.dock_bounce = !value.dock_bounce,
+            ))
+            .child(
+                self.switch(
+                    (
+                        "profile-call-window",
+                        t(
+                            "Открывать звонки в отдельном окне",
+                            "Open calls in a separate window",
+                        ),
+                        Icon::Phone,
+                    ),
+                    separate_call_window,
+                    palette,
+                    cx,
+                    |value| value.separate_call_window = !value.separate_call_window,
+                )
+                .gap(px(4.)),
+            )
+            .child(self.section(
+                Section::Language,
+                "profile-language",
+                (t("Язык", "Language"), None, Some(lang.name())),
+                Icon::Language,
+                palette,
+                cx,
+            ))
+            .children(self.options(
+                Section::Language,
+                [
+                    OptionRow {
+                        id: "profile-language-ru",
+                        label: Language::Ru.name(),
+                        subtitle: None,
+                        active: lang == Language::Ru,
+                        choose: |value| value.language = Language::Ru,
+                        preview: None,
+                    },
+                    OptionRow {
+                        id: "profile-language-en",
+                        label: Language::En.name(),
+                        subtitle: None,
+                        active: lang == Language::En,
+                        choose: |value| value.language = Language::En,
+                        preview: None,
+                    },
+                ],
+                palette,
+                cx,
+            ))
+            .child(self.section(
+                Section::Timeout,
+                "profile-timeout",
+                (
+                    t("Автовыход", "Auto sign-out"),
+                    Some(t("После неактивности", "After inactivity")),
+                    Some(timeout_name(lang, idle_timeout)),
+                ),
+                Icon::DeleteHistory,
+                palette,
+                cx,
+            ))
+            .children(self.options(
+                Section::Timeout,
+                timeout_options(lang, idle_timeout),
+                palette,
+                cx,
+            ))
+            .when(self.storage_error, |body| {
+                body.child(div().p(px(8.)).text_color(palette.danger).child(t(
+                    "Не удалось сохранить настройки",
+                    "Could not save settings",
+                )))
+            })
+    }
+}
+
+/// Возвращает подпись звука в строке и списке выбора.
+fn sound_name(lang: Language, sound: NotificationSound) -> &'static str {
+    match sound {
+        NotificationSound::Default => lang.text("По умолчанию", "Default"),
+        NotificationSound::Subtle => lang.text("Тихий", "Subtle"),
+        NotificationSound::Digital => lang.text("Цифровой", "Digital"),
+        NotificationSound::Glass => lang.text("Стекло", "Glass"),
+        NotificationSound::Pulse => lang.text("Пульс", "Pulse"),
+        NotificationSound::None => lang.text("Без звука", "Off"),
+    }
+}
+
+/// Собирает список звуков в порядке Electron.
+fn sound_options(lang: Language, active: NotificationSound) -> impl Iterator<Item = OptionRow> {
+    use NotificationSound::*;
+    let definitions: [(_, _, fn(&mut PreferenceValues)); 6] = [
+        ("profile-sound-default", Default, |value| {
+            value.notification_sound = Default
+        }),
+        ("profile-sound-subtle", Subtle, |value| {
+            value.notification_sound = Subtle
+        }),
+        ("profile-sound-digital", Digital, |value| {
+            value.notification_sound = Digital
+        }),
+        ("profile-sound-glass", Glass, |value| {
+            value.notification_sound = Glass
+        }),
+        ("profile-sound-pulse", Pulse, |value| {
+            value.notification_sound = Pulse
+        }),
+        ("profile-sound-off", None, |value| {
+            value.notification_sound = None
+        }),
+    ];
+    definitions
+        .into_iter()
+        .map(move |(id, sound, choose)| OptionRow {
+            id,
+            label: sound_name(lang, sound),
+            subtitle: std::option::Option::None,
+            active: active == sound,
+            choose,
+            preview: Some(sound),
+        })
+}
+
+/// Возвращает подпись длительности на выбранном языке.
+fn timeout_name(lang: Language, timeout: IdleTimeout) -> &'static str {
+    match timeout {
+        IdleTimeout::SixHours => lang.text("6 часов", "6 hours"),
+        IdleTimeout::TwelveHours => lang.text("12 часов", "12 hours"),
+        IdleTimeout::Day => lang.text("24 часа", "24 hours"),
+        IdleTimeout::ThreeDays => lang.text("3 дня", "3 days"),
+        IdleTimeout::Week => lang.text("7 дней", "7 days"),
+        IdleTimeout::Never => lang.text("Никогда", "Never"),
+    }
+}
+
+/// Собирает список тайм-аутов в порядке длительности.
+fn timeout_options(lang: Language, active: IdleTimeout) -> impl Iterator<Item = OptionRow> {
+    use IdleTimeout::*;
+    let definitions: [(_, _, fn(&mut PreferenceValues)); 6] = [
+        ("profile-timeout-6h", SixHours, |value| {
+            value.idle_timeout = SixHours
+        }),
+        ("profile-timeout-12h", TwelveHours, |value| {
+            value.idle_timeout = TwelveHours
+        }),
+        ("profile-timeout-24h", Day, |value| value.idle_timeout = Day),
+        ("profile-timeout-3d", ThreeDays, |value| {
+            value.idle_timeout = ThreeDays
+        }),
+        ("profile-timeout-7d", Week, |value| {
+            value.idle_timeout = Week
+        }),
+        ("profile-timeout-never", Never, |value| {
+            value.idle_timeout = Never
+        }),
+    ];
+    definitions
+        .into_iter()
+        .map(move |(id, timeout, choose)| OptionRow {
+            id,
+            label: timeout_name(lang, timeout),
+            subtitle: None,
+            active: active == timeout,
+            choose,
+            preview: None,
+        })
+}

@@ -7,21 +7,24 @@ use gpui::{
     App, Context, Div, EventEmitter, FocusHandle, ImageSource, RenderImage, Resource, ScrollHandle,
     SharedString, Stateful, Window, div, img, point, prelude::*, px,
 };
+use workspace_core::directory::{ProfilePresence, UserProfile};
 
 use super::{
-    Avatar, AvatarSize, BadgeTone, Button, ButtonAppearance, Icon, PANEL_RADIUS, Palette, TextRole,
+    Avatar, AvatarPresence, BadgeTone, Button, ButtonAppearance, Icon, PANEL_RADIUS, Palette,
+    TextRole,
     controls::activate,
     icons::ORGANIZATION_LOGO,
     label,
     popup::{MenuInput, bind_menu_keys, menu_layer, menu_navigation, menu_surface, tooltip},
-    theme::{NAVIGATION_CHIP_RADIUS, ellipsized_label},
+    theme::{ellipsized_label, label_width},
     unread_badge,
 };
 use crate::gpui_client::contracts::AccountSession;
 
 const HEIGHT: f32 = 77.;
-const SECTION_SIZE: f32 = 44.;
-const SECTION_GAP: f32 = 4.;
+const SECTION_SIZE: f32 = 48.;
+const SECTION_GAP: f32 = 12.;
+const SECTION_ICON_SIZE: f32 = 32.;
 const QUICK_SIZE: f32 = 40.;
 const TRIGGER_SIZE: f32 = 32.;
 const GAP: f32 = 6.;
@@ -61,7 +64,7 @@ impl TopBarSection {
         Self::Calls,
     ];
 
-    /// Даёт разделу подпись для подсказки и заголовка.
+    /// Даёт разделу подпись для заголовка.
     pub const fn title(self) -> &'static str {
         match self {
             Self::Chats => "Чаты",
@@ -70,6 +73,19 @@ impl TopBarSection {
             Self::Contacts => "Контакты",
             Self::Calls => "Звонки",
         }
+    }
+
+    /// Даёт подпись для текущего языка интерфейса.
+    pub(in crate::gpui_client) fn localized_title(self, app: &App) -> &'static str {
+        let locale = crate::gpui_client::preferences::Preferences::read(app).language;
+        let english = match self {
+            Self::Chats => "Chats",
+            Self::Calendar => "Calendar",
+            Self::Mail => "Mail",
+            Self::Contacts => "Contacts",
+            Self::Calls => "Calls",
+        };
+        locale.text(self.title(), english)
     }
 
     /// Часть идентификатора кнопки и страницы раздела.
@@ -86,9 +102,9 @@ impl TopBarSection {
     /// Выбирает иконку раздела из набора Workspace.
     fn icon(self) -> Icon {
         match self {
-            Self::Chats => Icon::Chat,
+            Self::Chats => Icon::ChatBubble,
             Self::Calendar => Icon::Calendar,
-            Self::Mail => Icon::Mail,
+            Self::Mail => Icon::Envelope,
             Self::Contacts => Icon::Group,
             Self::Calls => Icon::Phone,
         }
@@ -117,6 +133,7 @@ pub struct TopBar {
     trigger_focus: FocusHandle,   // Сюда возвращается фокус после закрытия меню.
     profile_focus: FocusHandle,   // Кнопка профиля и точка возврата из панели.
     profile_avatar: Option<(AccountSession, Arc<RenderImage>)>, // Готовое фото входа, переданное окном.
+    profile_details: Option<(AccountSession, UserProfile)>,     // Имя и статус выбранного входа.
     menu_focus: FocusHandle, // Одна точка клавиатурного ввода для всего меню.
     menu_scroll: ScrollHandle, // Удерживает активную строку в видимой части меню.
     highlight: Option<MenuRow>, // Подсвеченная строка. None означает закрытое меню.
@@ -135,6 +152,7 @@ impl TopBar {
             trigger_focus: cx.focus_handle(),
             profile_focus: cx.focus_handle(),
             profile_avatar: None,
+            profile_details: None,
             menu_focus: cx.focus_handle(),
             menu_scroll: ScrollHandle::new(),
             highlight: None,
@@ -149,6 +167,18 @@ impl TopBar {
     ) {
         if self.profile_avatar != avatar {
             self.profile_avatar = avatar;
+            cx.notify();
+        }
+    }
+
+    /// Показывает сведения только для поколения, которому они принадлежат.
+    pub(in crate::gpui_client) fn set_profile_details(
+        &mut self,
+        details: Option<(AccountSession, UserProfile)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.profile_details != details {
+            self.profile_details = details;
             cx.notify();
         }
     }
@@ -433,7 +463,9 @@ impl TopBar {
             .child(ellipsized_label(
                 palette,
                 TextRole::Label,
-                "Добавить аккаунт",
+                crate::gpui_client::preferences::Preferences::read(cx)
+                    .language
+                    .text("Добавить аккаунт", "Add account"),
             ))
     }
 
@@ -498,7 +530,7 @@ impl TopBar {
             MenuInput::Close => self.dismiss_menu(window, cx),
         }
     }
-    /// Рисует компактную кнопку раздела с подсказкой и клавиатурной активацией.
+    /// Рисует кнопку раздела с общей зоной для клика и наведения.
     fn section_button(
         &self,
         section: TopBarSection,
@@ -508,10 +540,20 @@ impl TopBar {
     ) -> Stateful<Div> {
         let target = cx.weak_entity();
         let active = self.section == section;
+        let available = !self.accounts.is_empty();
         let id: SharedString = format!("workspace-top-bar-{}", section.id()).into();
         let selector = id.clone();
+        let icon = section
+            .icon()
+            .element(
+                px(size.min(SECTION_ICON_SIZE)),
+                if active { palette.text } else { palette.icon },
+            )
+            .when(available, |icon| {
+                icon.group_hover(id.clone(), |style| style.text_color(palette.text))
+            });
         let button = div()
-            .id(id)
+            .id(id.clone())
             .debug_selector(move || selector.to_string())
             .size(px(size))
             .flex_none()
@@ -519,7 +561,7 @@ impl TopBar {
             .items_center()
             .justify_center()
             .overflow_hidden()
-            .rounded(NAVIGATION_CHIP_RADIUS)
+            .rounded(PANEL_RADIUS)
             .border_1()
             .border_color(if active {
                 palette.border
@@ -527,19 +569,22 @@ impl TopBar {
                 gpui::transparent_black()
             })
             .when(active, |button| button.bg(palette.card_selected))
-            .child(section.icon().element(px(size.min(24.)), palette.text));
-        if self.accounts.is_empty() {
+            .child(icon);
+        if !available {
             return button;
         }
         activate(
-            button.hover(|button| button.bg(palette.card_hover)),
+            button.group(id).hover(|style| {
+                style
+                    .bg(palette.icon_hover_fill.opacity(0.35))
+                    .border_color(palette.border)
+            }),
             None,
             palette,
             move |_, app| {
                 let _ = target.update(app, |_, cx| cx.emit(TopBarAction::OpenSection(section)));
             },
         )
-        .tooltip(move |_, app| tooltip(palette, section.title().into(), app))
     }
 
     /// Показывает активный аккаунт и открывает его панель профиля.
@@ -548,17 +593,55 @@ impl TopBar {
         account: &TopBarAccount,
         side: gpui::Pixels,
         palette: Palette,
+        window: &Window,
         cx: &Context<Self>,
     ) -> Div {
-        let initials: String = account.label.chars().next().into_iter().collect();
+        let profile = self
+            .profile_details
+            .as_ref()
+            .filter(|(session, _)| *session == account.session)
+            .map(|(_, profile)| profile);
+        let name: SharedString = profile
+            .map(|profile| profile.display_name.clone().into())
+            .unwrap_or_else(|| account.label.clone());
+        let language = crate::gpui_client::preferences::Preferences::read(cx).language;
+        let detail: SharedString = profile
+            .map(|profile| {
+                profile
+                    .status_label()
+                    .unwrap_or_else(|| {
+                        match profile.presence {
+                            Some(ProfilePresence::Active) => language.text("В сети", "Online"),
+                            Some(ProfilePresence::Idle | ProfilePresence::DoNotDisturb) => {
+                                language.text("Отошёл", "Away")
+                            }
+                            Some(ProfilePresence::Offline) => language.text("Не в сети", "Offline"),
+                            None => "",
+                        }
+                        .to_owned()
+                    })
+                    .into()
+            })
+            .unwrap_or_else(|| account.detail.clone());
+        let initials: String = name.chars().next().into_iter().collect();
         let mut avatar = Avatar::from_initials(initials);
-        avatar.size = AvatarSize::Small;
+        avatar.presence = match profile.and_then(|profile| profile.presence) {
+            Some(ProfilePresence::Active) => AvatarPresence::Online,
+            Some(ProfilePresence::Idle | ProfilePresence::DoNotDisturb) => AvatarPresence::Away,
+            _ => AvatarPresence::Hidden,
+        };
         avatar.image = self
             .profile_avatar
             .as_ref()
             .filter(|(session, _)| *session == account.session)
             .map(|(_, image)| ImageSource::Render(image.clone()));
         let has_image = avatar.image.is_some();
+        let label_width = label_width(palette, TextRole::Label, &name, window).max(label_width(
+            palette,
+            TextRole::Caption,
+            &detail,
+            window,
+        ));
         let target = cx.weak_entity();
         div()
             .w(side)
@@ -573,9 +656,10 @@ impl TopBar {
                 activate(
                     div()
                         .id("workspace-profile-trigger")
-                        .h(px(40.))
+                        .h(px(48.))
                         .min_w_0()
-                        .px_1()
+                        // С учётом границы фокуса отступ от края до аватара равен 6 px.
+                        .p(px(5.))
                         .rounded(PANEL_RADIUS)
                         .border_1()
                         .border_color(gpui::transparent_black())
@@ -583,34 +667,30 @@ impl TopBar {
                         .items_center()
                         .gap_2()
                         .overflow_hidden()
-                        .hover(|row| row.bg(palette.card_hover))
-                        .child(avatar.render(palette).when(has_image, |photo| {
-                            photo.debug_selector(|| "workspace-profile-avatar-photo".into())
-                        }))
+                        .hover(|row| row.bg(palette.card_selected))
+                        .child(
+                            avatar
+                                .render_at_with_background(palette, px(36.), None)
+                                .when(has_image, |photo| {
+                                    photo.debug_selector(|| "workspace-profile-avatar-photo".into())
+                                }),
+                        )
                         .child(
                             div()
                                 .min_w_0()
-                                .w(px(164.))
-                                .child(ellipsized_label(
-                                    palette,
-                                    TextRole::Label,
-                                    account.label.clone(),
-                                ))
-                                .child(ellipsized_label(
-                                    palette,
-                                    TextRole::Caption,
-                                    account.detail.clone(),
-                                )),
+                                .w(label_width)
+                                .max_w(px(164.))
+                                .child(ellipsized_label(palette, TextRole::Label, name))
+                                .child(ellipsized_label(palette, TextRole::Caption, detail)),
                         )
-                        .child(Icon::ChevronDown.element(px(16.), palette.text_secondary)),
+                        .child(Icon::ChevronDown.element(px(16.), palette.text_muted)),
                     Some(&self.profile_focus),
                     palette,
                     move |_, app| {
                         let _ = target.update(app, |_, cx| cx.emit(TopBarAction::OpenProfile));
                     },
                 )
-                .debug_selector(|| "workspace-profile-trigger".into())
-                .tooltip(move |_, app| tooltip(palette, "Профиль".into(), app)),
+                .debug_selector(|| "workspace-profile-trigger".into()),
             )
     }
 }
@@ -627,13 +707,14 @@ impl Render for TopBar {
         let gaps = (count - 1.) * section_gap;
         let section_size = SECTION_SIZE.min((available - gaps) / count);
         let side = (width - (section_size * count + gaps)) / 2.;
-        let inset = (side - TRIGGER_SIZE).clamp(0., START_INSET);
-        let quick = quick_count(self.accounts.len(), side - inset);
+        let quick = quick_count(self.accounts.len(), side);
         let hidden = self.accounts.len() - quick;
-        let overflow = hidden > 0 && side - inset >= TRIGGER_SIZE + GAP + OVERFLOW_SIZE;
-        let trigger_x = inset
-            + quick as f32 * (QUICK_SIZE + GAP)
-            + if overflow { OVERFLOW_SIZE + GAP } else { 0. };
+        let quick_width = quick as f32 * (QUICK_SIZE + GAP);
+        let overflow = hidden > 0 && side - quick_width >= TRIGGER_SIZE + GAP + OVERFLOW_SIZE;
+        let trigger_offset = quick_width + if overflow { OVERFLOW_SIZE + GAP } else { 0. };
+        // Сначала оставляем место кнопкам аккаунтов, затем внешнему отступу.
+        let inset = (side - trigger_offset - TRIGGER_SIZE).clamp(0., START_INSET);
+        let trigger_x = inset + trigger_offset;
 
         let target = cx.entity().downgrade();
         let mut trigger = Button::new("workspace-account-menu-trigger", "");
@@ -686,7 +767,14 @@ impl Render for TopBar {
                                 })
                                 .debug_selector(|| "workspace-account-menu-trigger".to_owned())
                                 .tooltip(move |_, app| {
-                                    tooltip(palette, "Выбрать аккаунт".into(), app)
+                                    let locale =
+                                        crate::gpui_client::preferences::Preferences::read(app)
+                                            .language;
+                                    tooltip(
+                                        palette,
+                                        locale.text("Выбрать аккаунт", "Select account").into(),
+                                        app,
+                                    )
                                 }),
                         )
                     }),
@@ -707,7 +795,7 @@ impl Render for TopBar {
                 self.accounts
                     .iter()
                     .find(|account| account.selected)
-                    .map(|account| self.active_identity(account, px(side), palette, cx)),
+                    .map(|account| self.active_identity(account, px(side), palette, window, cx)),
             )
             .when(self.highlight.is_some(), |bar| {
                 let origin = point(px(trigger_x), px((HEIGHT + TRIGGER_SIZE) / 2. + 6.));

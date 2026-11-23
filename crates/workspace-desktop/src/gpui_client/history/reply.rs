@@ -315,14 +315,14 @@ impl Conversation {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let stroke = &event.keystroke;
+        use crate::gpui_client::preferences::{Preferences, shortcuts::matching};
         if event.is_held
-            || stroke.key != "l"
-            || !stroke.modifiers.control
-            || stroke.modifiers.platform
-            || stroke.modifiers.shift
-            || stroke.modifiers.alt
             || self.reply_menu.item.is_some()
+            || matching(
+                &event.keystroke,
+                Preferences::read_for(cx, &self.address.route.owner),
+            )
+            .is_none_or(|shortcut| shortcut.id != "interface.quoteMessage")
         {
             return;
         }

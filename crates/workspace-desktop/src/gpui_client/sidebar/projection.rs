@@ -9,6 +9,10 @@ use workspace_core::{
     storage::HistoryScope,
 };
 
+use crate::gpui_client::preferences::appearance::SidebarSort;
+
+use super::order::sort_topics;
+
 const INITIAL_TOPIC_COUNT: usize = 3;
 
 /// Независимые ступени показа тем внутри раскрытого канала.
@@ -52,9 +56,15 @@ pub(super) struct Presentation {
     expanded: HashSet<Uuid>,        // Раскрытые вручную каналы вне поиска.
     reveals: HashMap<Uuid, Reveal>, // Временные ступени раскрытия отдельных тем.
     search_reveals: HashSet<Uuid>, // Каналы, в которых показаны также несовпавшие темы текущего запроса.
+    sort: SidebarSort,             // Режим порядка тем из настроек выбранного входа.
 }
 
 impl Presentation {
+    /// Применяет новый порядок тем и сообщает об изменении видимых строк.
+    pub(super) fn set_sort(&mut self, sort: SidebarSort) -> bool {
+        std::mem::replace(&mut self.sort, sort) != sort
+    }
+
     /// Возвращает true, когда изменился запрос и прежние поисковые раскрытия сброшены.
     pub(super) fn set_query(&mut self, raw: &str) -> bool {
         let query = raw.trim().to_lowercase();
@@ -97,7 +107,8 @@ impl Presentation {
         if chat.direct {
             return false;
         }
-        let Some((index, topic)) = ordered_topics(chat)
+        let Some((index, topic)) = sort_topics(chat, self.sort)
+            .into_iter()
             .enumerate()
             .find(|(_, topic)| topic.id == target)
         else {
@@ -244,8 +255,9 @@ impl Presentation {
             return name_matches.then_some(());
         }
 
-        let (mut matching, other): (Vec<_>, Vec<_>) =
-            ordered_topics(chat).partition(|topic| self.matches(&topic.name));
+        let (mut matching, other): (Vec<_>, Vec<_>) = sort_topics(chat, self.sort)
+            .into_iter()
+            .partition(|topic| self.matches(&topic.name));
         if !name_matches && matching.is_empty() {
             return None;
         }
@@ -288,21 +300,16 @@ impl Presentation {
         } else {
             None
         };
-        group.topics = ordered_topics(chat).take(visible).collect();
+        group.topics = sort_topics(chat, self.sort)
+            .into_iter()
+            .take(visible)
+            .collect();
     }
 
     /// Сравнивает уже нормализованный запрос с названием или именем.
     fn matches(&self, text: &str) -> bool {
         text.to_lowercase().contains(&self.query)
     }
-}
-
-/// Выдаёт незавершённые темы первыми, сохраняя порядок каталога внутри обеих групп.
-fn ordered_topics(chat: &Chat) -> impl Iterator<Item = &Topic> {
-    chat.topics
-        .iter()
-        .filter(|topic| !topic.metadata.is_done)
-        .chain(chat.topics.iter().filter(|topic| topic.metadata.is_done))
 }
 
 #[cfg(test)]

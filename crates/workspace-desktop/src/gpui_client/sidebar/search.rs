@@ -54,7 +54,12 @@ pub(super) fn render(
                 .min_w(px(24.))
                 .px(px(3.))
                 .tooltip(move |_, app| {
-                    crate::gpui_client::ui::popup::tooltip(palette, "Очистить поиск".into(), app)
+                    let locale = crate::gpui_client::preferences::Preferences::read(app).language;
+                    crate::gpui_client::ui::popup::tooltip(
+                        palette,
+                        locale.text("Очистить поиск", "Clear search").into(),
+                        app,
+                    )
                 })
                 .debug_selector(|| "catalog-clear".into()),
         );

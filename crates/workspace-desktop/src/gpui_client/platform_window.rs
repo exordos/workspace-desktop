@@ -285,17 +285,25 @@ impl WindowPlatform {
             return;
         };
         let target = &click.target;
+        let settings = super::preferences::Preferences::read_for(app, &target.context);
+        let title = settings.language.text("Новое сообщение", "New message");
+        let body_label = settings.language.text("Аккаунт", "Account");
+        if settings.notification_sound != super::preferences::NotificationSound::None {
+            super::notification_audio::preview(settings.notification_sound);
+        }
+        if settings.dock_bounce {
+            macos::request_attention();
+        }
         let AccountId(account) = &target.context.account_id;
         let id = format!(
             "{}/{}/{}",
             account, target.context.project_id, target.message_id
         );
         let label = label.unwrap_or_else(|| account.get(..8).unwrap_or(account));
-        let body = format!("Аккаунт {label}");
-        let delivery =
-            platform
-                .notifications
-                .show(&id, "Новое сообщение", &body, target, click.generation);
+        let body = format!("{body_label} {label}");
+        let delivery = platform
+            .notifications
+            .show(&id, title, &body, target, click.generation);
         let op_id = operation();
         log::debug!("op_id={op_id} event=workspace_notification_requested");
         app.spawn(async move |_| {

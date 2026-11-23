@@ -37,6 +37,19 @@ pub(super) struct RailEntry {
     pub unread: Option<u32>, // Серверный счётчик, если он известен.
 }
 
+impl RailEntry {
+    /// Переводит системное имя папки и сохраняет пользовательский текст.
+    fn title_for(&self, app: &App) -> &str {
+        let locale = crate::gpui_client::preferences::Preferences::read(app).language;
+        match self.kind {
+            FolderKind::All => locale.text("Все чаты", "All chats"),
+            FolderKind::Personal => locale.text("Личные", "Direct messages"),
+            FolderKind::Channels => locale.text("Каналы", "Channels"),
+            _ => &self.title,
+        }
+    }
+}
+
 /// Входные данные и настройки панели папок текущего аккаунта.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct RailState {
@@ -368,10 +381,14 @@ impl FolderRail {
 
     /// Подготавливает быстрый список и сразу переводит ввод в поиск.
     fn open_quick(&mut self, serial: u64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.serial != serial || !self.state.vertical || !self.overflow {
+        if self.serial != serial || self.state.visible().next().is_none() {
             return;
         }
-        self.query.update(cx, |query, cx| query.clear(cx));
+        let locale = crate::gpui_client::preferences::Preferences::read(cx).language;
+        self.query.update(cx, |query, cx| {
+            query.set_placeholder(locale.text("Найти папку", "Find a folder"), cx);
+            query.clear(cx);
+        });
         self.quick_scroll = ScrollHandle::new();
         if let Some(index) = self
             .state
@@ -392,9 +409,19 @@ impl FolderRail {
                 }
             },
         );
-        let bounds = self.quick_button.bounds();
+        let anchor = if self.state.vertical {
+            let bounds = if self.overflow {
+                self.quick_button.bounds()
+            } else {
+                self.first.bounds()
+            };
+            point(bounds.right(), bounds.top())
+        } else {
+            let bounds = self.scroll.bounds();
+            point(bounds.left(), bounds.bottom())
+        };
         self.overlay = Some(Overlay::Quick {
-            anchor: point(bounds.right(), bounds.top()),
+            anchor,
             active: None,
             _submit: submit,
         });
@@ -402,12 +429,19 @@ impl FolderRail {
         cx.notify();
     }
 
+    /// Открывает доступный список папок из назначенного клавиатурного сочетания.
+    pub(super) fn open_quick_shortcut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_quick(self.serial, window, cx);
+    }
+
     /// Возвращает видимые папки, отфильтрованные по названию без учёта регистра.
     fn quick_entries(&self, app: &App) -> Vec<&RailEntry> {
         let query = self.query.read(app).text().trim().to_lowercase();
         self.state
             .visible()
-            .filter(|entry| query.is_empty() || entry.title.to_lowercase().contains(&query))
+            .filter(move |entry| {
+                query.is_empty() || entry.title_for(app).to_lowercase().contains(&query)
+            })
             .collect()
     }
 

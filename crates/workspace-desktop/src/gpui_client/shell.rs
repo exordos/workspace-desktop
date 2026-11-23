@@ -253,6 +253,40 @@ impl Shell {
         Some(self.open_conversation(route, generation))
     }
 
+    /// Повторяет сохранённый переход, только если разговор ещё в каталоге текущего входа.
+    pub(super) fn restore_navigation(
+        &mut self,
+        route: Option<&ChatRoute>,
+    ) -> Result<Option<ShellEffect>, ()> {
+        let selected = self
+            .selected()
+            .filter(|session| self.is_active(session))
+            .ok_or(())?;
+        if self.conversation.as_ref().map(|address| &address.route) == route {
+            return Ok(None);
+        }
+        let generation = selected.generation;
+        if let Some(route) = route {
+            let chats = selected
+                .catalog_chats(
+                    self.selected_catalog(),
+                    self.folders.get(&route.owner).map(Arc::as_ref),
+                )
+                .ok_or(())?;
+            if selected.owner != route.owner || !catalog_contains(chats, route.scope) {
+                return Err(());
+            }
+        }
+        self.begin_navigation();
+        Ok(match route {
+            Some(route) => Some(self.open_conversation(route.clone(), generation)),
+            None => self
+                .conversation
+                .take()
+                .map(|_| ShellEffect::CloseConversation),
+        })
+    }
+
     /// Открывает тему из проверенного снимка панели текущего разговора.
     pub(super) fn open_details_topic(
         &mut self,

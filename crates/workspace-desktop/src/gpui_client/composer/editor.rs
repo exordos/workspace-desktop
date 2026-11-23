@@ -2,7 +2,10 @@
 
 use std::{cell::RefCell, ops::Range, rc::Rc};
 
-use crate::gpui_client::ui::{Palette, ThemeMode};
+use crate::gpui_client::{
+    preferences::{Language, Preferences},
+    ui::Palette,
+};
 
 mod formatting;
 mod text_menu;
@@ -41,10 +44,6 @@ mod keys {
             Cut,
             Paste,
             OpenTextMenu,
-            FormatBold,
-            FormatItalic,
-            FormatStrike,
-            FormatInlineCode,
         ]
     );
 }
@@ -127,7 +126,7 @@ impl Editor {
     }
 
     /// Показывает снимок выбранной вкладки ответа.
-    pub(super) fn show_reply(&mut self, text: &str, cx: &mut Context<Self>) {
+    pub(in crate::gpui_client) fn show_reply(&mut self, text: &str, cx: &mut Context<Self>) {
         self.replace(0..self.text.len(), text, cx);
     }
 
@@ -170,10 +169,6 @@ impl Editor {
             KeyBinding::new("cmd-v", keys::Paste, Some("WorkspaceComposerEditor")),
             KeyBinding::new("shift-f10", keys::OpenTextMenu, Some("ComposerSends")),
             KeyBinding::new("menu", keys::OpenTextMenu, Some("ComposerSends")),
-            KeyBinding::new("cmd-b", keys::FormatBold, Some("ComposerSends")),
-            KeyBinding::new("cmd-i", keys::FormatItalic, Some("ComposerSends")),
-            KeyBinding::new("cmd-shift-x", keys::FormatStrike, Some("ComposerSends")),
-            KeyBinding::new("cmd-e", keys::FormatInlineCode, Some("ComposerSends")),
         ]);
     }
 
@@ -197,6 +192,32 @@ impl Editor {
         let inserted = self.replace(selection, &text, cx);
         self.anchor = inserted.start + relative_selection.start;
         self.caret = inserted.start + relative_selection.end;
+    }
+
+    /// Применяет выбранную комбинацию только в рабочем поле без активной композиции IME.
+    fn format_shortcut(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::gpui_client::preferences::{Preferences, shortcuts::matching};
+        if self.marked.is_some() || self.text_menu.is_open() {
+            return;
+        }
+        let Some(shortcut) = matching(&event.keystroke, Preferences::read(cx)) else {
+            return;
+        };
+        let format = match shortcut.id {
+            "composer.bold" => Format::Bold,
+            "composer.italic" => Format::Italic,
+            "composer.strike" => Format::Strike,
+            "composer.code" => Format::InlineCode,
+            _ => return,
+        };
+        self.apply_format(format, cx);
+        window.prevent_default();
+        cx.stop_propagation();
     }
 
     /// Продолжает список по Shift+Enter или вставляет обычный перевод строки.
@@ -546,24 +567,13 @@ impl Render for Editor {
             .when(self.send_on_enter, |field| {
                 field
                     .on_key_down(cx.listener(Self::handle_enter))
+                    .on_key_down(cx.listener(Self::format_shortcut))
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(Self::open_text_menu_at_pointer),
                     )
                     .on_action(cx.listener(|editor, _: &keys::OpenTextMenu, window, cx| {
                         editor.open_text_menu_from_keyboard(window, cx);
-                    }))
-                    .on_action(cx.listener(|editor, _: &keys::FormatBold, _, cx| {
-                        editor.apply_format(Format::Bold, cx)
-                    }))
-                    .on_action(cx.listener(|editor, _: &keys::FormatItalic, _, cx| {
-                        editor.apply_format(Format::Italic, cx)
-                    }))
-                    .on_action(cx.listener(|editor, _: &keys::FormatStrike, _, cx| {
-                        editor.apply_format(Format::Strike, cx)
-                    }))
-                    .on_action(cx.listener(|editor, _: &keys::FormatInlineCode, _, cx| {
-                        editor.apply_format(Format::InlineCode, cx)
                     }))
             })
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
@@ -694,6 +704,7 @@ fn measure_text(
     editor: &Editor,
     style: &TextStyle,
     palette: Palette,
+    locale: Language,
     width: Pixels,
     line_height: Pixels,
     window: &Window,
@@ -702,9 +713,9 @@ fn measure_text(
     let text = if !placeholder {
         editor.text()
     } else if editor.framed_probe {
-        "Сообщение…"
+        locale.text("Сообщение…", "Message…")
     } else {
-        "Написать сообщение…"
+        locale.text("Написать сообщение…", "Write a message…")
     };
     let selection = editor.selection();
     let mut boundaries = vec![0, text.len(), selection.start, selection.end];
@@ -803,7 +814,7 @@ impl Element for EditorSurface {
 
         let editor = self.0.clone();
         let text_style = window.text_style();
-        let palette = Palette::for_mode(ThemeMode::from(window.appearance()));
+        let palette = Palette::for_window(window, cx);
         let cache = measurement.clone();
         let id = window.request_measured_layout(style, move |known, available, window, cx| {
             let width = match (known.width, available.width) {
@@ -819,6 +830,7 @@ impl Element for EditorSurface {
                         editor.read(cx),
                         &text_style,
                         palette,
+                        Preferences::read(cx).language,
                         width,
                         LINE_HEIGHT,
                         window,
@@ -855,7 +867,8 @@ impl Element for EditorSurface {
                 measure_text(
                     editor,
                     &window.text_style(),
-                    Palette::for_mode(ThemeMode::from(window.appearance())),
+                    Palette::for_window(window, cx),
+                    Preferences::read(cx).language,
                     bounds.size.width,
                     line_height,
                     window,
@@ -906,7 +919,7 @@ impl Element for EditorSurface {
         let caret_color = if editor.framed_probe {
             rgb(0x94b3ff).into()
         } else {
-            Palette::for_mode(ThemeMode::from(window.appearance())).accent
+            Palette::for_window(window, cx).accent
         };
         window.handle_input(&focus, ElementInputHandler::new(bounds, self.0.clone()), cx);
         window.with_content_mask(Some(ContentMask { bounds }), |window| {

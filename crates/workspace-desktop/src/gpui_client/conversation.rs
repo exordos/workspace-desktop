@@ -18,8 +18,8 @@ use std::collections::HashMap;
 
 use futures::channel::oneshot;
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyDownEvent, Pixels, Render,
-    ScrollWheelEvent, Subscription, Window, canvas, div, prelude::*, px,
+    App, Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyDownEvent, ObjectFit, Pixels,
+    Render, ScrollWheelEvent, StyledImage, Subscription, Window, canvas, div, img, prelude::*, px,
 };
 use uuid::Uuid;
 use workspace_core::{
@@ -39,6 +39,7 @@ use super::{
     avatars::AvatarImages,
     composer::{Composer, ComposerEvent, QueueWriteOutcome, SendSource, Submission},
     contracts::{AccountSession, ChatEntry, ConversationAddress},
+    preferences::Preferences,
     right_panel::RightPanel,
     runtime::RuntimeClient,
     ui::{
@@ -123,6 +124,17 @@ pub struct Conversation {
 }
 
 impl Conversation {
+    /// Возвращает фокус истории и открытого редактора для обхода рабочего окна.
+    pub(super) fn history_and_editor_focus(&self, app: &App) -> (FocusHandle, Option<FocusHandle>) {
+        let editor = self
+            .sending
+            .as_ref()
+            .map(|sending| sending.view.read(app))
+            .filter(|editor| self.has_access() && editor.reply_available())
+            .map(|editor| editor.editor_focus(app));
+        (self.history_focus.clone(), editor)
+    }
+
     /// Регистрирует клавиши просмотра фото для рабочего окна.
     pub(super) fn bind_attachment_keys(app: &mut App) {
         Attachments::bind_keys(app);
@@ -317,10 +329,11 @@ impl Conversation {
             session.owner == self.address.route.owner
                 && session.generation == self.address.generation
         });
-        let heading = session
+        let chats = session
             .and(catalog)
             .filter(|catalog| catalog.generation == self.address.generation)
-            .and_then(|catalog| catalog.chats.as_deref())
+            .and_then(|catalog| catalog.chats.as_ref());
+        let heading = chats
             .and_then(|chats| chats.iter().find(|chat| chat.id == scope.stream_id))
             .map(|chat| Heading {
                 chat: Some(chat.name.clone()),
@@ -339,6 +352,13 @@ impl Conversation {
         if heading != self.heading {
             self.heading = heading;
             self.refresh_heading_avatar(cx);
+            cx.notify();
+        }
+        if self
+            .details
+            .as_mut()
+            .is_some_and(|panel| panel.set_catalog(chats))
+        {
             cx.notify();
         }
     }
@@ -974,11 +994,21 @@ impl Conversation {
 impl Conversation {
     /// Рисует название чата или тему и название её канала из каталога.
     fn render_heading(&self, palette: Palette, cx: &Context<Self>) -> gpui::Div {
+        let locale = Preferences::read_for(cx, &self.address.route.owner).language;
         let chat = self.heading.chat.as_deref();
         let (title, detail) = if self.address.route.scope.topic_id.is_some() {
-            (self.heading.topic.as_deref().unwrap_or("Тема"), chat)
+            (
+                self.heading
+                    .topic
+                    .as_deref()
+                    .unwrap_or(locale.text("Тема", "Topic")),
+                chat,
+            )
         } else {
-            (chat.unwrap_or("Разговор"), None)
+            (
+                chat.unwrap_or(locale.text("Разговор", "Conversation")),
+                None,
+            )
         };
         div()
             .debug_selector(|| "conversation-heading".into())
@@ -1040,6 +1070,7 @@ impl Conversation {
         palette: Palette,
         cx: &Context<Self>,
     ) -> gpui::Div {
+        let locale = Preferences::read_for(cx, &self.address.route.owner).language;
         let disabled = self.active.is_some()
             || self
                 .action_error
@@ -1056,13 +1087,13 @@ impl Conversation {
             (
                 &history.older,
                 "history-older",
-                "Старые сообщения",
+                locale.text("Старые сообщения", "Older messages"),
                 HistoryDirection::Older,
             ),
             (
                 &history.newer,
                 "history-newer",
-                "Новые сообщения",
+                locale.text("Новые сообщения", "Newer messages"),
                 HistoryDirection::Newer,
             ),
         ] {
@@ -1090,24 +1121,35 @@ impl Conversation {
         cause: Option<Failure>,
         cx: &Context<Self>,
     ) -> gpui::Div {
+        let locale = Preferences::read_for(cx, &self.address.route.owner).language;
+        let t = |ru, en| locale.text(ru, en);
         let retry: fn(&mut Self, &mut Context<Self>) = Self::retry;
         let (message, command) = match cause {
-            Some(Failure::AccessLost) => ("Доступ к разговору отозван", None),
+            Some(Failure::AccessLost) => (
+                t(
+                    "Доступ к разговору отозван",
+                    "Access to this conversation was revoked",
+                ),
+                None,
+            ),
             Some(Failure::MissingMessage) => (
-                "Сообщение больше недоступно",
+                t(
+                    "Сообщение больше недоступно",
+                    "This message is no longer available",
+                ),
                 Some((
                     "history-latest",
-                    "К последним",
+                    t("К последним", "Go to latest"),
                     Self::latest as fn(&mut Self, &mut Context<Self>),
                 )),
             ),
             Some(_) => (
-                "Не удалось загрузить сообщения",
-                Some(("history-retry", "Повторить", retry)),
+                t("Не удалось загрузить сообщения", "Could not load messages"),
+                Some(("history-retry", t("Повторить", "Retry"), retry)),
             ),
             None => (
-                "Не удалось обновить историю",
-                Some(("history-retry", "Повторить", retry)),
+                t("Не удалось обновить историю", "Could not refresh history"),
+                Some(("history-retry", t("Повторить", "Retry"), retry)),
             ),
         };
         div()
@@ -1135,7 +1177,8 @@ impl Conversation {
 
     /// Возвращает кнопку перехода к хвосту, когда читатель находится выше последних сообщений.
     fn render_latest(&self, palette: Palette, cx: &Context<Self>) -> gpui::Div {
-        let mut latest = Button::new("history-latest", "К последним");
+        let locale = Preferences::read_for(cx, &self.address.route.owner).language;
+        let mut latest = Button::new("history-latest", locale.text("К последним", "Go to latest"));
         latest.icon = Some(Icon::ChevronDown);
         latest.disabled = self.active.is_some();
         div().absolute().bottom_3().right_3().child(
@@ -1149,6 +1192,7 @@ impl Conversation {
 impl Conversation {
     /// Показывает шапку и историю, отделяя первые состояния от ошибок догрузки.
     fn render_chat(&mut self, palette: Palette, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let locale = Preferences::read_for(cx, &self.address.route.owner).language;
         let root = div()
             .id("conversation-chat")
             .debug_selector(|| "conversation-chat".into())
@@ -1180,13 +1224,22 @@ impl Conversation {
                         .gap_2()
                         .debug_selector(|| "history-loading".into())
                         .child(Icon::Pending.element(px(24.), palette.accent))
-                        .child(label(palette, TextRole::Body, "Загружаем историю…")),
+                        .child(label(
+                            palette,
+                            TextRole::Body,
+                            locale.text("Загружаем историю…", "Loading history…"),
+                        )),
                 ),
             ),
             State::Failed(cause) => {
                 root.child(centered.child(self.render_problem(palette, Some(*cause), cx)))
             }
             State::Ready(history) => {
+                let route = &self.address.route;
+                let background = Preferences::read_for(cx, &route.owner)
+                    .appearance
+                    .background
+                    .for_chat(Some(route.scope));
                 let latest = self.entry != ChatEntry::Latest
                     || history.newer != HistoryEdge::End
                     || !self.viewport.at_tail();
@@ -1202,10 +1255,14 @@ impl Conversation {
                     .action_error
                     .map(|_| self.render_problem(palette, None, cx));
                 let viewport = if empty {
-                    label(palette, TextRole::Caption, "Сообщений пока нет")
-                        .m_auto()
-                        .debug_selector(|| "history-empty".into())
-                        .into_any_element()
+                    label(
+                        palette,
+                        TextRole::Caption,
+                        locale.text("Сообщений пока нет", "No messages yet"),
+                    )
+                    .m_auto()
+                    .debug_selector(|| "history-empty".into())
+                    .into_any_element()
                 } else {
                     let reply = self
                         .sending
@@ -1235,6 +1292,18 @@ impl Conversation {
                         .flex_1()
                         .min_h_0()
                         .min_w_0()
+                        .children(background.map(|background| {
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .overflow_hidden()
+                                .debug_selector(|| "conversation-background".into())
+                                .child(
+                                    img(background.source())
+                                        .size_full()
+                                        .object_fit(ObjectFit::Cover),
+                                )
+                        }))
                         .child(paging)
                         .child(self.history_frame(palette, viewport, cx))
                         .children(problem.map(|problem| {

@@ -1,11 +1,13 @@
 //! Преобразует подтверждённые данные Messenger в видимые сведения и разрешённые кнопки.
 
+use std::collections::HashMap;
+
 use gpui::{App, ImageSource, SharedString, rgb};
 use workspace_core::{
     directory::{ProfilePresence, UserProfile},
     messenger::details::{
-        ChannelSidebar, DirectSidebar, SidebarDetails, SidebarMember, StreamNotificationMode,
-        StreamRole, TopicNotificationMode, sidebar_profile_link,
+        ChannelSidebar, DirectSidebar, SidebarDetails, SidebarMember, SidebarTopic,
+        StreamNotificationMode, StreamRole, TopicNotificationMode, sidebar_profile_link,
     },
 };
 
@@ -18,8 +20,57 @@ use super::{
 };
 use crate::gpui_client::{
     contracts::ConversationAddress,
+    preferences::{Preferences, appearance::SidebarSort},
+    sidebar::order::sort_topics,
     ui::{AvatarPresence, Icon},
 };
+
+/// Показывает обычные темы перед приглушёнными, используя активный режим и превью каталога.
+fn panel_topics<'a>(
+    panel: &Panel,
+    channel: &'a ChannelSidebar,
+    address: &ConversationAddress,
+    app: &App,
+) -> Vec<&'a SidebarTopic> {
+    let mode = Preferences::read_for(app, &address.route.owner)
+        .appearance
+        .sort;
+    let positions: HashMap<_, _> = panel
+        .catalog
+        .as_deref()
+        .and_then(|chats| {
+            chats
+                .iter()
+                .find(|chat| chat.id == address.route.scope.stream_id)
+        })
+        .map(|chat| {
+            sort_topics(chat, mode)
+                .into_iter()
+                .enumerate()
+                .map(|(index, topic)| (topic.id, index))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut topics: Vec<_> = channel.topics.iter().filter(|topic| !topic.done).collect();
+    topics.sort_by_key(|topic| {
+        let muted = channel_topic_muted(channel, topic);
+        let unread_first =
+            mode == SidebarSort::UnreadFirst && !muted && topic.active_unread_count > 0;
+        (
+            muted,
+            !unread_first,
+            positions.get(&topic.id).copied().unwrap_or(usize::MAX),
+        )
+    });
+    topics
+}
+
+/// Наследует режим уведомлений канала, если тема не переопределяет его явно.
+fn channel_topic_muted(channel: &ChannelSidebar, topic: &SidebarTopic) -> bool {
+    topic.notification_mode == TopicNotificationMode::Mute
+        || (topic.notification_mode == TopicNotificationMode::Default
+            && channel.notification_mode == StreamNotificationMode::Muted)
+}
 
 /// Подбирает одно из двух представлений для выбранного адреса.
 pub(super) fn content(
@@ -163,19 +214,13 @@ fn channel_content(
             })
             .count(),
         topics_expanded: panel.topics_expanded,
-        topics: channel
-            .topics
-            .iter()
-            .filter(|topic| !topic.done)
+        topics: panel_topics(panel, channel, address, app)
+            .into_iter()
             .map(|topic| TopicView {
                 id: topic.id,
                 title: topic.name.clone().into(),
                 selected: current_topic == Some(topic.id),
-                muted: Some(
-                    topic.notification_mode == TopicNotificationMode::Mute
-                        || (topic.notification_mode == TopicNotificationMode::Default
-                            && channel.notification_mode == StreamNotificationMode::Muted),
-                ),
+                muted: Some(channel_topic_muted(channel, topic)),
                 unread: u64::from(if topic.active_unread_count > 0 {
                     topic.active_unread_count
                 } else {

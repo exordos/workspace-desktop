@@ -1,4 +1,4 @@
-//! Переносит цвета Blue Mist в GPUI и задаёт общие радиусы и роли текста.
+//! Подключает палитры Workspace к режиму текущего окна и задаёт общие радиусы и роли текста.
 
 use gpui::{
     App, Div, FontWeight, Hsla, Pixels, ShapedLine, SharedString, Window, WindowAppearance, canvas,
@@ -7,12 +7,14 @@ use gpui::{
 
 use unicode_segmentation::UnicodeSegmentation;
 
+use super::super::preferences::{Preferences, appearance::ThemeChoice};
+
+mod workspace_palettes;
+
 /// Радиус панелей рабочего окна, строк каталога и меню действий.
 pub(in crate::gpui_client) const PANEL_RADIUS: Pixels = px(6.);
 /// Радиус композера, диалога, всплывающей панели и подсказки.
 pub(in crate::gpui_client) const SURFACE_RADIUS: Pixels = px(10.);
-/// Радиус кнопки раздела в верхней навигации.
-pub(super) const NAVIGATION_CHIP_RADIUS: Pixels = px(12.);
 /// Радиус внешних углов пузыря сообщения.
 pub(super) const MESSAGE_BUBBLE_RADIUS: Pixels = px(18.);
 /// Радиус компактных кнопок и полей ввода UI-кита.
@@ -42,7 +44,7 @@ impl From<WindowAppearance> for ThemeMode {
     }
 }
 
-/// Цвета Blue Mist и видимость рамки фокуса для текущей отрисовки.
+/// Цвета активной палитры и видимость рамки фокуса для текущей отрисовки.
 #[derive(Clone, Copy, Debug)]
 pub struct Palette {
     pub background: Hsla,       // Фон окна и нейтральная подложка аватара.
@@ -70,6 +72,7 @@ pub struct Palette {
     pub icon: Hsla,             // Цвет обычной иконки.
     pub disabled: Hsla,         // Иконка недоступного действия.
     pub icon_hover: Hsla,       // Иконка под указателем.
+    pub icon_hover_fill: Hsla,  // Цвет подложки кнопки раздела до применения прозрачности.
     pub presence_online: Hsla,  // Индикатор «В сети».
     pub presence_away: Hsla,    // Индикатор «Отошёл».
     pub(in crate::gpui_client) keyboard_focus_visible: bool, // Можно показать рамку у элемента с фокусом.
@@ -78,7 +81,19 @@ pub struct Palette {
 impl Palette {
     /// Берёт оформление и видимость рамки фокуса из текущего окна.
     pub(in crate::gpui_client) fn for_window(window: &Window, app: &App) -> Self {
-        Self::for_mode(ThemeMode::from(window.appearance())).with_window_input(window, app)
+        let system = ThemeMode::from(window.appearance());
+        let palette = if app.try_global::<Preferences>().is_some() {
+            let preferences = &Preferences::read(app).appearance;
+            let mode = match preferences.theme {
+                ThemeChoice::Light => ThemeMode::Light,
+                ThemeChoice::Dark => ThemeMode::Dark,
+                ThemeChoice::System => system,
+            };
+            workspace_palettes::workspace_palette(mode, preferences.palette)
+        } else {
+            Self::for_mode(system)
+        };
+        palette.with_window_input(window, app)
     }
 
     /// Добавляет способ ввода окна к выбранной палитре, например в галерее двух тем.
@@ -121,6 +136,7 @@ impl Palette {
                 icon: rgb(0x8d9bae).into(),
                 disabled: rgb(0xb8c3d1).into(),
                 icon_hover: rgb(0x1a2330).into(),
+                icon_hover_fill: rgb(0xdce8fb).into(),
                 presence_online: rgb(0x26c038).into(),
                 presence_away: rgb(0xff8900).into(),
                 keyboard_focus_visible: false,
@@ -151,6 +167,7 @@ impl Palette {
                 icon: rgb(0x748396).into(),
                 disabled: rgb(0x4b596a).into(),
                 icon_hover: rgb(0xaab9cc).into(),
+                icon_hover_fill: rgb(0xaab9cc).into(),
                 presence_online: rgb(0x26c038).into(),
                 presence_away: rgb(0xff8900).into(),
                 keyboard_focus_visible: false,
@@ -207,6 +224,24 @@ impl TextRole {
 /// Рисует текст системным шрифтом GPUI в заданной роли.
 pub fn label(palette: Palette, role: TextRole, text: impl Into<SharedString>) -> Div {
     text_role(palette, role).child(text.into())
+}
+
+/// Измеряет подпись тем же шрифтом, которым её рисует шапка.
+pub(super) fn label_width(
+    palette: Palette,
+    role: TextRole,
+    text: &SharedString,
+    window: &Window,
+) -> Pixels {
+    let (size, _, weight, _) = role.style(palette);
+    let mut style = window.text_style();
+    style.font_weight = weight;
+    let run = style.to_run(text.len());
+    window
+        .text_system()
+        .shape_line(text.clone(), size, &[run], None)
+        .width
+        .ceil()
 }
 
 /// Задаёт общую роль текста для надписей и выделяемого тела сообщения.

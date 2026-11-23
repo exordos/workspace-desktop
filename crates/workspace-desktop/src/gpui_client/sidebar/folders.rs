@@ -83,6 +83,17 @@ impl FolderPane {
 impl EventEmitter<FolderIntent> for Sidebar {}
 
 impl Sidebar {
+    /// Показывает быстрый список папок из глобальной клавиатурной команды.
+    pub(in crate::gpui_client) fn open_folder_list(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.folders
+            .rail
+            .update(cx, |rail, cx| rail.open_quick_shortcut(window, cx));
+    }
+
     /// Подтверждает, что обход Tab дошёл до поиска в рабочем окне.
     #[cfg(all(test, feature = "gpui-test"))]
     pub(in crate::gpui_client) fn tested_search_focused(
@@ -126,6 +137,45 @@ impl Sidebar {
             active.folder_settings = self.folders.preferences(&active.session.owner);
         }
         self.update_folder_view(cx);
+    }
+
+    /// Возвращает текущее размещение папок только для активного входа.
+    pub(in crate::gpui_client) fn folder_placement(
+        &self,
+        session: &AccountSession,
+    ) -> Option<bool> {
+        self.active
+            .as_ref()
+            .filter(|active| &active.session == session)
+            .map(|active| active.folder_settings.vertical)
+    }
+
+    /// Применяет расположение из панели настроек, сохраняя видимость системных папок.
+    pub(in crate::gpui_client) fn set_folder_placement(
+        &mut self,
+        session: &AccountSession,
+        vertical: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(active) = &mut self.active
+            && &active.session == session
+            && active.folder_settings.vertical != vertical
+        {
+            active.folder_settings.vertical = vertical;
+            self.save_folder_preferences(cx);
+        }
+    }
+
+    /// Публикует один снимок для живого сайдбара и записи на диск в рабочем потоке.
+    fn save_folder_preferences(&mut self, cx: &mut Context<Self>) {
+        if let Some(active) = &self.active {
+            let (session, value) = (active.session.clone(), active.folder_settings);
+            self.folders
+                .preferences
+                .insert(session.owner.clone(), value);
+            cx.emit(FolderIntent::Preferences { session, value });
+            self.update_folder_view(cx);
+        }
     }
 
     /// Разрешает серверные действия только после подтверждения сессии.
@@ -336,12 +386,7 @@ impl Sidebar {
                 } else {
                     value.vertical = !value.vertical;
                 }
-                let (session, value) = (active.session.clone(), *value);
-                self.folders
-                    .preferences
-                    .insert(session.owner.clone(), value);
-                cx.emit(FolderIntent::Preferences { session, value });
-                self.update_folder_view(cx);
+                self.save_folder_preferences(cx);
             }
             RailAction::Retry => self.send_folder_command(FolderCommand::Retry, false, cx),
             RailAction::Create | RailAction::Edit(_) | RailAction::Delete(_) => {

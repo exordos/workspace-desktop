@@ -19,6 +19,7 @@ struct Fixture {
     open_focus: FocusHandle,    // Фокус основного маршрута.
     expand_focus: FocusHandle,  // Фокус кнопки раскрытия.
     preview_focus: FocusHandle, // Фокус области превью.
+    avatar_focus: FocusHandle,  // Фокус перехода в общую тему.
     preview_id: Option<Uuid>,   // Какое сообщение показывается в тестовой карточке.
     calls: Vec<Action>,         // Последовательность принятых действий.
 }
@@ -65,7 +66,7 @@ impl Render for Fixture {
                         focus: self.preview_focus.clone(),
                         on_open: Self::record(cx, Action::Preview),
                     }),
-                    avatar: Some(Self::record(cx, Action::General)),
+                    avatar: Some((self.avatar_focus.clone(), Self::record(cx, Action::General))),
                 },
             ),
         )
@@ -78,6 +79,7 @@ fn fixture(_: &mut Window, cx: &mut Context<Fixture>) -> Fixture {
         open_focus: cx.focus_handle(),
         expand_focus: cx.focus_handle(),
         preview_focus: cx.focus_handle(),
+        avatar_focus: cx.focus_handle(),
         preview_id: Some(Uuid::from_u128(2)),
         calls: Vec::new(),
     }

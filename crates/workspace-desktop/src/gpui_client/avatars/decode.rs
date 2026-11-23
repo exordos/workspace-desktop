@@ -17,7 +17,7 @@ pub(super) const MAX_STILL_BYTES: u32 = MAX_RENDER_SIDE * MAX_RENDER_SIDE * 4;
 const MAX_ANIMATION_FRAMES: usize = 96;
 
 /// Готовит BGRA-кадры и оставляет заглушку при повреждённом или слишком большом исходнике.
-pub(super) fn decode(avatar: &AvatarImage, animated: bool) -> Option<RenderImage> {
+pub(in crate::gpui_client) fn decode(avatar: &AvatarImage, animated: bool) -> Option<RenderImage> {
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_SOURCE_SIDE);
     limits.max_image_height = Some(MAX_SOURCE_SIDE);

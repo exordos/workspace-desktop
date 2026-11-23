@@ -414,6 +414,36 @@ impl Storage {
         Ok(read_unread(&connection, owner)?.map(|saved| saved.count))
     }
 
+    /// Убирает восстанавливаемые данные после остановки синхронизации всего профиля.
+    /// Черновики, очередь, защита доступа к черновикам и файлы остаются доступны после запуска.
+    pub fn clear_rebuildable_messenger_cache(&self) -> Result<(), StorageError> {
+        let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM sync_cursors WHERE source = ?1",
+            [crate::messenger::SOURCE_ID],
+        )?;
+        transaction.execute_batch(
+            "DELETE FROM history_windows;
+             DELETE FROM history_changes;
+             DELETE FROM sync_messages;
+             DELETE FROM messenger_notification_targets;
+             DELETE FROM messenger_unread;
+             DELETE FROM messenger_catalog;
+             DELETE FROM messenger_catalog_counts;
+             DELETE FROM messenger_catalog_fence;
+             DELETE FROM messenger_catalog_checkpoint;
+             DELETE FROM messenger_folders;
+             DELETE FROM messenger_folder_state;
+             DELETE FROM messenger_folder_refresh;
+             DELETE FROM directory_avatars;
+             DELETE FROM directory_avatar_state;
+             DELETE FROM messenger_media_refs;",
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Удаляет непригодную позицию и зависимые данные владельца одной транзакцией.
     pub(crate) fn reset_source(
         &self,
@@ -1170,6 +1200,51 @@ mod tests {
             id: id.into(),
             text: text.into(),
         }
+    }
+
+    /// Очистка удаляет историю и позицию журнала, сохраняя введённый текст и очередь.
+    #[test]
+    fn rebuildable_cache_reset_keeps_drafts_and_outbox() {
+        let storage = Storage::in_memory().unwrap();
+        let owner = owner();
+        let scope = DraftScope {
+            stream_id: Uuid::from_u128(1),
+            topic_id: Uuid::from_u128(2),
+        };
+        let access = storage.prepare_draft_access(&owner, scope).unwrap();
+        let draft = PlaintextDraft {
+            id: Uuid::from_u128(3),
+            version: 1,
+            markdown: "Черновик".into(),
+            replies: None,
+        };
+        storage.save_plaintext_draft(&access, &draft).unwrap();
+        let queued = PreparedSend {
+            canonical_id: Uuid::from_u128(4),
+            public_id: Uuid::from_u128(5),
+            stream_id: scope.stream_id,
+            topic_id: scope.topic_id,
+            markdown: "Ждёт отправки".into(),
+        };
+        storage.save_prepared_send(&owner, &queued).unwrap();
+        let source = crate::messenger::SOURCE_ID;
+        apply_message(
+            &storage,
+            &owner,
+            source,
+            cursor("epoch", 1),
+            message("old", "cache"),
+        )
+        .unwrap();
+        storage.clear_rebuildable_messenger_cache().unwrap();
+        assert!(storage.cursor(&owner, source).unwrap().is_none());
+        assert!(storage.message(&owner, "old").unwrap().is_none());
+        assert_eq!(storage.pending_sends(&owner).unwrap(), [queued]);
+        let saved = storage
+            .read_plaintext_draft(&access, Some(draft.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.markdown, draft.markdown);
     }
 
     /// Проверяет запись очереди после закрытия базы, повторного сохранения и сброса источника.

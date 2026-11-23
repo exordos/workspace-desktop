@@ -325,6 +325,7 @@ struct DetailsFixture {
 struct OwnAvatarFixture {
     lookups: AtomicUsize,   // Число чтений ссылки на своё фото по UUID пользователя.
     downloads: AtomicUsize, // Число скачиваний его файла.
+    status_updates: Mutex<Vec<Value>>, // Запрошенные правки статуса текущего пользователя.
 }
 
 impl DetailsFixture {
@@ -653,12 +654,24 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
 
     if let Some(details) = &state.details {
         if let Some(own) = &details.profile_avatar {
+            if path == format!("/api/workspace/v1/users/{USER}/actions/presence/invoke")
+                && user == USER
+            {
+                assert_eq!(request.method(), Method::POST);
+                let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                own.status_updates.lock().unwrap().push(body.clone());
+                return json_response(
+                    StatusCode::OK,
+                    json!({"uuid":USER,"username":"own","status":body["status"],"status_text":body["text"],"status_emoji":body["emoji"]}),
+                );
+            }
             if path == format!("/api/workspace/v1/users/{USER}") && user == USER {
                 assert_eq!(request.method(), Method::GET);
                 own.lookups.fetch_add(1, Ordering::SeqCst);
                 return json_response(
                     StatusCode::OK,
-                    json!({"uuid":USER,"avatar":format!("urn:image:{OWN_AVATAR_FILE}")}),
+                    json!({"uuid":USER,"username":"own","status":"idle","avatar":format!("urn:image:{OWN_AVATAR_FILE}")}),
                 );
             }
             if path
@@ -1114,9 +1127,9 @@ fn start_runtime(
     .unwrap()
 }
 
-/// Шапка и открытый профиль показывают своё фото, скачанное один раз под текущим входом.
+/// Шапка и личная карточка используют одно фото текущего входа.
 #[gpui::test]
-fn own_avatar_is_shared_between_top_bar_and_profile_root(cx: &mut TestAppContext) {
+fn own_avatar_is_shared_between_top_bar_and_personal_info(cx: &mut TestAppContext) {
     cx.update(bind_keys);
     let server = Server::serve(Received {
         details: Some(DetailsFixture {
@@ -1149,13 +1162,75 @@ fn own_avatar_is_shared_between_top_bar_and_profile_root(cx: &mut TestAppContext
         |ui| ui.debug_bounds("workspace-profile-avatar-photo").is_some(),
     );
     click(ui, "workspace-profile-trigger");
+    click(ui, "profile-personal-info");
     until(
         ui,
-        "то же фото отображается на корневой странице профиля",
-        |ui| ui.debug_bounds("profile-root-avatar-photo").is_some(),
+        "то же фото отображается на странице личной информации",
+        |ui| ui.debug_bounds("profile-personal-avatar-photo").is_some(),
     );
-    assert_eq!(counters.lookups.load(Ordering::SeqCst), 1);
+    // Помимо общего запроса аватара, корень и карточка читают свои поля справочника.
+    assert!(counters.lookups.load(Ordering::SeqCst) >= 1);
     assert_eq!(counters.downloads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        futures::executor::block_on(runtime.shutdown()),
+        RuntimeExit::Clean
+    );
+}
+
+/// Автоматический idle не становится ручным отсутствием при сохранении текста статуса.
+#[gpui::test]
+fn own_status_modal_posts_normalized_values_to_active_owner(cx: &mut TestAppContext) {
+    cx.update(bind_keys);
+    let server = Server::serve(Received {
+        details: Some(DetailsFixture {
+            profile_avatar: Some(OwnAvatarFixture::default()),
+            ..DetailsFixture::default()
+        }),
+        ..Received::default()
+    });
+    let profile = tempfile::tempdir().unwrap();
+    let (runtime, events) =
+        start_runtime(profile.path(), saved_account(&server, USER, Uuid::nil()));
+    let (client, ui) =
+        cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
+    ui.update(|_, app| {
+        let subscription = events.attach(&client, app, Client::handle_runtime);
+        client.update(app, |client, cx| client.attach(subscription, cx));
+    });
+    ui.simulate_resize(size(px(1440.), px(900.)));
+    until(
+        ui,
+        "доступен вход текущего владельца",
+        |ui| ui.debug_bounds("workspace-profile-avatar-photo").is_some(),
+    );
+    click(ui, "workspace-profile-trigger");
+    click(ui, "profile-status");
+    until(
+        ui,
+        "исходный профиль загружен перед изменением",
+        |ui| ui.debug_bounds("profile-status-ready").is_some(),
+    );
+    click(ui, "profile-status-text");
+    ui.simulate_input("  На встрече  ");
+    click(ui, "profile-status-save");
+    until(
+        ui,
+        "ответ закрывает модалку и возвращает панель",
+        |ui| !ui.read(|app| client.read(app).right_panel.read(app).has_modal()),
+    );
+    let own = server
+        .state
+        .details
+        .as_ref()
+        .unwrap()
+        .profile_avatar
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        *own.status_updates.lock().unwrap(),
+        [json!({"status":"active","emoji":null,"text":"На встрече"})],
+    );
+    assert!(ui.debug_bounds("profile-root-page").is_some());
     assert_eq!(
         futures::executor::block_on(runtime.shutdown()),
         RuntimeExit::Clean
@@ -1923,7 +1998,9 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
 
     click(ui, "workspace-profile-trigger");
     click(ui, "profile-settings");
-    click(ui, "right-panel-close-all");
+    click(ui, "profile-close");
+    assert!(ui.read(|app| first.read(app).tested_details_is_open(app)));
+    click(ui, "conversation-details-close");
     ui.read(|app| {
         assert!(!first.read(app).tested_details_is_open(app));
         first

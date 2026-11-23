@@ -80,7 +80,7 @@ impl Avatar {
     }
 
     /// Сохраняет стандартную палитру или подбирает контраст для заданного цвета.
-    fn render_at_with_background(
+    pub(super) fn render_at_with_background(
         self,
         palette: Palette,
         size: gpui::Pixels,

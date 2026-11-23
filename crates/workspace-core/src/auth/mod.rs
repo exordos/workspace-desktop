@@ -419,11 +419,36 @@ impl Auth {
         self.load_accounts()?;
         let slot = self.slot_or_insert(account_id);
         let mut state = slot.lock().unwrap();
+        self.logout_state(account_id, &mut state)
+    }
+
+    /// Завершает только поколение, из которого окно подтвердило выход.
+    pub fn logout_generation(
+        &self,
+        context: &OwnerContext,
+        generation: SessionGeneration,
+    ) -> Result<(), AuthError> {
+        let slot = self.account_slot(&context.account_id)?;
+        let mut state = slot.lock().unwrap();
+        if state.generation != generation
+            || state.record.as_ref().map(|record| &record.context) != Some(context)
+        {
+            return Err(AuthError::SessionUnavailable);
+        }
+        self.logout_state(&context.account_id, &mut state)
+    }
+
+    /// Публикует отзыв доступа до удаления секретов, пока заблокирован исходный вход.
+    fn logout_state(
+        &self,
+        account_id: &AccountId,
+        state: &mut AccountState,
+    ) -> Result<(), AuthError> {
         state.end(SessionStatus::SigningOut);
         state.generation = SessionGeneration(self.next_sequence());
-        self.publish(account_id, &state);
-        self.finish_logout(&mut state)?;
-        self.publish(account_id, &state);
+        self.publish(account_id, state);
+        self.finish_logout(state)?;
+        self.publish(account_id, state);
         Ok(())
     }
 

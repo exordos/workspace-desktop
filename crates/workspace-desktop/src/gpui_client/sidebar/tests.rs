@@ -728,6 +728,32 @@ fn stream_header_preview_and_chevron_have_separate_actions(cx: &mut TestAppConte
         events.borrow().as_slice(),
         &[open(&a, 2, Some(3)), open(&a, 2, Some(4))]
     );
+
+    ui.update(|window, app| {
+        AppPreferences::select(app, Some(&a.owner));
+        AppPreferences::update(app, |settings| settings.chat_click = ChatClick::LatestTopic)
+            .unwrap();
+        window.refresh();
+    });
+    ui.run_until_parked();
+    let header = ui.debug_bounds(row(2, None)).unwrap();
+    ui.simulate_click(
+        point(header.left() + px(70.), header.top() + px(13.)),
+        Modifiers::none(),
+    );
+    click(
+        ui,
+        "catalog-stream-avatar-00000000-0000-0000-0000-000000000002",
+    );
+    assert_eq!(
+        events.borrow().as_slice(),
+        &[
+            open(&a, 2, Some(3)),
+            open(&a, 2, Some(4)),
+            open(&a, 2, Some(4)),
+            open(&a, 2, Some(3))
+        ]
+    );
 }
 
 /// Проверяет переход по результатам и возврат фокуса после показа и скрытия остальных тем.

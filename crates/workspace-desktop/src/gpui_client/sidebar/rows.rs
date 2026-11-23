@@ -9,8 +9,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
 use crate::gpui_client::ui::{
-    Avatar, AvatarPresence, BadgeTone, ChatRow, ChatRowPreview, Icon, PANEL_RADIUS, Palette,
-    TextRole, activate, ellipsized_label, label, popup::tooltip, unread_badge,
+    Avatar, AvatarPresence, AvatarSize, BadgeTone, ChatRow, ChatRowPreview, Icon, PANEL_RADIUS,
+    Palette, TextRole, activate, ellipsized_label, label, popup::tooltip, unread_badge,
 };
 
 /// Имя группы наведения для кнопки раскрытия внутри канала.
@@ -27,6 +27,8 @@ pub(super) struct ChatRowDetails {
     pub(super) image: Option<ImageSource>,      // Готовое фото собеседника в личном чате.
     pub(super) pinned: bool,                    // Закрепление в папке, в которой показана строка.
     pub(super) muted: bool,                     // Строка приглушается из-за режима уведомлений.
+    pub(super) compact: bool,                   // Уменьшает строку и скрывает превью и время.
+    pub(super) hide_avatar: bool, // Прячет аватар, если он не служит отдельным переходом.
 }
 
 /// Действие, которое оболочка связывает с состоянием каталога.
@@ -37,7 +39,7 @@ pub(super) struct ChannelActions {
     pub(super) open: Option<RowAction>, // Открывает основной маршрут канала.
     pub(super) toggle: RowAction,       // Разворачивает или сворачивает список тем.
     pub(super) preview: Option<PreviewAction>, // Открывает тему последнего сообщения.
-    pub(super) avatar: Option<RowAction>, // Открывает общую тему, если основная область ведёт в другую.
+    pub(super) avatar: Option<(FocusHandle, RowAction)>, // Фокус и действие для перехода в общую тему.
 }
 
 /// Отдельная область перехода к теме последнего сообщения.
@@ -59,6 +61,30 @@ pub(super) fn direct_row(
 ) -> Stateful<Div> {
     let mut avatar = row_avatar(&title, details.presence);
     avatar.image = details.image;
+    if details.compact {
+        avatar.size = AvatarSize::Small;
+        let row = compact_stream(row_surface(ElementId::Uuid(id), palette, selected))
+            .bg(if selected {
+                palette.card_selected
+            } else {
+                palette.card
+            })
+            .children((!details.hide_avatar).then(|| avatar.render(palette)))
+            .child(ChatRow::text(palette, title, None))
+            .children(
+                ChatRow::metadata(
+                    palette,
+                    None,
+                    details.unread,
+                    details.mention,
+                    details.pinned.then(|| pin(palette)),
+                )
+                .map(|column| column.min_w(px(32.))),
+            )
+            .when(details.muted, |row| row.opacity(0.7))
+            .debug_selector(move || format!("catalog-chat-{id}"));
+        return activate(row, focus, palette, on_open);
+    }
     ChatRow {
         id: ElementId::Uuid(id),
         avatar,
@@ -79,6 +105,11 @@ pub(super) fn direct_row(
     .min_h(px(64.))
     .when(details.muted, |row| row.opacity(0.7))
     .debug_selector(move || format!("catalog-chat-{id}"))
+}
+
+/// Задаёт плотные внутренние отступы для строки канала или личного чата.
+fn compact_stream(row: Stateful<Div>) -> Stateful<Div> {
+    row.min_h(px(32.)).gap_2().px(px(7.)).py(px(5.))
 }
 
 /// Рисует общую подложку для заголовка канала, его тем и кнопки раскрытия.
@@ -121,21 +152,24 @@ impl ChannelRow {
             avatar,
         } = actions;
         let id = self.id;
-        let icon = row_avatar(&self.title, self.details.presence)
-            .render_with_background(palette, sidebar_color(self.color));
+        let mut icon = row_avatar(&self.title, self.details.presence);
+        if self.details.compact {
+            icon.size = AvatarSize::Small;
+        }
+        let icon = icon.render_with_background(palette, sidebar_color(self.color));
         let avatar = div()
             .relative()
-            .size(px(40.))
+            .size(px(if self.details.compact { 32. } else { 40. }))
             .flex_none()
             .child(icon)
-            .children(avatar.map(|action| {
+            .children(avatar.map(|(focus, action)| {
                 let text: SharedString = format!("Общий чат: {}", self.title).into();
                 // Отдельный маршрут накрывает существующий аватар целиком.
                 inner_action(
                     "avatar".into(),
                     palette,
                     palette.card_hover.opacity(0.25),
-                    None,
+                    Some(&focus),
                     action,
                 )
                 .absolute()
@@ -153,24 +187,29 @@ impl ChannelRow {
             .flex_1()
             .min_w_0()
             .child(title)
-            .children(self.details.preview.map(|message| {
-                let caption = preview_label(palette, message);
-                match preview {
-                    Some(preview) => inner_action(
-                        ElementId::Uuid(preview.id),
-                        palette,
-                        palette.card,
-                        Some(&preview.focus),
-                        preview.on_open,
-                    )
-                    .w_full()
-                    .min_w_0()
-                    .child(caption)
-                    .debug_selector(move || format!("catalog-stream-preview-{id}"))
-                    .into_any_element(),
-                    None => caption.into_any_element(),
-                }
-            }));
+            .children(
+                self.details
+                    .preview
+                    .filter(|_| !self.details.compact)
+                    .map(|message| {
+                        let caption = preview_label(palette, message);
+                        match preview {
+                            Some(preview) => inner_action(
+                                ElementId::Uuid(preview.id),
+                                palette,
+                                palette.card,
+                                Some(&preview.focus),
+                                preview.on_open,
+                            )
+                            .w_full()
+                            .min_w_0()
+                            .child(caption)
+                            .debug_selector(move || format!("catalog-stream-preview-{id}"))
+                            .into_any_element(),
+                            None => caption.into_any_element(),
+                        }
+                    }),
+            );
         let action = self.expanded.map(|expanded| {
             expand_slot(
                 id,
@@ -205,15 +244,19 @@ impl ChannelRow {
             .min_h(px(64.))
             .px(px(9.))
             .py(px(9.))
-            .child(avatar)
+            .when(self.details.compact, compact_stream)
+            .children((!self.details.hide_avatar).then_some(avatar))
             .child(body)
-            .children(ChatRow::metadata(
-                palette,
-                self.details.time,
-                unread,
-                self.details.mention,
-                action,
-            ))
+            .children(
+                ChatRow::metadata(
+                    palette,
+                    self.details.time.filter(|_| !self.details.compact),
+                    unread,
+                    self.details.mention,
+                    action,
+                )
+                .map(|column| column.when(self.details.compact, |column| column.min_w(px(32.)))),
+            )
             .when(self.details.muted, |row| row.opacity(0.7))
             .debug_selector(move || format!("catalog-chat-{id}"));
         row.when_some(open, |row, open| activate(row, focus, palette, open))
@@ -253,6 +296,9 @@ impl TopicRow {
         .pl(px(37.))
         .pr(px(7.))
         .py(px(7.))
+        .when(self.details.compact, |row| {
+            row.min_h(px(32.)).gap_2().pl(px(35.)).py(px(5.))
+        })
         .child(
             div()
                 .w(px(3.))
@@ -271,16 +317,20 @@ impl TopicRow {
                 .children(
                     self.details
                         .preview
+                        .filter(|_| !self.details.compact)
                         .map(|preview| preview_label(palette, preview)),
                 ),
         )
-        .children(ChatRow::metadata(
-            palette,
-            self.details.time,
-            self.details.unread,
-            self.details.mention,
-            None,
-        ))
+        .children(
+            ChatRow::metadata(
+                palette,
+                self.details.time.filter(|_| !self.details.compact),
+                self.details.unread,
+                self.details.mention,
+                None,
+            )
+            .map(|column| column.when(self.details.compact, |column| column.min_w(px(32.)))),
+        )
         .when(self.details.muted, |row| row.opacity(0.7))
         .debug_selector(move || selector.clone());
         activate(row, focus, palette, on_open)

@@ -7175,6 +7175,7 @@ dependencies = [
 name = "workspace-desktop"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "block2 0.5.1",
  "futures",
  "gpui",
@@ -7191,6 +7192,7 @@ dependencies = [
  "rpassword",
  "rustls",
  "security-framework",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

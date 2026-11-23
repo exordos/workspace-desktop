@@ -3,6 +3,7 @@
 
 mod history_positions;
 mod notification_banner;
+mod preference_runtime;
 
 use std::collections::HashMap;
 
@@ -12,6 +13,7 @@ use gpui::{
 use workspace_core::{
     auth::SessionStatus,
     context::{AccountId, OwnerContext, SessionGeneration},
+    directory::UserProfile,
 };
 
 use history_positions::HistoryPositions;
@@ -39,7 +41,7 @@ use super::{
 };
 
 mod profile;
-use profile::Profile;
+use profile::{Licenses, Profile, ProfileServices};
 
 /// Дополнительный вход в уже открытом окне.
 struct AddAccount {
@@ -89,6 +91,10 @@ pub(super) struct Client {
     shell: Shell,           // Выбор, адрес разговора и фильтр событий по входам.
     runtime: RuntimeClient, // Очередь команд рабочего потока этого профиля.
     sidebar: Entity<Sidebar>, // Единственный каталог; хранит поиск каждого входа.
+    sidebar_visible: bool,  // Показывается ли каталог в рабочем разделе.
+    search_return: Option<FocusHandle>, // Куда вернуться после завершения поиска сочетанием.
+    idle: Option<preference_runtime::IdleSession>, // Таймер автовыхода для выбранного входа.
+    places: preference_runtime::Places, // Маршруты навигации назад и вперёд выбранного входа.
     conversation: Option<Entity<Conversation>>, // Экран актуального адреса, если он открыт.
     history_positions: HistoryPositions, // Опоры чтения недавних разговоров этого окна.
     details_navigation: Option<Subscription>, // Подписка на переход из правой панели текущего экрана.
@@ -96,12 +102,18 @@ pub(super) struct Client {
     sign_in: Option<Entity<SignIn>>,          // Открытая форма первого или дополнительного входа.
     add_account: Option<AddAccount>,          // Ход дополнительного входа, пока видна форма.
     profile_requested: Option<AccountSession>, // Нажатие профиля ждёт окно для передачи фокуса.
+    licenses: Option<Entity<Licenses>>,       // Основная страница лицензий вместо разговора.
     profile_avatar: AvatarImages,             // Фото активного входа для верхней панели.
+    profile_subject: Option<AccountSession>,  // Владелец уже запрошенного видимого профиля.
+    profile_details: Option<UserProfile>,     // Подтверждённое имя и статус шапки.
     labels: HashMap<AccountId, String>,       // Подписи для переключателя и баннеров.
     top_bar: Entity<TopBar>, // Шапка хранит локальный фокус и показывает снимок оболочки.
     notification_banner: Entity<NotificationBanner>, // Планка разрешения поверх рабочей области.
     _top_bar_subscriptions: [Subscription; 2], // Выбор аккаунта и открытие экранов из шапки.
     initial_focus: FocusHandle, // Корневая точка обхода до выбора первого элемента.
+    top_zone: FocusHandle,   // Общий фокус шапки для обхода клавишей F6.
+    sidebar_zone: FocusHandle, // Общий фокус каталога и папок.
+    main_zone: FocusHandle,  // Фокус содержимого раздела или истории.
     restore_focus: Option<ReturnFocus>, // После закрытия формы вернуть фокус в рабочую область.
     ready: bool,             // Рабочий поток открыл профиль и подготовил подписки.
     received_accounts: bool, // Пришёл первый снимок аккаунтов, может быть пустым.
@@ -121,6 +133,11 @@ impl Client {
         })
         .detach();
         let top_bar = cx.new(TopBar::new);
+        cx.observe_global::<super::preferences::Preferences>(|client, cx| {
+            client.refresh_top_bar_accounts(cx);
+            cx.notify();
+        })
+        .detach();
         let initial_focus = cx.focus_handle();
         let notification_banner = cx.new(|cx| {
             NotificationBanner::new(
@@ -169,6 +186,10 @@ impl Client {
             shell: Shell::new(options.active),
             runtime,
             sidebar,
+            sidebar_visible: true,
+            search_return: None,
+            idle: None,
+            places: preference_runtime::Places::default(),
             conversation: None,
             history_positions: HistoryPositions::default(),
             right_panel,
@@ -176,12 +197,18 @@ impl Client {
             sign_in: None,
             add_account: None,
             profile_requested: None,
+            licenses: None,
             profile_avatar: AvatarImages::default(),
+            profile_subject: None,
+            profile_details: None,
             labels: options.labels,
             top_bar,
             notification_banner,
             _top_bar_subscriptions: [selection, top_bar_action],
             initial_focus,
+            top_zone: cx.focus_handle(),
+            sidebar_zone: cx.focus_handle(),
+            main_zone: cx.focus_handle(),
             restore_focus: None,
             ready: false,
             received_accounts: false,
@@ -428,9 +455,7 @@ impl Client {
             }
             None => {}
         }
-        let accounts = self.top_bar_accounts();
-        self.top_bar
-            .update(cx, |view, cx| view.set_accounts(accounts, cx));
+        self.refresh_top_bar_accounts(cx);
         let catalog = self.shell.selected_catalog();
         let conversation = self.shell.conversation();
         if let Some(view) = &self.conversation {
@@ -450,6 +475,7 @@ impl Client {
                 cx,
             );
         });
+        self.record_place();
         cx.notify();
     }
 
@@ -495,7 +521,7 @@ impl Client {
 
     /// Меняет показанный раздел, сохраняя открытый разговор до возврата в мессенджер.
     fn open_section(&mut self, section: TopBarSection, cx: &mut Context<Self>) {
-        if self.section != section && self.status().is_none() {
+        if self.status().is_none() && (self.licenses.take().is_some() || self.section != section) {
             self.section = section;
             if section != TopBarSection::Chats {
                 self.sidebar.update(cx, |view, cx| view.on_hidden(cx));
@@ -505,14 +531,39 @@ impl Client {
             self.top_bar
                 .update(cx, |bar, cx| bar.set_section(section, cx));
             log::debug!("event=workspace_section_opened section={}", section.id());
+            self.record_place();
             cx.notify();
         }
+    }
+
+    /// Открывает лицензионный реестр в рабочей области и закрывает сайдбар версии.
+    fn open_licenses(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let client = cx.weak_entity();
+        let licenses = cx.new(|cx| Licenses::new(client, cx));
+        self.licenses = Some(licenses.clone());
+        self.right_panel
+            .update(cx, |panel, cx| panel.close_all(window, cx));
+        licenses.read(cx).focus_search(window, cx);
+        self.sync_right_panel_context(cx);
+        self.sync_conversation_avatar_visibility(cx);
+        cx.notify();
+    }
+
+    /// Возвращает рабочий экран с фокусом на кнопке аккаунта.
+    fn close_licenses(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.licenses = None;
+        window.focus(&self.top_bar.read(cx).profile_focus());
+        self.sync_right_panel_context(cx);
+        self.sync_conversation_avatar_visibility(cx);
+        cx.notify();
+        window.refresh();
     }
 
     /// Выключает подписки на фото при уходе из рабочей области, сохраняя состояние разговора.
     fn sync_conversation_avatar_visibility(&self, cx: &mut Context<Self>) {
         if let Some(conversation) = &self.conversation {
             let visible = self.section == TopBarSection::Chats
+                && self.licenses.is_none()
                 && self.sign_in.is_none()
                 && self.status().is_none();
             let address = self.shell.conversation();
@@ -548,12 +599,16 @@ impl Client {
 
     /// Привязывает стек к входу и открытому разговору в видимом разделе.
     fn sync_right_panel_context(&self, cx: &mut Context<Self>) {
+        super::preferences::Preferences::select(
+            cx,
+            self.shell.selected().map(|session| &session.owner),
+        );
         let account = self
             .status()
             .is_none()
             .then(|| self.shell.selected())
             .flatten();
-        let conversation = (self.section == TopBarSection::Chats)
+        let conversation = (self.section == TopBarSection::Chats && self.licenses.is_none())
             .then(|| self.shell.conversation())
             .flatten();
         self.right_panel.update(cx, |panel, cx| {
@@ -569,9 +624,18 @@ impl Client {
             && self.status().is_none()
         {
             let opener = self.top_bar.read(cx).profile_focus();
-            self.right_panel.update(cx, |panel, cx| {
-                Profile::toggle(panel, session, opener, &self.runtime, window, cx);
-            });
+            let services = ProfileServices {
+                runtime: self.runtime.clone(),
+                sidebar: self.sidebar.downgrade(),
+                client: cx.weak_entity(),
+                account_label: self
+                    .labels
+                    .get(&session.owner.account_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                details: self.profile_details.clone(),
+            };
+            Profile::toggle(&self.right_panel, session, opener, services, window, cx);
         }
     }
 
@@ -596,6 +660,82 @@ impl Client {
         };
         self.top_bar
             .update(cx, |bar, cx| bar.set_profile_avatar(avatar, cx));
+    }
+
+    /// Один раз читает имя и статус для нового поколения, отбрасывая поздние ответы.
+    fn sync_profile_details(&mut self, cx: &mut Context<Self>) {
+        let session = self
+            .shell
+            .selected()
+            .filter(|session| {
+                self.status().is_none() && self.sign_in.is_none() && session.user_uuid().is_some()
+            })
+            .cloned();
+        if self.profile_subject == session {
+            return;
+        }
+        self.profile_subject = session.clone();
+        self.profile_details = None;
+        self.top_bar
+            .update(cx, |bar, cx| bar.set_profile_details(None, cx));
+        if let Some(session) = session {
+            let runtime = self.runtime.clone();
+            cx.spawn(async move |client, cx| {
+                let requested = session.clone();
+                let result = runtime
+                    .request(move |services| async move {
+                        services
+                            .messenger
+                            .own_profile(&services.sync, &requested.owner, requested.generation)
+                            .await
+                    })
+                    .await;
+                if let Ok(Ok(profile)) = result {
+                    let _ = client.update(cx, |client, cx| {
+                        if client.profile_subject.as_ref() == Some(&session)
+                            && client.profile_details.is_none()
+                        {
+                            client.set_profile_details(&session, profile, cx);
+                        }
+                    });
+                }
+            })
+            .detach();
+        }
+    }
+
+    /// Сразу показывает подтверждённое состояние в кнопке аккаунта.
+    fn set_profile_details(
+        &mut self,
+        session: &AccountSession,
+        profile: UserProfile,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shell.selected() == Some(session)
+            && self.sign_in.is_none()
+            && self.status().is_none()
+        {
+            self.profile_details = Some(profile.clone());
+            self.top_bar.update(cx, |bar, cx| {
+                bar.set_profile_details(Some((session.clone(), profile)), cx)
+            });
+        }
+    }
+
+    /// После подтверждения IAM меняет имя, оставляя последние данные присутствия.
+    fn set_profile_name(
+        &mut self,
+        session: &AccountSession,
+        name: String,
+        fallback: Option<&UserProfile>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.profile_subject.as_ref() == Some(session)
+            && let Some(mut profile) = self.profile_details.as_ref().or(fallback).cloned()
+        {
+            profile.display_name = name;
+            self.set_profile_details(session, profile, cx);
+        }
     }
 
     /// Переключает тему из открытой панели и оставляет панель на новом адресе.
@@ -669,9 +809,12 @@ impl Client {
             .handle_action(ShellAction::SelectAccount(session))
     }
 
-    /// Подготавливает подписи и счётчики с учётом выбранного оболочкой входа.
-    fn top_bar_accounts(&self) -> Vec<TopBarAccount> {
-        self.shell
+    /// Обновляет подписи и счётчики шапки с учётом выбранного входа и языка.
+    fn refresh_top_bar_accounts(&self, cx: &mut Context<Self>) {
+        let locale = super::preferences::Preferences::read(cx).language;
+        let t = |ru, en| locale.text(ru, en);
+        let accounts = self
+            .shell
             .accounts()
             .iter()
             .enumerate()
@@ -681,12 +824,19 @@ impl Client {
                     .labels
                     .get(&session.owner.account_id)
                     .cloned()
-                    .unwrap_or_else(|| format!("Аккаунт {}", index + 1));
+                    .unwrap_or_else(|| format!("{} {}", t("Аккаунт", "Account"), index + 1));
                 let label = match account.status {
                     SessionStatus::Active => display_name,
-                    SessionStatus::Restoring => format!("{display_name} · Вход…"),
-                    SessionStatus::TemporarilyUnavailable => format!("{display_name} · Нет связи"),
-                    _ => format!("{display_name} · Требуется вход"),
+                    SessionStatus::Restoring => {
+                        format!("{display_name} · {}", t("Вход…", "Signing in…"))
+                    }
+                    SessionStatus::TemporarilyUnavailable => {
+                        format!("{display_name} · {}", t("Нет связи", "Offline"))
+                    }
+                    _ => format!(
+                        "{display_name} · {}",
+                        t("Требуется вход", "Sign-in required")
+                    ),
                 };
                 let server = session.owner.server.trim_start_matches("https://");
                 TopBarAccount {
@@ -697,7 +847,9 @@ impl Client {
                     unread: account.unread,
                 }
             })
-            .collect()
+            .collect();
+        self.top_bar
+            .update(cx, |view, cx| view.set_accounts(accounts, cx));
     }
 
     /// Сообщает о начальном состоянии или ошибке только безопасным текстом.
@@ -730,9 +882,11 @@ impl Render for Client {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.focus_workspace(window, cx);
         self.sync_profile_avatar(cx);
+        self.sync_profile_details(cx);
         RightPanel::restore_focus(&self.right_panel, window, cx);
         self.open_requested_profile(window, cx);
         let palette = Palette::for_window(window, cx);
+        let locale = super::preferences::Preferences::read(cx).language;
         let root = div()
             .size_full()
             .flex()
@@ -741,8 +895,17 @@ impl Render for Client {
             .bg(palette.background)
             .text_color(palette.text)
             .track_focus(&self.initial_focus)
+            .capture_any_mouse_down(cx.listener(|client, _, _, cx| client.idle_activity(cx)))
+            .on_mouse_move(cx.listener(|client, _, _, cx| client.idle_activity(cx)))
+            .on_scroll_wheel(cx.listener(|client, _, _, cx| client.idle_activity(cx)))
             .on_action(next_control)
             .on_action(previous_control)
+            .on_action(cx.listener(|client, _: &super::NextArea, window, cx| {
+                client.move_focus_area(false, window, cx);
+            }))
+            .on_action(cx.listener(|client, _: &super::PreviousArea, window, cx| {
+                client.move_focus_area(true, window, cx);
+            }))
             .on_action(cx.listener(|client, _: &Back, window, cx| {
                 client
                     .right_panel
@@ -755,6 +918,10 @@ impl Render for Client {
             }));
         if let Some(sign_in) = &self.sign_in {
             return root.child(div().flex().flex_1().min_h_0().child(sign_in.clone()));
+        }
+
+        if let Some(licenses) = &self.licenses {
+            return root.child(div().flex().flex_1().min_h_0().child(licenses.clone()));
         }
 
         let route_error = self.shell.route_error();
@@ -773,12 +940,13 @@ impl Render for Client {
             let section = self.section;
             div()
                 .relative()
+                .track_focus(&self.main_zone)
                 .flex()
                 .flex_1()
                 .min_h_0()
                 .min_w_0()
                 .child(
-                    label(palette, TextRole::Heading, section.title())
+                    label(palette, TextRole::Heading, section.localized_title(cx))
                         .id("workspace-section")
                         .debug_selector(move || format!("workspace-section-{}", section.id()))
                         .flex_1()
@@ -794,7 +962,11 @@ impl Render for Client {
                 .items_center()
                 .justify_center()
                 .p_4()
-                .child(label(palette, TextRole::Body, "Выберите разговор"));
+                .child(label(
+                    palette,
+                    TextRole::Body,
+                    locale.text("Выберите разговор", "Select a conversation"),
+                ));
             div()
                 .flex()
                 .flex_1()
@@ -802,19 +974,23 @@ impl Render for Client {
                 .min_w_0()
                 .overflow_hidden()
                 .gap(px(PANEL_GAP))
-                .child(
-                    div()
-                        .id("workspace-sidebar-and-folders")
-                        .w(sidebar_width(window.viewport_size().width)
-                            + px(self.sidebar.read(cx).folder_rail_width()))
-                        .h_full()
-                        .flex_none()
-                        .overflow_hidden()
-                        .child(self.sidebar.clone()),
-                )
+                .when(self.sidebar_visible, |layout| {
+                    layout.child(
+                        div()
+                            .id("workspace-sidebar-and-folders")
+                            .track_focus(&self.sidebar_zone)
+                            .w(sidebar_width(window.viewport_size().width)
+                                + px(self.sidebar.read(cx).folder_rail_width()))
+                            .h_full()
+                            .flex_none()
+                            .overflow_hidden()
+                            .child(self.sidebar.clone()),
+                    )
+                })
                 .child(
                     div()
                         .id("workspace-conversation-panel")
+                        .track_focus(&self.main_zone)
                         .debug_selector(|| "workspace-conversation-panel".into())
                         .relative()
                         .flex()
@@ -837,25 +1013,31 @@ impl Render for Client {
                 .into_any_element()
         };
 
-        root.child(self.top_bar.clone())
-            .children(route_error.map(|message| {
-                label(palette, TextRole::Body, message)
-                    .p_2()
-                    .text_color(palette.danger)
-            }))
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .pt(px(PANEL_GAP))
-                    .child(content),
-            )
-            .when(show_notifications, |root| {
-                root.child(gpui::deferred(self.notification_banner.clone()).with_priority(3))
-            })
-            .child(self.sidebar.read(cx).folder_dialog())
+        root.child(
+            div()
+                .flex_none()
+                .track_focus(&self.top_zone)
+                .child(self.top_bar.clone()),
+        )
+        .children(route_error.map(|message| {
+            label(palette, TextRole::Body, message)
+                .p_2()
+                .text_color(palette.danger)
+        }))
+        .child(
+            div()
+                .flex()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .pt(px(PANEL_GAP))
+                .child(content),
+        )
+        .when(show_notifications, |root| {
+            root.child(gpui::deferred(self.notification_banner.clone()).with_priority(3))
+        })
+        .child(self.sidebar.read(cx).folder_dialog())
+        .children(RightPanel::modal_frame(&self.right_panel, window, cx))
     }
 }
 
@@ -1163,10 +1345,13 @@ mod tests {
         let (client, ui) =
             cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
         ui.simulate_resize(size(px(700.), px(640.)));
+        let mut profile_account = account("A");
+        profile_account.session.owner.server = "https://w.test".into();
+        profile_account.session.owner.project_id = "a".into();
         ui.update(|_, app| {
             client.update(app, |view, cx| {
                 view.handle_ready(Ok(()), cx);
-                view.handle_runtime(RuntimeEvent::Accounts(vec![account("A")]), cx);
+                view.handle_runtime(RuntimeEvent::Accounts(vec![profile_account]), cx);
             });
         });
         ui.run_until_parked();
@@ -1184,19 +1369,82 @@ mod tests {
                 id: "profile-root".into(),
             }
         });
-        click(ui, "workspace-profile-trigger");
+        let trigger = ui.debug_bounds("workspace-profile-trigger").unwrap();
+        assert_eq!(trigger.size.height, px(48.));
+        assert!(trigger.size.width < px(160.));
+        // Верхний отступ тоже входит в область кнопки профиля.
+        let edge = gpui::point(trigger.center().x, trigger.top() + px(2.));
+        ui.simulate_click(edge, Modifiers::none());
+        ui.run_until_parked();
         assert!(ui.debug_bounds("profile-root-page").is_some());
         click(ui, "profile-personal-info");
         assert!(ui.debug_bounds("profile-personal-info-page").is_some());
         click(ui, "profile-back");
         click(ui, "profile-settings");
         assert!(ui.debug_bounds("profile-settings-page").is_some());
+        for width in [700., 1200.] {
+            ui.simulate_resize(size(px(width), px(640.)));
+            ui.run_until_parked();
+            assert!(ui.debug_bounds("profile-settings-page").is_some());
+            ui.update(|window, app| {
+                let panel = &client.read(app).right_panel;
+                let mut frame =
+                    RightPanel::frame(panel, Palette::for_window(window, app), window, app)
+                        .unwrap();
+                let style = frame.style();
+                let border = &style.border_widths;
+                assert_eq!(
+                    [border.top, border.right, border.bottom, border.left],
+                    [None; 4]
+                );
+                let corners = &style.corner_radii;
+                assert_eq!(
+                    [
+                        corners.top_left,
+                        corners.top_right,
+                        corners.bottom_right,
+                        corners.bottom_left
+                    ],
+                    [Some(px(6.).into()); 4],
+                );
+            });
+        }
+        ui.simulate_resize(size(px(700.), px(640.)));
+        ui.run_until_parked();
         click(ui, "profile-language");
-        assert!(ui.debug_bounds("profile-language-page").is_some());
-        press_key(ui, "escape");
+        assert!(ui.debug_bounds("profile-language-ru").is_some());
+        click(ui, "workspace-profile-trigger");
+        assert!(!ui.read(|app| {
+            client
+                .read(app)
+                .right_panel
+                .read(app)
+                .is_active(&root_profile)
+        }));
+        click(ui, "workspace-profile-trigger");
+        assert!(ui.debug_bounds("profile-language-ru").is_some());
         click(ui, "profile-hotkeys");
-        assert!(ui.debug_bounds("profile-hotkeys-page").is_some());
-        click(ui, "right-panel-close-all");
+        assert!(ui.read(|app| client.read(app).right_panel.read(app).has_modal()));
+        assert!(ui.debug_bounds("profile-hotkeys-dialog").is_some());
+        press_key(ui, "escape");
+        assert!(!ui.read(|app| client.read(app).right_panel.read(app).has_modal()));
+        assert!(ui.debug_bounds("profile-language-ru").is_some());
+        click(ui, "profile-back");
+        click(ui, "profile-status");
+        assert!(ui.debug_bounds("profile-status-dialog").is_some());
+        press_key(ui, "escape");
+        assert!(!ui.read(|app| client.read(app).right_panel.read(app).has_modal()));
+        ui.simulate_resize(size(px(1200.), px(900.)));
+        ui.run_until_parked();
+        click(ui, "profile-about");
+        assert!(ui.debug_bounds("profile-about-page").is_some());
+        click(ui, "profile-licenses");
+        assert!(ui.read(|app| client.read(app).licenses.is_some()));
+        assert!(ui.debug_bounds("profile-licenses-page").is_some());
+        click(ui, "profile-licenses-close");
+        assert!(ui.read(|app| client.read(app).licenses.is_none()));
+        click(ui, "workspace-profile-trigger");
+        click(ui, "profile-close");
         let active_profile = |ui: &mut gpui::VisualTestContext| {
             ui.read(|app| {
                 let panel = client.read(app).right_panel.read(app);
@@ -1215,6 +1463,127 @@ mod tests {
         ui.run_until_parked();
         assert!(!active_profile(ui));
         assert!(ui.update(|window, app| client.read(app).initial_focus.is_focused(window)));
+        assert_eq!(
+            futures::executor::block_on(runtime.shutdown()),
+            RuntimeExit::Clean
+        );
+    }
+
+    /// Проверяет язык, запись сочетания, запуск поиска и переходы по истории из рабочего окна.
+    #[gpui::test]
+    fn general_preferences_apply_language_and_remapped_search(cx: &mut TestAppContext) {
+        use crate::gpui_client::preferences::{Language, Preferences};
+
+        let directory = tempfile::tempdir().unwrap();
+        cx.update(|app| {
+            bind_keys(app);
+            Preferences::install(directory.path(), app);
+        });
+        let (runtime, _events) = RuntimeClient::start_in(directory.path().into()).unwrap();
+        let (client, ui) =
+            cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
+        ui.simulate_resize(size(px(1400.), px(900.)));
+        ui.update(|_, app| {
+            Client::install_settings_input(&client, app);
+            client.update(app, |view, cx| {
+                view.handle_ready(Ok(()), cx);
+                view.handle_runtime(RuntimeEvent::Accounts(vec![account("A")]), cx);
+            });
+        });
+        ui.run_until_parked();
+
+        let click = |ui: &mut gpui::VisualTestContext, id: &'static str| {
+            let bounds = ui
+                .debug_bounds(id)
+                .unwrap_or_else(|| panic!("Пункт не виден: {id}"));
+            ui.simulate_click(bounds.center(), Modifiers::none());
+            ui.run_until_parked();
+        };
+        click(ui, "workspace-profile-trigger");
+        click(ui, "profile-settings");
+        click(ui, "profile-language");
+        click(ui, "profile-language-en");
+        assert_eq!(ui.read(|app| Preferences::read(app).language), Language::En);
+        assert_eq!(
+            ui.read(|app| TopBarSection::Calendar.localized_title(app)),
+            "Calendar"
+        );
+
+        ui.simulate_resize(size(px(700.), px(600.)));
+        ui.run_until_parked();
+        click(ui, "profile-hotkeys");
+        let first = ui
+            .debug_bounds("profile-hotkey-label-navigation.back")
+            .unwrap();
+        let second = ui
+            .debug_bounds("profile-hotkey-label-navigation.forward")
+            .unwrap();
+        assert!(first.size.width > px(100.), "подпись ужалась: {first:?}");
+        assert!(
+            first.bottom() < second.top(),
+            "строки наложились: {first:?}, {second:?}"
+        );
+        ui.simulate_resize(size(px(1400.), px(900.)));
+        ui.run_until_parked();
+        click(ui, "profile-hotkey-navigation.chatSearch");
+        assert!(ui.debug_bounds("profile-hotkey-editor").is_some());
+        press_key(ui, "escape");
+        assert!(ui.read(|app| client.read(app).right_panel.read(app).has_modal()));
+        click(ui, "profile-hotkey-navigation.chatSearch");
+        press_key(ui, "alt-shift-j");
+        click(ui, "profile-hotkey-save");
+        assert_eq!(
+            ui.read(|app| Preferences::read(app)
+                .hotkeys
+                .get("navigation.chatSearch")
+                .cloned()),
+            Some(Some("alt-shift-j".to_string()))
+        );
+        press_key(ui, "escape");
+        assert!(!ui.read(|app| client.read(app).right_panel.read(app).has_modal()));
+        press_key(ui, "cmd-k");
+        assert!(!ui.update(|window, app| {
+            client
+                .read(app)
+                .sidebar
+                .read(app)
+                .tested_search_focused(window, app)
+        }));
+        press_key(ui, "alt-shift-j");
+        assert!(ui.update(|window, app| {
+            client
+                .read(app)
+                .sidebar
+                .read(app)
+                .tested_search_focused(window, app)
+        }));
+
+        click(ui, "workspace-top-bar-calendar");
+        click(ui, "workspace-top-bar-mail");
+        assert_eq!(ui.read(|app| client.read(app).section), TopBarSection::Mail);
+        press_key(ui, "alt-left");
+        assert_eq!(
+            ui.read(|app| client.read(app).section),
+            TopBarSection::Calendar
+        );
+        press_key(ui, "alt-right");
+        assert_eq!(ui.read(|app| client.read(app).section), TopBarSection::Mail);
+        let a = account("A");
+        let b = account("B");
+        ui.update(|_, app| {
+            client.update(app, |view, cx| {
+                view.handle_runtime(RuntimeEvent::Accounts(vec![a.clone(), b.clone()]), cx);
+                view.handle_action(ShellAction::SelectAccount(b.session.clone()), cx);
+            });
+        });
+        assert_eq!(ui.read(|app| Preferences::read(app).language), Language::Ru);
+        assert!(ui.read(|app| Preferences::read(app).hotkeys.is_empty()));
+        ui.update(|_, app| {
+            client.update(app, |view, cx| {
+                view.handle_action(ShellAction::SelectAccount(a.session), cx)
+            });
+        });
+        assert_eq!(ui.read(|app| Preferences::read(app).language), Language::En);
         assert_eq!(
             futures::executor::block_on(runtime.shutdown()),
             RuntimeExit::Clean
@@ -1286,7 +1655,7 @@ mod tests {
         );
     }
 
-    /// Вход меняется от кнопки корня, а каталог того же окна следует за новым владельцем.
+    /// Проверяет смену входа, кнопки разделов и возврат к открытому чату.
     #[gpui::test]
     fn account_control_replaces_sidebar_content(cx: &mut TestAppContext) {
         cx.update(bind_keys);
@@ -1361,6 +1730,14 @@ mod tests {
         let conversation = ui
             .read(|app| client.read(app).conversation.clone())
             .unwrap();
+        let bar = ui.debug_bounds("workspace-top-bar").unwrap();
+        let sections = ui.debug_bounds("workspace-top-bar-sections").unwrap();
+        let chats = ui.debug_bounds("workspace-top-bar-chats").unwrap();
+        assert_eq!(sections.center().x, bar.center().x);
+        assert_eq!(chats.size, size(px(48.), px(48.)));
+        assert_eq!(chats.left(), sections.left());
+        assert_eq!(chats.center().y, sections.center().y);
+        let mut previous = chats;
         for (section, button_id, page_id) in [
             (
                 TopBarSection::Calendar,
@@ -1384,14 +1761,26 @@ mod tests {
             ),
         ] {
             let button = ui.debug_bounds(button_id).unwrap();
-            ui.simulate_click(button.center(), Modifiers::none());
+            assert_eq!(button.size, chats.size);
+            assert_eq!(button.center().y, sections.center().y);
+            assert_eq!(button.left() - previous.right(), px(12.));
+            // Клик попадает в кнопку за пределами глифа.
+            let edge = gpui::point(button.left() + px(4.), button.center().y);
+            ui.simulate_click(edge, Modifiers::none());
             ui.run_until_parked();
             assert!(ui.debug_bounds(page_id).is_some());
             assert_eq!(ui.read(|app| client.read(app).section), section);
+            assert_eq!(ui.debug_bounds(button_id), Some(button));
+            previous = button;
         }
-        let chats = ui.debug_bounds("workspace-top-bar-chats").unwrap();
+        assert_eq!(previous.right(), sections.right());
         ui.simulate_click(chats.center(), Modifiers::none());
         ui.run_until_parked();
+        ui.simulate_keystrokes("tab");
+        press_key(ui, "enter");
+        assert!(ui.debug_bounds("workspace-section-calendar").is_some());
+        ui.simulate_keystrokes("shift-tab");
+        press_key(ui, "space");
         ui.read(|app| {
             assert_eq!(client.read(app).section, TopBarSection::Chats);
             assert!(client.read(app).conversation.as_ref() == Some(&conversation));

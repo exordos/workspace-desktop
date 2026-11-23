@@ -9,8 +9,8 @@ mod toolbar;
 mod toolbar_preferences;
 
 use gpui::{
-    App, Context, Entity, EventEmitter, Focusable, IntoElement, Pixels, Render, SharedString,
-    Subscription, Window, div, prelude::*, px,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Pixels, Render,
+    SharedString, Subscription, Window, div, prelude::*, px,
 };
 use uuid::Uuid;
 use workspace_core::messenger::quote::{Source as QuoteSource, SourceCheckError};
@@ -131,7 +131,14 @@ pub(super) struct Composer {
 impl Composer {
     /// Переводит фокус на ввод, когда пользователь выбирает «Написать» в сведениях лички.
     pub(super) fn focus_editor(&self, window: &mut Window, app: &App) {
-        self.editor.read(app).focus_handle(app).focus(window);
+        if self.reply_available() {
+            self.editor_focus(app).focus(window);
+        }
+    }
+
+    /// Возвращает цель редактора при обходе областей окна.
+    pub(super) fn editor_focus(&self, app: &App) -> FocusHandle {
+        self.editor.read(app).focus_handle(app)
     }
 
     /// Создаёт редактор привязанного к открытому разговору черновика.
@@ -412,6 +419,7 @@ impl Render for Composer {
     /// Показывает поле, доступность отправки и причину, если сохранить текст не получилось.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::for_window(window, cx);
+        let locale = super::preferences::Preferences::read(cx).language;
         let editor = self.editor.read(cx);
         let expanded = ToolbarPreferences::expanded(cx);
         let can_format = editor.can_format();
@@ -510,9 +518,9 @@ impl Render for Composer {
                             app.new(|_| SendTooltip {
                                 palette,
                                 text: if saving {
-                                    "Сохраняем сообщение…"
+                                    locale.text("Сохраняем сообщение…", "Saving message…")
                                 } else {
-                                    "Отправить (Enter)"
+                                    locale.text("Отправить (Enter)", "Send (Enter)")
                                 }
                                 .into(),
                             })

@@ -14,7 +14,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
 };
@@ -86,6 +86,13 @@ pub enum RequestError {
     Stopped, // Фоновая работа остановлена или ответ уже не будет получен.
 }
 
+/// Безопасная причина, по которой окно не смогло подтвердить выход.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LogoutError {
+    Worker, // Фоновая работа недоступна.
+    Auth,   // Core отклонил сессию либо не закончил очистку её секретов.
+}
+
 /// Отдаёт подписку Core или ожидание восстановления выбранного входа.
 pub(super) enum AvatarSubscription {
     Ready(watch::Receiver<AvatarState>), // Изменения аватара в действующем входе.
@@ -102,6 +109,7 @@ pub struct RuntimeClient {
     stop: watch::Sender<bool>, // Истина запрещает новые запросы и будит цикл остановки.
     started: watch::Receiver<Option<Result<(), StartupError>>>, // Итог инициализации; None, пока она идёт.
     ended: watch::Receiver<Option<RuntimeExit>>, // Итог остановки; None, пока исполнитель работает.
+    clear_cache: Arc<AtomicBool>, // После остановки убрать данные мессенджера под блокировкой профиля.
 }
 
 impl RuntimeClient {
@@ -157,6 +165,7 @@ impl RuntimeClient {
                     Runtime::new(services.sync.clone(), vec![services.messenger.clone()])
                 })?;
             parts.services.folder_preferences = Arc::new(FolderPreferenceStore::open(&directory));
+            parts.cache_directory = Some(directory);
             Ok((parts, released))
         })
     }
@@ -176,6 +185,8 @@ impl RuntimeClient {
 
         let drafts = Arc::new(super::composer::DraftBuffer::default());
         let worker_drafts = drafts.clone();
+        let clear_cache = Arc::new(AtomicBool::new(false));
+        let worker_clear_cache = clear_cache.clone();
         thread::Builder::new()
             .name("workspace-gpui-sync".into())
             .spawn(move || {
@@ -186,6 +197,7 @@ impl RuntimeClient {
                         .map_err(|_| StartupError::Worker)?;
                     let (mut parts, profile_released) = setup()?;
                     parts.services.drafts = worker_drafts;
+                    let cache_directory = parts.cache_directory.take();
                     // Поздние ответы ещё должны уметь отменить попытку, пока Tokio ждёт
                     // окончания начатых блокирующих запросов.
                     let login_auth = Arc::clone(&parts.services.auth);
@@ -197,11 +209,15 @@ impl RuntimeClient {
                         stopping,
                     ));
                     drop(executor);
+                    let reset_ok = !worker_clear_cache.load(Ordering::Acquire)
+                        || cache_directory
+                            .as_deref()
+                            .is_some_and(|directory| remove_cache(directory).is_ok());
                     drop(login_auth);
                     // Auth продлевает токены в отдельных потоках. Пока такой поток держит
                     // профиль и может писать в Keychain, выход ещё не подтверждён.
                     let _ = profile_released.blocking_recv();
-                    Ok(exit)
+                    Ok(if reset_ok { exit } else { RuntimeExit::Failed })
                 };
                 let exit = match drive() {
                     Ok(exit) => exit,
@@ -222,6 +238,7 @@ impl RuntimeClient {
                 stop,
                 started,
                 ended: ended.clone(),
+                clear_cache,
             },
             RuntimeEvents {
                 incoming,
@@ -253,6 +270,30 @@ impl RuntimeClient {
     pub async fn shutdown(&self) -> RuntimeExit {
         self.stop.send_replace(true);
         wait_for_exit(&mut self.ended.clone()).await
+    }
+
+    /// Останавливает фоновые задачи и стирает только кэш и вид папок в закрытом профиле.
+    pub(super) async fn reset_cache(&self) -> RuntimeExit {
+        self.clear_cache.store(true, Ordering::Release);
+        self.shutdown().await
+    }
+
+    /// Передаёт Core выход по выбранному поколению. Начатый отзыв доводится до конца.
+    pub(super) async fn logout(&self, session: AccountSession) -> Result<(), LogoutError> {
+        let reply = self
+            .enqueue(move |services, reply| async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    services
+                        .auth
+                        .logout_generation(&session.owner, session.generation)
+                })
+                .await
+                .map_err(|_| LogoutError::Worker)
+                .and_then(|result| result.map_err(|_| LogoutError::Auth));
+                let _ = reply.send(result);
+            })
+            .map_err(|_| LogoutError::Worker)?;
+        reply.await.map_err(|_| LogoutError::Worker)?
     }
 
     /// Даёт ключ общего исполнителя всем копиям клиентского дескриптора.
@@ -458,11 +499,27 @@ pub struct WorkerServices {
 
 /// Настроенные зависимости одного запуска Bootstrap.
 struct WorkerParts {
-    services: WorkerServices, // Входы для запросов окна и подписок.
-    runtime: Runtime,         // Владелец задач синхронизации.
-    catalog: CatalogStartup,  // Владелец начальной загрузки каталога.
+    services: WorkerServices,         // Входы для запросов окна и подписок.
+    runtime: Runtime,                 // Владелец задач синхронизации.
+    catalog: CatalogStartup,          // Владелец начальной загрузки каталога.
+    cache_directory: Option<PathBuf>, // Каталог для очистки после закрытия SQLite.
 }
 
+/// Удаляет только известные локальные данные мессенджера, сохраняя аккаунты и токены.
+fn remove_cache(directory: &std::path::Path) -> io::Result<()> {
+    let storage = Storage::open(directory.join("messenger.sqlite3")).map_err(io::Error::other)?;
+    storage
+        .clear_rebuildable_messenger_cache()
+        .map_err(io::Error::other)?;
+    for file in ["folder-rail.json", "composer-toolbar.json"] {
+        match std::fs::remove_file(directory.join(file)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
 /// Передаёт обычные операции хранилищу и закрывает сигнал после освобождения файла профиля.
 struct ProfileAccounts {
     store: JsonAccountStore, // Общий JSON и блокировка профиля; освобождается первой.
@@ -551,6 +608,7 @@ impl WorkerParts {
             Runtime::new(services.sync.clone(), vec![services.messenger.clone()])
         })?;
         parts.services.folder_preferences = Arc::new(FolderPreferenceStore::open(&directory));
+        parts.cache_directory = Some(directory);
         Ok((parts, released))
     }
 
@@ -592,6 +650,7 @@ impl WorkerParts {
             services,
             runtime,
             catalog: startup,
+            cache_directory: None,
         })
     }
 

@@ -5,7 +5,37 @@ use objc2::{
     rc::{Retained, autoreleasepool},
     runtime::{Bool, NSObject},
 };
+use objc2_app_kit::{
+    NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
+    NSRequestUserAttentionType,
+};
 use objc2_foundation::{MainThreadMarker, NSArray, NSString};
+
+use crate::gpui_client::preferences::appearance::ThemeChoice;
+
+/// Меняет оформление нативной рамки и диалогов. В режиме «Системная» убирает переопределение.
+pub(in crate::gpui_client) fn set_application_theme(theme: ThemeChoice) {
+    let Some(main_thread) = main_thread() else {
+        return;
+    };
+    let appearance = match theme {
+        ThemeChoice::Light => NSAppearance::appearanceNamed(unsafe { NSAppearanceNameAqua }),
+        ThemeChoice::Dark => NSAppearance::appearanceNamed(unsafe { NSAppearanceNameDarkAqua }),
+        ThemeChoice::System => None,
+    };
+    NSApplication::sharedApplication(main_thread).setAppearance(appearance.as_deref());
+}
+
+/// Просит Dock коротко подсветить значок, когда окно приложения сейчас не активно.
+pub(super) fn request_attention() {
+    if main_thread().is_some() {
+        unsafe {
+            let application: Retained<NSObject> =
+                msg_send_id![class!(NSApplication), sharedApplication];
+            let _: isize = msg_send![&application, requestUserAttention: NSRequestUserAttentionType::NSInformationalRequest];
+        }
+    }
+}
 
 /// Отключает системное восстановление окон до запуска GPUI.
 pub(in crate::gpui_client) fn disable_state_restoration() {

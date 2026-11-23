@@ -1,7 +1,7 @@
 //! Связывает аватары GPUI с подписками Core по UUID пользователя.
 //! Поверхности выбирают нужные UUID, а общая сущность декодирует фото для всех подписчиков.
 
-mod decode;
+pub(super) mod decode;
 
 use std::{
     collections::{HashMap, HashSet},

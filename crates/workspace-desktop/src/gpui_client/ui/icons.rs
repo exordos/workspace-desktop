@@ -11,6 +11,21 @@ pub const SEARCH_ICON_SIZE: Pixels = px(18.);
 
 /// Путь к многоцветному логотипу, доступному через ресурсы GPUI.
 pub(super) const ORGANIZATION_LOGO: &str = "organization-fallback.svg";
+const STATUS_EMOJI_CATEGORIES: &str = "icons/status-emoji-categories.svg";
+const BACKGROUNDS: [(&str, &[u8]); 3] = [
+    (
+        "chat-backgrounds/mountains.svg",
+        include_bytes!("../../../assets/chat-backgrounds/mountains.svg"),
+    ),
+    (
+        "chat-backgrounds/sea.svg",
+        include_bytes!("../../../assets/chat-backgrounds/sea.svg"),
+    ),
+    (
+        "chat-backgrounds/forest.svg",
+        include_bytes!("../../../assets/chat-backgrounds/forest.svg"),
+    ),
+];
 
 // Одно имя ресурса используется и при отрисовке, и при поиске в AssetSource.
 macro_rules! workspace_icons {
@@ -41,7 +56,8 @@ macro_rules! workspace_icons {
                 let found: Option<&'static [u8]> = match path {
                     $(p if p == Icon::$variant.path() => Some(include_bytes!(concat!("../../../assets/icons/", $filename))),)+
                     ORGANIZATION_LOGO => Some(include_bytes!("../../../assets/organization-fallback.svg")),
-                    _ => None,
+                    STATUS_EMOJI_CATEGORIES => Some(include_bytes!("../../../assets/icons/status-emoji-categories.svg")),
+                    _ => BACKGROUNDS.iter().find(|(name, _)| *name == path).map(|(_, bytes)| *bytes),
                 };
                 Ok(found.map(Cow::Borrowed))
             }
@@ -49,8 +65,8 @@ macro_rules! workspace_icons {
             /// Перечисляет встроенные SVG под запрошенным путём.
             fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
                 let prefix = path.trim_end_matches('/');
-                let paths = [ORGANIZATION_LOGO, $(Icon::$variant.path()),+];
-                Ok(paths.into_iter().filter(|file| {
+                let paths = [ORGANIZATION_LOGO, STATUS_EMOJI_CATEGORIES, $(Icon::$variant.path()),+];
+                Ok(paths.into_iter().chain(BACKGROUNDS.iter().map(|(name, _)| *name)).filter(|file| {
                     prefix.is_empty() || *file == prefix || file.strip_prefix(prefix).is_some_and(|suffix| suffix.starts_with('/'))
                 }).map(Into::into).collect())
             }
@@ -63,6 +79,12 @@ macro_rules! workspace_icons {
 pub struct WorkspaceAssets;
 
 workspace_icons! {
+    Command => ("command.svg", "Горячие клавиши."),
+    ChatBubble => ("chat_bubble.svg", "Действие при клике по чату."),
+    VolumeUp => ("volume_up.svg", "Звук уведомлений."),
+    DesktopWindows => ("desktop_windows.svg", "Системный режим или Dock."),
+    Language => ("language.svg", "Язык интерфейса."),
+    DeleteHistory => ("delete_history.svg", "Автоматический выход после неактивности."),
     Account => ("account_circle.svg", "Аккаунт или пользователь без фотографии."),
     Add => ("add.svg", "Создание элемента."),
     At => ("at.svg", "Уведомления об упоминаниях."),
@@ -76,12 +98,18 @@ workspace_icons! {
     Chat => ("chat_bubble_outline.svg", "Мессенджер или личный разговор."),
     Channels => ("channels.svg", "Системная папка каналов."),
     ChevronDown => ("chevron-down.svg", "Раскрытый раздел."),
+    ChevronLeft => ("chevron-left.svg", "Назад к предыдущему экрану."),
     ChevronRight => ("chevron-right.svg", "Свёрнутый раздел."),
     ChevronUp => ("chevron-up.svg", "Свернуть открытый раздел."),
     Close => ("close.svg", "Закрытие или очистка поля."),
     Copy => ("copy.svg", "Копирование текста."),
+    DashboardCustomize => ("dashboard_customize.svg", "Сервер текущего аккаунта."),
+    Delete => ("delete.svg", "Очистка или удаление."),
+    Download => ("download.svg", "Загрузка обновления."),
+    Draw => ("draw.svg", "Внешний вид приложения."),
     DoneAll => ("done_all.svg", "Подтверждённая отправка."),
     Error => ("error.svg", "Ошибка действия."),
+    Envelope => ("mail.svg", "Раздел почты."),
     Folder => ("folder.svg", "Папка разговоров."),
     FolderOpen => ("folder_open.svg", "Выбранная папка."),
     Folders => ("folders.svg", "Все чаты."),
@@ -94,9 +122,12 @@ workspace_icons! {
     Group => ("group.svg", "Тип аккаунта."),
     Handshake => ("handshake.svg", "Руководитель."),
     Home => ("home.svg", "Переход к избранному."),
+    Image => ("image.svg", "Выбрать фото из галереи."),
     Info => ("info.svg", "Дополнительные сведения."),
     Links => ("links.svg", "Ссылка на профиль."),
+    Logout => ("logout_compact.svg", "Выход из аккаунта."),
     Mail => ("mail_outline.svg", "Адрес электронной почты."),
+    NewWindow => ("new_window.svg", "Открытие сведений."),
     PersonAdd => ("person_add.svg", "Добавление участника."),
     Phone => ("phone.svg", "Телефон или звонок."),
     Reply => ("reply.svg", "Ответить на сообщение."),
@@ -104,8 +135,15 @@ workspace_icons! {
     Send => ("send.svg", "Отправка сообщения."),
     Settings => ("settings.svg", "Настройки."),
     Smile => ("smile.svg", "Эмодзи."),
+    StatusSmile => ("sentiment_satisfied.svg", "Статус пользователя."),
     Stylus => ("border_color.svg", "Изменение профиля."),
     Topic => ("lists.svg", "Тема канала."),
+    NightTheme => ("bedtime.svg", "Тёмный режим оформления."),
+    DayTheme => ("wb_sunny.svg", "Светлый режим оформления."),
+    FolderLayout => ("folder_copy.svg", "Расположение папок."),
+    StreamOrder => ("list_arrow.svg", "Порядок каналов и тем."),
+    Background => ("images.svg", "Фон чата."),
+    BackgroundAdd => ("plus.svg", "Добавление пользовательского фона."),
     ComposerToolbar => ("composer-bottom-panel-open.svg", "Скрытие инструментов форматирования."),
     ComposerToolbarExpand => ("composer-bottom-panel-close.svg", "Показ инструментов форматирования."),
     ComposerLink => ("composer-add-link.svg", "Вставка ссылки."),

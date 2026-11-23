@@ -99,6 +99,12 @@ impl TextInput {
         }
     }
 
+    /// Использует рамку и подложку, которые рисует родительская форма.
+    pub(in crate::gpui_client) fn unframed(mut self) -> Self {
+        self.framed = false;
+        self
+    }
+
     /// Регистрирует команды редактирования текста.
     pub(crate) fn bind_keys(app: &mut App) {
         let context = Some("WorkspaceTextInput");
@@ -121,6 +127,18 @@ impl TextInput {
     /// Возвращает значение поля экрану. Для пароля и кода это исходный текст.
     pub(crate) fn text(&self) -> &str {
         &self.text
+    }
+
+    /// Меняет подсказку при смене языка, сохраняя введённую строку.
+    pub(in crate::gpui_client) fn set_placeholder(
+        &mut self,
+        text: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.placeholder != text {
+            self.placeholder = text;
+            cx.notify();
+        }
     }
 
     /// Обновляет значение одной строкой и ставит курсор в конец.
@@ -159,6 +177,11 @@ impl TextInput {
     /// Передаёт фокус этому полю.
     pub(crate) fn focus(&self, window: &mut Window) {
         window.focus(&self.focus);
+    }
+
+    /// Даёт рабочему окну цель при переходе между областями.
+    pub(in crate::gpui_client) fn keyboard_focus(&self) -> FocusHandle {
+        self.focus.clone()
     }
 
     /// Проверяет, что система ещё редактирует незавершённый фрагмент текста.

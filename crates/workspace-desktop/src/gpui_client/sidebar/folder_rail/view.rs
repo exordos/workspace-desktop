@@ -36,7 +36,7 @@ impl FolderRail {
         let mut button = Button::new(ElementId::Uuid(id), "");
         button.appearance = ButtonAppearance::Ghost;
         let rail = cx.entity().downgrade();
-        let title: SharedString = entry.title.clone().into();
+        let title: SharedString = entry.title_for(cx).to_owned().into();
         let text = label(palette, TextRole::Caption, title.clone())
             .text_color(if selected {
                 palette.text
@@ -383,7 +383,7 @@ impl FolderRail {
                             .element(px(18.), icon_color),
                     )
                     .child(
-                        label(palette, TextRole::Caption, entry.title.clone())
+                        label(palette, TextRole::Caption, entry.title_for(cx).to_owned())
                             .flex_1()
                             .min_w_0()
                             .truncate(),
@@ -395,11 +395,16 @@ impl FolderRail {
             );
         }
         if rows.is_empty() {
+            let locale = crate::gpui_client::preferences::Preferences::read(cx).language;
             list = list.child(
-                label(palette, TextRole::Caption, "Папки не найдены")
-                    .px_2()
-                    .py_1()
-                    .debug_selector(|| "folder-rail-quick-empty".into()),
+                label(
+                    palette,
+                    TextRole::Caption,
+                    locale.text("Папки не найдены", "No folders found"),
+                )
+                .px_2()
+                .py_1()
+                .debug_selector(|| "folder-rail-quick-empty".into()),
             );
         }
         menu_surface(

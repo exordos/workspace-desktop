@@ -12,7 +12,10 @@ use gpui::{
     Task, WeakEntity, Window, div, prelude::*,
 };
 use uuid::Uuid;
-use workspace_core::messenger::details::{SidebarDetails, sidebar_profile_link};
+use workspace_core::messenger::{
+    catalog::Chat,
+    details::{SidebarDetails, sidebar_profile_link},
+};
 
 use super::{Conversation, Failure, OpenDetailsTopic};
 use crate::gpui_client::{
@@ -59,6 +62,7 @@ pub(super) struct Panel {
     state: Option<State>,                  // None, пока панель закрыта.
     avatars: AvatarImages,                 // Подписки панели на общие фото по UUID человека.
     snapshot: Option<Arc<SidebarDetails>>, // Последний снимок до закрытия или сброса.
+    catalog: Option<Arc<[Chat]>>,          // Превью для порядка тем из каталога того же входа.
     reopen_on_access: bool, // Перенос открытой панели при переходе в другую тему канала.
     topics_expanded: bool,  // Показ списка тем в текущей панели.
     share_feedback: Option<Task<()>>, // Галочка после копирования ссылки.
@@ -100,6 +104,7 @@ impl Panel {
             state: None,
             avatars: AvatarImages::default(),
             snapshot: None,
+            catalog: None,
             reopen_on_access: false,
             topics_expanded: true,
             share_feedback: None,
@@ -109,6 +114,18 @@ impl Panel {
             refocus_close: false,
             trigger: cx.focus_handle(),
             retry: cx.focus_handle(),
+        }
+    }
+
+    /// Подключает снимок списка чатов с временем сообщений. Возвращает true при замене снимка.
+    pub(super) fn set_catalog(&mut self, catalog: Option<&Arc<[Chat]>>) -> bool {
+        match (&self.catalog, catalog) {
+            (Some(current), Some(next)) if Arc::ptr_eq(current, next) => false,
+            (None, None) => false,
+            _ => {
+                self.catalog = catalog.cloned();
+                true
+            }
         }
     }
 
@@ -325,7 +342,11 @@ impl Render for DetailsBody {
 
 impl Conversation {
     /// Открывает сведения через общую рамку или закрывает экран, если он сверху.
-    fn toggle_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::gpui_client) fn toggle_details(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.can_open_details() {
             return;
         }
@@ -384,6 +405,7 @@ impl Conversation {
                             })
                             .unwrap_or("Информация")
                     },
+                    |_| false,
                     move |app| {
                         back.update(app, |view, cx| {
                             let cancelled = view

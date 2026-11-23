@@ -6,7 +6,9 @@ mod client;
 pub mod composer;
 pub mod contracts;
 pub mod conversation;
+mod notification_audio;
 pub mod platform_window;
+mod preferences;
 mod right_panel;
 pub mod runtime;
 pub mod shell;
@@ -30,7 +32,10 @@ use sidebar::Sidebar;
 use sign_in::SignIn;
 use ui::WorkspaceAssets;
 
-actions!(workspace_focus, [NextControl, PreviousControl]);
+actions!(
+    workspace_focus,
+    [NextControl, PreviousControl, NextArea, PreviousArea]
+);
 
 /// Подписи аккаунтов и выбор первого входа, переданные при запуске.
 #[derive(Default)]
@@ -74,6 +79,8 @@ fn run_in(
     application.on_reopen(WindowPlatform::show_window);
     application.run(move |app| {
         bind_keys(app);
+        preferences::Preferences::install(&profile, app);
+        bind_native_theme(app);
         composer::install_toolbar_preferences(&profile, app);
         let window_options = WindowPlatform::window_options(&profile, app);
         let window = app.open_window(window_options, |window, app| {
@@ -97,7 +104,26 @@ fn run_in(
                 }
             })
             .detach();
+            cx.observe_window_activation(window, |client, window, cx| {
+                client.check_idle(window, cx);
+            })
+            .detach();
         });
+        Client::install_settings_input(&client, app);
+        app.spawn(async move |cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(30))
+                    .await;
+                if window
+                    .update(cx, |client, window, cx| client.check_idle(window, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
         if WindowPlatform::install(
             app,
             window.into(),
@@ -135,6 +161,28 @@ fn refresh_on_appearance(window: &Window) {
         .detach();
 }
 
+/// Синхронизирует нативное оформление на старте и при смене выбора или активного входа.
+fn bind_native_theme(app: &mut App) {
+    use preferences::Preferences;
+
+    let mut previous = Preferences::read(app).appearance.theme;
+    platform_window::macos::set_application_theme(previous);
+    let mut pending = None;
+    app.observe_global::<Preferences>(move |app| {
+        let current = Preferences::read(app).appearance.theme;
+        if current != previous {
+            previous = current;
+            // AppKit может синхронно вызвать обновление окна. К этому моменту
+            // GPUI должен закончить запись настроек и отпустить контекст приложения.
+            let apply = app.foreground_executor().spawn(async move {
+                platform_window::macos::set_application_theme(current);
+            });
+            drop(pending.replace(apply));
+        }
+    })
+    .detach();
+}
+
 /// Регистрирует системный ввод и общий порядок фокуса для всех частей окна.
 fn bind_keys(app: &mut App) {
     conversation::Conversation::bind_attachment_keys(app);
@@ -146,6 +194,13 @@ fn bind_keys(app: &mut App) {
     app.bind_keys([
         KeyBinding::new("tab", NextControl, None),
         KeyBinding::new("shift-tab", PreviousControl, None),
+        KeyBinding::new("f6", NextArea, None),
+        KeyBinding::new("shift-f6", PreviousArea, None),
+        KeyBinding::new(
+            "escape",
+            preferences::shortcuts::CancelRecording,
+            Some("WorkspaceHotkeyRecording"),
+        ),
     ]);
     ui::TopBar::bind_keys(app);
 }
