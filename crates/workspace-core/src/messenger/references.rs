@@ -1,12 +1,13 @@
-//! Находит прямые ссылки Workspace на вложения в обычном Markdown сообщений.
-//! Данные для карточки и индекса доступа получаются из одного разбора.
+//! Находит файлы Workspace и веб-ссылки в открытом Markdown сообщений.
+//! Карточки вложений и индекс доступа используют общий разбор файловых ссылок.
 
 use std::ops::Range;
 
 use markdown::{ParseOptions, mdast::Node, to_mdast};
+use reqwest::Url;
 use uuid::Uuid;
 
-use crate::storage::media::{MediaKind, MediaLink};
+use crate::storage::media::{ExternalLink, MediaKind, MediaLink};
 
 /// Вложение и сведения, которые можно взять из самого сообщения для показа карточки.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,8 +78,70 @@ pub(crate) fn media_links(text: &str) -> Vec<MediaLink> {
         .map(|reference| MediaLink {
             file_id: reference.file_id,
             kind: reference.kind,
+            name: reference
+                .name
+                .as_deref()
+                .and_then(clean_label)
+                .or_else(|| clean_label(&reference.label)),
         })
         .collect()
+}
+
+/// Берёт ссылки HTTP и HTTPS из открытого Markdown без запросов к сайтам и разбора цитат.
+pub(crate) fn external_links(text: &str) -> Vec<ExternalLink> {
+    if !text.contains("://") && !text.contains("www.") {
+        return Vec::new();
+    }
+    let Ok(document) = to_mdast(text, &ParseOptions::gfm()) else {
+        return Vec::new();
+    };
+    let mut links = Vec::new();
+    let mut pending = vec![&document];
+    while let Some(node) = pending.pop() {
+        match node {
+            Node::Blockquote(_) => {}
+            Node::Link(link) => {
+                if let Some(url) = external_url(&link.url) {
+                    let label = clean_label(&display_label(node)).unwrap_or_else(|| url.clone());
+                    links.push(ExternalLink { url, label });
+                }
+            }
+            _ => pending.extend(node.children().into_iter().flatten().rev()),
+        }
+    }
+    links
+}
+
+/// Проверяет явный веб-адрес, отбрасывая относительные пути и логин в адресе.
+fn external_url(value: &str) -> Option<String> {
+    if value
+        .chars()
+        .any(|ch| ch.is_control() || ch.is_whitespace())
+        || !value.split_once("://").is_some_and(|(scheme, _)| {
+            scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http")
+        })
+    {
+        return None;
+    }
+    let url = Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    Some(url.into())
+}
+
+/// Пригодная для показа короткая подпись без управляющих символов.
+fn clean_label(text: &str) -> Option<String> {
+    let label: String = text
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(256)
+        .collect();
+    (!label.trim().is_empty()).then_some(label)
 }
 
 /// Собирает читаемую подпись, оставляя Markdown-разметку в исходной строке.
@@ -160,6 +223,36 @@ fn decode_query_value(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Включает прямые веб-ссылки, пропускает цитаты, вставленные картинки и опасные схемы.
+    #[test]
+    fn extracts_external_links_only_from_visible_markdown() {
+        let text = concat!(
+            "[**Документация**](https://example.test/guide) https://example.test/bare\n\n",
+            "<http://example.test/autolink>\n\n",
+            "> [цитата](https://private.test/quote)\n\n",
+            "\u{60}https://private.test/code\u{60} ![картинка](https://private.test/image)\n\n",
+            "[js](javascript:alert()) [вход](https://example.test@private.test/) [путь](/local)",
+        );
+        let links = external_links(text);
+        assert_eq!(
+            links
+                .into_iter()
+                .map(|link| (link.label, link.url))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Документация".into(), "https://example.test/guide".into()),
+                (
+                    "https://example.test/bare".into(),
+                    "https://example.test/bare".into()
+                ),
+                (
+                    "http://example.test/autolink".into(),
+                    "http://example.test/autolink".into()
+                ),
+            ],
+        );
+    }
 
     /// Проверяет разбор обычных вложений и отбрасывание ссылок вне доступного источника.
     #[test]

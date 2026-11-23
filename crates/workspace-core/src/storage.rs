@@ -438,7 +438,8 @@ impl Storage {
              DELETE FROM messenger_folder_refresh;
              DELETE FROM directory_avatars;
              DELETE FROM directory_avatar_state;
-             DELETE FROM messenger_media_refs;",
+             DELETE FROM messenger_media_refs;
+             DELETE FROM messenger_web_links;",
         )?;
         transaction.commit()?;
         Ok(())
@@ -1202,7 +1203,7 @@ mod tests {
         }
     }
 
-    /// Очистка удаляет историю и позицию журнала, сохраняя введённый текст и очередь.
+    /// Очистка удаляет историю, ссылки и позицию журнала, сохраняя черновик и очередь.
     #[test]
     fn rebuildable_cache_reset_keeps_drafts_and_outbox() {
         let storage = Storage::in_memory().unwrap();
@@ -1228,17 +1229,47 @@ mod tests {
         };
         storage.save_prepared_send(&owner, &queued).unwrap();
         let source = crate::messenger::SOURCE_ID;
-        apply_message(
-            &storage,
-            &owner,
-            source,
-            cursor("epoch", 1),
-            message("old", "cache"),
-        )
-        .unwrap();
+        let old = message(
+            &Uuid::from_u128(6).to_string(),
+            "[Ссылка](https://workspace.test/document)",
+        );
+        let placement = MessagePlacement {
+            stream_id: scope.stream_id.to_string(),
+            topic_id: scope.topic_id.to_string(),
+        };
+        let metadata = HistoryMetadata {
+            author_id: None,
+            created_at: HistoryTime::parse("2026-01-01T00:00:00Z").unwrap(),
+            updated_at: None,
+        };
+        storage
+            .apply(
+                &owner,
+                source,
+                &cursor("epoch", 1),
+                EventWrite {
+                    message: Some(&old),
+                    placement: Some(&placement),
+                    metadata: Some(&metadata),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let link_count = || -> i64 {
+            storage
+                .connection
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM messenger_web_links", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(link_count(), 1);
         storage.clear_rebuildable_messenger_cache().unwrap();
         assert!(storage.cursor(&owner, source).unwrap().is_none());
-        assert!(storage.message(&owner, "old").unwrap().is_none());
+        assert!(storage.message(&owner, &old.id).unwrap().is_none());
+        assert_eq!(link_count(), 0);
         assert_eq!(storage.pending_sends(&owner).unwrap(), [queued]);
         let saved = storage
             .read_plaintext_draft(&access, Some(draft.id))

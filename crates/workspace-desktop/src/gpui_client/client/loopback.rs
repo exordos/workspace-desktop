@@ -1,6 +1,7 @@
 //! Проверяет путь от окна через каталог и очередь до локального HTTPS/WSS-сервера.
 
 mod drafts;
+mod gallery;
 mod media;
 mod position;
 
@@ -2256,6 +2257,7 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
 /// Проверяет кнопки владельца, приглашение, событие состава и выход без лишнего доступа.
 #[gpui::test]
 fn sidebar_members_offer_only_allowed_actions_and_refresh_after_changes(cx: &mut TestAppContext) {
+    use gpui::{ScrollDelta, ScrollWheelEvent, point};
     use workspace_core::messenger::details::{ChannelSidebar, StreamRole};
 
     cx.update(bind_keys);
@@ -2320,6 +2322,30 @@ fn sidebar_members_offer_only_allowed_actions_and_refresh_after_changes(cx: &mut
             })
         })
     };
+    // Участники идут после вложений и тем. Доводим нужное действие до видимой части панели.
+    let click_member_action = |ui: &mut VisualTestContext, selector| {
+        let panel = ui
+            .debug_bounds(DETAILS_PANEL)
+            .expect("Открыты сведения канала");
+        let target = ui
+            .debug_bounds(selector)
+            .expect("Отрисовано действие участника");
+        let position = panel.center();
+        ui.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(0.), position.y - target.center().y)),
+            ..Default::default()
+        });
+        ui.run_until_parked();
+        let shown = ui
+            .debug_bounds(selector)
+            .expect("Отрисовано действие после прокрутки");
+        assert!(
+            panel.contains(&shown.center()),
+            "Действие {selector} вне панели"
+        );
+        click(ui, selector);
+    };
     until(
         ui,
         "владелец видит обе привязки и право приглашения",
@@ -2355,7 +2381,7 @@ fn sidebar_members_offer_only_allowed_actions_and_refresh_after_changes(cx: &mut
                 && channel_matches(ui, &|channel| channel.members.len() == 3)
         },
     );
-    click(ui, REMOVE_INVITEE);
+    click_member_action(ui, REMOVE_INVITEE);
     until(
         ui,
         "владелец удаляет другого участника",
@@ -2401,7 +2427,7 @@ fn sidebar_members_offer_only_allowed_actions_and_refresh_after_changes(cx: &mut
             })
         },
     );
-    click(ui, LEAVE_CHANNEL);
+    click_member_action(ui, LEAVE_CHANNEL);
     until(
         ui,
         "выход закрывает историю и панель B",

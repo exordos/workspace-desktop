@@ -67,6 +67,7 @@ fn add(cache: &MediaCache, owner: &OwnerContext, source: MediaSource, key: Media
         &[MediaLink {
             file_id: key.file_id,
             kind: MediaKind::Image,
+            name: Some("example from message.png".into()),
         }],
     )
     .unwrap();
@@ -275,10 +276,10 @@ fn pages_history_and_copies_and_evicts_oldest_objects() {
     assert_ne!(one.copies[0].key, two.copies[0].key);
     assert!(two.next.is_none());
     let newest = cache
-        .list_history(&account, first.scope, None, None, 2)
+        .list_history(&account, first.scope, 0, None, None, 2)
         .unwrap();
     let older = cache
-        .list_history(&account, first.scope, None, newest.next, 2)
+        .list_history(&account, first.scope, 0, None, newest.next, 2)
         .unwrap();
     assert_eq!(newest.attachments.len(), 2);
     assert_eq!(older.attachments[0].message_id, first.message_id);
@@ -295,7 +296,7 @@ fn pages_history_and_copies_and_evicts_oldest_objects() {
     );
     assert!(
         cache
-            .list_history(&account, first.scope, None, None, 3)
+            .list_history(&account, first.scope, 0, None, None, 3)
             .unwrap()
             .attachments
             .iter()

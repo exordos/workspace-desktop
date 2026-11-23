@@ -19,10 +19,10 @@ use crate::{
     context::{OwnerContext, SessionGeneration},
     runtime::SourceError,
     storage::{
-        HistoryScope, StorageError,
+        StorageError,
         media::{
-            MediaCache, MediaCacheError, MediaKey, MediaMetadata, MediaReader, MediaSource,
-            MediaTempFile, MediaVariant, MediaWriteFence,
+            MediaCache, MediaCacheError, MediaHistoryItem, MediaKey, MediaMetadata, MediaReader,
+            MediaSource, MediaTempFile, MediaVariant, MediaWriteFence,
         },
     },
     sync::Sync,
@@ -138,8 +138,54 @@ impl MessengerSource {
         message_id: Uuid,
         file_id: Uuid,
     ) -> Result<MediaFile, OpenMediaError> {
-        self.open_cached_media(sync, access, access.scope, message_id, file_id, None)
+        let source = MediaSource {
+            scope: access.scope,
+            message_id,
+        };
+        self.open_cached_media(sync, access, source, file_id, None)
             .await
+    }
+
+    /// Открывает оригинал через точный источник записи выбранной галереи.
+    pub async fn open_gallery_media(
+        &self,
+        sync: &Sync,
+        access: &MediaAccess,
+        whole_stream: bool,
+        item: &MediaHistoryItem,
+    ) -> Result<MediaFile, OpenMediaError> {
+        let source = gallery_source(access, whole_stream, item)?;
+        let current =
+            sync.auth()
+                .with_active_generation(&access.owner, access.generation, || {
+                    access.verify_gallery(sync, None)
+                })??;
+        self.open_cached_media(sync, access, source, item.file_id, Some(current))
+            .await
+    }
+
+    /// Открывает уже сохранённые байты, оставляя отсутствие копии без сетевого запроса.
+    pub fn open_gallery_cached_media(
+        &self,
+        sync: &Sync,
+        access: &MediaAccess,
+        whole_stream: bool,
+        item: &MediaHistoryItem,
+    ) -> Result<Option<MediaFile>, OpenMediaError> {
+        let source = gallery_source(access, whole_stream, item)?;
+        let cache = sync.media_cache().ok_or(OpenMediaError::Unconfigured)?;
+        let key = MediaKey {
+            file_id: item.file_id,
+            variant: MediaVariant::Original,
+        };
+        sync.auth()
+            .with_active_generation(&access.owner, access.generation, || {
+                access.verify(sync)?;
+                let fence = cache.prepare(&access.owner, source, key)?;
+                Ok(cache
+                    .open_fenced(&fence, unix_seconds())?
+                    .map(|reader| MediaFile::new(sync, access, reader)))
+            })?
     }
 
     /// Открывает готовую копию или загружает оригинал, пока ссылка и сессия действительны.
@@ -147,50 +193,51 @@ impl MessengerSource {
         &self,
         sync: &Sync,
         access: &MediaAccess,
-        scope: HistoryScope,
-        message_id: Uuid,
+        source: MediaSource,
         file_id: Uuid,
-        gallery_generation: Option<i64>,
+        gallery: Option<i64>,
     ) -> Result<MediaFile, OpenMediaError> {
         let owner = &access.owner;
         let generation = access.generation;
         let cache = sync.media_cache().ok_or(OpenMediaError::Unconfigured)?;
-        let source = MediaSource { scope, message_id };
         let key = MediaKey {
             file_id,
             variant: MediaVariant::Original,
         };
-        let fence = sync.auth().with_active_generation(owner, generation, || {
-            access.verify(sync)?;
-            let storage = sync.storage();
-            if let Some(expected) = gallery_generation
-                && storage.media_history_generation(owner)? != expected
-            {
-                return Err(OpenMediaError::Unavailable);
-            }
-            match cache.prepare(owner, source, key) {
-                Err(MediaCacheError::Unavailable) => {
-                    // Старый профиль индексирует запрошенное сообщение при первом открытии вложения.
-                    let history_generation = storage.media_history_generation(owner)?;
-                    if !storage.index_media_history(
-                        owner,
-                        scope,
-                        history_generation,
-                        Some(message_id),
-                    )? {
-                        return Err(OpenMediaError::Unavailable);
+        let fence = sync.auth().with_active_generation(
+            owner,
+            generation,
+            || -> Result<_, OpenMediaError> {
+                verify_access(sync, access, gallery)?;
+                match cache.prepare(owner, source, key) {
+                    Err(MediaCacheError::Unavailable) => {
+                        // Старый профиль индексирует запрошенное сообщение при первом открытии вложения.
+                        let storage = sync.storage();
+                        let history_generation = storage.media_history_generation(owner)?;
+                        if !storage.index_media_history(
+                            owner,
+                            source.scope,
+                            history_generation,
+                            Some(source.message_id),
+                        )? {
+                            return Err(OpenMediaError::Unavailable);
+                        }
+                        Ok(cache.prepare(owner, source, key)?)
                     }
-                    Ok(cache.prepare(owner, source, key)?)
+                    result => Ok(result?),
                 }
-                result => Ok(result?),
-            }
-        })??;
+            },
+        )??;
         let gate = sync.media_loads.gate(owner, generation, key);
         let _guard = gate.lock().await;
         let operation = Uuid::new_v4();
-        let reader = match sync.auth().with_active_generation(owner, generation, || {
-            cache.open_fenced(&fence, unix_seconds())
-        })?? {
+        let open = || {
+            sync.auth().with_active_generation(owner, generation, || {
+                verify_access(sync, access, gallery)?;
+                Ok::<_, OpenMediaError>(cache.open_fenced(&fence, unix_seconds())?)
+            })?
+        };
+        let reader = match open()? {
             Some(reader) => {
                 log::debug!("Кэш вложений: op_id={operation} status=hit");
                 reader
@@ -198,17 +245,12 @@ impl MessengerSource {
             None => {
                 log::debug!("Кэш вложений: op_id={operation} status=fetch");
                 let received =
-                    finish_download(&self.rest, sync, cache, owner, generation, key, &fence).await;
+                    finish_download(&self.rest, sync, cache, access, key, &fence, gallery).await;
                 if received.is_err() {
                     log::debug!("Кэш вложений: op_id={operation} status=fetch_failed");
                 }
                 received?;
-                let ready = sync
-                    .auth()
-                    .with_active_generation(owner, generation, || {
-                        cache.open_fenced(&fence, unix_seconds())
-                    })??
-                    .ok_or(OpenMediaError::Unavailable)?;
+                let ready = open()?.ok_or(OpenMediaError::Unavailable)?;
                 let cleanup = cache.clone();
                 spawn_blocking(move || {
                     if let Err(error) = cleanup.enforce_budget() {
@@ -222,12 +264,52 @@ impl MessengerSource {
                 ready
             }
         };
-        Ok(MediaFile {
+        Ok(MediaFile::new(sync, access, reader))
+    }
+}
+
+impl MediaFile {
+    /// Связывает читатель байтов с профилем и поколением, которым выдан допуск.
+    fn new(sync: &Sync, access: &MediaAccess, reader: MediaReader) -> Self {
+        Self {
             auth: sync.auth().clone(),
-            owner: owner.clone(),
-            generation,
+            owner: access.owner.clone(),
+            generation: access.generation,
             reader,
-        })
+        }
+    }
+}
+
+/// Принимает запись из текущей темы либо из другой темы выбранного стрима.
+fn gallery_source(
+    access: &MediaAccess,
+    whole_stream: bool,
+    item: &MediaHistoryItem,
+) -> Result<MediaSource, OpenMediaError> {
+    let panel_scope = access.gallery_scope(whole_stream);
+    if item.scope.stream_id != panel_scope.stream_id
+        || panel_scope
+            .topic_id
+            .is_some_and(|topic| Some(topic) != item.scope.topic_id)
+    {
+        return Err(OpenMediaError::Unavailable);
+    }
+    Ok(MediaSource {
+        scope: item.scope,
+        message_id: item.message_id,
+    })
+}
+
+/// Проверяет версию доступа темы, а у галереи ещё и поколение всей истории.
+fn verify_access(
+    sync: &Sync,
+    access: &MediaAccess,
+    gallery: Option<i64>,
+) -> Result<(), OpenMediaError> {
+    if gallery.is_some() {
+        access.verify_gallery(sync, gallery).map(|_| ())
+    } else {
+        access.verify(sync)
     }
 }
 
@@ -236,15 +318,26 @@ async fn finish_download(
     rest: &RestClient,
     sync: &Sync,
     cache: &MediaCache,
-    owner: &OwnerContext,
-    generation: SessionGeneration,
+    access: &MediaAccess,
     key: MediaKey,
     fence: &MediaWriteFence,
+    gallery: Option<i64>,
 ) -> Result<(), OpenMediaError> {
     let auth = sync.auth();
+    let owner = &access.owner;
+    let generation = access.generation;
     let mut sessions = std::pin::pin!(auth.subscribe());
     let mut changes = sync.media_changes();
-    check_fence(sync, cache, owner, generation, fence)?;
+    let check_current = || {
+        auth.with_active_generation(owner, generation, || -> Result<_, OpenMediaError> {
+            verify_access(sync, access, gallery)?;
+            if !cache.is_current(fence)? {
+                return Err(MediaCacheError::Stale.into());
+            }
+            Ok(())
+        })?
+    };
+    check_current()?;
     let transfer = async {
         let token = auth
             .access_token_for_generation(owner, Service::Messenger, generation)
@@ -259,35 +352,22 @@ async fn finish_download(
     let completed = loop {
         tokio::select! {
             result = &mut transfer => break result?,
-            _ = sessions.next() => check_fence(sync, cache, owner, generation, fence)?,
-            _ = changes.changed() => check_fence(sync, cache, owner, generation, fence)?,
+            _ = sessions.next() => check_current()?,
+            _ = changes.changed() => check_current()?,
         }
     };
     let Some((staged, metadata)) = completed else {
-        auth.with_active_generation(owner, generation, || cache.reject(fence))??;
+        auth.with_active_generation(owner, generation, || {
+            verify_access(sync, access, gallery)?;
+            Ok::<_, OpenMediaError>(cache.reject(fence)?)
+        })??;
         sync.note_media_change();
         return Err(OpenMediaError::Unavailable);
     };
     auth.with_active_generation(owner, generation, || {
-        cache.publish(fence.clone(), staged, metadata, unix_seconds())
+        verify_access(sync, access, gallery)?;
+        Ok::<_, OpenMediaError>(cache.publish(fence.clone(), staged, metadata, unix_seconds())?)
     })??;
-    Ok(())
-}
-
-/// Проверяет право сессии и версии локальной ссылки после сигнала изменения.
-fn check_fence(
-    sync: &Sync,
-    cache: &MediaCache,
-    owner: &OwnerContext,
-    generation: SessionGeneration,
-    fence: &MediaWriteFence,
-) -> Result<(), OpenMediaError> {
-    if !sync
-        .auth()
-        .with_active_generation(owner, generation, || cache.is_current(fence))??
-    {
-        return Err(MediaCacheError::Stale.into());
-    }
     Ok(())
 }
 

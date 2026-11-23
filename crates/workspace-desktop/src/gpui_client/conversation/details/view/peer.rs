@@ -9,7 +9,12 @@ use crate::gpui_client::ui::{
 };
 
 /// Рисует карточку, которую можно прокрутить вместе со всеми строками профиля.
-pub(super) fn render(peer: &PeerView, palette: Palette, dispatch: &Dispatch) -> Div {
+pub(super) fn render(
+    peer: &PeerView,
+    gallery: Option<Div>,
+    palette: Palette,
+    dispatch: &Dispatch,
+) -> Div {
     let avatar = peer.avatar.avatar();
     let presence_color = match avatar.presence {
         AvatarPresence::Online => palette.presence_online,
@@ -159,6 +164,7 @@ pub(super) fn render(peer: &PeerView, palette: Palette, dispatch: &Dispatch) -> 
         .when(has_actions, |content| {
             content.child(div().flex().gap(px(8.)).children(visible_actions))
         })
+        .children(gallery)
         .child(
             div().flex().flex_col().gap(px(12.)).children(
                 peer.fields

@@ -3,6 +3,7 @@
 #[path = "history/attachments.rs"]
 mod attachments;
 mod details;
+mod gallery_source;
 #[path = "history/fixtures.rs"]
 mod history_fixtures;
 #[path = "history/lab.rs"]
@@ -29,8 +30,9 @@ use workspace_core::{
 };
 
 use self::{
-    attachments::Attachments,
+    attachments::{Attachments, PhotoReturn},
     details::Panel,
+    gallery_source::GalleryExport,
     reply::{ReplyControls, ReplyMenu},
     source::{Failure, Load, LoadResult, Snapshot, Source, runtime_source},
     viewport::{Position, Viewport},
@@ -112,6 +114,7 @@ pub struct Conversation {
     viewport: Viewport, // Виртуальный список и его положение.
     scroll_direction: Option<HistoryDirection>, // Последний жест, до него проверяем заполнение окна.
     attachments: Attachments, // Карточки и одиночный просмотр вложений этого разговора.
+    gallery_export: Option<GalleryExport>, // Выбор места и запись одного файла из галереи.
     screen_focus: FocusHandle, // Запасной фокус при исчезновении истории и панели.
     history_focus: FocusHandle, // Точка клавиатурной прокрутки в открытом разговоре.
     reply_menu: ReplyMenu,    // Меню выбранного подтверждённого сообщения.
@@ -184,6 +187,7 @@ impl Conversation {
             viewport: Viewport::with_page_ahead(HISTORY_PAGE_AHEAD),
             scroll_direction: None,
             attachments: Attachments::new(cx),
+            gallery_export: None,
             screen_focus: cx.focus_handle(),
             history_focus: cx.focus_handle().tab_stop(true),
             reply_menu: ReplyMenu::new(cx.focus_handle()),
@@ -375,6 +379,7 @@ impl Conversation {
         self.refresh_heading_avatar(cx);
         if !visible {
             self.clear_history_avatars();
+            self.cancel_gallery_export();
             self.attachments.invalidate(|_| true, cx);
             self.attachments.take_restore();
         }
@@ -432,21 +437,25 @@ impl Conversation {
         {
             return;
         }
+        let scope = self.address.route.scope;
         match &update.change {
             SyncChange::HistoryAccessRevoked(_) => {
                 // Файл может принадлежать другой области того же владельца.
                 self.attachments.invalidate(|_| true, cx);
+                self.cancel_gallery_export();
             }
             SyncChange::HistoryMessageChanged { message_id } => {
                 self.attachments
                     .invalidate(|key| key.message == *message_id, cx);
+                self.invalidate_gallery_export(|message, _| message == *message_id);
             }
             SyncChange::MediaFileInvalidated { file_id } => {
                 self.attachments.invalidate(|key| key.file == *file_id, cx);
+                self.invalidate_gallery_export(|_, file| file == *file_id);
             }
             _ => {}
         }
-        let scope = self.address.route.scope;
+        self.refresh_open_gallery(&update.change, cx);
         match update.change {
             SyncChange::MessengerReset => self.restart(cx),
             SyncChange::SidebarDetailsChanged { stream_id } if scope.stream_id == stream_id => {
@@ -496,6 +505,7 @@ impl Conversation {
 
     /// Скрывает прежние строки и начинает загрузку выбранного окна.
     fn reopen(&mut self, cx: &mut Context<Self>) {
+        self.cancel_gallery_export();
         if let Some(details) = &mut self.details {
             details.clear(&self.address, None, cx);
         }
@@ -515,6 +525,7 @@ impl Conversation {
 
     /// Скрывает историю и делает любые запоздавшие ответы неприменимыми.
     fn fail(&mut self, error: Failure, cx: &mut Context<Self>) {
+        self.cancel_gallery_export();
         if let Some(details) = &mut self.details {
             let fallback = matches!(error, Failure::AccessLost).then_some(&self.screen_focus);
             details.clear(&self.address, fallback, cx);
@@ -747,6 +758,9 @@ impl Conversation {
             self.clear_history_avatars();
         }
         self.state = State::Ready(window);
+        if matches!(flight.load, Load::Extend(..)) {
+            self.mark_open_gallery_needs_refresh(cx);
+        }
         if stalled {
             self.action_error = Some(flight);
         }
@@ -1411,14 +1425,16 @@ impl Render for Conversation {
             }
         }
         let menu = self.render_reply_menu(window, palette, cx);
-        if let Some((key, focus)) = self.attachments.take_restore() {
-            if self.viewport.has_visible_attachment(key) {
-                window.focus(&focus);
-            } else if self.has_access() {
-                window.focus(&self.history_focus);
-            } else {
-                window.focus(&self.screen_focus);
-            }
+        if let Some(restore) = self.attachments.take_restore() {
+            let focus = match &restore {
+                PhotoReturn::Gallery(focus) => focus,
+                PhotoReturn::History(key, focus) if self.viewport.has_visible_attachment(*key) => {
+                    focus
+                }
+                _ if self.has_access() => &self.history_focus,
+                _ => &self.screen_focus,
+            };
+            window.focus(focus);
         }
         let photo = self.attachments.overlay(window, palette, cx);
         div()

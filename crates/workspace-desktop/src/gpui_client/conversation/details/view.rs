@@ -1,14 +1,21 @@
 //! Представление двух правых панелей. Получает снимок состояния и передаёт действия экрану.
 
 mod channel;
+mod gallery;
 mod peer;
 
 use std::rc::Rc;
 
-use gpui::{App, Div, ImageSource, SharedString, Window};
+use gpui::{App, Div, FocusHandle, ImageSource, SharedString, Window};
 use uuid::Uuid;
 
+use super::{
+    Conversation,
+    gallery::{Action as GalleryAction, Gallery},
+};
 use crate::gpui_client::ui::{Avatar, AvatarPresence, Icon, Palette};
+
+pub(super) use gallery::title as gallery_title;
 
 /// Данные одного из двух видов панели.
 pub(super) enum PanelContent {
@@ -154,6 +161,7 @@ pub(super) enum PanelAction {
     OpenTopic(Uuid),                     // Открыть тему канала.
     AddMembers,                          // Показать выбор новых участников.
     RemoveMember(Uuid),                  // Удалить привязку к каналу.
+    Gallery(GalleryAction),              // Открыть раздел вложений или выполнить его действие.
 }
 
 type Dispatch = Rc<dyn Fn(PanelAction, &mut Window, &mut App)>;
@@ -162,11 +170,24 @@ type Dispatch = Rc<dyn Fn(PanelAction, &mut Window, &mut App)>;
 pub(super) fn render(
     content: &PanelContent,
     palette: Palette,
+    gallery_triggers: Option<&[FocusHandle; 4]>,
     dispatch: impl Fn(PanelAction, &mut Window, &mut App) + 'static,
 ) -> Div {
     let dispatch: Dispatch = Rc::new(dispatch);
+    let gallery = gallery_triggers.map(|triggers| gallery::triggers(triggers, palette, &dispatch));
     match content {
-        PanelContent::Peer(peer) => peer::render(peer, palette, &dispatch),
-        PanelContent::Channel(channel) => channel::render(channel, palette, &dispatch),
+        PanelContent::Peer(peer) => peer::render(peer, gallery, palette, &dispatch),
+        PanelContent::Channel(channel) => channel::render(channel, gallery, palette, &dispatch),
     }
+}
+
+/// Создаёт содержимое вложенного экрана с действиями текущего разговора.
+pub(super) fn render_gallery(
+    conversation: &Conversation,
+    gallery: &Gallery,
+    palette: Palette,
+    dispatch: impl Fn(PanelAction, &mut Window, &mut App) + 'static,
+) -> Div {
+    let dispatch: Dispatch = Rc::new(dispatch);
+    gallery::render(conversation, gallery, palette, &dispatch)
 }

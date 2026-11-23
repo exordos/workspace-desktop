@@ -7,8 +7,14 @@ use uuid::Uuid;
 use super::{Cursor, Message, Storage, StorageError, read_cursor};
 use crate::{
     context::OwnerContext,
-    messenger::{SOURCE_ID, references::media_links},
+    messenger::{
+        SOURCE_ID,
+        references::{external_links, media_links},
+    },
 };
+
+const MEDIA_PROJECTION_CONFLICT: i64 = 1;
+const MEDIA_PROJECTION_CURRENT: i64 = 3;
 
 /// Область запроса истории. Пустая тема означает весь стрим.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,7 +270,7 @@ pub(super) fn initialize(connection: &Connection) -> Result<(), StorageError> {
          CREATE INDEX IF NOT EXISTS history_members_by_message
             ON history_members(account_id, server, organization_id, project_id, user_id, message_id);",
     )?;
-    // 0 — старая запись без проекции, 1 — конфликт с журналом, 2 — уже разобрана.
+    // 0 — без проекции, 1 — конфликт, 2 — старый индекс файлов, 3 — текущий индекс.
     let has_media_flag: bool = connection.query_row(
         "SELECT EXISTS (SELECT 1 FROM pragma_table_info('history_changes') WHERE name = 'media_projection')",
         [], |row| row.get(0),
@@ -477,7 +483,7 @@ impl Storage {
         Ok(read_state(&connection, owner)?.generation)
     }
 
-    /// Индексирует старые сообщения подтверждённой области, если их вложений ещё нет в проекции.
+    /// Дополняет индекс файлов и веб-ссылок из ранее сохранённой подтверждённой истории.
     pub(crate) fn index_media_history(
         &self,
         owner: &OwnerContext,
@@ -496,13 +502,14 @@ impl Storage {
                  WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3 AND project_id = ?4
                    AND user_id = ?5 AND stream_id = ?6 AND (?7 IS NULL OR topic_id = ?7)
                    AND (?8 IS NULL OR message_id = ?8)
-                   AND created_at IS NOT NULL AND instr(text, 'urn') > 0
+                   AND created_at IS NOT NULL
+                   AND (instr(text, 'urn') > 0 OR instr(text, '://') > 0 OR instr(text, 'www.') > 0)
                    AND NOT EXISTS (
                        SELECT 1 FROM history_changes AS changes
                        WHERE changes.account_id = ?1 AND changes.server = ?2
                          AND changes.organization_id = ?3 AND changes.project_id = ?4
                          AND changes.user_id = ?5 AND changes.message_id = sync_messages.message_id
-                         AND changes.media_projection <> 0
+                         AND changes.media_projection IN (?9, ?10)
                    )",
             )?;
             query
@@ -516,6 +523,8 @@ impl Storage {
                         scope.stream_id.to_string(),
                         scope.topic_id.map(|topic| topic.to_string()),
                         message.map(|id| id.to_string()),
+                        MEDIA_PROJECTION_CONFLICT,
+                        MEDIA_PROJECTION_CURRENT,
                     ],
                     |row| row.get(0),
                 )?
@@ -693,7 +702,7 @@ impl Storage {
                 revision,
                 guard.cursor.as_ref(),
             )?;
-            super::media::replace_message_refs(
+            project_message_refs(
                 &transaction,
                 owner,
                 message.id,
@@ -702,7 +711,7 @@ impl Storage {
                     topic_id: Some(message.topic_id),
                 },
                 message.metadata.created_at.as_str(),
-                &media_links(&message.text),
+                &message.text,
             )?;
             transaction.execute(
                 "INSERT OR IGNORE INTO history_members VALUES (?6, ?1, ?2, ?3, ?4, ?5, ?7)",
@@ -767,7 +776,7 @@ impl Storage {
     }
 }
 
-/// Обновляет ссылки активной записи после события или при первой индексации старого профиля.
+/// Обновляет ссылки открытого сообщения после события или при обновлении старого индекса.
 pub(super) fn project_media_message(
     connection: &Connection,
     owner: &OwnerContext,
@@ -797,21 +806,42 @@ pub(super) fn project_media_message(
         Some((stream_id, topic_id, created_at, text))
             if let (Ok(stream_id), Ok(topic_id)) = (stream_id.parse(), topic_id.parse()) =>
         {
-            super::media::replace_message_refs(
-                connection,
-                owner,
-                id,
-                HistoryScope {
-                    stream_id,
-                    topic_id: Some(topic_id),
-                },
-                &created_at,
-                &media_links(&text),
-            )
+            let scope = HistoryScope {
+                stream_id,
+                topic_id: Some(topic_id),
+            };
+            project_message_refs(connection, owner, id, scope, &created_at, &text)
         }
         _ => super::media::remove_message_refs(connection, owner, id),
     }?;
     mark_media_indexed(connection, owner, message_id)
+}
+
+/// Обновляет оба индекса из одного подтверждённого текста и размещения сообщения.
+fn project_message_refs(
+    connection: &Connection,
+    owner: &OwnerContext,
+    message_id: Uuid,
+    scope: HistoryScope,
+    created_at: &str,
+    text: &str,
+) -> Result<(), StorageError> {
+    super::media::replace_message_refs(
+        connection,
+        owner,
+        message_id,
+        scope,
+        created_at,
+        &media_links(text),
+    )?;
+    super::media::replace_link_refs(
+        connection,
+        owner,
+        message_id,
+        scope,
+        created_at,
+        &external_links(text),
+    )
 }
 
 /// Запоминает завершённый разбор, включая обычные сообщения без вложений.
@@ -821,16 +851,21 @@ fn mark_media_indexed(
     message_id: &str,
 ) -> Result<(), StorageError> {
     connection.execute(
-        "UPDATE history_changes SET media_projection = 2
-         WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
-           AND project_id = ?4 AND user_id = ?5 AND message_id = ?6 AND media_projection <> 2",
+        "INSERT INTO history_changes
+           (account_id, server, organization_id, project_id, user_id, message_id,
+            revision, deleted, snapshot, media_projection)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 0, ?7)
+         ON CONFLICT(account_id, server, organization_id, project_id, user_id, message_id)
+         DO UPDATE SET media_projection = excluded.media_projection
+         WHERE media_projection <> excluded.media_projection",
         params![
             owner.account_id.0,
             owner.server,
             owner.organization_id,
             owner.project_id,
             owner.user_id,
-            message_id
+            message_id,
+            MEDIA_PROJECTION_CURRENT,
         ],
     )?;
     Ok(())
@@ -1038,7 +1073,7 @@ pub(super) fn before_change(
                 if !same_body {
                     // До получения согласованной страницы старые файловые ссылки нельзя открыть.
                     connection.execute(
-                        "UPDATE history_changes SET media_projection = 1
+                        "UPDATE history_changes SET media_projection = ?7
                          WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
                            AND project_id = ?4 AND user_id = ?5 AND message_id = ?6",
                         params![
@@ -1047,7 +1082,8 @@ pub(super) fn before_change(
                             owner.organization_id,
                             owner.project_id,
                             owner.user_id,
-                            message.id
+                            message.id,
+                            MEDIA_PROJECTION_CONFLICT,
                         ],
                     )?;
                     if let Ok(id) = Uuid::parse_str(&message.id) {

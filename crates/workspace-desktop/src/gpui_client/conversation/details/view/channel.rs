@@ -12,7 +12,12 @@ use crate::gpui_client::ui::{
 };
 
 /// Рисует сведения о канале с закреплённым аватаром и счётчиками.
-pub(super) fn render(channel: &ChannelView, palette: Palette, dispatch: &Dispatch) -> Div {
+pub(super) fn render(
+    channel: &ChannelView,
+    gallery: Option<Div>,
+    palette: Palette,
+    dispatch: &Dispatch,
+) -> Div {
     let header = div()
         .flex()
         .flex_none()
@@ -94,6 +99,7 @@ pub(super) fn render(channel: &ChannelView, palette: Palette, dispatch: &Dispatc
                                         .py(px(8.)),
                                 )
                         }))
+                        .children(gallery)
                         .child(render_topics(channel, palette, dispatch))
                         .child(render_members(channel, palette, dispatch)),
                 ),

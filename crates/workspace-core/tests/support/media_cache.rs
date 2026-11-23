@@ -25,7 +25,7 @@ use workspace_core::{
     runtime::{EventSource, SourceSession},
     storage::{
         Cursor, HistoryChange, HistoryScope, Message, MessagePlacement, Storage,
-        media::{MediaCachePolicy, MediaFilter},
+        media::{MediaCachePolicy, MediaFilter, MediaKind},
     },
     sync::{Event, Sync, SyncChange, SyncUpdate},
 };
@@ -142,8 +142,20 @@ impl Api {
                 (ANCHOR, Uuid::from_u128(8))
             };
             json_response(json!([
-                history_message(linked, topic, user, format!("[вложение](urn:file:{FILE})")),
-                history_message(plain, topic, user, "сообщение без вложений".into())
+                history_message(
+                    linked,
+                    topic,
+                    user,
+                    format!(
+                        "[вложение](urn:file:{FILE}?name=report.pdf) [Документ](https://example.test/{topic})"
+                    )
+                ),
+                history_message(
+                    plain,
+                    topic,
+                    user,
+                    "сообщение без вложений https://example.test/news".into()
+                )
             ]))
         };
         let response = format!(
@@ -462,6 +474,9 @@ async fn media_cache_rejects_stale_snapshot_link_after_message_edit() {
         let sync = sync_for(&fixture.auth, &profile);
         let client = source();
         let opening = load_history(&client, &sync, &owner, generation, TOPIC).await;
+        let access = opening.media_access().unwrap();
+        let links = client.list_links(&sync, &access, false, None, 10).unwrap();
+        assert!(links.links.iter().any(|link| link.message_id == NEWER));
         let mut opened = opening.open_media(NEWER, FILE).await.unwrap();
         sync.apply(
             &owner,
@@ -488,6 +503,8 @@ async fn media_cache_rejects_stale_snapshot_link_after_message_edit() {
             "источник открытой копии больше не подтверждён"
         );
         assert!(opening.open_media(NEWER, FILE).await.is_err());
+        let links = client.list_links(&sync, &access, false, None, 10).unwrap();
+        assert!(links.links.iter().all(|link| link.message_id != NEWER));
         assert_eq!(api.requests.load(Relaxed), requests);
 
         let reopened = client
@@ -505,6 +522,197 @@ async fn media_cache_rejects_stale_snapshot_link_after_message_edit() {
     })
     .await
     .expect("не завершилась проверка правки и старой копии");
+}
+
+/// Галерея читает известную историю и байты, соблюдая область и поколения страниц.
+#[tokio::test]
+async fn media_gallery_uses_owned_access_and_projects_legacy_history() {
+    timeout(DEADLINE, async {
+        let api = Arc::new(Api::default());
+        let (url, server) = server(api.clone()).await;
+        let fixture = Fixture::new(|_, _| unreachable!());
+        let owner = fixture.login_at(&url, "first");
+        let generation = generation(&fixture.auth, &owner);
+        let profile = tempfile::tempdir().unwrap();
+        let sync = sync_for(&fixture.auth, &profile);
+        let client = source();
+        let access = load_history(&client, &sync, &owner, generation, TOPIC)
+            .await
+            .media_access()
+            .unwrap();
+        load_history(&client, &sync, &owner, generation, OTHER_TOPIC).await;
+
+        // Старый профиль хранит подтверждённые сообщения и ссылки на файлы без новых полей.
+        let db = rusqlite::Connection::open(profile.path().join("workspace.sqlite")).unwrap();
+        db.execute_batch(
+            "UPDATE history_changes SET media_projection = 2;
+             UPDATE messenger_media_refs SET name = NULL;
+             DELETE FROM messenger_web_links;",
+        )
+        .unwrap();
+        db.execute(
+            "DELETE FROM history_changes WHERE message_id = ?1",
+            [OLDER.to_string()],
+        )
+        .unwrap();
+        drop(db);
+
+        let requests = api.requests.load(Relaxed);
+        let list = client
+            .list_media(&sync, &access, true, Some(MediaKind::File), None, 1)
+            .unwrap();
+        assert_eq!(list.attachments.len(), 1);
+        let cursor = list.next.unwrap();
+        let rest = client
+            .list_media(
+                &sync,
+                &access,
+                true,
+                Some(MediaKind::File),
+                Some(cursor.clone()),
+                1,
+            )
+            .unwrap();
+        assert!(rest.next.is_none());
+        let entries = [list.attachments[0].clone(), rest.attachments[0].clone()];
+        let other = entries
+            .iter()
+            .find(|item| item.scope == scope(OTHER_TOPIC))
+            .unwrap();
+        assert_eq!(other.name.as_deref(), Some("report.pdf"));
+        assert_eq!(other.size, None);
+        assert!(!other.cached);
+        assert!(
+            client
+                .open_gallery_cached_media(&sync, &access, true, other)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            client
+                .open_gallery_media(&sync, &access, false, other)
+                .await
+                .is_err()
+        );
+        let mut foreign = other.clone();
+        foreign.scope.stream_id = Uuid::from_u128(1000);
+        assert!(
+            client
+                .open_gallery_media(&sync, &access, true, &foreign)
+                .await
+                .is_err()
+        );
+
+        let links = client.list_links(&sync, &access, false, None, 1).unwrap();
+        let link_cursor = links.next.unwrap();
+        let remaining = client
+            .list_links(&sync, &access, false, Some(link_cursor.clone()), 1)
+            .unwrap();
+        assert!(remaining.next.is_none());
+        let scoped_urls = [links.links[0].url.clone(), remaining.links[0].url.clone()];
+        assert!(scoped_urls.contains(&format!("https://example.test/{TOPIC}")));
+        assert!(scoped_urls.contains(&"https://example.test/news".into()));
+        assert!(
+            client
+                .list_links(&sync, &access, true, Some(link_cursor.clone()), 2)
+                .is_err()
+        );
+        let full = client.list_links(&sync, &access, true, None, 10).unwrap();
+        assert_eq!(full.links.len(), 4);
+        assert!(full.links.iter().any(|item| {
+            item.scope == scope(OTHER_TOPIC)
+                && item.label == "Документ"
+                && item.url == format!("https://example.test/{OTHER_TOPIC}")
+        }));
+        assert_eq!(api.requests.load(Relaxed), requests);
+
+        assert_eq!(
+            bytes(
+                client
+                    .open_gallery_media(&sync, &access, true, other)
+                    .await
+                    .unwrap()
+            ),
+            FIRST_BYTES
+        );
+        assert_eq!(
+            bytes(
+                client
+                    .open_gallery_cached_media(&sync, &access, true, other)
+                    .unwrap()
+                    .unwrap()
+            ),
+            FIRST_BYTES
+        );
+        let current = client
+            .list_media(&sync, &access, true, Some(MediaKind::File), None, 10)
+            .unwrap();
+        assert!(
+            current
+                .attachments
+                .iter()
+                .all(|item| item.cached && item.size == Some(FIRST_BYTES.len() as u64))
+        );
+        assert_eq!(api.downloads.load(Relaxed), 1);
+
+        sync.apply(
+            &owner,
+            generation,
+            SOURCE_ID,
+            Event::HistoryChanged {
+                cursor: Cursor {
+                    epoch_generation: "test".into(),
+                    epoch_version: 1,
+                },
+                change: HistoryChange::RemoveTopic(MessagePlacement {
+                    stream_id: CHAT.to_string(),
+                    topic_id: OTHER_TOPIC.to_string(),
+                }),
+            },
+        )
+        .unwrap();
+        assert!(
+            client
+                .list_links(&sync, &access, false, Some(link_cursor), 1)
+                .is_err()
+        );
+        assert!(
+            client
+                .list_media(&sync, &access, true, Some(MediaKind::File), Some(cursor), 1)
+                .is_err()
+        );
+        assert!(
+            client
+                .open_gallery_cached_media(&sync, &access, true, other)
+                .is_err()
+        );
+        assert!(
+            client
+                .open_gallery_media(&sync, &access, true, other)
+                .await
+                .is_err()
+        );
+        let unaffected = entries
+            .iter()
+            .find(|item| item.scope == scope(TOPIC))
+            .unwrap();
+        assert_eq!(
+            bytes(
+                client
+                    .open_gallery_media(&sync, &access, true, unaffected)
+                    .await
+                    .unwrap()
+            ),
+            FIRST_BYTES
+        );
+        let fresh = client.list_links(&sync, &access, true, None, 10).unwrap();
+        assert_eq!(fresh.links.len(), 2);
+        assert!(fresh.links.iter().all(|item| item.scope == scope(TOPIC)));
+        assert_eq!(api.requests.load(Relaxed), requests + 1);
+        server.abort();
+    })
+    .await
+    .expect("не завершилась проверка локальных страниц галереи");
 }
 
 /// Очистка темы сохраняет файл для соседней темы, а удаление файла убирает байты, сохраняя историю.

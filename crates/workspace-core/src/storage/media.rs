@@ -1,10 +1,12 @@
 //! Хранит индекс вложений и копий, управляет записью и удалением локальных файлов.
 //! Запросы для каталога и сводки вынесены в соседний модуль.
 
+mod links;
 mod queries;
 #[cfg(test)]
 mod tests;
 
+pub use links::{LinkHistoryCursor, LinkHistoryItem, LinkHistoryPage};
 pub use queries::{
     MediaClearReport, MediaCopy, MediaCopyCursor, MediaCopyPage, MediaCopyQuery, MediaCopySort,
     MediaEstimate, MediaFilter, MediaHistoryCursor, MediaHistoryItem, MediaHistoryPage,
@@ -65,10 +67,18 @@ pub struct MediaKey {
 }
 
 /// Прямая ссылка, выделенная из поддерживаемой разметки сообщения.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MediaLink {
-    pub file_id: Uuid,   // UUID цели из Markdown.
-    pub kind: MediaKind, // Вид из ссылки.
+    pub file_id: Uuid,        // UUID цели из Markdown.
+    pub kind: MediaKind,      // Вид из ссылки.
+    pub name: Option<String>, // Подпись или имя из открытого Markdown.
+}
+
+/// Веб-ссылка из исходного сообщения, которую можно показать в списке.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ExternalLink {
+    pub url: String,   // Проверенный абсолютный адрес HTTP или HTTPS.
+    pub label: String, // Подпись из сообщения или адрес, когда подписи нет.
 }
 
 /// Где пользователь открывает вложение.
@@ -191,7 +201,7 @@ pub(super) fn initialize(connection: &Connection) -> Result<(), StorageError> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             owner TEXT NOT NULL, stream TEXT NOT NULL, topic TEXT,
             message TEXT NOT NULL, position INTEGER NOT NULL,
-            file TEXT NOT NULL, kind INTEGER NOT NULL, created_at TEXT NOT NULL,
+            file TEXT NOT NULL, kind INTEGER NOT NULL, created_at TEXT NOT NULL, name TEXT,
             UNIQUE(owner, message, position)
         );
         CREATE INDEX IF NOT EXISTS messenger_media_refs_scope
@@ -219,6 +229,15 @@ pub(super) fn initialize(connection: &Connection) -> Result<(), StorageError> {
             PRIMARY KEY(owner, file)
         );",
     )?;
+    let has_name: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('messenger_media_refs') WHERE name = 'name')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_name {
+        connection.execute_batch("ALTER TABLE messenger_media_refs ADD COLUMN name TEXT;")?;
+    }
+    links::initialize(connection)?;
     Ok(())
 }
 
@@ -236,7 +255,7 @@ pub(crate) fn replace_message_refs(
     let topic = scope.topic_id.map(|id| id.to_string());
     let message = message_id.to_string();
     let mut statement = connection.prepare_cached(
-        "SELECT stream, topic, file, kind, created_at FROM messenger_media_refs
+        "SELECT stream, topic, file, kind, created_at, name FROM messenger_media_refs
          WHERE owner = ?1 AND message = ?2 ORDER BY position",
     )?;
     let previous = statement
@@ -247,6 +266,7 @@ pub(crate) fn replace_message_refs(
                 row.get::<_, String>(2)?,
                 MediaKind::read(row.get(3)?)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -259,6 +279,15 @@ pub(crate) fn replace_message_refs(
                 && row.4 == created_at
         })
     {
+        // Подпись не меняет право читать байты, оставляем номер существующей ссылки.
+        let mut update = connection.prepare_cached(
+            "UPDATE messenger_media_refs SET name = ?4 WHERE owner = ?1 AND message = ?2 AND position = ?3",
+        )?;
+        for (position, (row, link)) in previous.iter().zip(links).enumerate() {
+            if row.5 != link.name {
+                update.execute(params![owner, message, position as i64, link.name])?;
+            }
+        }
         return Ok(());
     }
     connection.execute(
@@ -267,8 +296,8 @@ pub(crate) fn replace_message_refs(
     )?;
     let mut insert = connection.prepare_cached(
         "INSERT INTO messenger_media_refs
-         (owner, stream, topic, message, position, file, kind, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         (owner, stream, topic, message, position, file, kind, created_at, name)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?;
     for (position, link) in links.iter().enumerate() {
         insert.execute(params![
@@ -279,11 +308,14 @@ pub(crate) fn replace_message_refs(
             position as i64,
             link.file_id.to_string(),
             link.kind as i64,
-            created_at
+            created_at,
+            link.name
         ])?;
     }
     Ok(())
 }
+
+pub(crate) use links::replace_link_refs;
 
 /// Убирает места появления вложений в удалённом сообщении.
 pub(crate) fn remove_message_refs(
@@ -295,6 +327,7 @@ pub(crate) fn remove_message_refs(
         "DELETE FROM messenger_media_refs WHERE owner = ?1 AND message = ?2",
         params![owner_key(owner), message_id.to_string()],
     )?;
+    links::remove_message(connection, owner, message_id)?;
     Ok(())
 }
 
@@ -333,6 +366,7 @@ pub(crate) fn revoke_scope(
          AND (?3 IS NULL OR topic = ?3)",
         params![owner, stream, topic],
     )?;
+    links::remove_scope(connection, &owner, &stream, topic.as_deref())?;
     Ok(())
 }
 
@@ -354,6 +388,7 @@ pub(crate) fn reset(connection: &Connection, owner: &OwnerContext) -> Result<(),
         "DELETE FROM messenger_media_refs WHERE owner = ?1",
         params![owner],
     )?;
+    links::remove_owner(connection, &owner)?;
     connection.execute(
         "UPDATE messenger_media_objects SET pending = 1 WHERE owner = ?1 AND pending = 0",
         params![owner],

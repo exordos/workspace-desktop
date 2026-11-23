@@ -1,5 +1,6 @@
 //! Управляет открытием, фокусом, загрузкой и действиями правой панели разговора.
 
+mod gallery;
 mod picker;
 mod presentation;
 mod source;
@@ -25,6 +26,7 @@ use crate::gpui_client::{
     runtime::RuntimeClient,
     ui::{Button, Palette, TextRole, label},
 };
+use gallery::Gallery;
 use picker::Picker;
 use source::{Mutation, Problem};
 use view::PanelAction;
@@ -69,6 +71,9 @@ pub(super) struct Panel {
     mutation: Option<PendingMutation>, // Текущее изменение, пока ждём подтверждение сервера.
     mutation_error: Option<MutationKind>, // Последняя ошибка рядом с действием.
     picker: Option<Picker>, // Выбор участников внутри панели владельца.
+    gallery: Option<Gallery>, // Выбранный раздел вложений и его страницы.
+    gallery_triggers: [FocusHandle; 4], // Кнопки категорий для возврата после галереи.
+    refocus_gallery: Option<FocusHandle>, // Кнопка, с которой открыли галерею.
     refocus_close: bool,    // После успеха или потери прав поле поиска исчезает.
     trigger: FocusHandle,   // Кнопка сведений в шапке разговора.
     retry: FocusHandle,     // Кнопка повтора после временного сбоя.
@@ -82,13 +87,24 @@ impl Panel {
         runtime: RuntimeClient,
         cx: &mut Context<Conversation>,
     ) -> Self {
+        cx.on_release(|view, app| {
+            if let Some(panel) = view.details.as_mut() {
+                panel.release_gallery(app);
+            }
+        })
+        .detach();
         let host_changes = cx.observe(&host, |view, host, cx| {
+            let mut closed_gallery = false;
             if let Some(panel) = view.details.as_mut()
                 && panel
                     .body
                     .is_some_and(|id| !host.read(cx).contains_view(id))
             {
-                panel.reset();
+                closed_gallery = panel.gallery.is_some();
+                panel.reset(cx);
+            }
+            if closed_gallery {
+                view.cancel_gallery_export();
             }
             cx.notify();
         });
@@ -111,6 +127,9 @@ impl Panel {
             mutation: None,
             mutation_error: None,
             picker: None,
+            gallery: None,
+            gallery_triggers: std::array::from_fn(|_| cx.focus_handle()),
+            refocus_gallery: None,
             refocus_close: false,
             trigger: cx.focus_handle(),
             retry: cx.focus_handle(),
@@ -136,7 +155,7 @@ impl Panel {
         fallback: Option<&FocusHandle>,
         cx: &mut Context<Conversation>,
     ) {
-        self.reset();
+        self.reset(cx);
         self.host.update(cx, |host, cx| {
             host.invalidate_conversation(address, fallback.unwrap_or(&self.trigger).clone(), cx)
         });
@@ -149,7 +168,7 @@ impl Panel {
     }
 
     /// Закрывает панель и отменяет ожидание её запросов в окне.
-    fn reset(&mut self) {
+    fn reset(&mut self, app: &mut App) {
         self.body = None;
         if let Some(State::Loading { op_id, .. }) = self.state.as_ref() {
             log::debug!("gpui_details op_id={op_id} event=cancelled");
@@ -163,7 +182,16 @@ impl Panel {
         self.mutation = None;
         self.mutation_error = None;
         self.picker = None;
+        self.release_gallery(app);
+        self.refocus_gallery = None;
         self.refocus_close = false;
+    }
+
+    /// Снимает вложенный экран и освобождает его миниатюры.
+    fn release_gallery(&mut self, app: &mut App) {
+        if let Some(mut gallery) = self.gallery.take() {
+            gallery.release_previews(app);
+        }
     }
 
     /// Оставляет подписки собеседника или участников текущего канала.
@@ -211,13 +239,21 @@ impl Panel {
     fn render_content(
         &self,
         palette: Palette,
-        address: &ConversationAddress,
+        view: &Conversation,
         cx: &Context<Conversation>,
     ) -> Div {
         let Some(state) = self.state.as_ref() else {
             return div();
         };
-        let content = if let (Some(picker), Some(SidebarDetails::Channel(channel))) =
+        let target = cx.entity().downgrade();
+        let dispatch = move |intent, window: &mut Window, app: &mut App| {
+            let _ = target.update(app, |screen, cx| {
+                screen.handle_panel_action(intent, window, cx)
+            });
+        };
+        let content = if let Some(gallery) = &self.gallery {
+            view::render_gallery(view, gallery, palette, dispatch)
+        } else if let (Some(picker), Some(SidebarDetails::Channel(channel))) =
             (&self.picker, self.snapshot.as_deref())
         {
             picker.content(
@@ -228,13 +264,15 @@ impl Panel {
                 self.mutation_error == Some(MutationKind::Add),
             )
         } else if let Some(details) = self.snapshot.as_deref() {
-            let data = presentation::content(self, details, address, cx);
-            let target = cx.entity().downgrade();
-            view::render(&data, palette, move |intent, window, app| {
-                let _ = target.update(app, |screen, cx| {
-                    screen.handle_panel_action(intent, window, cx)
-                });
-            })
+            let data = presentation::content(self, details, &view.address, cx);
+            view::render(
+                &data,
+                palette,
+                view.gallery_access()
+                    .is_some()
+                    .then_some(&self.gallery_triggers),
+                dispatch,
+            )
             .debug_selector(|| "conversation-details-ready".into())
         } else {
             match state {
@@ -265,7 +303,9 @@ impl Panel {
 
     /// Выбирает заголовок видимого представления.
     fn title(&self, address: &ConversationAddress) -> &'static str {
-        if self.picker.is_some() {
+        if let Some(gallery) = &self.gallery {
+            view::gallery_title(gallery.category)
+        } else if self.picker.is_some() {
             "Добавить участников"
         } else if match self.snapshot.as_deref() {
             Some(details) => matches!(details, SidebarDetails::Channel(_)),
@@ -334,7 +374,13 @@ impl Render for DetailsBody {
                 if std::mem::take(&mut panel.refocus_close) {
                     panel.host.read(cx).focus_close(&panel.key, window);
                 }
-                panel.render_content(palette, &view.address, cx)
+                if let Some(focus) = panel.refocus_gallery.take() {
+                    window.focus(&focus);
+                }
+                view.details
+                    .as_ref()
+                    .map(|panel| panel.render_content(palette, view, cx))
+                    .unwrap_or_else(div)
             })
             .unwrap_or_else(|_| div())
     }
@@ -354,8 +400,12 @@ impl Conversation {
             return;
         };
         if panel.host.read(cx).is_active(&panel.key) {
-            panel.reset();
+            let closed_gallery = panel.gallery.is_some();
+            panel.reset(cx);
             panel.host.update(cx, |host, cx| host.pop(window, cx));
+            if closed_gallery {
+                self.cancel_gallery_export();
+            }
         } else {
             self.load_details(window, cx);
         }
@@ -391,6 +441,7 @@ impl Conversation {
             );
             if opened.is_some() {
                 let title = conversation.downgrade();
+                let nested = conversation.downgrade();
                 let back = conversation.downgrade();
                 host.configure_conversation(
                     &panel.key,
@@ -405,13 +456,32 @@ impl Conversation {
                             })
                             .unwrap_or("Информация")
                     },
-                    |_| false,
+                    move |app| {
+                        nested.upgrade().is_some_and(|conversation| {
+                            conversation
+                                .read(app)
+                                .details
+                                .as_ref()
+                                .is_some_and(|panel| panel.gallery.is_some())
+                        })
+                    },
                     move |app| {
                         back.update(app, |view, cx| {
-                            let cancelled = view
-                                .details
-                                .as_mut()
-                                .is_some_and(|panel| panel.picker.take().is_some());
+                            let mut closed_gallery = false;
+                            let cancelled = view.details.as_mut().is_some_and(|panel| {
+                                if let Some(mut gallery) = panel.gallery.take() {
+                                    closed_gallery = true;
+                                    panel.refocus_gallery =
+                                        Some(gallery.trigger(&panel.gallery_triggers).clone());
+                                    gallery.release_previews(cx);
+                                    true
+                                } else {
+                                    panel.picker.take().is_some()
+                                }
+                            });
+                            if closed_gallery {
+                                view.cancel_gallery_export();
+                            }
                             if cancelled {
                                 cx.notify();
                             }
@@ -537,7 +607,7 @@ impl Conversation {
     /// Закрывает панель по явному действию и возвращает фокус её кнопке.
     fn close_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(panel) = &mut self.details {
-            panel.reset();
+            panel.reset(cx);
             panel.host.update(cx, |host, cx| host.pop(window, cx));
             cx.notify();
         }
@@ -556,10 +626,14 @@ impl Conversation {
         if !panel.host.read(cx).is_active(&panel.key) {
             return;
         }
+        if let PanelAction::Gallery(action) = intent {
+            self.handle_gallery_action(action, window, cx);
+            return;
+        }
         match (intent, panel.snapshot.as_deref()) {
             (PanelAction::MessagePeer, Some(SidebarDetails::Peer(_))) => {
                 if let Some(sending) = &self.sending {
-                    panel.reset();
+                    panel.reset(cx);
                     panel.host.update(cx, |host, cx| host.pop(window, cx));
                     sending.view.read(cx).focus_editor(window, cx);
                     cx.notify();

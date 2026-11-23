@@ -16,7 +16,10 @@ use crate::{
     storage::{
         HistoryDirection, HistoryEdge, HistoryPageEdges, HistoryPageOutcome, HistoryPageTarget,
         HistoryScope, HistoryWindow,
-        media::{MediaHistoryCursor, MediaHistoryPage, MediaKind},
+        media::{
+            LinkHistoryCursor, LinkHistoryPage, MediaCache, MediaHistoryCursor, MediaHistoryPage,
+            MediaKind,
+        },
     },
     sync::{Sync, SyncError},
 };
@@ -87,6 +90,53 @@ impl MediaAccess {
         }
         Ok(())
     }
+
+    /// Дополнительно проверяет, что галерея опирается на текущее поколение журнала.
+    pub(super) fn verify_gallery(
+        &self,
+        sync: &Sync,
+        expected: Option<i64>,
+    ) -> Result<i64, OpenMediaError> {
+        self.verify(sync)?;
+        let current = sync.storage().media_history_generation(&self.owner)?;
+        if expected.is_some_and(|generation| generation != current) {
+            return Err(OpenMediaError::Unavailable);
+        }
+        Ok(current)
+    }
+
+    /// Строит весь стрим или оставляет точную область, подтверждённую при открытии истории.
+    pub(super) fn gallery_scope(&self, whole_stream: bool) -> HistoryScope {
+        HistoryScope {
+            stream_id: self.scope.stream_id,
+            topic_id: self.scope.topic_id.filter(|_| !whole_stream),
+        }
+    }
+
+    /// Проверяет допуск, готовит первую страницу старого профиля и читает локальный индекс.
+    fn list_gallery<T>(
+        &self,
+        sync: &Sync,
+        whole_stream: bool,
+        first: bool,
+        expected: Option<i64>,
+        read: impl FnOnce(&MediaCache, HistoryScope, i64) -> Result<T, OpenMediaError>,
+    ) -> Result<T, OpenMediaError> {
+        let cache = sync.media_cache().ok_or(OpenMediaError::Unconfigured)?;
+        let scope = self.gallery_scope(whole_stream);
+        sync.auth()
+            .with_active_generation(&self.owner, self.generation, || {
+                let expected = self.verify_gallery(sync, expected)?;
+                if first
+                    && !sync
+                        .storage()
+                        .index_media_history(&self.owner, scope, expected, None)?
+                {
+                    return Err(OpenMediaError::Unavailable);
+                }
+                read(cache, scope, expected)
+            })?
+    }
 }
 
 /// Подтверждённое окно вокруг сообщения и допуск для открытия его вложений.
@@ -104,7 +154,7 @@ pub struct LatestHistoryOpening<'a> {
     scope: HistoryScope,           // Точная область, подтверждённая сервером.
     pub cached: Option<HistoryWindow>, // Пригодный хвост или None, если его нет.
     media_access: Option<MediaAccess>, // Подтверждённый допуск к вложениям.
-    gallery_generation: Option<i64>, // Версия истории владельца, пока пригодны все темы и курсоры.
+    gallery_generation: Option<i64>, // Поколение истории при подтверждении допуска.
 }
 
 impl LatestHistoryOpening<'_> {
@@ -145,20 +195,14 @@ impl LatestHistoryOpening<'_> {
             .open_cached_media(
                 self.sync,
                 access,
-                self.stream_scope(),
-                message_id,
+                crate::storage::media::MediaSource {
+                    scope: access.gallery_scope(true),
+                    message_id,
+                },
                 file_id,
                 Some(generation),
             )
             .await
-    }
-
-    /// Возвращает весь стрим, к которому относится подтверждённое открытие.
-    fn stream_scope(&self) -> HistoryScope {
-        HistoryScope {
-            stream_id: self.scope.stream_id,
-            topic_id: None,
-        }
     }
 
     /// Возвращает страницу вложений уже известной истории темы или её стрима.
@@ -173,33 +217,18 @@ impl LatestHistoryOpening<'_> {
             .media_access
             .as_ref()
             .ok_or(OpenMediaError::Unconfigured)?;
-        let history_generation = self
+        let generation = self
             .gallery_generation
             .ok_or(OpenMediaError::Unconfigured)?;
-        let cache = self
-            .sync
-            .media_cache()
-            .ok_or(OpenMediaError::Unconfigured)?;
-        let scope = if whole_stream {
-            self.stream_scope()
-        } else {
-            self.scope
-        };
-        self.sync
-            .auth()
-            .with_active_generation(self.owner, self.generation, || {
-                access.verify(self.sync)?;
-                let storage = self.sync.storage();
-                let current = if after.is_none() {
-                    storage.index_media_history(self.owner, scope, history_generation, None)?
-                } else {
-                    storage.media_history_generation(self.owner)? == history_generation
-                };
-                if !current {
-                    return Err(OpenMediaError::Unavailable);
-                }
-                Ok(cache.list_history(self.owner, scope, kind, after, limit)?)
-            })?
+        access.list_gallery(
+            self.sync,
+            whole_stream,
+            after.is_none(),
+            Some(generation),
+            |cache, scope, generation| {
+                Ok(cache.list_history(&access.owner, scope, generation, kind, after, limit)?)
+            },
+        )
     }
 
     /// Запрашивает последнюю страницу; ошибка не удаляет ранее прочитанное окно.
@@ -211,6 +240,47 @@ impl LatestHistoryOpening<'_> {
 }
 
 impl MessengerSource {
+    /// Возвращает известные вложения по допуску подтверждённой темы или её стрима.
+    pub fn list_media(
+        &self,
+        sync: &Sync,
+        access: &MediaAccess,
+        whole_stream: bool,
+        kind: Option<MediaKind>,
+        after: Option<MediaHistoryCursor>,
+        limit: usize,
+    ) -> Result<MediaHistoryPage, OpenMediaError> {
+        access.list_gallery(
+            sync,
+            whole_stream,
+            after.is_none(),
+            None,
+            |cache, scope, generation| {
+                Ok(cache.list_history(&access.owner, scope, generation, kind, after, limit)?)
+            },
+        )
+    }
+
+    /// Возвращает известные веб-ссылки из открытых сообщений подтверждённого разговора.
+    pub fn list_links(
+        &self,
+        sync: &Sync,
+        access: &MediaAccess,
+        whole_stream: bool,
+        after: Option<LinkHistoryCursor>,
+        limit: usize,
+    ) -> Result<LinkHistoryPage, OpenMediaError> {
+        access.list_gallery(
+            sync,
+            whole_stream,
+            after.is_none(),
+            None,
+            |cache, scope, generation| {
+                Ok(cache.list_links(&access.owner, scope, generation, after, limit)?)
+            },
+        )
+    }
+
     /// Проверяет доступ и возвращает сохранённый хвост до запроса последней страницы.
     pub async fn open_latest_history<'a>(
         &'a self,

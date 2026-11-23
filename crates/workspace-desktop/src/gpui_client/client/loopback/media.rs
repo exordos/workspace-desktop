@@ -11,9 +11,10 @@ const CAPTION: &str = "history-reply-body-00000000-0000-0000-0000-000000000048";
 
 /// Возвращает тестовое вложение и считает запросы всего HTTPS-сервера.
 pub(super) struct Fixture {
-    requests: AtomicUsize,  // Включает запросы членства и истории.
-    downloads: AtomicUsize, // Запросы именно оригинала выбранного фото.
+    pub(super) requests: AtomicUsize, // Включает запросы членства и истории.
+    pub(super) downloads: AtomicUsize, // Запросы оригиналов вложений.
     pub(super) live: broadcast::Sender<RecoverySignal>, // События файлов на локальном WSS.
+    gallery: bool,                    // Включает референсы обеих тем канала и четыре типа записей.
 }
 
 impl Fixture {
@@ -23,6 +24,15 @@ impl Fixture {
             requests: AtomicUsize::new(0),
             downloads: AtomicUsize::new(0),
             live: broadcast::channel(16).0,
+            gallery: false,
+        }
+    }
+
+    /// Использует тот же сервер вложений для каталога канала.
+    pub(super) fn for_gallery() -> Self {
+        Self {
+            gallery: true,
+            ..Self::new()
         }
     }
 
@@ -38,6 +48,14 @@ impl Fixture {
         user: &str,
         peer: &str,
     ) -> Option<Response<Full<Bytes>>> {
+        if self.gallery
+            && let Some((response, is_download)) = super::gallery::response(request, user, peer)
+        {
+            if is_download {
+                self.downloads.fetch_add(1, Ordering::SeqCst);
+            }
+            return Some(response);
+        }
         let path = request.uri().path();
         if path == format!("/api/workspace/v1/messenger/files/{FILE}/actions/download") {
             assert_eq!((request.method(), user), (&Method::GET, USER));

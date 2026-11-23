@@ -128,22 +128,45 @@ pub struct MediaCopyPage {
     pub next: Option<MediaCopyCursor>, // Следующая граница, если есть ещё записи.
 }
 
-/// Граница страницы ссылок из истории, которую уже видел Core.
+/// Область и эпоха, в которых выдан курсор галереи.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct GalleryCursorScope {
+    owner: String,       // Кодированный контекст владельца.
+    scope: HistoryScope, // Целый стрим или конкретная тема.
+    generation: i64,     // Поколение локального журнала.
+}
+
+impl GalleryCursorScope {
+    /// Привязывает курсор к текущему владельцу, разделу и поколению журнала.
+    pub(super) fn new(owner: &OwnerContext, scope: HistoryScope, generation: i64) -> Self {
+        Self {
+            owner: owner_key(owner),
+            scope,
+            generation,
+        }
+    }
+}
+
+/// Граница страницы вложений из истории, которую уже видел Core.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediaHistoryCursor {
-    created_at: String, // Время сообщения для основной сортировки.
-    id: i64,            // Внутренняя версия ссылки для разрешения совпадений времени.
+    scope: GalleryCursorScope, // Условия первой страницы.
+    kind: Option<MediaKind>,   // Фильтр деталей, с которым выдана первая страница.
+    created_at: String,        // Время сообщения для основной сортировки.
+    id: i64,                   // Внутренняя версия ссылки для разрешения совпадений времени.
 }
 
 /// Запись галереи с размещением и состоянием локальной копии.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediaHistoryItem {
-    pub scope: HistoryScope, // Стрим и тема исходного сообщения.
-    pub message_id: Uuid,    // Исходное сообщение.
-    pub file_id: Uuid,       // Файл, на который оно ссылается.
-    pub kind: MediaKind,     // Вид прямой ссылки.
-    pub created_at: String,  // Серверное время сообщения в UTC.
-    pub cached: bool,        // Для этой ссылки есть доступная копия оригинала.
+    pub scope: HistoryScope,  // Стрим и тема исходного сообщения.
+    pub message_id: Uuid,     // Исходное сообщение.
+    pub file_id: Uuid,        // Файл, на который оно ссылается.
+    pub kind: MediaKind,      // Вид прямой ссылки.
+    pub created_at: String,   // Серверное время сообщения в UTC.
+    pub cached: bool,         // Для этой ссылки есть доступная копия оригинала.
+    pub name: Option<String>, // Имя из разрешённой копии либо подпись исходного сообщения.
+    pub size: Option<u64>,    // Число байтов оригинала, если уже есть доступная копия.
 }
 
 /// Страница известных вложений без загрузки байтов.
@@ -166,21 +189,30 @@ impl MediaCache {
         &self,
         owner: &OwnerContext,
         scope: HistoryScope,
+        generation: i64,
         kind: Option<MediaKind>,
         after: Option<MediaHistoryCursor>,
         limit: usize,
     ) -> Result<MediaHistoryPage, MediaCacheError> {
+        let boundary = GalleryCursorScope::new(owner, scope, generation);
+        if after
+            .as_ref()
+            .is_some_and(|cursor| cursor.scope != boundary || cursor.kind != kind)
+        {
+            return Err(MediaCacheError::Stale);
+        }
         let connection = self.connection()?;
         let limit = page_limit(limit);
         let mut statement = connection.prepare_cached(
             "SELECT ref.id, ref.stream, ref.topic, ref.message, ref.file, ref.kind, ref.created_at,
-                 EXISTS(SELECT 1 FROM messenger_media_objects AS copy
-                     WHERE copy.owner = ref.owner AND copy.file = ref.file
-                       AND copy.variant = 0 AND copy.pending = 0
-                       AND (copy.file_stream IS NOT NULL OR EXISTS (
-                         SELECT 1 FROM messenger_media_origins AS origin
-                         WHERE origin.object = copy.id AND origin.stream = ref.stream)))
+                    COALESCE(copy.name, ref.name), copy.size
              FROM messenger_media_refs AS ref
+             LEFT JOIN messenger_media_objects AS copy
+               ON copy.owner = ref.owner AND copy.file = ref.file
+               AND copy.variant = 0 AND copy.pending = 0
+               AND (copy.file_stream IS NOT NULL OR EXISTS (
+                 SELECT 1 FROM messenger_media_origins AS origin
+                 WHERE origin.object = copy.id AND origin.stream = ref.stream))
              WHERE ref.owner = ?1 AND ref.stream = ?2 AND (?3 IS NULL OR ref.topic = ?3)
                AND (?4 IS NULL OR ref.kind = ?4)
                AND (?5 IS NULL OR (ref.created_at, ref.id) < (?5, ?6))
@@ -198,6 +230,13 @@ impl MediaCache {
                     limit as i64 + 1,
                 ],
                 |row| {
+                    let size = row
+                        .get::<_, Option<i64>>(8)?
+                        .map(|value| {
+                            u64::try_from(value)
+                                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(8, value))
+                        })
+                        .transpose()?;
                     Ok((
                         row.get::<_, i64>(0)?,
                         MediaHistoryItem {
@@ -209,13 +248,17 @@ impl MediaCache {
                             file_id: uuid_column(row, 4)?,
                             kind: MediaKind::read(row.get(5)?)?,
                             created_at: row.get(6)?,
-                            cached: row.get(7)?,
+                            cached: size.is_some(),
+                            name: row.get(7)?,
+                            size,
                         },
                     ))
                 },
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let next = after_page(&mut entries, limit).map(|(id, item)| MediaHistoryCursor {
+            scope: boundary,
+            kind,
             id: *id,
             created_at: item.created_at.clone(),
         });
@@ -594,12 +637,12 @@ fn read_selected(
 }
 
 /// Нормализует размер страницы до поддерживаемого диапазона.
-fn page_limit(requested: usize) -> usize {
+pub(super) fn page_limit(requested: usize) -> usize {
     requested.clamp(1, 200)
 }
 
 /// Убирает строку, запрошенную для определения наличия следующей страницы.
-fn after_page<T>(entries: &mut Vec<T>, limit: usize) -> Option<&T> {
+pub(super) fn after_page<T>(entries: &mut Vec<T>, limit: usize) -> Option<&T> {
     if entries.len() <= limit {
         return None;
     }
