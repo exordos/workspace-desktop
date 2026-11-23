@@ -19,11 +19,13 @@ use crate::{
 
 use super::rest::{RestClient, STREAMS_PATH, TOPICS_PATH};
 
+#[cfg(test)]
+mod latest_tests;
 mod preview;
+pub(crate) use preview::SidebarPreviews;
 pub use preview::{
     ProtectedSidebarSummary, SidebarKeyServiceKind, SidebarPreview, SidebarPreviewBody,
 };
-pub(crate) use preview::{SidebarPreviews, attach as attach_previews};
 
 const USERS_PATH: &str = "/api/workspace/v1/users/";
 
@@ -56,9 +58,9 @@ pub struct ChatMetadata {
     pub direct_peer_id: Option<Uuid>, // Собеседник в личном чате.
     pub direct_peer_username: Option<String>, // Имя учётной записи собеседника для поиска.
     pub direct_peer_email: Option<String>, // Доступный адрес собеседника для поиска.
-    pub last_message_id: Option<Uuid>, // Ссылка на последнее сообщение, если оно есть.
+    pub last_message_id: Option<Uuid>, // UUID последнего известного сообщения разговора.
     #[serde(skip)]
-    pub preview: Option<SidebarPreview>, // Превью из фонового запроса текущего входа.
+    pub preview: Option<SidebarPreview>, // Превью того же сообщения для текущего входа.
     pub color: Option<u32>,    // Цвет в формате RGB, заданный сервером.
     pub invite_only: bool,     // Вступление в канал требует приглашения.
     pub notification_mode: Option<String>, // Режим уведомлений из ответа сервера.
@@ -74,9 +76,9 @@ pub struct TopicMetadata {
     pub is_done: bool,                 // Тема завершена.
     pub is_default: bool,              // Тема используется по умолчанию в своём канале.
     pub color: Option<u32>,            // Цвет темы в формате RGB, если его вернул сервер.
-    pub last_message_id: Option<Uuid>, // Ссылка на последнее сообщение, если оно есть.
+    pub last_message_id: Option<Uuid>, // UUID последнего известного сообщения темы.
     #[serde(skip)]
-    pub preview: Option<SidebarPreview>, // Превью из фонового запроса текущего входа.
+    pub preview: Option<SidebarPreview>, // Превью того же сообщения для текущего входа.
     pub notification_mode: Option<String>, // Режим уведомлений темы из ответа сервера.
     pub unread_count: Option<u64>,     // Все непрочитанные сообщения, если известны.
     pub active_unread_count: Option<u64>, // Непрочитанные, влияющие на уведомления.
@@ -152,9 +154,28 @@ impl Catalog {
     pub(crate) fn with_snapshots<T>(
         &self,
         owners: &[OwnerContext],
+        previews: &HashMap<OwnerContext, SidebarPreviews>,
         publish: impl FnOnce(Vec<Option<Vec<Chat>>>) -> T,
     ) -> Result<T, StorageError> {
-        self.storage.with_catalog_snapshots(owners, publish)
+        self.storage.with_catalog_snapshots(owners, |snapshots| {
+            publish(
+                owners
+                    .iter()
+                    .zip(snapshots)
+                    .map(|(owner, snapshot)| {
+                        snapshot.map(|mut snapshot| {
+                            preview::attach(
+                                owner,
+                                &mut snapshot.chats,
+                                &snapshot.messages,
+                                previews.get(owner),
+                            );
+                            snapshot.chats
+                        })
+                    })
+                    .collect(),
+            )
+        })
     }
 
     /// Обновляет каталог только для поколения, которое запросило загрузку.

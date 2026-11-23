@@ -285,7 +285,7 @@ impl Storage {
             message.metadata.author_id,
             &message.body,
         )?;
-        if confirmed && !history::has_message_revision(&transaction, owner, &id)? {
+        let inserted = if confirmed && !history::has_message_revision(&transaction, owner, &id)? {
             let (body, key_id) = message.body.storage_parts();
             let inserted = transaction.execute(
                 "INSERT OR IGNORE INTO sync_messages (account_id, server, organization_id, project_id, user_id,
@@ -311,8 +311,15 @@ impl Storage {
                 )?;
                 history::project_media_message(&transaction, owner, &message.id.to_string())?;
             }
-        }
+            inserted
+        } else {
+            false
+        };
         transaction.commit()?;
+        drop(connection);
+        if inserted {
+            self.notify_catalog_rows();
+        }
         Ok(confirmed)
     }
 

@@ -3,6 +3,7 @@
 
 mod avatars;
 mod catalog_counts;
+mod catalog_messages;
 mod drafts;
 mod folders;
 mod history;
@@ -12,6 +13,7 @@ pub mod media;
 mod outbox;
 
 pub(crate) use avatars::{AvatarEvent, AvatarFence, AvatarSnapshot};
+pub(crate) use catalog_messages::{CatalogMessage, CatalogSnapshot};
 pub use drafts::{
     DraftAccess, DraftOpening, DraftReplies, DraftReply, DraftScope, DraftVersion,
     DraftWriteOutcome, PlaintextDraft,
@@ -296,12 +298,12 @@ impl Storage {
     pub(crate) fn with_catalog_snapshots<T>(
         &self,
         owners: &[OwnerContext],
-        publish: impl FnOnce(Vec<Option<Vec<Chat>>>) -> T,
+        publish: impl FnOnce(Vec<Option<CatalogSnapshot>>) -> T,
     ) -> Result<T, StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let snapshots = owners
             .iter()
-            .map(|owner| catalog_counts::read_catalog(&connection, owner))
+            .map(|owner| catalog_messages::read_snapshot(&connection, owner))
             .collect::<Result<_, _>>()?;
         Ok(publish(snapshots))
     }
@@ -342,9 +344,14 @@ impl Storage {
 
     /// Будит читателей каталога и папок после записи связанных данных.
     fn notify_catalog_change(&self) {
+        self.notify_catalog_rows();
+        self.notify_folder_change();
+    }
+
+    /// Просит перечитать строки каталога после записи сообщений.
+    fn notify_catalog_rows(&self) {
         self.catalog_changes
             .send_modify(|version| *version = version.wrapping_add(1));
-        self.notify_folder_change();
     }
 
     /// Открывает базу по пути и создаёт таблицы при необходимости.
@@ -882,8 +889,13 @@ impl Storage {
         }
         if catalog_changed || counts_changed {
             self.notify_catalog_change();
-        } else if folder_changed || unread_changed {
-            self.notify_folder_change();
+        } else {
+            if source == crate::messenger::SOURCE_ID && (message_inserted || history_changed) {
+                self.notify_catalog_rows();
+            }
+            if folder_changed || unread_changed {
+                self.notify_folder_change();
+            }
         }
         Ok(AppliedEvent {
             outcome: ApplyOutcome::Applied,

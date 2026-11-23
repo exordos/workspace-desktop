@@ -15,7 +15,9 @@ use crate::{
         },
         rest::WireHistoryMessage,
     },
-    storage::{HistoryMessage, HistoryTime, KeyServicePayload, MessageBody},
+    storage::{
+        CatalogMessage, HistoryMessage, HistoryScope, HistoryTime, KeyServicePayload, MessageBody,
+    },
 };
 
 use super::{Catalog, CatalogError, Chat};
@@ -27,9 +29,9 @@ const TEXT_LIMIT: usize = 240;
 /// Последнее подтверждённое сообщение, которое можно показать в строке списка.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SidebarPreview {
-    pub message_id: Uuid,            // UUID последнего сообщения из каталога.
+    pub message_id: Uuid,            // UUID последнего известного сообщения.
     pub topic_id: Uuid,              // Тема, в которой лежит сообщение.
-    pub author_id: Uuid,             // UUID автора сообщения.
+    pub author_id: Uuid,             // UUID автора или nil, если журнал его не передал.
     pub author_name: Option<String>, // Имя автора, если оно уже есть в снимке каталога.
     pub created_at: HistoryTime,     // Время создания сообщения в UTC.
     pub text: SidebarPreviewBody,    // Обычная подпись или исходный зашифрованный конверт.
@@ -200,7 +202,7 @@ impl Catalog {
                     return None;
                 }
                 let stream = row.stream_id;
-                let preview = make_preview(row, owner, &names)?;
+                let preview = make_preview(&row, owner, &names)?;
                 Some((preview.message_id, (stream, preview)))
             }));
         }
@@ -211,22 +213,22 @@ impl Catalog {
 
 /// Собирает подпись обычного сообщения или переносит конверт без расшифровки.
 fn make_preview(
-    row: HistoryMessage,
+    row: &HistoryMessage,
     owner: &OwnerContext,
     names: &HashMap<Uuid, String>,
 ) -> Option<SidebarPreview> {
-    let author_id = row.metadata.author_id?;
-    let text = match row.body {
+    let author_id = row.metadata.author_id.unwrap_or(Uuid::nil());
+    let text = match &row.body {
         MessageBody::Markdown(text) => {
-            let summary = preview_text(&text);
+            let summary = preview_text(text);
             if summary.is_empty() {
                 return None;
             }
             SidebarPreviewBody::Summary(summary)
         }
         MessageBody::Encrypted { key_id, ciphertext } => SidebarPreviewBody::Encrypted {
-            key_id,
-            ciphertext,
+            key_id: *key_id,
+            ciphertext: ciphertext.clone(),
             owner: owner.clone(),
             stream_id: row.stream_id,
         },
@@ -245,7 +247,7 @@ fn make_preview(
         topic_id: row.topic_id,
         author_id,
         author_name: names.get(&author_id).cloned(),
-        created_at: row.metadata.created_at,
+        created_at: row.metadata.created_at.clone(),
         text,
     })
 }
@@ -307,33 +309,97 @@ fn inline_link_labels(mut text: &str) -> String {
     labels
 }
 
-/// Привязывает ответы к текущему каталогу, сохраняя изменения или отзывы доступа из SQLite.
-pub(crate) fn attach(owner: &OwnerContext, chats: &mut [Chat], previews: &SidebarPreviews) {
-    let own_id = owner.user_id.parse::<Uuid>().ok();
-    for chat in chats {
-        let get = |last_message_id: Option<Uuid>| {
-            let (stream_id, preview) = previews.get(&last_message_id?)?;
-            (*stream_id == chat.id).then_some(preview)
-        };
-        let chat_preview = get(chat.metadata.last_message_id).filter(|preview| {
-            chat.direct || chat.topics.iter().any(|topic| topic.id == preview.topic_id)
-        });
-        chat.metadata.preview = named_preview(chat_preview, own_id);
-        for topic in &mut chat.topics {
-            let topic_preview =
-                get(topic.metadata.last_message_id).filter(|preview| preview.topic_id == topic.id);
-            topic.metadata.preview = named_preview(topic_preview, own_id);
+/// Подтверждённое сообщение из общей базы или из точного запроса каталога.
+#[derive(Clone, Copy)]
+enum Candidate<'a> {
+    Remote(&'a SidebarPreview), // Тело, полученное по UUID из снимка каталога.
+    Local(&'a CatalogMessage),  // Строка из общей базы, доступная истории.
+}
+
+impl Candidate<'_> {
+    /// Использует серверный порядок по времени создания и публичному UUID.
+    fn order(&self) -> (&HistoryTime, Uuid) {
+        match self {
+            Self::Remote(preview) => (&preview.created_at, preview.message_id),
+            Self::Local(row) => (&row.message.metadata.created_at, row.message.id),
         }
+    }
+
+    /// Готовит UUID и превью вместе, включая случай, когда тело пока нельзя показать.
+    fn presentation(
+        self,
+        owner: &OwnerContext,
+        own_id: Option<Uuid>,
+        names: &HashMap<Uuid, String>,
+    ) -> (Option<Uuid>, Option<SidebarPreview>) {
+        let mut preview = match self {
+            Self::Remote(fetched) => Some(fetched.clone()),
+            Self::Local(row) if row.can_preview => make_preview(&row.message, owner, names),
+            Self::Local(_) => None,
+        };
+        if let Some(preview) = &mut preview
+            && Some(preview.author_id) == own_id
+        {
+            preview.author_name = Some("Вы".to_owned());
+        }
+        (Some(self.order().1), preview)
     }
 }
 
-/// Подписывает своё сообщение независимо от наличия автора в справочнике.
-fn named_preview(preview: Option<&SidebarPreview>, own_id: Option<Uuid>) -> Option<SidebarPreview> {
-    let mut preview = preview?.clone();
-    if Some(preview.author_id) == own_id {
-        preview.author_name = Some("Вы".to_owned());
+/// Сравнивает порядок двух известных сообщений, если они есть.
+fn latest<'a>(a: Option<Candidate<'a>>, b: Option<Candidate<'a>>) -> Option<Candidate<'a>> {
+    a.into_iter()
+        .chain(b)
+        .max_by(|a, b| a.order().cmp(&b.order()))
+}
+
+/// Выбирает самое свежее подтверждённое сообщение отдельно для темы и её разговора.
+pub(super) fn attach(
+    owner: &OwnerContext,
+    chats: &mut [Chat],
+    messages: &HashMap<HistoryScope, CatalogMessage>,
+    previews: Option<&SidebarPreviews>,
+) {
+    let own_id = owner.user_id.parse::<Uuid>().ok();
+    let names = chats
+        .iter()
+        .filter_map(|chat| Some((chat.metadata.direct_peer_id?, chat.name.clone())))
+        .collect();
+    for chat in chats {
+        let get = |last_message_id: Option<Uuid>| {
+            let (stream_id, preview) = previews?.get(&last_message_id?)?;
+            (*stream_id == chat.id).then_some(preview)
+        };
+        let remote = get(chat.metadata.last_message_id)
+            .filter(|preview| {
+                chat.direct || chat.topics.iter().any(|topic| topic.id == preview.topic_id)
+            })
+            .map(Candidate::Remote);
+        let scope = HistoryScope {
+            stream_id: chat.id,
+            topic_id: None,
+        };
+        let mut chat_latest = latest(messages.get(&scope).map(Candidate::Local), remote);
+        for topic in &mut chat.topics {
+            let scope = HistoryScope {
+                topic_id: Some(topic.id),
+                ..scope
+            };
+            let remote = get(topic.metadata.last_message_id)
+                .filter(|preview| preview.topic_id == topic.id)
+                .map(Candidate::Remote);
+            let local = messages.get(&scope).map(Candidate::Local);
+            if let Some(message) = latest(local, remote) {
+                (topic.metadata.last_message_id, topic.metadata.preview) =
+                    message.presentation(owner, own_id, &names);
+                chat_latest = latest(chat_latest, Some(message));
+            }
+        }
+        if let Some(message) = chat_latest {
+            (chat.metadata.last_message_id, chat.metadata.preview) =
+                message.presentation(owner, own_id, &names);
+        }
     }
-    Some(preview)
 }
 
 #[cfg(test)]
@@ -412,7 +478,8 @@ mod tests {
         let mut foreign = raw.clone();
         foreign["user_uuid"] = json!("other");
         assert!(decode(foreign).is_err());
-        let preview = make_preview(decode(raw).unwrap().unwrap(), &owner, &HashMap::new()).unwrap();
+        let preview =
+            make_preview(&decode(raw).unwrap().unwrap(), &owner, &HashMap::new()).unwrap();
         assert_eq!((preview.message_id, preview.topic_id), (message, topic));
         assert_eq!(
             preview.body(),

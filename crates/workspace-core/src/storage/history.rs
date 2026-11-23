@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use uuid::Uuid;
 
-use super::{Cursor, Message, MessageBody, Storage, StorageError, read_cursor};
+use super::{CatalogMessage, Cursor, Message, MessageBody, Storage, StorageError, read_cursor};
 use crate::{
     context::OwnerContext,
     messenger::{
@@ -19,7 +19,7 @@ const MEDIA_PROJECTION_CONFLICT: i64 = 1;
 const MEDIA_PROJECTION_CURRENT: i64 = 3;
 
 /// Область запроса истории. Пустая тема означает весь стрим.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct HistoryScope {
     pub stream_id: Uuid,        // UUID стрима.
     pub topic_id: Option<Uuid>, // UUID темы или весь стрим.
@@ -609,6 +609,8 @@ impl Storage {
         )?;
         project_media_message(&transaction, owner, &confirmed.id.to_string())?;
         transaction.commit()?;
+        drop(connection);
+        self.notify_catalog_rows();
         Ok(ConfirmedEdit::Applied)
     }
 
@@ -1042,6 +1044,10 @@ impl Storage {
             )?;
         }
         transaction.commit()?;
+        drop(connection);
+        if !messages.is_empty() {
+            self.notify_catalog_rows();
+        }
         Ok(HistoryPageOutcome::Saved(window_id))
     }
 
@@ -1332,6 +1338,79 @@ fn history_message(
         history_record,
     ).optional()?;
     current.map(TryInto::try_into).transpose()
+}
+
+/// Читает конец известной области по тому же индексу порядка, что и история.
+pub(super) fn latest_catalog_message(
+    connection: &Connection,
+    owner: &OwnerContext,
+    scope: HistoryScope,
+) -> Result<Option<CatalogMessage>, StorageError> {
+    let topic_filter = if scope.topic_id.is_some() {
+        "topic_id = ?7"
+    } else {
+        "topic_id IS NOT NULL AND ?7 IS NULL"
+    };
+    let mut query = connection.prepare_cached(&format!(
+        "SELECT message_id, stream_id, topic_id, text, author_id, created_at, updated_at, encryption_key_id,
+                key_service_payload, key_service_canonical_id
+         FROM sync_messages
+         WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3 AND project_id = ?4
+           AND user_id = ?5 AND stream_id = ?6 AND created_at IS NOT NULL AND {topic_filter}
+         ORDER BY created_at DESC, message_id DESC"
+    ))?;
+    let rows = query.query_map(
+        params![
+            owner.account_id.0,
+            owner.server,
+            owner.organization_id,
+            owner.project_id,
+            owner.user_id,
+            scope.stream_id.to_string(),
+            scope.topic_id.map(|id| id.to_string())
+        ],
+        history_record,
+    )?;
+    for row in rows {
+        let record = row?;
+        // Старый журнал мог сохранить сообщение без публичного UUID.
+        let Ok(message) = HistoryMessage::try_from(record) else {
+            continue;
+        };
+        let can_preview = !matches!(message.body, MessageBody::Encrypted { .. })
+            || message_revision(connection, owner, &message.id.to_string())?.media_projection
+                != MEDIA_PROJECTION_CONFLICT;
+        return Ok(Some(CatalogMessage {
+            message,
+            can_preview,
+        }));
+    }
+    Ok(None)
+}
+
+/// Разрешает серверное превью, пока общая строка или событие не уточнили его состояние.
+pub(super) fn catalog_hint_allowed(
+    connection: &Connection,
+    owner: &OwnerContext,
+    scope: HistoryScope,
+    id: Uuid,
+) -> Result<bool, StorageError> {
+    Ok(connection.prepare_cached(
+        "SELECT NOT EXISTS (
+            SELECT 1 FROM history_changes WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
+              AND project_id = ?4 AND user_id = ?5 AND message_id = ?6
+              AND (deleted OR media_projection = ?9)
+         ) AND NOT EXISTS (
+            SELECT 1 FROM sync_messages WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
+              AND project_id = ?4 AND user_id = ?5 AND message_id = ?6
+              AND ((stream_id IS NOT NULL AND topic_id IS NOT NULL AND created_at IS NOT NULL)
+                   OR stream_id <> ?7 OR (?8 IS NOT NULL AND topic_id <> ?8))
+         )"
+    )?.query_row(
+        params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id,
+            id.to_string(), scope.stream_id.to_string(), scope.topic_id.map(|id| id.to_string()), MEDIA_PROJECTION_CONFLICT],
+        |row| row.get(0),
+    )?)
 }
 
 /// Сверяет точный зашифрованный снимок и возвращает его версии под блокировкой базы.

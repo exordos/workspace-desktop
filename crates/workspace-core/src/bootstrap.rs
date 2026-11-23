@@ -9,13 +9,13 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::{
     auth::{Auth, AuthError, SessionSnapshot, SessionStatus},
     context::{OwnerContext, SessionGeneration},
-    messenger::catalog::{Catalog, CatalogError, Chat, SidebarPreviews, attach_previews},
+    messenger::catalog::{Catalog, CatalogError, Chat, SidebarPreviews},
     runtime::{Runtime, RuntimeError},
     storage::StorageError,
 };
 
 /// Последнее состояние каталога для одного входа в Workspace.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChatList {
     pub generation: SessionGeneration, // Вход, к которому относится состояние.
     pub chats: Option<Arc<[Chat]>>,    // Снимок, если его удалось получить из SQLite или сервера.
@@ -225,22 +225,22 @@ pub(crate) fn publish_catalog(
     lists: &watch::Sender<ChatLists>,
 ) -> Result<(), crate::storage::StorageError> {
     let owners: Vec<_> = current.keys().cloned().collect();
-    catalog.with_snapshots(&owners, |snapshots| {
+    catalog.with_snapshots(&owners, previews, |snapshots| {
         for (owner, chats) in owners.iter().zip(snapshots) {
             let list = current
                 .get_mut(owner)
                 .expect("владелец взят из текущего снимка");
-            let chats = chats.map(|mut chats| {
-                if let Some(previews) = previews.get(owner) {
-                    attach_previews(owner, &mut chats, previews);
-                }
-                chats
-            });
             if list.chats.as_deref() != chats.as_deref() {
                 list.chats = chats.map(Arc::from);
             }
         }
-        lists.send_replace(current.clone());
+        lists.send_if_modified(|published| {
+            if published == current {
+                return false;
+            }
+            *published = current.clone();
+            true
+        });
     })
 }
 
