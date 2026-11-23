@@ -308,6 +308,7 @@ impl ChannelMembership {
 /// Управляет ответами профиля и проверяет, какого пользователя запросил каждый вход.
 #[derive(Default)]
 struct DetailsFixture {
+    reflow: bool, // Два длинных сообщения для проверки переноса у опоры и хвоста.
     avatar_fetches: AtomicUsize, // Сколько раз сервер прочитал изображение собеседника.
     profile_avatar: Option<OwnAvatarFixture>, // Включает отдельные счётчики аватара текущего входа.
     users: Mutex<Vec<(&'static str, &'static str)>>, // Токен владельца и UUID собеседника.
@@ -851,7 +852,11 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
                     "created_at":format!("2026-11-17T10:00:{:02}Z", number - DETAILS_FIRST_ROW),
                     "payload":{
                         "kind":"markdown",
-                        "content": "Тестовая строка разной длины. ".repeat(4 + (number as usize) % 5),
+                        "content": if state.details.as_ref().is_some_and(|fixture| fixture.reflow) {
+                            position::reflow_text(number)
+                        } else {
+                            "Тестовая строка разной длины. ".repeat(4 + (number as usize) % 5)
+                        },
                     },
                 }))
                 .collect::<Vec<_>>()

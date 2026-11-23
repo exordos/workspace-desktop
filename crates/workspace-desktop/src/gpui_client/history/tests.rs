@@ -33,6 +33,39 @@ impl Conversation {
             .map(|y| self.viewport.list().viewport_bounds().top() + px(y))
     }
 
+    /// Даёт границы области и пузыря вместе с координатой нужного фрагмента текста.
+    pub(in crate::gpui_client) fn tested_history_geometry(
+        &self,
+        id: Uuid,
+        byte: usize,
+    ) -> Option<(
+        gpui::Bounds<gpui::Pixels>,
+        gpui::Bounds<gpui::Pixels>,
+        gpui::Pixels,
+    )> {
+        Some((
+            self.viewport.list().viewport_bounds(),
+            self.viewport.tested_bounds(id)?,
+            self.viewport.tested_text_y(id, byte)?,
+        ))
+    }
+
+    /// Находит начало визуальной строки, в которую попал указанный байт.
+    pub(in crate::gpui_client) fn tested_history_line_start(
+        &self,
+        id: Uuid,
+        byte: usize,
+    ) -> Option<usize> {
+        let layout = self.viewport.tested_text_layout(id)?;
+        let y = layout.position_for_index(byte)?.y + px(1.);
+        let left = layout.bounds().left() - px(1.);
+        Some(
+            layout
+                .index_for_position(gpui::point(left, y))
+                .unwrap_or_else(|index| index),
+        )
+    }
+
     /// Сверяет применение страницы вместе с её границей после полного ответа Core.
     pub(in crate::gpui_client) fn tested_older_page(&self) -> Option<(usize, HistoryEdge)> {
         let State::Ready(window) = &self.state else {

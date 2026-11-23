@@ -1,6 +1,6 @@
 //! Проверяет чтение A → B → A и применение запоздавшей страницы через рабочие маршруты GPUI и HTTPS.
 
-use gpui::{ScrollDelta, ScrollWheelEvent, point};
+use gpui::{App, ScrollDelta, ScrollWheelEvent, point};
 
 use super::*;
 
@@ -226,6 +226,204 @@ fn restores_same_message_and_y_after_switching_chats_and_prefetch(cx: &mut TestA
         "Догрузка: {current:?} → {after:?}"
     );
     assert_eq!(fixture.requested.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        futures::executor::block_on(runtime.shutdown()),
+        RuntimeExit::Clean
+    );
+}
+
+const REFLOW_ROW: u128 = DETAILS_LAST_ROW - 16;
+const REFLOW_MARKER: &str = "Место чтения внутри длинного сообщения";
+
+/// Даёт длинное тело опорному и последнему сообщению. Предыдущий абзац меняет высоту от ширины.
+pub(super) fn reflow_text(number: u128) -> String {
+    if number == REFLOW_ROW {
+        format!(
+            "{}{REFLOW_MARKER}. {}",
+            "Длинный абзац перед читаемым фрагментом. ".repeat(24),
+            "Продолжение длинного сообщения. ".repeat(8)
+        )
+    } else if number == DETAILS_LAST_ROW - 1 {
+        "Последнее сообщение переносится в несколько строк. ".repeat(6)
+    } else {
+        format!("Сообщение {number}")
+    }
+}
+
+/// Снимает геометрию в первом кадре открытия или закрытия панели по клику.
+fn first_panel_frame<T: Copy + 'static>(
+    ui: &mut VisualTestContext,
+    client: &Entity<Client>,
+    selector: &'static str,
+    open: bool,
+    sample: impl Fn(&App) -> T + 'static,
+) -> T {
+    let capture = std::rc::Rc::new(std::cell::Cell::new(None));
+    let frame = capture.clone();
+    let subscription = ui.update(|window, app| {
+        let panel = client.read(app).right_panel.clone();
+        window.observe(&panel, app, move |panel, window, app| {
+            if frame.get().is_none() && panel.read(app).is_empty() != open {
+                window.refresh();
+                window.draw(app).clear();
+                frame.set(Some(sample(app)));
+            }
+        })
+    });
+    click(ui, selector);
+    drop(subscription);
+    capture
+        .get()
+        .expect("Панель изменилась и GPUI построил первый кадр")
+}
+
+/// Открывает синтетическую личку в рабочем клиенте со штатным правым разделом и HTTPS.
+fn reflow_chat<'a>(
+    cx: &'a mut TestAppContext,
+    server: &Server,
+    profile: &std::path::Path,
+) -> (Entity<Client>, &'a mut VisualTestContext, RuntimeClient) {
+    cx.update(bind_keys);
+    let account = saved_account(server, USER, Uuid::nil());
+    let (runtime, events) = start_runtime(profile, account);
+    let (client, ui) =
+        cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
+    ui.update(|_, app| {
+        let subscription = events.attach(&client, app, Client::handle_runtime);
+        client.update(app, |client, cx| client.attach(subscription, cx));
+    });
+    ui.simulate_resize(size(px(1150.), px(690.)));
+    until(
+        ui,
+        "рабочий вход и каталог готовы",
+        |ui| ui.debug_bounds(CHAT_ROW).is_some() && server.state.ready.load(Ordering::SeqCst) > 0,
+    );
+    click(ui, CHAT_ROW);
+    until(
+        ui,
+        "последнее сообщение показано",
+        |ui| message_y(ui, &client, Uuid::from_u128(DETAILS_LAST_ROW - 1)).is_some(),
+    );
+    (client, ui, runtime)
+}
+
+/// Проверяет в рабочем клиенте, что фрагмент внутри длинного сообщения остаётся на прежней высоте.
+#[gpui::test]
+fn right_panel_reflow_keeps_the_reading_fragment_on_the_first_frame(cx: &mut TestAppContext) {
+    let server = Server::serve(Received {
+        details: Some(DetailsFixture {
+            reflow: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let profile = tempfile::tempdir().unwrap();
+    let (client, ui, runtime) = reflow_chat(cx, &server, profile.path());
+    let view = ui.read(|app| client.read(app).conversation.clone().unwrap());
+    let id = Uuid::from_u128(REFLOW_ROW);
+    let text = reflow_text(REFLOW_ROW);
+    let nearby = text.find(REFLOW_MARKER).unwrap() + 'М'.len_utf8();
+    let (viewport, _, line_y) = (0..16)
+        .find_map(|_| {
+            ui.read(|app| view.read(app).tested_history_geometry(id, nearby))
+                .or_else(|| {
+                    scroll(ui, 90.);
+                    None
+                })
+        })
+        .expect("В прокручиваемом списке появилась разметка длинного сообщения");
+    // Удерживаем первую букву реально перенесённой строки, на высоте которой остановились.
+    let start = ui.read(|app| {
+        view.read(app)
+            .tested_history_line_start(id, nearby)
+            .unwrap()
+    });
+    assert!(start > 0, "Фрагмент находится внутри перенесённого абзаца");
+    let fragment = text[start..].trim_start();
+    let byte = text.len() - fragment.len() + fragment.chars().next().unwrap().len_utf8();
+    let sample = move |app: &App| view.read(app).tested_history_geometry(id, byte).unwrap();
+
+    scroll(ui, f32::from(viewport.top() - line_y - px(3.)));
+    let (wide, row, before) = ui.read(&sample);
+    let wide_height = row.size.height;
+    assert!(row.top() < wide.top() && row.bottom() > wide.top());
+    assert!((before - wide.top() + px(3.)).abs() <= px(1.));
+
+    let mut measurements = Vec::new();
+    for (selector, open) in [
+        (DETAILS_TRIGGER, true),
+        ("conversation-details-close", false),
+    ] {
+        let (viewport, row, line_y) =
+            first_panel_frame(ui, &client, selector, open, sample.clone());
+        assert_eq!(viewport.size.width < wide.size.width, open);
+        assert_eq!(row.size.height > wide_height, open);
+        measurements.push((open, viewport.size.width, line_y));
+    }
+    for (open, width, line_y) in measurements {
+        eprintln!(
+            "history_reflow anchor_uuid={id} panel_open={open} width_px={} y_before_px={} y_after_px={} delta_px={}",
+            f32::from(width),
+            f32::from(before),
+            f32::from(line_y),
+            f32::from(line_y - before)
+        );
+        assert!(
+            (line_y - before).abs() <= px(1.),
+            "Панель открыта={open}: {before:?} → {line_y:?}"
+        );
+    }
+    assert_eq!(
+        futures::executor::block_on(runtime.shutdown()),
+        RuntimeExit::Clean
+    );
+}
+
+/// Проверяет, что после переноса последнего сообщения нижний отступ хвоста не меняется.
+#[gpui::test]
+fn right_panel_reflow_keeps_tail_gap_on_the_first_frame(cx: &mut TestAppContext) {
+    let server = Server::serve(Received {
+        details: Some(DetailsFixture {
+            reflow: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let profile = tempfile::tempdir().unwrap();
+    let (client, ui, runtime) = reflow_chat(cx, &server, profile.path());
+    let view = ui.read(|app| client.read(app).conversation.clone().unwrap());
+    let id = Uuid::from_u128(DETAILS_LAST_ROW - 1);
+    let sample = move |app: &App| {
+        let (viewport, bounds, _) = view
+            .read(app)
+            .tested_history_geometry(id, 0)
+            .expect("Последнее сообщение нарисовано");
+        (
+            viewport.size.width,
+            bounds.size.height,
+            viewport.bottom() - bounds.bottom(),
+        )
+    };
+    let (wide, initial_height, before) = ui.read(&sample);
+    assert_eq!(before, px(12.));
+    for (selector, open) in [
+        (DETAILS_TRIGGER, true),
+        ("conversation-details-close", false),
+    ] {
+        let (width, height, after) = first_panel_frame(ui, &client, selector, open, sample.clone());
+        assert_eq!(width < wide, open);
+        assert_eq!(height > initial_height, open);
+        eprintln!(
+            "history_reflow tail_uuid={id} panel_open={open} width_px={} gap_before_px={} gap_after_px={}",
+            f32::from(width),
+            f32::from(before),
+            f32::from(after)
+        );
+        assert!(
+            (after - before).abs() <= px(1.),
+            "Хвост, панель открыта={open}: {before:?} → {after:?}"
+        );
+    }
     assert_eq!(
         futures::executor::block_on(runtime.shutdown()),
         RuntimeExit::Clean

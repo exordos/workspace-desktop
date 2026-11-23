@@ -103,6 +103,14 @@ struct EditAnchor {
     source: ReadingLine, // Та же строка в последнем показанном кадре.
 }
 
+/// Сохраняет тот же фрагмент при нескольких сменах ширины без прокрутки.
+#[derive(Clone, Copy)]
+struct ReflowAnchor {
+    id: Uuid,           // Сообщение, которое человек продолжает читать.
+    scroll: ListOffset, // Позиция после последней смены ширины.
+    target: LineTarget, // Байтовая позиция фрагмента и высота его строки.
+}
+
 /// Снимок виртуального списка и реально нарисованные границы последнего кадра.
 pub(super) struct Viewport {
     rows: Rc<Vec<Row>>, // Состав списка для отложенного построения видимых элементов.
@@ -114,6 +122,7 @@ pub(super) struct Viewport {
     painted_offset: Rc<Cell<Option<ListOffset>>>, // Смещение, для которого измерены прямоугольники.
     measure: Option<Measurement>,                 // Следующее измерение после замены снимка.
     edit_anchor: Option<EditAnchor>, // Поправка внутри текста опоры для следующего кадра.
+    reflow_anchor: Rc<Cell<Option<ReflowAnchor>>>, // Опора между сменами ширины без жеста.
 }
 
 impl Viewport {
@@ -129,6 +138,7 @@ impl Viewport {
             painted_offset: Rc::default(),
             measure: None,
             edit_anchor: None,
+            reflow_anchor: Rc::default(),
         }
     }
 
@@ -162,6 +172,7 @@ impl Viewport {
         self.painted_offset.set(None);
         self.measure = None;
         self.edit_anchor = None;
+        self.reflow_anchor.set(None);
     }
 
     /// Сверяет последний отрисованный кадр с текущим смещением списка.
@@ -230,6 +241,15 @@ impl Viewport {
             Position::Restore(anchor) => index.contains_key(&anchor.id).then_some(anchor),
             Position::Tail | Position::Around(_) => None,
         };
+        // Одна и та же байтовая позиция имеет смысл, пока текст и маршрут совпадают.
+        if self.reflow_anchor.get().is_some_and(|reflow| {
+            !matches!(position, Position::Reading)
+                || !same_offset(self.list.logical_scroll_top(), reflow.scroll)
+                || self.index.get(&reflow.id).map(|&ix| &self.rows[ix].body)
+                    != index.get(&reflow.id).map(|&ix| &rows[ix].body)
+        }) {
+            self.reflow_anchor.set(None);
+        }
         let source = if let (Position::Reading, Some(anchor)) = (&position, anchor) {
             self.reading_line(anchor.id, &rows[index[&anchor.id]])
         } else {
@@ -362,6 +382,16 @@ impl Viewport {
         }
     }
 
+    /// Берёт разбивку текста из последнего кадра, когда человек остановился внутри сообщения.
+    fn reflow_reading(&self, scroll: ListOffset) -> Option<ReadingLine> {
+        if !self.paint_matches(scroll) {
+            return None;
+        }
+        let row = self.rows.get(scroll.item_ix)?;
+        let layout = self.painted_text.borrow().get(&row.id)?.clone();
+        ReadingLine::at_top(layout, self.list.viewport_bounds().top())
+    }
+
     /// Показывает локальные строки с управляемым содержимым отдельных баблов.
     pub(super) fn render_standalone(
         &mut self,
@@ -394,6 +424,14 @@ impl Viewport {
         cards: Option<Cards>,
         accessory: impl Fn(Uuid) -> Option<AnyElement> + 'static,
     ) -> impl IntoElement {
+        let previous_width = self.list.viewport_bounds().size.width;
+        let previous_scroll = self.list.logical_scroll_top();
+        let following_tail = self.at_tail();
+        let reading = (!following_tail)
+            .then(|| self.reflow_reading(previous_scroll))
+            .flatten();
+        let reflow_anchor = self.reflow_anchor.clone();
+        let edit_anchor = self.edit_anchor.take();
         self.painted.borrow_mut().clear();
         self.painted_text.borrow_mut().clear();
         self.painted_offset.set(None);
@@ -420,42 +458,66 @@ impl Viewport {
             )
         });
         let measured_line = Rc::new(Cell::new(None::<(Uuid, Uuid, LineTarget)>));
-        let correction = self.edit_anchor.take().map(|edit| {
+        let correction = {
             let list = list_state.clone();
             let rows = self.rows.clone();
             let message = message.clone();
             let measured_line = measured_line.clone();
             canvas(
                 move |bounds, window, app| {
-                    if !same_offset(list.logical_scroll_top(), edit.scroll) {
+                    let scroll = list.logical_scroll_top();
+                    let row = rows.get(scroll.item_ix);
+                    let retained = reflow_anchor.get().filter(|anchor| {
+                        same_offset(scroll, anchor.scroll)
+                            && row.is_some_and(|row| row.id == anchor.id)
+                    });
+                    reflow_anchor.set(retained);
+                    let Some(row) = row else { return };
+                    let resized = bounds.size.width != previous_width;
+                    let edit = edit_anchor.filter(|edit| row.id == edit.id && same_offset(scroll, edit.scroll));
+                    let (op_id, target) = if let Some(edit) = &edit {
+                        (edit.op_id, edit.source.target(&row.body))
+                    } else if resized && !following_tail && same_offset(scroll, previous_scroll) {
+                        let target = retained.map(|anchor| anchor.target)
+                            .or_else(|| reading?.target(&row.body));
+                        (Uuid::new_v4(), target)
+                    } else {
                         return;
-                    }
-                    let row = &rows[edit.scroll.item_ix];
-                    let target = edit.source.target(&row.body);
-                    let offset = target.and_then(|target| {
-                        target.measure(bounds.size.width, window, app, |app| {
+                    };
+                    let measured = target.and_then(|target| {
+                        let offset = target.measure(bounds.size.width, window, app, |app| {
                             let (message, text) = message(row, app);
                             (row_container(row, palette).child(message), text)
-                        })
+                        })?;
+                        Some((target, offset))
                     });
-                    if let (Some(target), Some(_)) = (target, offset) {
-                        measured_line.set(Some((edit.id, edit.op_id, target)));
+                    let offset_in_item = match measured {
+                        Some((target, offset)) => {
+                            measured_line.set(Some((row.id, op_id, target)));
+                            offset
+                        }
+                        None if edit.is_some() => row.inset(),
+                        None => return,
+                    };
+                    list.scroll_to(ListOffset { item_ix: scroll.item_ix, offset_in_item });
+                    if resized && let Some((target, _)) = measured {
+                        reflow_anchor.set(Some(ReflowAnchor {
+                            id: row.id,
+                            scroll: list.logical_scroll_top(),
+                            target,
+                        }));
                     }
-                    list.scroll_to(ListOffset {
-                        item_ix: edit.scroll.item_ix,
-                        offset_in_item: offset.unwrap_or_else(|| row.inset()),
-                    });
                     log::debug!(
-                        "gpui_history op_id={} event=text_anchor_positioned anchor_uuid={} old_offset_px={} new_offset_px={}",
-                        edit.op_id, edit.id, f32::from(edit.scroll.offset_in_item),
-                        f32::from(list.logical_scroll_top().offset_in_item)
+                        "gpui_history op_id={op_id} event=text_anchor_positioned anchor_uuid={} old_offset_px={} new_offset_px={} width_before_px={} width_after_px={}",
+                        row.id, f32::from(scroll.offset_in_item), f32::from(offset_in_item),
+                        f32::from(previous_width), f32::from(bounds.size.width)
                     );
                 },
                 |_, (), _, _| (),
             )
             .absolute()
             .inset_0()
-        });
+        };
         let rows = self.rows.clone();
         let items = list(self.list.clone(), move |index, _, app| {
             let row = &rows[index];
@@ -501,7 +563,7 @@ impl Viewport {
             .flex_1()
             .min_h_0()
             .w_full()
-            .children(correction)
+            .child(correction)
             .child(items)
     }
 
@@ -558,11 +620,15 @@ impl Viewport {
     /// Возвращает координату строки текста в окне для проверки первого кадра.
     #[cfg(all(test, feature = "gpui-test"))]
     pub(super) fn tested_text_y(&self, id: Uuid, byte: usize) -> Option<Pixels> {
-        self.painted_text
-            .borrow()
-            .get(&id)?
+        self.tested_text_layout(id)?
             .position_for_index(byte)
             .map(|point| point.y)
+    }
+
+    /// Даёт фактические переносы текста из кадра для проверки фрагмента внутри строки.
+    #[cfg(all(test, feature = "gpui-test"))]
+    pub(super) fn tested_text_layout(&self, id: Uuid) -> Option<TextLayout> {
+        self.painted_text.borrow().get(&id).cloned()
     }
 
     /// Возвращает опору чтения после показанного кадра для проверки вставки.
