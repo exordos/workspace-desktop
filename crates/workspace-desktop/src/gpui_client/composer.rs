@@ -81,10 +81,9 @@ pub(super) struct Submission {
 
 /// Намерение, которое редактор передаёт экрану разговора.
 pub(super) enum ComposerEvent {
-    Send(Submission), // Просьба сохранить подготовленный текст в очереди.
-    RetryDestination(ConversationAddress), // Повторная проверка разрешения для того же экрана.
-    ReplyAvailabilityChanged, // Истории нужно обновить доступность действий ответа.
-    DraftRestored,    // Истории нужно заполнить доступные предпросмотры восстановленных цитат.
+    Send(Box<Submission>), // Просьба сохранить подготовленный текст в очереди.
+    DestinationChanged,    // Экрану нужно обновить нижнюю область и действия ответа.
+    DraftRestored,         // Истории нужно заполнить доступные предпросмотры восстановленных цитат.
 }
 
 /// Пояснение к той попытке, которая не попала в очередь.
@@ -194,16 +193,20 @@ impl Composer {
         self.editor.clone()
     }
 
+    /// Возвращает причину завершённой проверки, если отправка заблокирована.
+    pub(super) fn destination_error(&self) -> Option<DestinationError> {
+        match self.destination {
+            Destination::Unavailable(error) => Some(error),
+            _ => None,
+        }
+    }
+
     /// Убирает разрешение на отправку, пока история проходит повторную проверку.
     pub fn invalidate_destination(&mut self, cx: &mut Context<Self>) {
-        let was_available = self.reply_available();
-        // При временной проверке уже подтверждённая версия продолжает принимать ввод.
-        // Отзыв доступа к прежней области проверяется в Core при каждой записи.
+        // Сохраняем текущий снимок, чтобы вернуть ввод после подтверждения области.
         self.persist_draft(cx);
         self.destination = Destination::Unchecked;
-        if was_available {
-            cx.emit(ComposerEvent::ReplyAvailabilityChanged);
-        }
+        cx.emit(ComposerEvent::DestinationChanged);
         cx.notify();
     }
 
@@ -275,9 +278,7 @@ impl Composer {
                 Destination::Unavailable(error)
             }
         };
-        if self.reply_available() {
-            cx.emit(ComposerEvent::ReplyAvailabilityChanged);
-        }
+        cx.emit(ComposerEvent::DestinationChanged);
         log::debug!(
             "gpui_send op_id={op_id} event=destination_finished available={}",
             matches!(self.destination, Destination::Ready { .. }),
@@ -339,7 +340,7 @@ impl Composer {
             self.address.generation.0,
             self.address.revision.0,
         );
-        cx.emit(ComposerEvent::Send(submission));
+        cx.emit(ComposerEvent::Send(Box::new(submission)));
         cx.notify();
     }
 
@@ -393,7 +394,7 @@ impl Composer {
                 ) =>
             {
                 self.destination = Destination::Unavailable(error);
-                cx.emit(ComposerEvent::ReplyAvailabilityChanged);
+                cx.emit(ComposerEvent::DestinationChanged);
             }
             _ => {}
         }
@@ -425,13 +426,13 @@ impl Render for Composer {
         let can_format = editor.can_format();
         let too_long = over_limit(&self.replies.markdown(editor.text()));
         let write_failure = self.current_write_failure(cx);
-        let explanation = match &self.destination {
-            Destination::Unchecked | Destination::Checking(_) => {
-                Some(("Проверяем возможность отправки…", false))
-            }
-            Destination::Unavailable(error) => Some((error.text(), false)),
-            Destination::Ready { .. } if too_long => Some(("Текст длиннее 40 000 символов", true)),
-            Destination::Ready { .. } => write_failure.map(|failure| (failure.text(), true)),
+        let explanation = if too_long {
+            Some(locale.text(
+                "Текст длиннее 40 000 символов",
+                "The message exceeds 40,000 characters",
+            ))
+        } else {
+            write_failure.map(WriteFailure::text)
         };
         let appearance = if too_long || write_failure.is_some() {
             FieldAppearance::Invalid
@@ -455,7 +456,6 @@ impl Render for Composer {
             Icon::Send.element(px(24.), color)
         };
         let target = cx.entity().downgrade();
-        let retry = target.clone();
         let toolbar = expanded.then(|| self.toolbar.row(palette, can_format, window, cx));
         // Сетка сначала задаёт общую ширину поля и пояснения. От неё зависит высота переносов.
         div()
@@ -531,35 +531,13 @@ impl Render for Composer {
             )
             // Панель прокручивается в пределах поля, оставляя справа место под отправку.
             .children(toolbar.map(|row| div().min_w_0().pr(SEND_SIZE + FIELD_SEND_GAP).child(row)))
-            .when_some(explanation, |view, (text, error)| {
+            .when_some(explanation, |view, text| {
                 view.child(
                     label(palette, TextRole::Caption, text)
-                        .text_color(if error {
-                            palette.danger
-                        } else {
-                            palette.text_secondary
-                        })
+                        .text_color(palette.danger)
                         .debug_selector(|| "conversation-send-explanation".into()),
                 )
             })
-            .when(
-                matches!(self.destination, Destination::Unavailable(_)),
-                |view| {
-                    view.child(
-                        div().flex().justify_end().child(
-                            Button::new("conversation-send-retry", "Проверить отправку")
-                                .render(palette, None, move |_, app| {
-                                    let _ = retry.update(app, |view, cx| {
-                                        cx.emit(ComposerEvent::RetryDestination(
-                                            view.address.clone(),
-                                        ));
-                                    });
-                                })
-                                .debug_selector(|| "conversation-send-retry".into()),
-                        ),
-                    )
-                },
-            )
     }
 }
 

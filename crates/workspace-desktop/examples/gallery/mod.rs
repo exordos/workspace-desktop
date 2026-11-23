@@ -1,6 +1,9 @@
 //! Собирает две палитры из общих компонентов и показывает переходы фокуса, выбор и ввод.
 
+mod conversation_notices;
 mod quotes;
+
+use std::time::Duration;
 
 use gpui::{
     App, Application, Bounds, Context, Div, Entity, Focusable, KeyBinding, SharedString,
@@ -27,6 +30,7 @@ struct Panel {
     id: &'static str,      // Префикс ключей элементов панели.
     selected: u8,          // Номер выбранной строки каталога.
     draft: Entity<Editor>, // Общий редактор с локальным черновиком.
+    retrying_notice: bool, // Пример плашки временно показывает повторную проверку.
 }
 
 impl Panel {
@@ -37,7 +41,24 @@ impl Panel {
             id,
             selected: 0,
             draft: cx.new(Editor::for_conversation),
+            retrying_notice: false,
         }
+    }
+
+    /// Показывает фазу проверки до возврата в исходное состояние примера.
+    fn retry_notice(&mut self, cx: &mut Context<Self>) {
+        self.retrying_notice = true;
+        cx.notify();
+        cx.spawn(async move |panel, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(800))
+                .await;
+            let _ = panel.update(cx, |panel, cx| {
+                panel.retrying_notice = false;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Рисует панель с каталогом, сообщениями, полями и кнопками.
@@ -53,6 +74,7 @@ impl Panel {
         disabled.appearance = ButtonAppearance::Primary;
         disabled.disabled = true;
         let target = cx.entity().downgrade();
+        let notice_target = target.clone();
 
         div()
             .flex()
@@ -103,6 +125,13 @@ impl Panel {
             )
             .child(delivery(palette, "Посмотрел, спасибо!", DeliveryMark::Read))
             .child(delivery(palette, "Повторю после проверки связи", DeliveryMark::Failed))
+            .child(conversation_notices::examples(
+                palette,
+                self.retrying_notice,
+                move |_, app| {
+                    let _ = notice_target.update(app, Panel::retry_notice);
+                },
+            ))
             .child(quotes::messages(palette))
             .child(field(
                 palette,

@@ -263,6 +263,15 @@ fn reply_drag_and_keyboard_reorder_after_destination_failure(cx: &mut TestAppCon
     );
     ui.run_until_parked();
     assert!(ui.debug_bounds("conversation-send-retry").is_some());
+    assert!(ui.update(|window, app| {
+        let view = view.read(app);
+        let (history, editor) = view.history_and_editor_focus(app);
+        editor.is_none() && history.is_focused(window)
+    }));
+
+    click(ui, "conversation-send-retry");
+    allow(&requests, Ok(TOPIC), ui);
+    assert_eq!(draft(&view, ui), "Ответ Б");
 
     let first_width = ui.debug_bounds(TABS[0]).unwrap().size.width;
     let second_width = ui.debug_bounds(TABS[1]).unwrap().size.width;
@@ -281,8 +290,6 @@ fn reply_drag_and_keyboard_reorder_after_destination_failure(cx: &mut TestAppCon
     assert_eq!(ui.debug_bounds(TABS[0]).unwrap().size.width, first_width);
     assert_eq!(draft(&view, ui), "Ответ Б");
 
-    click(ui, "conversation-send-retry");
-    allow(&requests, Ok(TOPIC), ui);
     click(ui, "conversation-send");
     let reordered = next(&requests.save, "повтор после восстановления цели");
     assert_eq!(

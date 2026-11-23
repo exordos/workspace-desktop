@@ -3,6 +3,7 @@
 
 mod content;
 mod controls;
+mod conversation_notice;
 mod focus;
 mod icons;
 pub(super) mod popup;
@@ -20,6 +21,7 @@ pub use content::{
 };
 pub(in crate::gpui_client) use controls::activate;
 pub use controls::{Button, ButtonAppearance, FieldAppearance, field};
+pub use conversation_notice::ConversationNotice;
 pub use focus::track_focus_input;
 pub use icons::{Icon, SEARCH_ICON_SIZE, WorkspaceAssets};
 pub use quote::{QuoteSurface, quote_frame, quote_preview};

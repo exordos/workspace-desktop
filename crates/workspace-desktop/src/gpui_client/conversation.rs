@@ -37,14 +37,16 @@ use self::{
 };
 use super::{
     avatars::AvatarImages,
-    composer::{Composer, ComposerEvent, QueueWriteOutcome, SendSource, Submission},
+    composer::{
+        Composer, ComposerEvent, DestinationError, QueueWriteOutcome, SendSource, Submission,
+    },
     contracts::{AccountSession, ChatEntry, ConversationAddress},
     preferences::Preferences,
     right_panel::RightPanel,
     runtime::RuntimeClient,
     ui::{
-        Avatar, Button, ButtonAppearance, Icon, PANEL_RADIUS, Palette, SURFACE_RADIUS, TextRole,
-        label,
+        Avatar, Button, ButtonAppearance, ConversationNotice, Icon, PANEL_RADIUS, Palette,
+        SURFACE_RADIUS, TextRole, label,
     },
 };
 
@@ -226,16 +228,7 @@ impl Conversation {
                     ComposerEvent::Send(submission) => {
                         conversation.save_submission(sender, submission, cx)
                     }
-                    ComposerEvent::RetryDestination(address)
-                        if conversation.has_access() && *address == conversation.address =>
-                    {
-                        if let Some(sending) = &conversation.sending {
-                            sending.view.update(cx, |editor, cx| {
-                                editor.retry_destination(&sending.source, cx)
-                            });
-                        }
-                    }
-                    ComposerEvent::ReplyAvailabilityChanged => cx.notify(),
+                    ComposerEvent::DestinationChanged => cx.notify(),
                     ComposerEvent::DraftRestored => {
                         sender.update(cx, |composer, cx| {
                             composer.refresh_draft_quotes(
@@ -244,7 +237,6 @@ impl Conversation {
                             );
                         });
                     }
-                    ComposerEvent::RetryDestination(_) => {}
                 },
             );
         self.sending = Some(Sending {
@@ -252,6 +244,17 @@ impl Conversation {
             source,
             _intents: intents,
         });
+    }
+
+    /// Повторяет проверку отправки, пока история этого разговора доступна.
+    fn retry_send_destination(&mut self, cx: &mut Context<Self>) {
+        if self.has_access()
+            && let Some(sending) = &self.sending
+        {
+            sending.view.update(cx, |editor, cx| {
+                editor.retry_destination(&sending.source, cx)
+            });
+        }
     }
 
     /// Перепроверяет адрес экрана и запускает одну запись очереди для принятого намерения.
@@ -992,6 +995,59 @@ impl Conversation {
 }
 
 impl Conversation {
+    /// Показывает доступный редактор или отдельное состояние отправки под историей.
+    fn render_chat_footer(
+        &self,
+        sending: &Sending,
+        palette: Palette,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        let editor = sending.view.read(cx);
+        if editor.reply_available() {
+            return sending.view.clone().into_any_element();
+        }
+
+        let locale = Preferences::read_for(cx, &self.address.route.owner).language;
+        let error = editor.destination_error();
+        let (ru, en) = match error {
+            None => (
+                "Проверяем доступ к отправке…",
+                "Checking if you can send messages…",
+            ),
+            Some(DestinationError::TopicClosed) => ("Эта тема решена", "This topic is resolved"),
+            Some(DestinationError::AccessLost) => (
+                "Отправка в этот разговор недоступна",
+                "Sending messages to this conversation is unavailable",
+            ),
+            Some(DestinationError::TopicChanged) => (
+                "Тема для отправки изменилась",
+                "The topic for sending messages has changed",
+            ),
+            Some(DestinationError::DraftUnavailable) => {
+                ("Не удалось открыть черновик", "Could not open the draft")
+            }
+            Some(
+                DestinationError::EncryptionUnavailable
+                | DestinationError::TopicUnavailable
+                | DestinationError::Unavailable,
+            ) => (
+                "Не удалось проверить доступ к отправке",
+                "Could not check if you can send messages",
+            ),
+        };
+        ConversationNotice {
+            text: locale.text(ru, en).into(),
+            action: error.map(|_| {
+                Button::new(
+                    "conversation-send-retry",
+                    locale.text("Повторить проверку", "Check again"),
+                )
+            }),
+        }
+        .render(palette, action(cx, Self::retry_send_destination))
+        .into_any_element()
+    }
+
     /// Рисует название чата или тему и название её канала из каталога.
     fn render_heading(&self, palette: Palette, cx: &Context<Self>) -> gpui::Div {
         let locale = Preferences::read_for(cx, &self.address.route.owner).language;
@@ -1326,7 +1382,11 @@ impl Conversation {
                             history.child(self.render_latest(palette, cx))
                         }),
                 )
-                .children(self.sending.as_ref().map(|sending| sending.view.clone()))
+                .children(
+                    self.sending
+                        .as_ref()
+                        .map(|sending| self.render_chat_footer(sending, palette, cx)),
+                )
             }
         }
     }
@@ -1337,6 +1397,19 @@ impl Render for Conversation {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::for_window(window, cx);
         self.restore_details_for_verified_history(window, cx);
+        if let Some(sending) = &self.sending {
+            let editor = sending.view.read(cx);
+            if (!self.has_access() || !editor.reply_available())
+                && editor.editor_focus(cx).is_focused(window)
+            {
+                let focus = if self.has_access() {
+                    &self.history_focus
+                } else {
+                    &self.screen_focus
+                };
+                window.focus(focus);
+            }
+        }
         let menu = self.render_reply_menu(window, palette, cx);
         if let Some((key, focus)) = self.attachments.take_restore() {
             if self.viewport.has_visible_attachment(key) {

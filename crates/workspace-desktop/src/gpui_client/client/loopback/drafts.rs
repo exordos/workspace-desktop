@@ -324,9 +324,9 @@ fn reply_draft_survives_navigation_and_restart_without_reviving_queued_input(
     );
 }
 
-/// Новые ответы сохраняются во время ручной проверки, а отозванная тема лички не возвращается.
+/// При ручной проверке ответ скрыт и сохранён. После отзыва ответ старой темы не возвращается.
 #[gpui::test]
-fn rechecking_keeps_new_answer_until_explicit_topic_revocation(cx: &mut TestAppContext) {
+fn rechecking_keeps_answer_until_explicit_topic_revocation(cx: &mut TestAppContext) {
     use workspace_core::storage::{Cursor, HistoryChange, MessagePlacement};
 
     cx.update(bind_keys);
@@ -348,7 +348,7 @@ fn rechecking_keeps_new_answer_until_explicit_topic_revocation(cx: &mut TestAppC
     add(ui, FIRST_ROW);
     enter(ui, "Ответ до перепроверки");
 
-    // В обычном ответе этот отказ сохраняет поле и предлагает ручную перепроверку.
+    // Отказ сохраняет ответ и предлагает ручную перепроверку под историей.
     server
         .state
         .direct_unavailable
@@ -356,7 +356,7 @@ fn rechecking_keeps_new_answer_until_explicit_topic_revocation(cx: &mut TestAppC
     press_enter(ui);
     until(
         ui,
-        "в редакторе предлагается повторная проверка",
+        "под историей предлагается повторная проверка",
         |ui| ui.debug_bounds("conversation-send-retry").is_some(),
     );
     server
@@ -370,7 +370,11 @@ fn rechecking_keeps_new_answer_until_explicit_topic_revocation(cx: &mut TestAppC
         "локальный сервер удерживает проверку",
         |_| fixture.destination_waiting.load(Ordering::SeqCst),
     );
-    enter(ui, " 🦊 новый");
+    assert!(ui.debug_bounds("conversation-send-notice").is_some());
+    assert!(ui.read(|app| {
+        let view = client.read(app).conversation.as_ref().unwrap();
+        view.read(app).history_and_editor_focus(app).1.is_none()
+    }));
     switch_topic(ui);
     ready_text(
         &client,
@@ -385,7 +389,7 @@ fn rechecking_keeps_new_answer_until_explicit_topic_revocation(cx: &mut TestAppC
         &client,
         ui,
         topic,
-        "Ответ до перепроверки 🦊 новый",
+        "Ответ до перепроверки",
         "ответ сохранился во время проверки",
     );
 
@@ -489,7 +493,7 @@ fn closed_topic_keeps_reply_draft_scoped_to_its_owner(cx: &mut TestAppContext) {
     switch_topic(ui);
     until(
         ui,
-        "в закрытой теме прочитан ответ первого владельца",
+        "в закрытой теме плашка скрывает сохранённый ответ первого владельца",
         |ui| {
             ui.read(|app| {
                 client.read(app).conversation.as_ref().is_some_and(|view| {
@@ -500,9 +504,13 @@ fn closed_topic_keeps_reply_draft_scoped_to_its_owner(cx: &mut TestAppContext) {
                                 && editor.draft(app) == "Ответ автора в теме"
                         })
                 })
-            })
+            }) && ui.debug_bounds("conversation-send-notice").is_some()
         },
     );
+    assert!(ui.read(|app| {
+        let view = client.read(app).conversation.as_ref().unwrap();
+        view.read(app).history_and_editor_focus(app).1.is_none()
+    }));
     press_enter(ui);
     assert_eq!(
         server

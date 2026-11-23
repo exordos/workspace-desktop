@@ -28,21 +28,6 @@ pub(in crate::gpui_client) enum DestinationError {
     DraftUnavailable,      // SQLite не смогла безопасно открыть текущую версию поля.
 }
 
-impl DestinationError {
-    /// Даёт короткое пояснение рядом с недоступной кнопкой отправки.
-    pub(super) fn text(self) -> &'static str {
-        match self {
-            Self::AccessLost => "Чат или тема для отправки недоступны",
-            Self::EncryptionUnavailable => "Отправка открытого текста недоступна",
-            Self::TopicUnavailable => "Сервер не указал тему для отправки",
-            Self::TopicClosed => "Тема закрыта для отправки",
-            Self::TopicChanged => "Тема для отправки изменилась",
-            Self::Unavailable => "Не удалось проверить возможность отправки",
-            Self::DraftUnavailable => "Не удалось открыть локальный черновик",
-        }
-    }
-}
-
 impl From<DirectSendError> for DestinationError {
     /// Отбрасывает детали токенов, адресов и HTTP-ответов.
     fn from(error: DirectSendError) -> Self {

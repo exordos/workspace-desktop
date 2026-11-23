@@ -1545,12 +1545,15 @@ fn direct_destination_change_requires_manual_recheck_before_enqueue(cx: &mut Tes
         press_enter(ui);
         until(
             ui,
-            "редактор требует ручной сверки цели",
+            "под историей предложена ручная сверка цели",
             |ui| topic(ui).is_none() && ui.debug_bounds("conversation-send-retry").is_some(),
         );
 
         // Пока цель не перепроверена, даже следующий Enter не пишет снимок.
-        refocus(ui);
+        assert!(ui.read(|app| {
+            let view = client.read(app).conversation.as_ref().unwrap();
+            view.read(app).history_and_editor_focus(app).1.is_none()
+        }));
         press_enter(ui);
         assert_eq!(
             ui.read(|app| composer.read(app).draft(app).to_owned()),
