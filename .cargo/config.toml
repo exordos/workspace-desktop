@@ -1,2 +1,3 @@
 [alias]
 dev = ["run", "--quiet", "--locked", "--manifest-path", "tools/workspace-dev/Cargo.toml", "--target-dir", "target/dev-launcher", "--"]
+check-architecture = ["run", "--quiet", "--locked", "--manifest-path", "tools/workspace-architecture/Cargo.toml", "--target-dir", "target/architecture-lint", "--"]

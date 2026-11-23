@@ -15,6 +15,8 @@
 
 При ревью изменений или отдельного этапа используй [Workspace Desktop Review](skills/workspace-desktop-review/SKILL.md). Если делегируешь ревью, передай субагенту путь к этому скиллу, задачу, критерии этапа и точный diff.
 
+Запускай `cargo check-architecture` из корня проверяемого checkout при изменениях в манифестах, Rust-коде на границе модулей или самом инструменте. Эту же команду используй в CI. [Правила проверки](docs/plans/roadmap/architecture-lint.md)
+
 ## Запуск приложения
 
 Окно и команда `workspace-auth sync` используют общий запуск `workspace_core::bootstrap`. Порядок начальной загрузки описывай в [Bootstrap](docs/plans/workspace-desktop-architecture.md#bootstrap), а запросы, обработку и хранение данных оставляй в модуле, который ими владеет.
@@ -57,6 +59,7 @@
 ## Проверки из корня workspace
 
 ```sh
+cargo check-architecture
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
