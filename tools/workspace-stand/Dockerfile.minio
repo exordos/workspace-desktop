@@ -1,0 +1,9 @@
+FROM golang:1.24.8-alpine AS build
+
+# Официальный MinIO Community распространяется исходным кодом.
+# Коммит соответствует RELEASE.2025-10-15T17-29-55Z.
+RUN CGO_ENABLED=0 go install github.com/minio/minio@9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a
+
+FROM alpine:3.22
+COPY --from=build /go/bin/minio /usr/local/bin/minio
+ENTRYPOINT ["minio"]
