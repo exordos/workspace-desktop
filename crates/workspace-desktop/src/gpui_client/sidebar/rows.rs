@@ -1,6 +1,7 @@
 //! Рисует строки каталога, подложку канала и управление списком его тем.
 //! Родитель передаёт метаданные, фокус и действия для каждой области строки.
 
+use super::protected_previews::SecurePreview;
 use gpui::{
     App, Div, ElementId, FocusHandle, Hsla, ImageSource, MouseButton, SharedString, Stateful,
     Transformation, Window, div, prelude::*, px, radians, rgb,
@@ -20,15 +21,16 @@ const STREAM_HOVER_GROUP: &str = "catalog-stream-row";
 #[derive(Clone, Default)]
 pub(super) struct ChatRowDetails {
     pub(super) preview: Option<ChatRowPreview>, // Превью последнего сообщения.
-    pub(super) time: Option<SharedString>,      // Подпись времени последнего сообщения.
+    pub(super) protected_preview: Option<gpui::Entity<SecurePreview>>, // Глифы держит дочернее представление.
+    pub(super) time: Option<SharedString>, // Подпись времени последнего сообщения.
     pub(super) unread: Option<(u64, BadgeTone)>, // Число и стиль бейджа этого разговора.
-    pub(super) mention: bool,                   // Есть личное упоминание.
-    pub(super) presence: AvatarPresence,        // Статус собеседника, если известен.
-    pub(super) image: Option<ImageSource>,      // Готовое фото собеседника в личном чате.
-    pub(super) pinned: bool,                    // Закрепление в папке, в которой показана строка.
-    pub(super) muted: bool,                     // Строка приглушается из-за режима уведомлений.
-    pub(super) compact: bool,                   // Уменьшает строку и скрывает превью и время.
-    pub(super) hide_avatar: bool, // Прячет аватар, если он не служит отдельным переходом.
+    pub(super) mention: bool,              // Есть личное упоминание.
+    pub(super) presence: AvatarPresence,   // Статус собеседника, если известен.
+    pub(super) image: Option<ImageSource>, // Готовое фото собеседника в личном чате.
+    pub(super) pinned: bool,               // Закрепление в папке, в которой показана строка.
+    pub(super) muted: bool,                // Строка приглушается из-за режима уведомлений.
+    pub(super) compact: bool,              // Уменьшает строку и скрывает превью и время.
+    pub(super) hide_avatar: bool,          // Прячет аватар, если он не служит отдельным переходом.
 }
 
 /// Действие, которое оболочка связывает с состоянием каталога.
@@ -96,10 +98,13 @@ pub(super) fn direct_row(
         selected,
         disabled: false,
     }
-    .render_with_action(
+    .render_with_caption(
         palette,
         focus,
         details.pinned.then(|| pin(palette)),
+        details
+            .protected_preview
+            .map(|preview| preview.into_any_element()),
         on_open,
     )
     .min_h(px(64.))
@@ -192,7 +197,8 @@ impl ChannelRow {
                     .preview
                     .filter(|_| !self.details.compact)
                     .map(|message| {
-                        let caption = preview_label(palette, message);
+                        let caption =
+                            preview_label(palette, message, self.details.protected_preview);
                         match preview {
                             Some(preview) => inner_action(
                                 ElementId::Uuid(preview.id),
@@ -206,7 +212,7 @@ impl ChannelRow {
                             .child(caption)
                             .debug_selector(move || format!("catalog-stream-preview-{id}"))
                             .into_any_element(),
-                            None => caption.into_any_element(),
+                            None => caption,
                         }
                     }),
             );
@@ -287,52 +293,50 @@ impl TopicRow {
         let title = ellipsized_label(palette, TextRole::Label, title)
             .when(self.completed, |title| title.line_through().opacity(0.7))
             .debug_selector(|| "chat-row-title".into());
-        let row = row_surface(
-            ElementId::Name(selector.clone().into()),
-            palette,
-            self.selected,
-        )
-        .min_h(px(36.))
-        .pl(px(37.))
-        .pr(px(7.))
-        .py(px(7.))
-        .when(self.details.compact, |row| {
-            row.min_h(px(32.)).gap_2().pl(px(35.)).py(px(5.))
-        })
-        .child(
-            div()
-                .w(px(3.))
-                .flex_none()
-                .rounded_full()
-                .bg(sidebar_color(self.color).unwrap_or(palette.icon))
-                .debug_selector(|| "catalog-topic-bar".into()),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_w_0()
-                .child(title)
-                .children(
-                    self.details
-                        .preview
-                        .filter(|_| !self.details.compact)
-                        .map(|preview| preview_label(palette, preview)),
-                ),
-        )
-        .children(
-            ChatRow::metadata(
+        let row =
+            row_surface(
+                ElementId::Name(selector.clone().into()),
                 palette,
-                self.details.time.filter(|_| !self.details.compact),
-                self.details.unread,
-                self.details.mention,
-                None,
+                self.selected,
             )
-            .map(|column| column.when(self.details.compact, |column| column.min_w(px(32.)))),
-        )
-        .when(self.details.muted, |row| row.opacity(0.7))
-        .debug_selector(move || selector.clone());
+            .min_h(px(36.))
+            .pl(px(37.))
+            .pr(px(7.))
+            .py(px(7.))
+            .when(self.details.compact, |row| {
+                row.min_h(px(32.)).gap_2().pl(px(35.)).py(px(5.))
+            })
+            .child(
+                div()
+                    .w(px(3.))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(sidebar_color(self.color).unwrap_or(palette.icon))
+                    .debug_selector(|| "catalog-topic-bar".into()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .child(title)
+                    .children(self.details.preview.filter(|_| !self.details.compact).map(
+                        |preview| preview_label(palette, preview, self.details.protected_preview),
+                    )),
+            )
+            .children(
+                ChatRow::metadata(
+                    palette,
+                    self.details.time.filter(|_| !self.details.compact),
+                    self.details.unread,
+                    self.details.mention,
+                    None,
+                )
+                .map(|column| column.when(self.details.compact, |column| column.min_w(px(32.)))),
+            )
+            .when(self.details.muted, |row| row.opacity(0.7))
+            .debug_selector(move || selector.clone());
         activate(row, focus, palette, on_open)
     }
 }
@@ -533,13 +537,21 @@ fn row_avatar(title: &str, presence: AvatarPresence) -> Avatar {
 }
 
 /// Сокращает превью до одной строки и оставляет автора перед текстом.
-fn preview_label(palette: Palette, preview: ChatRowPreview) -> Div {
+fn preview_label(
+    palette: Palette,
+    preview: ChatRowPreview,
+    protected: Option<gpui::Entity<SecurePreview>>,
+) -> gpui::AnyElement {
+    if let Some(protected) = protected {
+        return protected.into_any_element();
+    }
     let text = match preview.sender {
         Some(sender) => format!("{sender}: {}", preview.text),
         None => preview.text.to_string(),
     };
     ellipsized_label(palette, TextRole::Caption, clean_text(&text))
         .debug_selector(|| "chat-row-preview".into())
+        .into_any_element()
 }
 
 /// Сохраняет высоту элемента даже при многострочных данных от сервера.

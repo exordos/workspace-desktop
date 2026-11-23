@@ -33,8 +33,8 @@ use super::{
     preferences::{ChatClick, Preferences as AppPreferences, appearance::ChatDensity},
     runtime::RuntimeClient,
     ui::{
-        BadgeTone, Button, ButtonAppearance, ChatRowPreview, PANEL_RADIUS, Palette, TextInput,
-        TextInputChanged, TextRole, label,
+        BadgeTone, Button, ButtonAppearance, ChatRowPreview, Icon, PANEL_RADIUS, Palette,
+        TextInput, TextInputChanged, TextRole, label,
         popup::{MenuInput, menu_layer, menu_navigation, menu_surface, tooltip},
     },
 };
@@ -45,6 +45,7 @@ mod folder_rail;
 mod folders;
 pub(in crate::gpui_client) mod order;
 mod projection;
+mod protected_previews;
 mod rows;
 mod search;
 
@@ -54,6 +55,7 @@ use folder_rail::FolderRail;
 pub(super) use folders::FolderIntent;
 use folders::FolderPane;
 use projection::{ChatGroup, Presentation, TopicToggleFocus, TopicToggleKind};
+use protected_previews::ProtectedPreviews;
 use rows::{ChannelActions, ChannelRow, ChatRowDetails as RowDetails, PreviewAction, TopicRow};
 
 #[cfg(all(test, feature = "gpui-test"))]
@@ -68,6 +70,8 @@ pub struct Sidebar {
     saved: HashMap<AccountSession, Preferences>, // Поиск и раскрытые каналы других входов.
     menu_focus: FocusHandle, // Удерживает клавиатурный ввод внутри открытого меню.
     menu_scroll: ScrollHandle, // Не даёт подсветке уйти за края длинного списка папок.
+    #[cfg(all(test, feature = "gpui-test"))]
+    renders: usize, // Вызовы настоящего Render в проверках изоляции GPUI.
     folders: FolderPane,    // Подписки, панель и форма управления папками.
 }
 
@@ -81,9 +85,10 @@ struct Preferences {
 
 /// Каталог одного выбранного входа и состояние только его текущего показа.
 struct Active {
-    session: AccountSession,              // Владелец данных и поколение входа.
-    catalog: Option<ChatList>,            // Нет снимка до начала или завершения первого чтения.
-    selected: Option<HistoryScope>,       // Разговор, который сейчас открыт в окне.
+    session: AccountSession,   // Владелец данных и поколение входа.
+    catalog: Option<ChatList>, // Нет снимка до начала или завершения первого чтения.
+    protected_previews: Option<ProtectedPreviews>, // Отдельные отзывные подписи текущего каталога.
+    selected: Option<HistoryScope>, // Разговор, который сейчас открыт в окне.
     reveal_route: Option<HistoryScope>, // Внешняя тема, которую нужно показать, когда она станет доступна.
     search_target: Option<HistoryScope>, // Маршрут, открытый из поиска с сохранением ручного раскрытия.
     search: Entity<TextInput>,           // Поле системного ввода, живущее до смены входа.
@@ -311,6 +316,12 @@ impl Active {
 }
 
 impl Sidebar {
+    /// Возвращает число сборок настоящего GPUI-представления для проверки изоляции.
+    #[cfg(all(test, feature = "gpui-test"))]
+    pub(super) fn tested_render_count(&self) -> usize {
+        self.renders
+    }
+
     /// Создаёт каталог без выбранного входа.
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
@@ -320,6 +331,8 @@ impl Sidebar {
             menu_focus: cx.focus_handle(),
             menu_scroll: ScrollHandle::new(),
             folders: FolderPane::new(cx),
+            #[cfg(all(test, feature = "gpui-test"))]
+            renders: 0,
         }
     }
 
@@ -425,6 +438,7 @@ impl Sidebar {
                 self.active = Some(Active {
                     session: session.clone(),
                     catalog: None,
+                    protected_previews: None,
                     selected: None,
                     reveal_route: None,
                     search_target: None,
@@ -464,7 +478,35 @@ impl Sidebar {
                 .map(|address| address.route.scope);
             let same_snapshot = same_catalog(active.catalog.as_ref(), catalog);
             let route_changed = active.selected != selected;
-            if !route_changed && !switched && same_snapshot {
+            let profile = self
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.message_encryption(&active.session));
+            let replaced = match profile {
+                Some((engine, activation))
+                    if active
+                        .protected_previews
+                        .as_ref()
+                        .is_none_or(|previews| !previews.is_activation(&activation)) =>
+                {
+                    active.protected_previews =
+                        Some(ProtectedPreviews::new(engine, activation, cx));
+                    true
+                }
+                None => active.protected_previews.take().is_some(),
+                _ => false,
+            };
+            if (replaced || !same_snapshot)
+                && let Some(previews) = &mut active.protected_previews
+            {
+                previews.update(
+                    catalog
+                        .and_then(|catalog| catalog.chats.as_deref())
+                        .unwrap_or_default(),
+                    cx,
+                );
+            }
+            if !route_changed && !switched && same_snapshot && !replaced {
                 return;
             }
 
@@ -851,6 +893,10 @@ impl Sidebar {
         let title: SharedString = chat.name.clone().into();
         let key = RowKey::Chat(id);
         let mut details = active.row_details(key, stream_details(chat, &active.session));
+        details.protected_preview = active
+            .protected_previews
+            .as_ref()
+            .and_then(|previews| previews.view(chat.id, chat.metadata.preview.as_ref()));
         if let Some(item) = item {
             details.unread = unread_badge_value(
                 Some(u64::from(item.active_unread_count)),
@@ -932,6 +978,10 @@ impl Sidebar {
         let stream_id = chat.id;
         let key = RowKey::Topic(stream_id, topic.id);
         let mut details = active.row_details(key, topic_details(chat, topic, &active.session));
+        details.protected_preview = active
+            .protected_previews
+            .as_ref()
+            .and_then(|previews| previews.view(stream_id, topic.metadata.preview.as_ref()));
         details.compact = AppPreferences::read_for(cx, &active.session.owner)
             .appearance
             .density
@@ -1188,11 +1238,24 @@ impl Sidebar {
     }
 }
 
+/// Открытие формы защищённого канала из каталога выбранного входа.
+#[derive(Clone)]
+pub(super) struct OpenEncryptedChannel {
+    pub session: AccountSession, // Выбранный вход, которому принадлежит действие.
+    pub opener: FocusHandle,     // Точка возврата после закрытия диалога.
+}
+
 impl EventEmitter<SidebarAction> for Sidebar {}
+impl EventEmitter<OpenEncryptedChannel> for Sidebar {}
 
 impl Render for Sidebar {
     /// Показывает поиск и состояние загрузки, прокручивая отдельно строки каталога.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(all(test, feature = "gpui-test"))]
+        {
+            self.renders += 1;
+        }
+
         self.open_requested_folder_dialog(window, cx);
         let palette = Palette::for_window(window, cx);
         let locale = AppPreferences::read(cx).language;
@@ -1229,13 +1292,39 @@ impl Render for Sidebar {
         active.search.update(cx, |search, cx| {
             search.set_placeholder(t("Найти", "Search"), cx)
         });
+        let channel = self
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.message_encryption(&active.session))
+            .map(|_| {
+                let mut add = Button::new("e2ee-create-channel", "");
+                add.icon = Some(Icon::Add);
+                let intent = OpenEncryptedChannel {
+                    session: active.session.clone(),
+                    opener: active.search.read(cx).keyboard_focus(),
+                };
+                let sidebar = cx.entity().downgrade();
+                let title = t("Создать защищённый канал", "Create encrypted channel");
+                add.render(palette, None, move |_, app| {
+                    let _ = sidebar.update(app, |_, cx| cx.emit(intent.clone()));
+                })
+                .tooltip(move |_, app| tooltip(palette, title.into(), app))
+                .debug_selector(|| "e2ee-create-channel".into())
+            });
         panel = panel.child(
-            div()
-                .px(px(12.))
-                .pt(px(16.))
-                .pb(px(12.))
-                .flex_none()
-                .child(search::render(&active.search, palette, window, cx)),
+            div().px(px(12.)).pt(px(16.)).pb(px(12.)).flex_none().child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .items_center()
+                    .child(div().flex_1().min_w_0().child(search::render(
+                        &active.search,
+                        palette,
+                        window,
+                        cx,
+                    )))
+                    .children(channel),
+            ),
         );
         let catalog = active.catalog.clone();
         let snapshot = active.folder_view.clone();
@@ -1504,7 +1593,7 @@ fn message_details(preview: Option<&SidebarPreview>, session: &AccountSession) -
             } else {
                 preview.author_name.clone().map(Into::into)
             },
-            text: preview.text.clone().into(),
+            text: preview.text.fallback_text().to_owned().into(),
         }),
         time: preview
             .created_at

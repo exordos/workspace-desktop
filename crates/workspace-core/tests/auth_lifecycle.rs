@@ -20,7 +20,7 @@ use workspace_core::auth::{
 use workspace_core::context::{AccountId, OwnerContext};
 use workspace_core::notification_target::{NotificationTarget, NotificationTargetError};
 use workspace_core::runtime::{EventSource, EventStream, Runtime, SourceError, SourceSession};
-use workspace_core::storage::{Cursor, Message, Storage};
+use workspace_core::storage::{Cursor, Message, MessageBody, Storage};
 use workspace_core::sync::{
     ApplyOutcome, AvatarUpdate, Event, Sync as EventSync, SyncChange, SyncUpdate,
 };
@@ -37,6 +37,350 @@ mod message_actions;
 mod read_boundary;
 
 const SERVER: &str = "https://workspace.test";
+
+/// Обновляет окно и даёт рабочему процессу только адрес ответа, уже сохранённого для нужного входа.
+#[test]
+fn key_service_sync_emits_scoped_durable_placement_without_notification() {
+    use uuid::Uuid;
+    use workspace_core::{
+        messenger::SOURCE_ID,
+        storage::{
+            HistoryEdge, HistoryMessage, HistoryMetadata, HistoryPageEdges, HistoryPageTarget,
+            HistoryScope, HistoryTime, KeyResponseTarget, KeyServicePayload, MessagePlacement,
+        },
+    };
+
+    let fixture = Fixture::new(|_, _| unreachable!());
+    let owner = fixture.login("recipient");
+    let generation = fixture.auth.snapshot()[0].generation;
+    let storage = Arc::new(Storage::in_memory().unwrap());
+    let sync = EventSync::new(fixture.auth.clone(), storage.clone());
+    let mut updates = sync.subscribe();
+    let [stream, topic, public, key, request, device] = [(); 6].map(|()| Uuid::new_v4());
+    let message = Message {
+        id: public.to_string(),
+        body: MessageBody::KeyService {
+            canonical_id: None,
+            payload: KeyServicePayload::Reject(KeyResponseTarget {
+                key_uuid: key,
+                request_message_uuid: request,
+                sender_device_id: "old-device".into(),
+                recipient_device_id: device.to_string(),
+            }),
+        },
+    };
+    let cursor = Cursor {
+        epoch_generation: "key-service".into(),
+        epoch_version: 1,
+    };
+    let event = Event::MessageCreated {
+        cursor: cursor.clone(),
+        message: message.clone(),
+        placement: Some(MessagePlacement {
+            stream_id: stream.to_string(),
+            topic_id: topic.to_string(),
+        }),
+        metadata: Some(HistoryMetadata {
+            author_id: Some(Uuid::new_v4()),
+            created_at: HistoryTime::parse("2026-01-01T10:00:00Z").unwrap(),
+            updated_at: None,
+        }),
+    };
+    assert_eq!(
+        sync.apply(&owner, generation, SOURCE_ID, event.clone())
+            .unwrap(),
+        ApplyOutcome::Applied
+    );
+    let scope = HistoryScope {
+        stream_id: stream,
+        topic_id: Some(topic),
+    };
+    assert_eq!(
+        updates.try_recv().unwrap().change,
+        SyncChange::HistoryMessageCreated {
+            scope,
+            message_id: public
+        }
+    );
+    assert_eq!(
+        updates.try_recv().unwrap(),
+        SyncUpdate {
+            context: owner.clone(),
+            generation,
+            change: SyncChange::KeyServiceMessage {
+                scope,
+                message_id: public,
+                key_id: key,
+                recipient_device_id: device.to_string(),
+            },
+        }
+    );
+    assert_eq!(storage.cursor(&owner, SOURCE_ID).unwrap(), Some(cursor));
+    assert_eq!(
+        storage.message(&owner, &message.id).unwrap(),
+        Some(message.clone())
+    );
+    assert_eq!(
+        sync.apply(&owner, generation, SOURCE_ID, event).unwrap(),
+        ApplyOutcome::Duplicate
+    );
+    assert!(matches!(
+        updates.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+
+    // REST сохранил второй отказ прежде, чем рабочий процесс получил тот же WS-курсор.
+    let [next_public, stream, topic] = [(); 3].map(|()| Uuid::new_v4());
+    let next_scope = HistoryScope {
+        stream_id: stream,
+        topic_id: Some(topic),
+    };
+    let metadata = HistoryMetadata {
+        author_id: Some(Uuid::new_v4()),
+        created_at: HistoryTime::parse("2026-01-01T10:01:00Z").unwrap(),
+        updated_at: None,
+    };
+    let row = HistoryMessage {
+        id: next_public,
+        stream_id: stream,
+        topic_id: topic,
+        metadata: metadata.clone(),
+        body: message.body,
+    };
+    let guard = sync
+        .prepare_history_page(&owner, generation, next_scope, HistoryPageTarget::New)
+        .unwrap()
+        .unwrap();
+    sync.save_history_page(
+        guard,
+        std::slice::from_ref(&row),
+        HistoryPageEdges::New {
+            older: HistoryEdge::End,
+            newer: HistoryEdge::End,
+        },
+    )
+    .unwrap();
+    let service = Event::MessageCreated {
+        cursor: Cursor {
+            epoch_generation: "key-service".into(),
+            epoch_version: 2,
+        },
+        message: Message {
+            id: next_public.to_string(),
+            body: row.body,
+        },
+        placement: Some(MessagePlacement {
+            stream_id: stream.to_string(),
+            topic_id: topic.to_string(),
+        }),
+        metadata: Some(metadata),
+    };
+    assert_eq!(
+        sync.apply(&owner, generation, SOURCE_ID, service.clone())
+            .unwrap(),
+        ApplyOutcome::Applied
+    );
+    assert_eq!(
+        updates.try_recv().unwrap().change,
+        SyncChange::KeyServiceMessage {
+            scope: next_scope,
+            message_id: next_public,
+            key_id: key,
+            recipient_device_id: device.to_string(),
+        }
+    );
+    assert_eq!(
+        sync.apply(&owner, generation, SOURCE_ID, service).unwrap(),
+        ApplyOutcome::Duplicate
+    );
+    assert!(matches!(
+        updates.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    let page = sync
+        .key_service_responses(&owner, generation, device, None)
+        .unwrap();
+    assert!(page.next.is_none());
+    assert_eq!(
+        page.responses
+            .iter()
+            .map(|hint| (
+                hint.scope,
+                hint.response_id,
+                hint.request_id,
+                hint.canonical_id
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (scope, public, request, None),
+            (next_scope, next_public, request, None)
+        ]
+    );
+    assert!(
+        sync.key_service_responses(&owner, generation, Uuid::new_v4(), None)
+            .unwrap()
+            .responses
+            .is_empty()
+    );
+}
+
+/// Без подтверждённого происхождения не сохраняет маркер и оставляет прежний обычный черновик.
+#[test]
+fn unverified_draft_never_persists_unclosed_reply_or_purges_old_text() {
+    use uuid::Uuid;
+    use workspace_core::storage::{
+        DraftReplies, DraftReply, DraftScope, DraftWriteOutcome, PlaintextDraft,
+    };
+
+    let fixture = Fixture::new(|_, _| unreachable!());
+    let user = Uuid::new_v4().to_string();
+    let owner = fixture.login(&user);
+    let generation = fixture.auth.snapshot()[0].generation;
+    let storage = Arc::new(Storage::in_memory().unwrap());
+    let sync = EventSync::new(fixture.auth.clone(), storage.clone());
+    let scope = DraftScope {
+        stream_id: Uuid::new_v4(),
+        topic_id: Uuid::new_v4(),
+    };
+    let access = storage.prepare_draft_access(&owner, scope).unwrap();
+    let ordinary = PlaintextDraft {
+        id: Uuid::new_v4(),
+        version: 1,
+        markdown: "before selecting protected text".into(),
+        replies: None,
+    };
+    assert_eq!(
+        sync.save_draft(&owner, generation, &access, &ordinary)
+            .unwrap(),
+        DraftWriteOutcome::Saved
+    );
+    let tab = Uuid::new_v4();
+    let protected = PlaintextDraft {
+        version: 2,
+        replies: Some(DraftReplies {
+            active: tab,
+            tabs: vec![DraftReply {
+                id: tab,
+                message_id: Uuid::new_v4(),
+                fragment: None,
+                answer: ":::still in progress".into(),
+                creation: 1,
+            }],
+        }),
+        ..ordinary.clone()
+    };
+    assert!(
+        sync.save_draft(&owner, generation, &access, &protected)
+            .is_err()
+    );
+    assert!(
+        storage
+            .read_plaintext_draft(&access, Some(ordinary.id))
+            .unwrap()
+            == Some(ordinary.clone())
+    );
+    let mut updates = sync.subscribe();
+    assert!(
+        sync.prepare_send(
+            &owner,
+            generation,
+            scope.stream_id,
+            scope.topic_id,
+            ":::not prepared".into()
+        )
+        .is_err()
+    );
+    assert!(matches!(
+        updates.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+
+    fixture.auth.logout(&owner.account_id).unwrap();
+    let again = fixture.login(&user);
+    assert_eq!(again, owner);
+    let next = fixture.auth.snapshot()[0].generation;
+    assert_ne!(generation, next);
+    assert!(
+        sync.save_draft(&owner, generation, &access, &ordinary)
+            .is_err()
+    );
+    assert_eq!(
+        sync.save_draft(&owner, next, &access, &ordinary).unwrap(),
+        DraftWriteOutcome::Unchanged
+    );
+}
+
+/// Не даёт старой активации выдать или принять ключ после повторного входа того же пользователя.
+#[test]
+fn key_exchange_rejects_stale_login_before_network_or_key_io() {
+    use uuid::Uuid;
+    use workspace_core::messenger::{
+        MessengerSource,
+        encryption::{
+            ChatKeyAddress, ChatKeyStore, EncryptionSession, GroupKey, KeyStoreError,
+            MessageEncryption,
+            key_exchange::{KeyExchange, KeyExchangeError, KeyRequestOutcome, KeyRequestTarget},
+        },
+    };
+
+    /// Любое чтение или изменение ключа в устаревшей сессии считается ошибкой теста.
+    struct UnreachableKeys;
+    impl ChatKeyStore for UnreachableKeys {
+        /// Запрещает чтение ключа старым входом.
+        fn load(&self, _: &ChatKeyAddress) -> Result<Option<GroupKey>, KeyStoreError> {
+            panic!("a stale login read a group key")
+        }
+
+        /// Запрещает запись ключа старым входом.
+        fn save(&self, _: &ChatKeyAddress, _: &GroupKey) -> Result<(), KeyStoreError> {
+            panic!("a stale login saved a group key")
+        }
+
+        /// Запрещает удаление ключа старым входом.
+        fn remove(&self, _: &ChatKeyAddress) -> Result<(), KeyStoreError> {
+            panic!("a stale login removed a group key")
+        }
+    }
+
+    let fixture = Fixture::new(|_, _| unreachable!());
+    let user = Uuid::new_v4().to_string();
+    let owner = fixture.login(&user);
+    let generation = fixture.auth.snapshot()[0].generation;
+    let encryption = Arc::new(MessageEncryption::new(Arc::new(UnreachableKeys)));
+    let activation = encryption
+        .select_session(Some(EncryptionSession {
+            owner: owner.clone(),
+            generation,
+            device_id: Uuid::new_v4(),
+        }))
+        .unwrap();
+    let sync = Arc::new(EventSync::new(
+        fixture.auth.clone(),
+        Arc::new(Storage::in_memory().unwrap()),
+    ));
+    let exchange = KeyExchange::new(Arc::new(MessengerSource::new().unwrap()), sync, encryption);
+    fixture.auth.logout(&owner.account_id).unwrap();
+    assert_eq!(fixture.login(&user), owner);
+    let target = KeyRequestTarget {
+        stream_id: Uuid::new_v4(),
+        topic_id: Uuid::new_v4(),
+        key_id: Uuid::new_v4(),
+    };
+    let request_id = Uuid::new_v4();
+    assert!(matches!(
+        block_on(exchange.respond_to_key_request(
+            &activation,
+            target,
+            request_id,
+            KeyRequestOutcome::Granted
+        )),
+        Err(KeyExchangeError::Auth(AuthError::SessionUnavailable))
+    ));
+    assert!(matches!(
+        block_on(exchange.apply_key_response(&activation, target, Uuid::new_v4())),
+        Err(KeyExchangeError::Auth(AuthError::SessionUnavailable))
+    ));
+}
 
 /// Хранилища аккаунтов и секретов в памяти с управляемыми сбоями.
 #[derive(Default)]
@@ -684,7 +1028,7 @@ fn incoming_with_id(version: u64, id: &str, text: &str) -> Event {
         },
         message: Message {
             id: id.into(),
-            text: text.into(),
+            body: MessageBody::Markdown(text.into()),
         },
         placement: None,
         metadata: None,
@@ -712,8 +1056,8 @@ fn prepared_send_is_persisted_only_for_active_session() {
     assert_ne!(first.canonical_id, second.canonical_id);
     assert_ne!(first.public_id, second.public_id);
     assert_eq!(
-        (first.stream_id, first.topic_id, first.markdown.as_str()),
-        (stream, topic, "**Текст**\n")
+        (first.stream_id, first.topic_id, first.body.markdown()),
+        (stream, topic, Some("**Текст**\n"))
     );
 
     // Триггер имитирует отказ SQLite именно во время сохранения новой записи.
@@ -830,7 +1174,7 @@ fn messenger_updates_are_committed_deduplicated_and_scoped_to_the_session() {
         cursor: cursor(version),
         message: Message {
             id: "direct-message".into(),
-            text: "hello".into(),
+            body: MessageBody::Markdown("hello".into()),
         },
         conversation_id: "conversation".into(),
         placement: None,
@@ -927,7 +1271,7 @@ fn notification_target_requires_matching_session_conversation_and_message() {
     };
     let message = Message {
         id: "direct-message".into(),
-        text: "hello".into(),
+        body: MessageBody::Markdown("hello".into()),
     };
     // То же сообщение видно обоим участникам, но уведомление получил только второй.
     sync.apply(
@@ -1074,7 +1418,7 @@ async fn runtime_replays_event_after_cursor_write_failure() {
         cursor: cursor(8),
         message: Message {
             id: "replayed".into(),
-            text: "for B".into(),
+            body: MessageBody::Markdown("for B".into()),
         },
         conversation_id: "conversation".into(),
         placement: None,

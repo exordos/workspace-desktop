@@ -1,7 +1,7 @@
 //! Собирает фиксированную историю и ввод для проверки нагрузки UI-11.
 
 use uuid::Uuid;
-use workspace_core::storage::HistoryMessage;
+use workspace_core::storage::{HistoryMessage, MessageBody};
 
 pub(super) const PAGED_ROWS: u128 = 50;
 pub(super) const LAST_ROW: u128 = 650;
@@ -16,6 +16,8 @@ pub(super) fn grow_above(messages: &mut [HistoryMessage]) {
         .iter_mut()
         .find(|row| row.id == GROWING_ROW)
         .unwrap();
-    row.text
-        .push_str(&"\nСтрока после получения размера изображения.".repeat(7));
+    let MessageBody::Markdown(text) = &mut row.body else {
+        unreachable!("Стенд загружает обычный текст")
+    };
+    text.push_str(&"\nСтрока после получения размера изображения.".repeat(7));
 }

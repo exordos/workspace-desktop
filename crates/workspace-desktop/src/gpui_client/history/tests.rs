@@ -10,7 +10,9 @@ use workspace_core::{
     bootstrap::ChatListStatus,
     context::{AccountId, OwnerContext, SessionGeneration},
     messenger::catalog::{Chat, Topic},
-    storage::{DeliveryStatus, HistoryMessage, HistoryMetadata, HistoryTime, PreparedSend},
+    storage::{
+        DeliveryStatus, HistoryMessage, HistoryMetadata, HistoryTime, MessageBody, PreparedSend,
+    },
 };
 
 use crate::gpui_client::contracts::{ChatRoute, ConversationReply, NavigationRevision};
@@ -48,6 +50,55 @@ impl Conversation {
             self.viewport.tested_bounds(id)?,
             self.viewport.tested_text_y(id, byte)?,
         ))
+    }
+
+    /// Даёт границы области и пузыря, включая состояния с закрытым текстом.
+    pub(in crate::gpui_client) fn tested_history_row_bounds(
+        &self,
+        id: Uuid,
+    ) -> Option<(gpui::Bounds<gpui::Pixels>, gpui::Bounds<gpui::Pixels>)> {
+        Some((
+            self.viewport.list().viewport_bounds(),
+            self.viewport.tested_bounds(id)?,
+        ))
+    }
+
+    /// Считает вызовы Render контрольного обычного сообщения в рабочем Viewport.
+    pub(in crate::gpui_client) fn tested_bubble_renders(
+        &self,
+        id: Uuid,
+        cx: &App,
+    ) -> Option<usize> {
+        self.viewport.tested_bubble_renders(id, cx)
+    }
+
+    /// Проверяет повторное использование подготовки обычного тела после события сети.
+    pub(in crate::gpui_client) fn tested_history_body_identity(&self, id: Uuid) -> Option<usize> {
+        self.viewport.tested_body_identity(id)
+    }
+
+    /// Читает состояние защищённой строки после обработки события настоящим экраном.
+    pub(in crate::gpui_client) fn tested_history_encryption_state(
+        &self,
+        id: Uuid,
+    ) -> Option<&'static str> {
+        self.viewport.tested_encryption_state(id)
+    }
+
+    /// Сверяет конверт подтверждённой строки после перечитывания правки.
+    pub(in crate::gpui_client) fn tested_history_envelope(&self, id: Uuid, expected: &str) -> bool {
+        let State::Ready(history) = &self.state else {
+            return false;
+        };
+        history
+            .messages
+            .iter()
+            .find(|row| row.id == id)
+            .is_some_and(|row| {
+                matches!(
+                    &row.body, MessageBody::Encrypted { ciphertext, .. } if ciphertext == expected
+                )
+            })
     }
 
     /// Находит начало визуальной строки, в которую попал указанный байт.
@@ -155,10 +206,10 @@ fn window(
                 id: Uuid::from_u128(id),
                 stream_id: scope.stream_id,
                 topic_id: Uuid::from_u128(1001),
-                text: format!(
+                body: MessageBody::Markdown(format!(
                     "Сообщение {id}{}",
                     "\nСинтетическая строка".repeat((id % 3) as usize)
-                ),
+                )),
                 metadata: HistoryMetadata {
                     author_id: Some(Uuid::from_u128(910)),
                     created_at: HistoryTime::parse("2026-11-17T07:10:30Z").unwrap(),
@@ -207,7 +258,7 @@ fn scenario<'a>(
     });
     let address = address.clone();
     let (view, ui) =
-        cx.add_window_view(|_, cx| Conversation::with_source(address, source, None, cx));
+        cx.add_window_view(|_, cx| Conversation::with_source(address, source, None, None, cx));
     ui.simulate_resize(size(px(630.), px(400.)));
     ui.run_until_parked();
     (view, ui, requests)
@@ -375,6 +426,116 @@ fn visible_history_selects_only_incoming_group_avatars(cx: &mut TestAppContext) 
     assert!(!scrolled.contains(&group_author));
 }
 
+/// Две строки меняют размер, а опора между ними удерживается уже в первом кадре.
+#[gpui::test]
+fn encrypted_history_keeps_reading_anchor_in_the_first_frame(cx: &mut TestAppContext) {
+    let anchor = Uuid::from_u128(52);
+    let prior = Uuid::from_u128(51);
+    let later = Uuid::from_u128(54);
+    let address = address(ChatEntry::Around(anchor));
+    let (view, ui, requests) = scenario(cx, &address);
+    let mut page = window(
+        address.route.scope,
+        42..90,
+        HistoryEdge::End,
+        HistoryEdge::End,
+    );
+    for row in &mut page.messages {
+        if [prior, later].contains(&row.id) {
+            row.body = MessageBody::Encrypted {
+                key_id: Uuid::from_u128(9),
+                ciphertext: "test".into(),
+            };
+        }
+    }
+    answer(
+        request(&requests, Load::Open(ChatEntry::Around(anchor))),
+        page,
+        ui,
+    );
+    let geometry = |app: &App| {
+        let view = view.read(app);
+        (
+            view.tested_message_window_y(anchor).unwrap(),
+            view.tested_history_row_bounds(later).unwrap().1.size.height,
+        )
+    };
+    let (y, height) = ui.read(geometry);
+    let (new_y, new_height) = ui.update(|window, app| {
+        view.update(app, |view, cx| {
+            assert!(view.viewport.apply_encryption([
+                (prior, super::encryption::EncryptedPresentation::Failed),
+                (later, super::encryption::EncryptedPresentation::Failed)
+            ]));
+            cx.notify();
+        });
+        window.draw(app).clear();
+        geometry(app)
+    });
+    assert_eq!(y, new_y);
+    assert!(new_height > height);
+}
+
+/// У хвоста дельта двух строк не пересобирает вид неподвижного обычного бабла.
+#[gpui::test]
+fn encrypted_history_keeps_tail_and_plain_render_in_the_first_frame(cx: &mut TestAppContext) {
+    let control = Uuid::from_u128(55);
+    let moved = Uuid::from_u128(53);
+    let sealed = [Uuid::from_u128(52), Uuid::from_u128(54)];
+    let address = address(ChatEntry::Latest);
+    let (view, ui, requests) = scenario(cx, &address);
+    let mut page = window(
+        address.route.scope,
+        52..56,
+        HistoryEdge::End,
+        HistoryEdge::End,
+    );
+    for row in &mut page.messages {
+        if sealed.contains(&row.id) {
+            row.body = MessageBody::Encrypted {
+                key_id: Uuid::from_u128(9),
+                ciphertext: "test".into(),
+            };
+        }
+    }
+    answer(request(&requests, Load::Open(ChatEntry::Latest)), page, ui);
+    let sample = |app: &App| {
+        let view = view.read(app);
+        let (viewport, bounds) = view.tested_history_row_bounds(control).unwrap();
+        let moved_y = view.tested_message_window_y(moved).unwrap();
+        (
+            viewport.bottom() - bounds.bottom(),
+            view.tested_bubble_renders(control, app).unwrap(),
+            view.viewport.tested_body_identity(control).unwrap(),
+            view.viewport.tested_body_identity(moved).unwrap(),
+            view.tested_bubble_renders(moved, app).unwrap(),
+            moved_y,
+        )
+    };
+    let before = ui.update(|window, app| {
+        // Сначала обычный бабл измеряется, затем GPUI использует вид с известной высотой.
+        window.draw(app).clear();
+        window.draw(app).clear();
+        sample(app)
+    });
+    let after = ui.update(|window, app| {
+        view.update(app, |view, cx| {
+            let changes = sealed.map(|id| (id, super::encryption::EncryptedPresentation::Failed));
+            assert!(view.viewport.apply_encryption(changes));
+            cx.notify();
+        });
+        window.draw(app).clear();
+        sample(app)
+    });
+    assert_eq!(
+        (before.0, before.1, before.2, before.3),
+        (after.0, after.1, after.2, after.3)
+    );
+    // GPUI переносит уже подготовленную строку в новые экранные координаты.
+    assert_ne!(before.5, after.5);
+    assert!(after.4 > before.4);
+}
+
 /// Проверяет открытие у цели, ввод пользователя и неизменность координаты после страницы и события.
 #[gpui::test]
 fn preserves_visible_uuid_during_pages_and_updates(cx: &mut TestAppContext) {
@@ -451,7 +612,10 @@ fn preserves_visible_uuid_during_pages_and_updates(cx: &mut TestAppContext) {
         },
     );
     let mut updated = reading(&address, 1..102);
-    updated.messages[49].text += "\nСтрока выше опоры выросла";
+    let MessageBody::Markdown(text) = &mut updated.messages[49].body else {
+        unreachable!("Стенд загружает обычный текст")
+    };
+    text.push_str("\nСтрока выше опоры выросла");
     answer(request(&requests, Load::Read(41)), updated, ui);
     let after = ui.read(|cx| view.read(cx).viewport.y(anchor).unwrap());
     assert!(
@@ -528,7 +692,7 @@ fn fixed_topic_groups_and_wraps_at_both_panel_sizes(cx: &mut TestAppContext) {
         .iter_mut()
         .zip(topic["messages"].as_array().unwrap())
     {
-        message.text = row["text"].as_str().unwrap().to_owned();
+        message.body = MessageBody::Markdown(row["text"].as_str().unwrap().to_owned());
         message.metadata.author_id = if row["author"] == "a" {
             address.route.owner.user_id.parse().ok()
         } else {
@@ -709,7 +873,7 @@ fn cached_tail_refreshes_and_deduplicates_outbox(cx: &mut TestAppContext) {
             public_id: Uuid::from_u128(80),
             stream_id: address.route.scope.stream_id,
             topic_id: Uuid::from_u128(1001),
-            markdown: "Тестовое исходящее".into(),
+            body: workspace_core::storage::PreparedSendBody::Markdown("Тестовое исходящее".into()),
         },
         status: DeliveryStatus::Unknown,
     };
@@ -929,7 +1093,7 @@ fn edit_keeps_a_surviving_text_line_on_the_first_frame(cx: &mut TestAppContext) 
         let before_byte = body.find(marker).unwrap() + marker.chars().next().unwrap().len_utf8();
         let after_byte =
             shortened.find(expected).unwrap() + expected.chars().next().unwrap().len_utf8();
-        original.messages[0].text.clone_from(&body);
+        original.messages[0].body = MessageBody::Markdown(body);
         answer(
             request(&requests, Load::Open(ChatEntry::Around(anchor))),
             original.clone(),
@@ -963,7 +1127,7 @@ fn edit_keeps_a_surviving_text_line_on_the_first_frame(cx: &mut TestAppContext) 
             anchor
         );
 
-        original.messages[0].text.clone_from(&shortened);
+        original.messages[0].body = MessageBody::Markdown(shortened.clone());
         sync(
             &view,
             ui,
@@ -978,7 +1142,7 @@ fn edit_keeps_a_surviving_text_line_on_the_first_frame(cx: &mut TestAppContext) 
             window.observe(&view, app, move |view, window, app| {
                 if capture.get().is_none()
                     && matches!(&view.read(app).state, State::Ready(history)
-                        if history.messages[0].text == shortened)
+                        if history.messages[0].body.markdown() == Some(shortened.as_str()))
                 {
                     window.refresh();
                     window.draw(app).clear();

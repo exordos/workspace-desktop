@@ -1,7 +1,7 @@
 //! Проверяет цитирование, вкладки и неизменяемый снимок очереди через рабочий разговор.
 
 use gpui::point;
-use workspace_core::messenger::quote;
+use workspace_core::{messenger::quote, storage::MessageBody};
 
 use super::*;
 
@@ -18,7 +18,7 @@ fn server_message(id: Uuid, body: &str, own: bool, seconds: &str) -> HistoryMess
         id,
         stream_id: STREAM,
         topic_id: TOPIC,
-        text: body.into(),
+        body: MessageBody::Markdown(body.into()),
         metadata: HistoryMetadata {
             author_id: Some(Uuid::from_u128(if own { 900 } else { 901 })),
             created_at: HistoryTime::parse(&format!("2026-11-18T10:00:{seconds}Z")).unwrap(),

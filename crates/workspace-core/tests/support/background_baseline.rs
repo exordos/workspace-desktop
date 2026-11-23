@@ -2,7 +2,7 @@
 //! Прогон запускается явно и печатает параметры и задержки для сравнения.
 
 use super::*;
-use workspace_core::storage::{HistoryMetadata, HistoryTime, MessagePlacement};
+use workspace_core::storage::{HistoryMetadata, HistoryTime, MessageBody, MessagePlacement};
 
 /// Подаёт одинаковый поток в два Runtime-подключения и проверяет каждую запись.
 #[tokio::test]
@@ -40,7 +40,7 @@ async fn background_messenger_baseline() {
                 },
                 message: Message {
                     id: uuid::Uuid::from_u128(version as u128).to_string(),
-                    text: "Тестовое сообщение".into(),
+                    body: MessageBody::Markdown("Тестовое сообщение".into()),
                 },
                 conversation_id: uuid::Uuid::from_u128(10001).to_string(),
                 placement: Some(MessagePlacement {

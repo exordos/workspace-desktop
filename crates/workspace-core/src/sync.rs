@@ -1,11 +1,18 @@
 //! Связывает получение событий с локальной базой.
 //! Проверяет сессию перед записью и публикует изменения для оболочки после записи.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{cmp::Ordering, collections::HashSet, path::PathBuf, sync::Arc};
 
 use thiserror::Error;
 use tokio::sync::{broadcast, watch};
 use uuid::Uuid;
+
+mod fragment_origins;
+mod quote_origins;
+pub(crate) use fragment_origins::FragmentOriginsPermit;
+use fragment_origins::{CommittedOrigins, FragmentOrigins, OriginsPermit};
+pub(crate) use quote_origins::QuoteOriginPermit;
+use quote_origins::{QuoteOrigin, QuoteOrigins};
 
 use crate::{
     auth::{Auth, AuthError},
@@ -13,15 +20,20 @@ use crate::{
     directory::AvatarLoads,
     messenger::{
         details::{AvatarCache, SidebarCache, SidebarChange},
+        encryption::fragments::has_protected_draft,
         files::{MediaLoads, OpenMediaError},
+        quote::QuoteSourceFence,
+        send::PlainSendTarget,
     },
     notification_target::{NotificationTarget, NotificationTargetError},
     storage::{
-        AvatarEvent, Cursor, DeliveryStatus, DraftAccess, DraftOpening, DraftScope, DraftVersion,
-        DraftWriteOutcome, EventWrite, FolderChange, HistoryChange, HistoryMessage,
-        HistoryMetadata, HistoryPageEdges, HistoryPageGuard, HistoryPageOutcome, HistoryPageTarget,
-        HistoryScope, HistoryWindow, Message, MessagePlacement, OutboxEntry, PlaintextDraft,
-        PreparedSend, Storage, StorageError,
+        AvatarEvent, ConfirmedEdit, Cursor, DeliveryStatus, DraftAccess, DraftOpening, DraftScope,
+        DraftVersion, DraftWriteOutcome, EncryptedEditVersion, EventWrite, FolderChange,
+        HistoryChange, HistoryMessage, HistoryMetadata, HistoryPageEdges, HistoryPageGuard,
+        HistoryPageOutcome, HistoryPageTarget, HistoryScope, HistoryWindow, KeyRequestCursor,
+        KeyRequestPage, KeyResponseCursor, KeyResponsePage, KeyServicePayload, Message,
+        MessageBody, MessagePlacement, OutboxEntry, PlaintextDraft, PreparedSend, PreparedSendBody,
+        Storage, StorageError,
         media::{
             MediaCache, MediaCacheError, MediaCachePolicy, MediaClearReport, MediaCopyPage,
             MediaCopyQuery, MediaEstimate, MediaFilter,
@@ -31,7 +43,10 @@ use crate::{
 
 pub use crate::storage::ApplyOutcome;
 
-const MAX_MESSAGE_CHARACTERS: usize = 40_000;
+/// Версия серверного файла, которую удерживает чтение или декодированное превью.
+pub(crate) type ProtectedFilePermit = OriginsPermit<Uuid>;
+
+pub(crate) const MAX_MESSAGE_CHARACTERS: usize = 40_000;
 
 /// Вычисляет UUID размещения из темы и строкового канонического UUID, как Workspace API.
 fn public_send_id(topic_id: uuid::Uuid, canonical_id: uuid::Uuid) -> uuid::Uuid {
@@ -63,14 +78,24 @@ pub struct SyncUpdate {
 /// Изменения после записи в локальную базу.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyncChange {
-    Unread(u32),    // Готовое число непрочитанных в папке «Все чаты».
-    MessengerReset, // Кэш очищен. Счётчик неизвестен до снимка с сервера.
+    DraftPurgePending, // Локальный черновик закрыт, осталось удалить прежнюю серверную версию.
+    Unread(u32),       // Готовое число непрочитанных в папке «Все чаты».
+    MessengerReset,    // Кэш очищен. Счётчик неизвестен до снимка с сервера.
     HistoryMessageCreated {
         scope: HistoryScope,    // Стрим и тема сохранённого сообщения.
         message_id: uuid::Uuid, // UUID новой строки в базе.
     },
     HistoryMessageChanged {
         message_id: Uuid, // UUID исправленной или удалённой строки.
+    },
+    QuoteOriginChanged {
+        message_id: Uuid, // UUID оригинала, чья проверенная версия перестала действовать.
+    },
+    KeyServiceMessage {
+        scope: HistoryScope,         // Точные стрим и тема ответа на запрос ключа.
+        message_id: Uuid,            // Публичный UUID для авторитетной проверки ответа.
+        key_id: Uuid,                // Поколение ключа, о котором сообщило событие.
+        recipient_device_id: String, // Устройство, которому адресован ответ.
     },
     HistoryAccessRevoked(HistoryRevocation), // Область, которую больше нельзя показывать.
     MediaFileInvalidated {
@@ -213,6 +238,11 @@ impl HistoryRequest {
     pub fn marker(&self) -> Option<&str> {
         self.guard.marker()
     }
+
+    /// Запоминает точное серверное подтверждение для UUID со старой отметкой.
+    pub(crate) fn verify_legacy_encrypted_message(&mut self, id: Uuid) {
+        self.guard.verify_legacy_encrypted_message(id);
+    }
 }
 
 /// Причина, по которой событие не удалось обработать.
@@ -233,6 +263,8 @@ pub enum PrepareSendError {
     IdCollision, // Случайный UUID уже занят: исходная запись осталась без изменений.
     #[error("a message must contain non-whitespace text up to 40000 Unicode code points")]
     InvalidText, // Пустой текст или превышение лимита Workspace.
+    #[error("the forwarded message or its scope changed before queuing")]
+    SourceChanged, // Исходная строка изменилась или отозван доступ к чату.
 }
 
 /// Проверяет право сессии на запись и передаёт события в хранилище.
@@ -243,6 +275,9 @@ pub struct Sync {
     auth: Auth,                           // Авторизация для проверки владельца и поколения сессии.
     storage: Arc<Storage>,                // Общая локальная база сообщений, позиций и счётчиков.
     updates: broadcast::Sender<SyncUpdate>, // Канал изменений. Оформление окна получает их после записи.
+    fragment_origins: FragmentOrigins,      // Версии доступа исходных чатов открытых фрагментов.
+    quote_origins: QuoteOrigins,            // Проверенные версии исходников защищённых цитат.
+    protected_files: CommittedOrigins<Uuid>, // Проверенные версии серверных файлов по владельцу.
     media_cache: Option<MediaCache>,        // Дисковые копии вложений, если профиль указал каталог.
     media_authority: Arc<()>,               // Отличает допуск этого экземпляра от другого профиля.
     media_updates: watch::Sender<()>,       // Сигнал повторно проверить незавершённое чтение.
@@ -259,6 +294,9 @@ impl Sync {
             avatar_cache: AvatarCache::default(),
             avatar_loads: AvatarLoads::default(),
             updates: broadcast::channel(128).0,
+            fragment_origins: FragmentOrigins::default(),
+            quote_origins: QuoteOrigins::default(),
+            protected_files: CommittedOrigins::default(),
             media_cache: None,
             media_authority: Arc::new(()),
             media_updates: watch::channel(()).0,
@@ -400,15 +438,72 @@ impl Sync {
         source: &str,
     ) -> Result<(), SyncError> {
         self.auth.with_active_generation(owner, generation, || {
-            self.storage.reset_source(owner, source)?;
             if source == crate::messenger::SOURCE_ID {
+                self.quote_origins.commit_matching(
+                    owner,
+                    || {
+                        self.fragment_origins.commit(
+                            owner,
+                            None,
+                            || self.storage.reset_source(owner, source),
+                            |_| true,
+                        )
+                    },
+                    |_, _, _| true,
+                )?;
                 self.sidebar_cache
                     .invalidate(owner, generation, None, false);
                 self.note_media_change();
                 self.publish(owner, generation, SyncChange::MessengerReset);
+            } else {
+                self.storage.reset_source(owner, source)?;
             }
             Ok(())
         })?
+    }
+
+    /// Снимает версии доступа до авторитетной проверки исходных чатов.
+    pub(crate) fn prepare_fragment_origins(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        streams: &[Uuid],
+    ) -> Result<FragmentOriginsPermit, AuthError> {
+        self.auth.with_active_generation(owner, generation, || {
+            self.fragment_origins.capture(owner, streams)
+        })
+    }
+
+    /// Запоминает оригинал после проверки в той же блокировке авторизации, что и запись истории.
+    pub(crate) fn capture_quote_origin(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        original: &HistoryMessage,
+    ) -> Option<QuoteOriginPermit> {
+        let (permit, revoked) =
+            self.quote_origins
+                .capture(owner, generation, QuoteOrigin::from_message(original));
+        if revoked {
+            self.note_media_change();
+            self.publish(
+                owner,
+                generation,
+                SyncChange::QuoteOriginChanged {
+                    message_id: original.id,
+                },
+            );
+        }
+        permit
+    }
+
+    /// Закрепляет проверенную версию файла под той же блокировкой Auth, что и запись событий.
+    pub(crate) fn capture_protected_file(
+        &self,
+        owner: &OwnerContext,
+        file_id: Uuid,
+    ) -> ProtectedFilePermit {
+        self.protected_files.capture(owner, &[file_id])
     }
 
     /// Фиксирует условия записи до сетевого запроса. Доступ к стриму или теме проверяет вызывающий модуль.
@@ -440,12 +535,48 @@ impl Sync {
     ) -> Result<HistoryPageOutcome, SyncError> {
         self.auth
             .with_active_generation(&request.owner, request.generation, || {
-                Ok(self.storage.save_history_page(
+                let mut changed = HashSet::new();
+                let saved = self.quote_origins.commit_matching(
                     &request.owner,
-                    request.guard,
-                    messages,
-                    edges,
-                )?)
+                    || {
+                        self.storage.save_history_page(
+                            &request.owner,
+                            request.guard,
+                            messages,
+                            edges,
+                        )
+                    },
+                    |origin, conflicted, saved| {
+                        if matches!(saved, HistoryPageOutcome::Saved(_))
+                            && messages.iter().any(|message| {
+                                if message.id != origin.id {
+                                    return false;
+                                }
+                                let snapshot = QuoteOrigin::from_message(message);
+                                // При неопределённом порядке сохранённая история разрешает спор.
+                                // Снимок с более ранней правкой известную версию не заменяет.
+                                snapshot.compare_time(origin) != Some(Ordering::Less)
+                                    && (conflicted || snapshot != *origin)
+                            })
+                        {
+                            changed.insert(origin.id);
+                            true
+                        } else {
+                            false
+                        }
+                    },
+                )?;
+                if !changed.is_empty() {
+                    self.note_media_change();
+                }
+                for message_id in changed {
+                    self.publish(
+                        &request.owner,
+                        request.generation,
+                        SyncChange::HistoryMessageChanged { message_id },
+                    );
+                }
+                Ok(saved)
             })?
     }
 
@@ -477,7 +608,90 @@ impl Sync {
         })?
     }
 
-    /// Принимает ответ отправки только для действующего входа, не изменяя курсор событий.
+    /// Закрепляет действующую версию строки, которую показал редактор, перед PUT.
+    pub(crate) fn prepare_encrypted_edit(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        expected: &HistoryMessage,
+    ) -> Result<Option<EncryptedEditVersion>, SyncError> {
+        Ok(self.auth.with_active_generation(owner, generation, || {
+            self.storage.prepare_encrypted_edit(owner, expected)
+        })??)
+    }
+
+    /// Публикует подтверждённую правку точной строки без продвижения курсора журнала.
+    pub(crate) fn confirm_encrypted_edit(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        expected: &HistoryMessage,
+        version: EncryptedEditVersion,
+        confirmed: &HistoryMessage,
+    ) -> Result<bool, SyncError> {
+        self.auth.with_active_generation(owner, generation, || {
+            let outcome = self.quote_origins.commit_matching(
+                owner,
+                || {
+                    self.storage
+                        .confirm_encrypted_edit(owner, expected, version, confirmed)
+                },
+                |origin, _, outcome| {
+                    *outcome == ConfirmedEdit::Applied && origin.id == confirmed.id
+                },
+            )?;
+            if outcome == ConfirmedEdit::Applied {
+                self.note_media_change();
+                self.publish(
+                    owner,
+                    generation,
+                    SyncChange::HistoryMessageChanged {
+                        message_id: confirmed.id,
+                    },
+                );
+            }
+            Ok(outcome != ConfirmedEdit::Stale)
+        })?
+    }
+
+    /// Сверяет конверт восстановления. Вызывать под блокировкой того же поколения Auth.
+    pub(crate) fn matches_key_recovery_source(
+        &self,
+        owner: &OwnerContext,
+        expected: &HistoryMessage,
+    ) -> Result<bool, StorageError> {
+        self.storage.matches_encrypted_edit(owner, expected)
+    }
+
+    /// Находит сохранённые ответы текущего устройства вне открытого окна истории.
+    pub fn key_service_responses(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        recipient_device_id: Uuid,
+        after: Option<KeyResponseCursor>,
+    ) -> Result<KeyResponsePage, SyncError> {
+        Ok(self.auth.with_active_generation(owner, generation, || {
+            self.storage
+                .key_service_responses(owner, recipient_device_id, after)
+        })??)
+    }
+
+    /// Читает кандидатов для выдачи из сохранённых тем этого стрима и действующего входа.
+    /// Право на каждую выдачу проверяет `KeyExchange` по текущим данным сервера.
+    pub fn key_service_requests(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        stream_id: Uuid,
+        after: Option<KeyRequestCursor>,
+    ) -> Result<KeyRequestPage, SyncError> {
+        Ok(self.auth.with_active_generation(owner, generation, || {
+            self.storage.key_service_requests(owner, stream_id, after)
+        })??)
+    }
+
+    /// Принимает ответ отправки только для действующего входа и подходящего снимка.
     pub fn confirm_http_send(
         &self,
         owner: &OwnerContext,
@@ -612,6 +826,41 @@ impl Sync {
         access: &DraftAccess,
         draft: &PlaintextDraft,
     ) -> Result<DraftWriteOutcome, SyncError> {
+        if has_protected_draft(&draft.markdown)
+            || draft.replies.as_ref().is_some_and(|replies| {
+                replies.tabs.iter().any(|tab| {
+                    has_protected_draft(&tab.answer)
+                        || tab.fragment.as_deref().is_some_and(has_protected_draft)
+                })
+            })
+        {
+            return Err(StorageError::InvalidDraftRecord.into());
+        }
+        self.save_draft_text(owner, generation, access, draft)
+    }
+
+    /// Сохраняет буквальные маркеры только для отдельно подтверждённого внешнего Markdown.
+    pub fn save_external_draft(
+        &self,
+        target: &PlainSendTarget,
+        access: &DraftAccess,
+        draft: &PlaintextDraft,
+    ) -> Result<DraftWriteOutcome, SyncError> {
+        let (owner, generation, scope) = target.address();
+        if !target.literal_markers_allowed() || access.scope() != scope {
+            return Err(StorageError::StaleDraftAccess.into());
+        }
+        self.save_draft_text(owner, generation, access, draft)
+    }
+
+    /// Записывает уже классифицированный текст в область действующего входа.
+    fn save_draft_text(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        access: &DraftAccess,
+        draft: &PlaintextDraft,
+    ) -> Result<DraftWriteOutcome, SyncError> {
         if !access.belongs_to(owner) {
             return Err(StorageError::StaleDraftAccess.into());
         }
@@ -620,6 +869,32 @@ impl Sync {
             .with_confirmed_generation(owner, generation, || {
                 self.storage.save_plaintext_draft(access, draft)
             })??)
+    }
+
+    /// Отзывает обычную запись версии, посылая в хранилище только её адрес.
+    pub fn protect_draft(
+        &self,
+        target: &PlainSendTarget,
+        access: &DraftAccess,
+        version: DraftVersion,
+    ) -> Result<bool, SyncError> {
+        let (owner, generation, scope) = target.address();
+        if !target.fragments_allowed() || !access.belongs_to(owner) || access.scope() != scope {
+            return Err(StorageError::StaleDraftAccess.into());
+        }
+        let recorded = self
+            .auth
+            .with_confirmed_generation(owner, generation, || {
+                self.storage.protect_plaintext_draft(access, version)
+            })??;
+        if recorded {
+            let _ = self.updates.send(SyncUpdate {
+                context: owner.clone(),
+                generation,
+                change: SyncChange::DraftPurgePending,
+            });
+        }
+        Ok(recorded)
     }
 
     /// Создаёт снимок отправки и возвращает его только после записи для действующего входа.
@@ -647,27 +922,155 @@ impl Sync {
         if markdown.trim().is_empty() || markdown.chars().count() > MAX_MESSAGE_CHARACTERS {
             return Err(PrepareSendError::InvalidText);
         }
+        self.prepare_send_body(
+            owner,
+            generation,
+            stream_id,
+            topic_id,
+            PreparedSendBody::Markdown(markdown),
+            draft,
+        )
+    }
+
+    /// Фиксирует уже подготовленное содержимое и выдаёт устойчивые UUID отправки.
+    pub(crate) fn prepare_send_body(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        stream_id: Uuid,
+        topic_id: Uuid,
+        body: PreparedSendBody,
+        draft: Option<(&DraftAccess, DraftVersion)>,
+    ) -> Result<PreparedSend, PrepareSendError> {
+        if matches!(&body, PreparedSendBody::Markdown(text) if has_protected_draft(text)) {
+            return Err(PrepareSendError::InvalidText);
+        }
+        self.save_prepared_body(
+            owner,
+            generation,
+            DraftScope {
+                stream_id,
+                topic_id,
+            },
+            body,
+            draft,
+            None,
+        )
+    }
+
+    /// Принимает Markdown внешнего провайдера с буквальными маркерами в подтверждённой теме.
+    pub fn prepare_external_send(
+        &self,
+        target: &PlainSendTarget,
+        markdown: String,
+        draft: Option<(&DraftAccess, DraftVersion)>,
+    ) -> Result<PreparedSend, PrepareSendError> {
+        if !target.literal_markers_allowed()
+            || markdown.trim().is_empty()
+            || markdown.chars().count() > MAX_MESSAGE_CHARACTERS
+        {
+            return Err(PrepareSendError::InvalidText);
+        }
+        let (owner, generation, scope) = target.address();
+        self.save_prepared_body(
+            owner,
+            generation,
+            scope,
+            PreparedSendBody::Markdown(markdown),
+            draft,
+            None,
+        )
+    }
+
+    /// Сохраняет готовую пересылку, пока оригинал и наблюдаемые чаты ещё доступны.
+    pub(crate) fn prepare_forward(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        scope: DraftScope,
+        markdown: String,
+        origin: (&HistoryMessage, QuoteSourceFence),
+        access: &FragmentOriginsPermit,
+    ) -> Result<PreparedSend, PrepareSendError> {
+        self.save_prepared_body(
+            owner,
+            generation,
+            scope,
+            PreparedSendBody::Markdown(markdown),
+            None,
+            Some((origin, access)),
+        )
+    }
+
+    /// Фиксирует уже проверенное тело и точный адрес очереди.
+    fn save_prepared_body(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        scope: DraftScope,
+        body: PreparedSendBody,
+        draft: Option<(&DraftAccess, DraftVersion)>,
+        forward: Option<((&HistoryMessage, QuoteSourceFence), &FragmentOriginsPermit)>,
+    ) -> Result<PreparedSend, PrepareSendError> {
+        let DraftScope {
+            stream_id,
+            topic_id,
+        } = scope;
         self.auth
             .with_active_generation(owner, generation, || {
-                let canonical_id = uuid::Uuid::new_v4();
-                let message = PreparedSend {
-                    canonical_id,
-                    public_id: public_send_id(topic_id, canonical_id),
-                    stream_id,
-                    topic_id,
-                    markdown,
+                let save = || {
+                    let canonical_id = uuid::Uuid::new_v4();
+                    let message = PreparedSend {
+                        canonical_id,
+                        public_id: public_send_id(topic_id, canonical_id),
+                        stream_id,
+                        topic_id,
+                        body,
+                    };
+                    if !self
+                        .storage
+                        .save_prepared_send_with_draft(owner, &message, draft)
+                        .map_err(SyncError::from)?
+                    {
+                        return Err(PrepareSendError::IdCollision);
+                    }
+                    self.publish_send(owner, generation, &message);
+                    Ok(message)
                 };
-                if !self
-                    .storage
-                    .save_prepared_send_with_draft(owner, &message, draft)
-                    .map_err(SyncError::from)?
-                {
-                    return Err(PrepareSendError::IdCollision);
+                match forward {
+                    Some(((origin, fence), access)) => access
+                        .with_current(|| {
+                            if !fence.scope_still_accessible(&self.storage, owner, origin)?
+                                || !self
+                                    .storage
+                                    .quote_source_matches(owner, origin)
+                                    .map_err(SyncError::from)?
+                            {
+                                return Err(PrepareSendError::SourceChanged);
+                            }
+                            save()
+                        })
+                        .ok_or(PrepareSendError::SourceChanged)?,
+                    None => save(),
                 }
-                self.publish_send(owner, generation, &message);
-                Ok(message)
             })
             .map_err(SyncError::from)?
+    }
+
+    /// Повторяет защищённую отправку с тем же конвертом и адресом после явного действия.
+    pub fn retry_encrypted_send(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        canonical_id: Uuid,
+    ) -> Result<bool, SyncError> {
+        self.auth.with_active_generation(owner, generation, || {
+            let snapshot = self.storage.retry_encrypted_send(owner, canonical_id)?;
+            if let Some(snapshot) = &snapshot {
+                self.publish_send(owner, generation, snapshot);
+            }
+            Ok(snapshot.is_some())
+        })?
     }
 
     /// Подписывает оболочку на изменения. После пропуска событий счётчик можно перечитать.
@@ -719,8 +1122,10 @@ impl Sync {
             };
             let conversation = match &event {
                 Event::IncomingDirectMessage {
-                    conversation_id, ..
-                } => Some(conversation_id.as_str()),
+                    conversation_id,
+                    message,
+                    ..
+                } if message.body.markdown().is_some() => Some(conversation_id.as_str()),
                 _ => None,
             };
             let placement = match &event {
@@ -772,27 +1177,56 @@ impl Sync {
                 ) => Some(*file_id),
                 _ => None,
             };
-            let saved = self.storage.apply(
-                owner,
-                source,
-                event.cursor(),
-                EventWrite {
-                    message: event.message(),
-                    unread,
-                    notification_conversation: conversation,
-                    placement,
-                    metadata,
-                    history,
-                    folder,
-                    catalog_counts,
-                    avatar,
-                    media_invalidated,
-                    checkpoint: matches!(event, Event::Checkpoint(_)),
-                },
-            )?;
+            let write = || {
+                self.storage.apply(
+                    owner,
+                    source,
+                    event.cursor(),
+                    EventWrite {
+                        message: event.message(),
+                        unread,
+                        notification_conversation: conversation,
+                        placement,
+                        metadata,
+                        history,
+                        folder,
+                        catalog_counts,
+                        avatar,
+                        media_invalidated,
+                        checkpoint: matches!(event, Event::Checkpoint(_)),
+                    },
+                )
+            };
+            let revocation = match history {
+                Some(HistoryChange::RemoveStream(id)) if source == crate::messenger::SOURCE_ID => {
+                    id.parse().ok()
+                }
+                _ => None,
+            };
+            let saved = if let Some(file_id) = media_invalidated {
+                self.protected_files
+                    .commit_matching(owner, write, |candidate, saved| {
+                        *candidate == file_id && saved.outcome == ApplyOutcome::Applied
+                    })?
+            } else if let Some(change) = history.filter(|_| source == crate::messenger::SOURCE_ID) {
+                self.quote_origins.commit_matching(
+                    owner,
+                    || {
+                        if let Some(stream) = revocation {
+                            self.fragment_origins
+                                .commit(owner, Some(stream), write, |saved| saved.history_changed)
+                        } else {
+                            write()
+                        }
+                    },
+                    |origin, _, saved| saved.history_changed && origin.affected_by(change),
+                )?
+            } else {
+                write()?
+            };
             if saved.outcome == ApplyOutcome::Applied
                 && source == crate::messenger::SOURCE_ID
-                && (history.is_some() || media_invalidated.is_some())
+                && (saved.history_changed || media_invalidated.is_some())
             {
                 self.note_media_change();
                 if let Some(file_id) = media_invalidated {
@@ -806,9 +1240,8 @@ impl Sync {
             if let Some(count) = unread.filter(|_| saved.unread_changed) {
                 self.publish(owner, generation, SyncChange::Unread(count));
             }
-            if (saved.message_inserted || saved.send_confirmed)
-                && let (Some(placement), Some(_), Some(message)) =
-                    (placement, metadata, event.message())
+            if let (Some(placement), Some(_), Some(message)) =
+                (placement, metadata, event.message())
                 && let (Ok(stream_id), Ok(topic_id), Ok(message_id)) = (
                     placement.stream_id.parse(),
                     placement.topic_id.parse(),
@@ -825,6 +1258,14 @@ impl Sync {
                         generation,
                         SyncChange::HistoryMessageCreated { scope, message_id },
                     );
+                }
+                // REST может записать эту строку первым. Допуск рабочего процесса зависит от
+                // нового курсора WS, а не от результата INSERT для общего тела истории.
+                if saved.outcome == ApplyOutcome::Applied
+                    && source == crate::messenger::SOURCE_ID
+                    && let Some(change) = key_service_update(scope, message_id, &message.body)
+                {
+                    self.publish(owner, generation, change);
                 }
                 if saved.send_confirmed {
                     self.publish(owner, generation, SyncChange::OutboxChanged { scope });
@@ -850,7 +1291,9 @@ impl Sync {
                         );
                     }
                 }
-                if let Some(change) = history.and_then(history_update) {
+                if saved.history_changed
+                    && let Some(change) = history.and_then(history_update)
+                {
                     match &change {
                         SyncChange::HistoryAccessRevoked(HistoryRevocation::Stream(id)) => {
                             self.sidebar_cache
@@ -886,6 +1329,7 @@ impl Sync {
                     conversation_id,
                     ..
                 } = event
+                && message.body.markdown().is_some()
             {
                 self.publish(
                     owner,
@@ -987,6 +1431,27 @@ impl Sync {
             change,
         });
     }
+}
+
+/// Даёт рабочему процессу только адрес ответа. Перед применением он заново читает серверные записи.
+fn key_service_update(
+    scope: HistoryScope,
+    message_id: Uuid,
+    body: &MessageBody,
+) -> Option<SyncChange> {
+    let MessageBody::KeyService { payload, .. } = body else {
+        return None;
+    };
+    let target = match payload {
+        KeyServicePayload::Grant { target, .. } | KeyServicePayload::Reject(target) => target,
+        _ => return None,
+    };
+    Some(SyncChange::KeyServiceMessage {
+        scope,
+        message_id,
+        key_id: target.key_uuid,
+        recipient_device_id: target.recipient_device_id.clone(),
+    })
 }
 
 /// Выбирает изменение, которое открытая история должна показать после записи.

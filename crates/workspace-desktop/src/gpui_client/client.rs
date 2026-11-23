@@ -1,14 +1,17 @@
 //! Направляет действия между оболочкой, рабочим потоком, экраном разговора и AppKit.
 //! Здесь также собирается основная разметка окна из готовых компонентов.
 
+mod encrypted_channel;
 mod history_positions;
+mod key_inbox;
 mod notification_banner;
 mod preference_runtime;
 
 use std::collections::HashMap;
 
 use gpui::{
-    Context, Entity, FocusHandle, SharedString, Subscription, Task, Window, div, prelude::*, px,
+    AnyView, Context, Entity, FocusHandle, SharedString, StyleRefinement, Subscription, Task,
+    Window, div, prelude::*, px,
 };
 use workspace_core::{
     auth::SessionStatus,
@@ -25,7 +28,7 @@ use super::{
     contracts::{
         AccountSession, AccountSnapshot, RuntimeEvent, RuntimeExit, ShellAction, SidebarAction,
     },
-    conversation::{Conversation, OpenDetailsTopic},
+    conversation::{Conversation, OpenDetailsTopic, OpenForwardOriginal},
     next_control,
     platform_window::WindowPlatform,
     previous_control,
@@ -91,10 +94,12 @@ pub(super) struct Client {
     shell: Shell,           // Выбор, адрес разговора и фильтр событий по входам.
     runtime: RuntimeClient, // Очередь команд рабочего потока этого профиля.
     sidebar: Entity<Sidebar>, // Единственный каталог; хранит поиск каждого входа.
-    sidebar_visible: bool,  // Показывается ли каталог в рабочем разделе.
-    search_return: Option<FocusHandle>, // Куда вернуться после завершения поиска сочетанием.
+    encrypted_channel: Option<super::sidebar::OpenEncryptedChannel>, // Запрошенная форма для текущего входа.
+    key_response_scan: Option<Task<()>>, // Чтение сохранённых ответов для текущего выбора входа.
+    sidebar_visible: bool,               // Показывается ли каталог в рабочем разделе.
+    search_return: Option<FocusHandle>,  // Куда вернуться после завершения поиска сочетанием.
     idle: Option<preference_runtime::IdleSession>, // Таймер автовыхода для выбранного входа.
-    places: preference_runtime::Places, // Маршруты навигации назад и вперёд выбранного входа.
+    places: preference_runtime::Places,  // Маршруты навигации назад и вперёд выбранного входа.
     conversation: Option<Entity<Conversation>>, // Экран актуального адреса, если он открыт.
     history_positions: HistoryPositions, // Опоры чтения недавних разговоров этого окна.
     details_navigation: Option<Subscription>, // Подписка на переход из правой панели текущего экрана.
@@ -128,6 +133,13 @@ impl Client {
     pub(super) fn new(options: Options, runtime: RuntimeClient, cx: &mut Context<Self>) -> Self {
         let sidebar = cx.new(|cx| Sidebar::with_runtime(runtime.clone(), cx));
         cx.observe(&sidebar, |_, _, cx| cx.notify()).detach();
+        cx.subscribe(
+            &sidebar,
+            |client, _, intent: &super::sidebar::OpenEncryptedChannel, cx| {
+                client.request_encrypted_channel(intent, cx);
+            },
+        )
+        .detach();
         cx.subscribe(&sidebar, |client, _, intent: &FolderIntent, cx| {
             client.handle_folder_intent(intent.clone(), cx);
         })
@@ -135,6 +147,7 @@ impl Client {
         let top_bar = cx.new(TopBar::new);
         cx.observe_global::<super::preferences::Preferences>(|client, cx| {
             client.refresh_top_bar_accounts(cx);
+            client.sidebar.update(cx, |_, cx| cx.notify());
             cx.notify();
         })
         .detach();
@@ -191,6 +204,8 @@ impl Client {
             idle: None,
             places: preference_runtime::Places::default(),
             conversation: None,
+            encrypted_channel: None,
+            key_response_scan: None,
             history_positions: HistoryPositions::default(),
             right_panel,
             details_navigation: None,
@@ -308,6 +323,9 @@ impl Client {
             }
             RuntimeEvent::Sync(update) => {
                 use workspace_core::sync::{HistoryRevocation, SyncChange};
+                if let Some((activation, incoming)) = self.runtime.incoming_key(update) {
+                    self.queue_key_response(activation, incoming, cx);
+                }
                 match update.change {
                     SyncChange::HistoryAccessRevoked(HistoryRevocation::Stream(stream)) => {
                         self.runtime.drafts.revoke(
@@ -341,6 +359,13 @@ impl Client {
                         );
                     }
                     _ => {}
+                }
+            }
+            RuntimeEvent::SyncLagged => {
+                if let Some(session) = self.shell.selected()
+                    && let Some((_, activation)) = self.runtime.message_encryption(session)
+                {
+                    self.reconcile_key_inbox(activation, cx);
                 }
             }
             RuntimeEvent::Stopped(RuntimeExit::Failed) => self.stopped = true,
@@ -396,6 +421,12 @@ impl Client {
     /// Выполняет команду оболочки и обновляет связанные части того же окна.
     fn apply(&mut self, effect: Option<ShellEffect>, cx: &mut Context<Self>) {
         let effect = self.reconcile_sign_in(cx).or(effect);
+        if let Some(activation) = self
+            .runtime
+            .select_encryption_session(self.shell.selected())
+        {
+            self.reconcile_key_inbox(activation, cx);
+        }
         self.sync_right_panel_context(cx);
         match effect {
             Some(ShellEffect::OpenConversation(address)) => {
@@ -413,6 +444,20 @@ impl Client {
                         client.open_details_topic(target, cx)
                     },
                 ));
+                cx.subscribe(
+                    &conversation,
+                    |client, _, target: &OpenForwardOriginal, cx| {
+                        if client.section == TopBarSection::Chats {
+                            let effect = client.shell.open_forward_original(
+                                &target.address,
+                                target.scope,
+                                target.id,
+                            );
+                            client.apply(effect, cx);
+                        }
+                    },
+                )
+                .detach();
                 self.conversation = Some(conversation);
             }
             Some(ShellEffect::CloseConversation) => {
@@ -450,7 +495,7 @@ impl Client {
             }
             Some(ShellEffect::ConversationUpdated(address, update)) => {
                 if let Some(conversation) = &self.conversation {
-                    conversation.update(cx, |view, cx| view.apply_sync(&address, update, cx));
+                    conversation.update(cx, |view, cx| view.apply_sync(&address, *update, cx));
                 }
             }
             None => {}
@@ -885,6 +930,7 @@ impl Render for Client {
         self.sync_profile_details(cx);
         RightPanel::restore_focus(&self.right_panel, window, cx);
         self.open_requested_profile(window, cx);
+        self.open_requested_encrypted_channel(window, cx);
         let palette = Palette::for_window(window, cx);
         let locale = super::preferences::Preferences::read(cx).language;
         let root = div()
@@ -956,6 +1002,26 @@ impl Render for Client {
                 .children(RightPanel::frame(&self.right_panel, palette, window, cx))
                 .into_any_element()
         } else {
+            let viewport_width = window.viewport_size().width;
+            let sidebar_width =
+                sidebar_width(viewport_width) + px(self.sidebar.read(cx).folder_rail_width());
+            let catalog_extent = if self.sidebar_visible {
+                sidebar_width + px(PANEL_GAP)
+            } else {
+                px(0.)
+            };
+            let dock = self.right_panel.read(cx).docked_width(window);
+            let encrypted_history = self.conversation.as_ref().is_some_and(|conversation| {
+                let conversation = conversation.read(cx);
+                conversation.set_view_width(viewport_width - catalog_extent - dock);
+                conversation.has_encrypted_history()
+            });
+            let sidebar = AnyView::from(self.sidebar.clone());
+            let sidebar = if encrypted_history {
+                sidebar.cached(StyleRefinement::default().w_full().h_full())
+            } else {
+                sidebar
+            };
             let empty = div()
                 .size_full()
                 .flex()
@@ -979,12 +1045,11 @@ impl Render for Client {
                         div()
                             .id("workspace-sidebar-and-folders")
                             .track_focus(&self.sidebar_zone)
-                            .w(sidebar_width(window.viewport_size().width)
-                                + px(self.sidebar.read(cx).folder_rail_width()))
+                            .w(sidebar_width)
                             .h_full()
                             .flex_none()
                             .overflow_hidden()
-                            .child(self.sidebar.clone()),
+                            .child(sidebar),
                     )
                 })
                 .child(

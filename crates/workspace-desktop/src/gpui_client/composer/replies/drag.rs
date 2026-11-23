@@ -144,7 +144,7 @@ impl Composer {
             revision: self.replies.revision,
         };
         let target = cx.entity().downgrade();
-        let title = tab.quote.author.clone();
+        let title = tab.quote.author.display(self.language(cx)).into_owned();
         button.on_drag(source, move |source, _, window, app| {
             let preview = app.new(|_| DragPreview {
                 title: title.clone(),

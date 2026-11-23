@@ -1,7 +1,7 @@
 //! Читает страницы галереи через Core и сохраняет выбранный оригинал через системный диалог.
 
 use std::{
-    io::{self, Read, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -10,6 +10,7 @@ use gpui::{Context, FocusHandle, RenderImage, Task, Window};
 use uuid::Uuid;
 use workspace_core::{
     messenger::{
+        encryption::EncryptionActivation,
         files::{MediaFile, OpenMediaError},
         history::MediaAccess,
     },
@@ -19,7 +20,10 @@ use workspace_core::{
     },
 };
 
-use super::{Conversation, attachments::decode_thumbnail};
+use super::{
+    Conversation,
+    attachments::{ProtectedAttachment, decode_thumbnail},
+};
 use crate::gpui_client::{
     contracts::{ConversationAddress, ConversationReply},
     runtime::{RuntimeClient, WorkerServices},
@@ -224,10 +228,23 @@ impl GalleryExportStatus {
 pub(super) struct GalleryExport {
     id: Uuid,                    // Номер попытки для проверки ответа.
     message: Uuid,               // Исходное сообщение для отзыва ссылки.
+    quoting: Option<Uuid>,       // Цитирующий бабл для отмены после его правки.
     file: Uuid,                  // UUID файла для строки и событий Core.
     status: GalleryExportStatus, // Видимый результат или стадия работы.
     cancelled: Arc<Mutex<bool>>, // Синхронизирует отмену и публикацию готовой записи.
     _task: Task<()>,             // Владеет ожиданием системного диалога и результата.
+}
+
+/// Уже выбранная карточка в галерее или в раскрытом защищённом сообщении.
+enum ExportSource {
+    Gallery {
+        item: MediaHistoryItem, // Подтверждённая карточка из индекса обычных файлов.
+        whole_stream: bool,     // Открыт индекс всего чата, включая другие темы.
+    },
+    Protected {
+        source: ProtectedAttachment, // Точная карточка и отзываемые разрешения.
+        activation: EncryptionActivation, // Точный вход для загрузки оригинала.
+    },
 }
 
 impl Drop for GalleryExport {
@@ -259,11 +276,12 @@ impl Conversation {
 
     /// Отменяет сохранение, если изменились файл, сообщение или права источника.
     pub(super) fn invalidate_gallery_export(&mut self, affected: impl Fn(Uuid, Uuid) -> bool) {
-        if self
-            .gallery_export
-            .as_ref()
-            .is_some_and(|save| affected(save.message, save.file))
-        {
+        if self.gallery_export.as_ref().is_some_and(|save| {
+            affected(save.message, save.file)
+                || save
+                    .quoting
+                    .is_some_and(|message| affected(message, save.file))
+        }) {
             self.cancel_gallery_export();
         }
     }
@@ -273,6 +291,49 @@ impl Conversation {
         &mut self,
         item: MediaHistoryItem,
         whole_stream: bool,
+        source: FocusHandle,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_file_export(
+            ExportSource::Gallery { item, whole_stream },
+            source,
+            window,
+            cx,
+        );
+    }
+
+    /// Предлагает сохранить оригинал только у ещё действующей защищённой карточки.
+    pub(super) fn save_protected_attachment(
+        &mut self,
+        attachment: ProtectedAttachment,
+        source: FocusHandle,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(encryption) = self
+            .encryption
+            .as_ref()
+            .filter(|_| attachment.is_mounted(self))
+        else {
+            return;
+        };
+        let activation = encryption.activation.clone();
+        self.start_file_export(
+            ExportSource::Protected {
+                source: attachment,
+                activation,
+            },
+            source,
+            window,
+            cx,
+        );
+    }
+
+    /// Использует одинаковый выбор пути и защищённую запись файла для обеих поверхностей.
+    fn start_file_export(
+        &mut self,
+        origin: ExportSource,
         source: FocusHandle,
         window: &Window,
         cx: &mut Context<Self>,
@@ -293,8 +354,17 @@ impl Conversation {
         let address = self.address.clone();
         let cancelled = Arc::new(Mutex::new(false));
         let cancel_write = Arc::clone(&cancelled);
-        let message = item.message_id;
-        let file = item.file_id;
+        let (message, file, quoting, name) = match &origin {
+            ExportSource::Gallery { item, .. } => {
+                (item.message_id, item.file_id, None, suggested_name(item))
+            }
+            ExportSource::Protected { source, .. } => (
+                source.key.message,
+                source.key.file,
+                Some(source.row_id()),
+                "Вложение".to_owned(),
+            ),
+        };
         let start = std::env::home_dir().unwrap_or_else(|| PathBuf::from("/"));
         let downloads = start.join("Downloads");
         let start = if downloads.is_dir() {
@@ -302,7 +372,6 @@ impl Conversation {
         } else {
             &start
         };
-        let name = suggested_name(&item);
         let picker = cx.prompt_for_new_path(start, Some(&name));
         let task = cx.spawn_in(window, async move |target, cx| {
             let path = match picker.await {
@@ -327,6 +396,16 @@ impl Conversation {
                             {
                                 return false;
                             }
+                            if let ExportSource::Protected { source, .. } = &origin
+                                && !source.is_mounted(view)
+                            {
+                                view.finish_gallery_export(
+                                    id,
+                                    Some(GalleryExportStatus::Failed),
+                                    cx,
+                                );
+                                return false;
+                            }
                             window.focus(&source);
                             if path.is_none() {
                                 view.finish_gallery_export(id, None, cx);
@@ -347,11 +426,18 @@ impl Conversation {
             log::debug!("gpui_gallery op_id={id} event=save_requested");
             let reply = runtime
                 .conversation(address, move |services, _| async move {
-                    let file = match services
-                        .messenger
-                        .open_gallery_media(&services.sync, &access, whole_stream, &item)
-                        .await
-                    {
+                    let original = match origin {
+                        ExportSource::Gallery { item, whole_stream } => {
+                            services
+                                .messenger
+                                .open_gallery_media(&services.sync, &access, whole_stream, &item)
+                                .await
+                        }
+                        ExportSource::Protected { source, activation } => {
+                            source.open(&services, &access, &activation).await
+                        }
+                    };
+                    let file = match original {
                         Ok(file) => file,
                         Err(OpenMediaError::Cache(MediaCacheError::TooLarge)) => {
                             return GalleryExportStatus::TooLarge;
@@ -376,6 +462,7 @@ impl Conversation {
         self.gallery_export = Some(GalleryExport {
             id,
             message,
+            quoting,
             file,
             status: GalleryExportStatus::Choosing,
             cancelled,
@@ -448,7 +535,9 @@ fn write_original(
     let Ok(mut pending) = tempfile::NamedTempFile::new_in(directory) else {
         return GalleryExportStatus::Failed;
     };
-    let size = file.size();
+    let Ok(size) = file.size() else {
+        return GalleryExportStatus::Failed;
+    };
     if !io::copy(&mut file, &mut pending).is_ok_and(|written| written == size)
         || pending.flush().is_err()
     {
@@ -456,14 +545,14 @@ fn write_original(
     }
     // Проверяем отмену и действующие права непосредственно перед появлением файла.
     let stopped = cancelled.lock().unwrap_or_else(|error| error.into_inner());
-    if *stopped || !file.read(&mut [0]).is_ok_and(|read| read == 0) {
+    if *stopped {
         return GalleryExportStatus::Failed;
     }
-    match pending.persist_noclobber(path) {
-        Ok(_) => GalleryExportStatus::Done,
-        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+    match file.with_valid_access(|| pending.persist_noclobber(path)) {
+        Ok(Ok(_)) => GalleryExportStatus::Done,
+        Ok(Err(error)) if error.error.kind() == io::ErrorKind::AlreadyExists => {
             GalleryExportStatus::Occupied
         }
-        Err(_) => GalleryExportStatus::Failed,
+        _ => GalleryExportStatus::Failed,
     }
 }

@@ -19,6 +19,14 @@ const MODAL_CONTEXT: &str = "WorkspaceSettingsModal";
 
 actions!(workspace_right_panel, [Back, CloseAll, DismissModal]);
 
+const PANEL_WIDTH: f32 = 315.;
+const PANEL_GAP: f32 = 4.;
+
+/// Выбирает режим, в котором правая панель лежит поверх разговора.
+fn panel_overlays(window: &Window) -> bool {
+    window.viewport_size().width < px(1050.)
+}
+
 /// Ограничивает время жизни панели контекстом, из которого её открыли.
 #[derive(Clone, PartialEq, Eq)]
 pub(super) enum Scope {
@@ -40,7 +48,18 @@ impl PanelKey {
         account: Option<&AccountSession>,
         conversation: Option<&ConversationAddress>,
     ) -> bool {
-        match &self.scope {
+        self.scope.matches(account, conversation)
+    }
+}
+
+impl Scope {
+    /// Проверяет, что экран относится к текущему входу и, при необходимости, разговору.
+    fn matches(
+        &self,
+        account: Option<&AccountSession>,
+        conversation: Option<&ConversationAddress>,
+    ) -> bool {
+        match self {
             Scope::Account(session) => account == Some(session),
             Scope::Conversation(address) => {
                 conversation == Some(address)
@@ -83,7 +102,7 @@ struct Entry {
 /// Один диалог поверх окна. Закрывается вместе со страницей, которая его открыла.
 struct Modal {
     body: AnyView,                 // Диалог с собственной формой и состоянием.
-    session: AccountSession,       // Поколение, с которым диалог нужно закрыть.
+    scope: Scope,                  // Вход или разговор, к которому относится диалог.
     region: FocusHandle,           // Родительская область клавиатурного фокуса.
     opener: FocusHandle,           // Кнопка, к которой вернётся фокус.
     end: FocusHandle,              // Точка для обратного обхода после последней кнопки.
@@ -134,7 +153,7 @@ impl RightPanel {
         if self
             .modal
             .as_ref()
-            .is_some_and(|modal| Some(&modal.session) != account)
+            .is_some_and(|modal| !modal.scope.matches(account, conversation))
             && let Some(modal) = self.modal.take()
         {
             self.restore = Some((modal.region, self.fallback.clone()));
@@ -152,6 +171,13 @@ impl RightPanel {
         fallback: FocusHandle,
         cx: &mut Context<Self>,
     ) {
+        if self.modal.as_ref().is_some_and(
+            |modal| matches!(&modal.scope, Scope::Conversation(current) if current == address),
+        ) && let Some(modal) = self.modal.take()
+        {
+            self.restore = Some((modal.region, fallback.clone()));
+            self.changed("modal_invalidate", cx);
+        }
         self.prune(
             fallback,
             cx,
@@ -312,21 +338,53 @@ impl RightPanel {
         cx: &mut Context<Self>,
         build: impl FnOnce(FocusHandle, &mut Context<Self>) -> Entity<V>,
     ) {
-        if self.account.as_ref() != Some(session) || self.modal.is_some() {
-            return;
+        self.open_scoped_modal(Scope::Account(session.clone()), opener, window, cx, build);
+    }
+
+    /// Показывает диалог, который закроется при смене разговора или потере доступа.
+    pub fn open_conversation_modal<V: Render>(
+        &mut self,
+        address: &ConversationAddress,
+        opener: FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        build: impl FnOnce(FocusHandle, &mut Context<Self>) -> Entity<V>,
+    ) -> bool {
+        self.open_scoped_modal(
+            Scope::Conversation(address.clone()),
+            opener,
+            window,
+            cx,
+            build,
+        )
+    }
+
+    /// Проверяет владельца перед созданием содержимого и ставит фокус в диалог.
+    fn open_scoped_modal<V: Render>(
+        &mut self,
+        scope: Scope,
+        opener: FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        build: impl FnOnce(FocusHandle, &mut Context<Self>) -> Entity<V>,
+    ) -> bool {
+        if !scope.matches(self.account.as_ref(), self.conversation.as_ref()) || self.modal.is_some()
+        {
+            return false;
         }
         let region = cx.focus_handle();
         let body = build(region.clone(), cx).into();
         window.focus(&region);
         self.modal = Some(Modal {
             body,
-            session: session.clone(),
+            scope,
             region,
             opener,
             end: cx.focus_handle(),
             dismiss: None,
         });
         self.visible_change("modal_open", window, cx);
+        true
     }
 
     /// Блокирует команды под открытым модальным диалогом.
@@ -571,6 +629,15 @@ impl RightPanel {
         }
     }
 
+    /// Возвращает место, которое открытая рамка занимает рядом с разговором.
+    pub(super) fn docked_width(&self, window: &Window) -> gpui::Pixels {
+        if !self.entries.is_empty() && !panel_overlays(window) {
+            px(PANEL_WIDTH + PANEL_GAP)
+        } else {
+            px(0.)
+        }
+    }
+
     /// Оборачивает верхний экран общей рамкой. В узком окне рамка лежит поверх разговора.
     pub fn frame(
         host: &Entity<Self>,
@@ -580,7 +647,7 @@ impl RightPanel {
     ) -> Option<Stateful<Div>> {
         let stack = host.read(app);
         let entry = stack.entries.last()?;
-        let overlay = window.viewport_size().width < px(1050.);
+        let overlay = panel_overlays(window);
         let account_page = matches!(entry.key.scope, Scope::Account(_));
         let account_back = account_page
             && stack
@@ -639,7 +706,7 @@ impl RightPanel {
                 .key_context(KEY_CONTEXT)
                 .flex()
                 .flex_col()
-                .w(px(315.))
+                .w(px(PANEL_WIDTH))
                 .min_h_0()
                 .flex_none()
                 .rounded(PANEL_RADIUS)
@@ -663,7 +730,7 @@ impl RightPanel {
                             host.cycle_focus(true, window, cx)
                         }))
                 })
-                .when(!overlay, |panel| panel.h_full().ml(px(4.)))
+                .when(!overlay, |panel| panel.h_full().ml(px(PANEL_GAP)))
                 .child(
                     div()
                         .flex()

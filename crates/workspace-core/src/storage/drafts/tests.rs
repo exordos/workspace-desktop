@@ -5,7 +5,9 @@ use std::path::Path;
 use crate::{
     context::AccountId,
     messenger::SOURCE_ID,
-    storage::{ApplyOutcome, Cursor, EventWrite, HistoryChange, MessagePlacement},
+    storage::{
+        ApplyOutcome, Cursor, EventWrite, HistoryChange, MessagePlacement, PreparedSendBody,
+    },
 };
 
 use super::*;
@@ -80,8 +82,9 @@ fn local_draft_survives_legacy_profile_migration_and_reopen() {
                 .message(&owner, "legacy-message")
                 .unwrap()
                 .unwrap()
-                .text,
-            "старое сообщение"
+                .body
+                .markdown(),
+            Some("старое сообщение")
         );
         let access = storage.prepare_draft_access(&owner, scope).unwrap();
         assert!(
@@ -105,6 +108,93 @@ fn local_draft_survives_legacy_profile_migration_and_reopen() {
             .read_plaintext_draft(&access, Some(secondary.id))
             .unwrap()
             == Some(secondary)
+    );
+}
+
+/// Сохраняет только адрес удаления между запусками и отклоняет обычную запись после защиты.
+#[test]
+fn protected_draft_purge_survives_reopen_without_restoring_text() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("protected.sqlite");
+    let owner = owner();
+    let scope = scope(1, 2);
+    let ordinary = draft(19, 7, "old ordinary text");
+    let protection = DraftVersion {
+        id: ordinary.id,
+        version: 8,
+    };
+    {
+        let storage = Storage::open(&path).unwrap();
+        let access = storage.prepare_draft_access(&owner, scope).unwrap();
+        assert_eq!(
+            storage.save_plaintext_draft(&access, &ordinary).unwrap(),
+            DraftWriteOutcome::Saved
+        );
+        assert!(
+            storage
+                .protect_plaintext_draft(&access, protection)
+                .unwrap()
+        );
+        assert!(
+            storage
+                .read_plaintext_draft(&access, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    let storage = Storage::open(&path).unwrap();
+    let access = storage.prepare_draft_access(&owner, scope).unwrap();
+    assert_eq!(
+        storage.save_plaintext_draft(&access, &ordinary).unwrap(),
+        DraftWriteOutcome::Revoked
+    );
+    let pending = storage.pending_protected_draft_purges(&owner).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].0, scope);
+    assert_eq!(pending[0].1.id, ordinary.id);
+    assert_eq!(pending[0].1.version, protection.version);
+    let mut another = owner.clone();
+    another.account_id = AccountId("other-account".into());
+    assert!(
+        storage
+            .pending_protected_draft_purges(&another)
+            .unwrap()
+            .is_empty()
+    );
+    let old = DraftVersion {
+        id: protection.id,
+        version: 7,
+    };
+    storage
+        .confirm_protected_draft_purge(&owner, scope, old)
+        .unwrap();
+    assert_eq!(
+        storage
+            .pending_protected_draft_purges(&owner)
+            .unwrap()
+            .len(),
+        1
+    );
+    storage
+        .confirm_protected_draft_purge(&owner, scope, protection)
+        .unwrap();
+    assert!(
+        storage
+            .protect_plaintext_draft(&access, protection)
+            .unwrap()
+    );
+    assert!(
+        storage
+            .pending_protected_draft_purges(&owner)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        storage
+            .read_plaintext_draft(&access, None)
+            .unwrap()
+            .is_none()
     );
 }
 
@@ -388,7 +478,7 @@ fn outbox_recovers_consumed_reply_version_without_losing_newer_input() {
         public_id: Uuid::from_u128(75),
         stream_id: scope.stream_id,
         topic_id: scope.topic_id,
-        markdown: "Сообщение очереди".into(),
+        body: PreparedSendBody::Markdown("Сообщение очереди".into()),
     };
     let version = |draft: &PlaintextDraft| DraftVersion {
         id: draft.id,
@@ -476,7 +566,7 @@ fn outbox_rejects_reply_version_from_another_topic() {
         public_id: Uuid::from_u128(102),
         stream_id: neighbor_scope.stream_id,
         topic_id: neighbor_scope.topic_id,
-        markdown: "Сообщение из соседней темы".into(),
+        body: PreparedSendBody::Markdown("Сообщение из соседней темы".into()),
     };
     assert!(matches!(
         storage.save_prepared_send_with_draft(

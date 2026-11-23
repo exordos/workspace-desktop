@@ -1,7 +1,11 @@
 //! Проверяет путь от окна через каталог и очередь до локального HTTPS/WSS-сервера.
 
+mod calls;
 mod drafts;
+mod encryption;
+mod fragment_forward;
 mod gallery;
+mod key_lifecycle;
 mod media;
 mod position;
 
@@ -46,7 +50,7 @@ use workspace_core::{
     },
     context::OwnerContext,
     messenger::{SOURCE_ID, details::SidebarDetails},
-    storage::{Message as StoredMessage, Storage},
+    storage::{Message as StoredMessage, MessageBody, Storage},
     sync::Event,
 };
 
@@ -346,6 +350,15 @@ impl DetailsFixture {
 struct Received {
     media: Option<media::Fixture>, // Карточка фото из обычного сообщения и наблюдения HTTPS.
     drafting: Option<drafts::Fixture>, // Сообщения и задержка проверки цитаты для черновиков.
+    encrypted_history: bool,       // Штатный каталог и история защищённой лички.
+    fragment_forward: Option<fragment_forward::Fixture>, // Снимок и отправка защищённого фрагмента.
+    protected_wire: Option<encryption::ProtectedWire>, // Служебные сообщения и очередь E2EE.
+    meet_url: Option<&'static str>, // Публичный источник Jitsi в сценарии звонка.
+    meet_settings_failure: AtomicBool, // Первый ответ настройки звонка временно недоступен.
+    meet_settings_seen: AtomicBool, // Сервер действительно вернул временный отказ.
+    lifecycle_wire: Option<key_lifecycle::Fixture>, // Создание и ротация ключей нативного канала.
+    encrypted_edits: Mutex<HashMap<Uuid, &'static str>>, // Текущие REST-версии защищённых сообщений.
+    encryption_live: Option<broadcast::Sender<RecoverySignal>>, // Правки шифротекста через настоящий WSS.
     history_position: Option<position::Fixture>, // Длинная личка и управляемая догрузка старой страницы.
     sent: Mutex<Vec<(Uuid, &'static str)>>, // Публичный UUID и тема принятого POST в порядке поступления.
     ready: AtomicUsize,                     // Сколько подключений подтвердили готовность через WSS.
@@ -495,12 +508,23 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
     if let Some(media) = &state.media {
         media.observe();
     }
+    if path == "/api/workspace/v1/messenger/server_settings" {
+        assert_eq!(request.method(), Method::GET);
+        assert!(request.headers().get(header::AUTHORIZATION).is_none());
+        if state.meet_settings_failure.swap(false, Ordering::SeqCst) {
+            state.meet_settings_seen.store(true, Ordering::SeqCst);
+            return json_response(StatusCode::SERVICE_UNAVAILABLE, Value::Null);
+        }
+        return json_response(StatusCode::OK, json!({"meet_url": state.meet_url}));
+    }
     if path == "/api/workspace/v1/events/ws" {
         let protocol = request.headers()[header::SEC_WEBSOCKET_PROTOCOL]
             .to_str()
             .unwrap();
-        let two_accounts =
-            state.delayed.is_some() || state.recovery.is_some() || state.topic.is_some();
+        let two_accounts = state.delayed.is_some()
+            || state.recovery.is_some()
+            || state.topic.is_some()
+            || state.protected_wire.is_some();
         let user = match protocol {
             "workspace.events.v1, bearer.local-user" => USER,
             "workspace.events.v1, bearer.local-peer" if two_accounts => PEER,
@@ -537,6 +561,11 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
             && let Some(media) = &state.media
         {
             live = Some((media.live.subscribe(), false));
+        }
+        if user == USER
+            && let Some(sender) = &state.encryption_live
+        {
+            live = Some((sender.subscribe(), false));
         }
         let key = request.headers().get(header::SEC_WEBSOCKET_KEY).unwrap();
         let accept = derive_accept_key(key.as_bytes());
@@ -587,7 +616,10 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
     let (user, peer) = match request.headers()[header::AUTHORIZATION].to_str().unwrap() {
         "Bearer local-user" => (USER, PEER),
         "Bearer local-peer"
-            if state.delayed.is_some() || state.recovery.is_some() || state.topic.is_some() =>
+            if state.delayed.is_some()
+                || state.recovery.is_some()
+                || state.topic.is_some()
+                || state.protected_wire.is_some() =>
         {
             (PEER, USER)
         }
@@ -597,6 +629,24 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         && let Some(response) = media.response(&request, user, peer)
     {
         return response;
+    }
+    if let Some(lifecycle) = &state.lifecycle_wire {
+        return lifecycle.response(request, user).await;
+    }
+    if let Some(protected) = &state.protected_wire {
+        let protected_post = (path == MESSAGES && request.method() == Method::POST)
+            || (path.starts_with(MESSAGES) && request.method() == Method::PUT);
+        if protected_post {
+            return protected.accept(request, user).await;
+        }
+        if let Some(response) = protected.read(&request, user, peer) {
+            return response;
+        }
+    }
+    if let Some(forward) = &state.fragment_forward
+        && forward.handles(&request)
+    {
+        return forward.response(request, user, peer).await;
     }
     if path == FOLDERS && request.method() == Method::POST {
         let bytes = request.into_body().collect().await.unwrap().to_bytes();
@@ -803,6 +853,22 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         "default_topic_uuid": state.direct_topic(),
         "encryption": state.direct_encrypted.load(Ordering::SeqCst), "notification_mode":"all_messages",
     });
+    if state.fragment_forward.is_some() {
+        stream["source_name"] = json!("native");
+    }
+    if state.protected_wire.is_some() {
+        stream["source_name"] = json!("native");
+        stream["owner"] = json!(PEER);
+        stream["current_encryption_key_uuid"] = json!(encryption::KEY);
+        stream["allow_key_sharing_by_holders"] = json!(true);
+        if let Some(preview) = state
+            .protected_wire
+            .as_ref()
+            .and_then(encryption::ProtectedWire::preview)
+        {
+            stream["last_message_uuid"] = json!(preview);
+        }
+    }
     if state.details.as_ref().is_some_and(|details| {
         details.omit_stream_user.load(Ordering::SeqCst) && path == format!("{STREAMS}{STREAM}")
     }) {
@@ -813,6 +879,11 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         .as_ref()
         .map_or(("local", 1, 0), |r| r.baseline(user));
     let result = match path {
+        STREAMS if state.fragment_forward.is_some() => {
+            let mut channel = topic_channel(user, false);
+            channel["source_name"] = json!("native");
+            json!([stream, channel])
+        }
         STREAMS if state.topic.is_some() => json!([stream, topic_channel(user, false)]),
         STREAMS => json!([stream]),
         TOPICS if state.topic.is_some() => json!([channel_topic(user, TopicGate::Open)]),
@@ -854,6 +925,7 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         MESSAGES if state.drafting.is_some() => {
             draft_rows(user, peer)
         }
+        MESSAGES if state.encrypted_history => encryption::history(user, peer, &state.encrypted_edits.lock().unwrap()),
         path if state.drafting.is_some() && path.starts_with(MESSAGES) => {
             return state.drafting.as_ref().unwrap().anchor(path, user, peer).await;
         }
@@ -915,6 +987,9 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
             state.targets.fetch_add(1, Ordering::SeqCst);
             let gate = *state.topic.as_ref().unwrap().gate.lock().unwrap();
             let mut channel = topic_channel(user, gate == TopicGate::Encrypted);
+            if state.fragment_forward.is_some() {
+                channel["source_name"] = json!("native");
+            }
             if let Some(details) = &state.details {
                 channel["owner"] = json!(if details.membership.is_some() { USER } else { user });
                 if details.notifications_muted.load(Ordering::SeqCst) {
@@ -1618,7 +1693,7 @@ fn direct_destination_change_requires_manual_recheck_before_enqueue(cx: &mut Tes
             waiting.len() == 1
                 && waiting[0].status == workspace_core::storage::DeliveryStatus::Waiting
                 && waiting[0].snapshot.topic_id.to_string() == NEXT_DIRECT_TOPIC
-                && waiting[0].snapshot.markdown == MARKER
+                && waiting[0].snapshot.body.markdown() == Some(MARKER)
                 && ui.read(|app| composer.read(app).draft(app).is_empty())
         },
     );
@@ -2916,7 +2991,7 @@ async fn local_wss_recovers_pruned_cursor_and_changed_epoch() {
                             cursor,
                             message: StoredMessage {
                                 id: PEER_ROW.to_string(),
-                                text: "Данные A".into(),
+                                body: MessageBody::Markdown("Данные A".into()),
                             },
                             placement: None,
                             metadata: None,
@@ -2982,7 +3057,7 @@ async fn local_wss_recovers_pruned_cursor_and_changed_epoch() {
                 storage
                     .message(&owner_b, &FRESH_ROW.to_string())
                     .unwrap()
-                    .is_some_and(|row| row.text == "Обновлённая строка")
+                    .is_some_and(|row| row.body.markdown() == Some("Обновлённая строка"))
             })
             .await;
             recovery.event(

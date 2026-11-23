@@ -4,19 +4,57 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use uuid::Uuid;
 
 use super::{
-    DraftAccess, DraftVersion, HistoryMessage, HistoryScope, Message, MessagePlacement, Storage,
-    StorageError, drafts, history,
+    DraftAccess, DraftVersion, HistoryMessage, HistoryScope, Message, MessageBody,
+    MessagePlacement, Storage, StorageError, drafts, history,
 };
 use crate::context::OwnerContext;
 
-/// Неизменный снимок подготовленного текстового сообщения.
+/// Неизменный снимок подготовленного обычного или защищённого сообщения.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedSend {
-    pub canonical_id: Uuid, // UUID для тела запроса.
-    pub public_id: Uuid,    // UUID размещения для сверки с историей.
-    pub stream_id: Uuid,    // Исходный стрим.
-    pub topic_id: Uuid,     // Исходная тема.
-    pub markdown: String,   // Неизменное содержимое payload вида markdown.
+    pub canonical_id: Uuid,     // UUID для тела запроса.
+    pub public_id: Uuid,        // UUID размещения для сверки с историей.
+    pub stream_id: Uuid,        // Исходный стрим.
+    pub topic_id: Uuid,         // Исходная тема.
+    pub body: PreparedSendBody, // Данные для первой попытки и повторов.
+}
+
+/// Тело отправки с адресом локального ключа для защищённого сообщения.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PreparedSendBody {
+    Markdown(String), // Текст обычного сообщения.
+    Encrypted {
+        key_id: Uuid,       // Поколение, которым уже зашифровали тело.
+        ciphertext: String, // Готовый конверт, одинаковый для каждого повтора.
+        device_id: Uuid,    // Локальное устройство, на котором доступен ключ.
+    },
+}
+
+impl PreparedSendBody {
+    /// Возвращает текст обычной строки для композера и списка ожидания.
+    pub fn markdown(&self) -> Option<&str> {
+        match self {
+            Self::Markdown(text) => Some(text),
+            Self::Encrypted { .. } => None,
+        }
+    }
+
+    /// Проверяет формат ответа, а у E2EE также точное поколение и конверт.
+    pub(crate) fn matches_message(&self, body: &MessageBody) -> bool {
+        match (self, body) {
+            (Self::Markdown(_), MessageBody::Markdown(_)) => true,
+            (
+                Self::Encrypted {
+                    key_id, ciphertext, ..
+                },
+                MessageBody::Encrypted {
+                    key_id: received_key,
+                    ciphertext: received_text,
+                },
+            ) => key_id == received_key && ciphertext == received_text,
+            _ => false,
+        }
+    }
 }
 
 /// Состояние отправки, пока для неё нет подтверждённой строки истории.
@@ -33,13 +71,13 @@ pub enum DeliveryStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SendBlock {
     AccessLost,            // Личка или её исходная тема стали недоступны.
-    EncryptionUnavailable, // Нет явного разрешения отправлять открытый текст.
+    EncryptionUnavailable, // Формат запрещён или исходный локальный ключ недоступен.
 }
 
 /// Строка очереди вместе с состоянием, которое показывает окно.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutboxEntry {
-    pub snapshot: PreparedSend, // Текст и исходные идентификаторы сообщения.
+    pub snapshot: PreparedSend, // Готовое тело и исходные идентификаторы сообщения.
     pub status: DeliveryStatus, // Последнее зафиксированное состояние отправки.
 }
 
@@ -88,17 +126,56 @@ pub(super) fn initialize(connection: &Connection) -> Result<(), StorageError> {
              UPDATE messenger_outbox SET final_status = 1 WHERE first_attempt_claimed = 1;",
         )?;
     }
+    let has_encryption: bool = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('messenger_outbox') WHERE name = 'ciphertext')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_encryption {
+        connection.execute_batch(
+            "ALTER TABLE messenger_outbox ADD COLUMN ciphertext TEXT;
+             ALTER TABLE messenger_outbox ADD COLUMN encryption_key_id BLOB;
+             ALTER TABLE messenger_outbox ADD COLUMN encryption_device_id BLOB
+               CHECK (
+                 (ciphertext IS NULL AND encryption_key_id IS NULL AND encryption_device_id IS NULL)
+                 OR (markdown = '' AND ciphertext IS NOT NULL AND length(ciphertext) > 0
+                     AND encryption_key_id IS NOT NULL AND length(encryption_key_id) = 16
+                     AND encryption_device_id IS NOT NULL AND length(encryption_device_id) = 16)
+               );",
+        )?;
+    }
+    let has_confirmation: bool = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('messenger_outbox') WHERE name = 'confirmation_pending')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_confirmation {
+        connection.execute_batch(
+            "ALTER TABLE messenger_outbox ADD COLUMN confirmation_pending INTEGER NOT NULL DEFAULT 0
+               CHECK (confirmation_pending IN (0, 1));
+             UPDATE messenger_outbox SET confirmation_pending = first_attempt_claimed;",
+        )?;
+    }
     Ok(())
 }
 
 /// Читает неизменный снимок из результата запроса к очереди.
 fn read_prepared_send(row: &Row<'_>) -> rusqlite::Result<PreparedSend> {
+    let body = if let Some(ciphertext) = row.get(5)? {
+        PreparedSendBody::Encrypted {
+            key_id: Uuid::from_bytes(row.get(6)?),
+            ciphertext,
+            device_id: Uuid::from_bytes(row.get(7)?),
+        }
+    } else {
+        PreparedSendBody::Markdown(row.get(4)?)
+    };
     Ok(PreparedSend {
         canonical_id: Uuid::from_bytes(row.get(0)?),
         public_id: Uuid::from_bytes(row.get(1)?),
         stream_id: Uuid::from_bytes(row.get(2)?),
         topic_id: Uuid::from_bytes(row.get(3)?),
-        markdown: row.get(4)?,
+        body,
     })
 }
 
@@ -110,6 +187,7 @@ pub(super) fn confirm(
     stream: &str,
     topic: &str,
     author: Option<Uuid>,
+    body: &MessageBody,
 ) -> Result<bool, StorageError> {
     if author.is_none() || author != owner.user_id.parse().ok() {
         return Ok(false);
@@ -121,10 +199,18 @@ pub(super) fn confirm(
     ) else {
         return Ok(false);
     };
+    let (key_id, ciphertext) = match body {
+        MessageBody::Markdown(_) => (None, None),
+        MessageBody::KeyService { .. } => return Ok(false),
+        MessageBody::Encrypted { key_id, ciphertext } => {
+            (Some(key_id.as_bytes()), Some(ciphertext))
+        }
+    };
     Ok(connection.execute(
         "DELETE FROM messenger_outbox WHERE account_id = ?1 AND server = ?2
          AND organization_id = ?3 AND project_id = ?4 AND user_id = ?5
-         AND public_id = ?6 AND stream_id = ?7 AND topic_id = ?8 AND first_attempt_claimed = 1",
+         AND public_id = ?6 AND stream_id = ?7 AND topic_id = ?8 AND confirmation_pending = 1
+         AND encryption_key_id IS ?9 AND ciphertext IS ?10",
         params![
             owner.account_id.0,
             owner.server,
@@ -133,7 +219,9 @@ pub(super) fn confirm(
             owner.user_id,
             id.as_bytes(),
             stream.as_bytes(),
-            topic.as_bytes()
+            topic.as_bytes(),
+            key_id,
+            ciphertext,
         ],
     )? != 0)
 }
@@ -177,7 +265,7 @@ pub(super) fn reject_revoked(
 }
 
 impl Storage {
-    /// Сохраняет подтверждение HTTP и закрывает подходящую запись одной транзакцией.
+    /// Сохраняет подтверждение HTTP только для подходящей строки утверждённого формата.
     pub(crate) fn confirm_http_send(
         &self,
         owner: &OwnerContext,
@@ -195,15 +283,17 @@ impl Storage {
             &stream,
             &topic,
             message.metadata.author_id,
+            &message.body,
         )?;
         if confirmed && !history::has_message_revision(&transaction, owner, &id)? {
+            let (body, key_id) = message.body.storage_parts();
             let inserted = transaction.execute(
                 "INSERT OR IGNORE INTO sync_messages (account_id, server, organization_id, project_id, user_id,
-                 message_id, text, stream_id, topic_id, author_id, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 message_id, text, stream_id, topic_id, author_id, created_at, updated_at, encryption_key_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id,
-                    id, message.text, stream, topic, message.metadata.author_id.map(|id| id.to_string()),
-                    message.metadata.created_at.as_str(), message.metadata.updated_at.as_ref().map(|time| time.as_str())],
+                    id, body, stream, topic, message.metadata.author_id.map(|id| id.to_string()),
+                    message.metadata.created_at.as_str(), message.metadata.updated_at.as_ref().map(|time| time.as_str()), key_id],
             )? != 0;
             if inserted {
                 history::record_creation(
@@ -211,7 +301,7 @@ impl Storage {
                     owner,
                     &Message {
                         id,
-                        text: message.text.clone(),
+                        body: message.body.clone(),
                     },
                     Some(&MessagePlacement {
                         stream_id: stream,
@@ -244,12 +334,32 @@ impl Storage {
     ) -> Result<bool, StorageError> {
         let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (markdown, ciphertext, key_id, device_id) = match &message.body {
+            PreparedSendBody::Markdown(markdown) => (markdown.as_str(), None, None, None),
+            PreparedSendBody::Encrypted {
+                key_id,
+                ciphertext,
+                device_id,
+            } => {
+                if draft.is_some() || key_id.is_nil() || device_id.is_nil() || ciphertext.is_empty()
+                {
+                    return Err(StorageError::InvalidPreparedSend);
+                }
+                (
+                    "",
+                    Some(ciphertext),
+                    Some(key_id.as_bytes()),
+                    Some(device_id.as_bytes()),
+                )
+            }
+        };
         // Первый вариант остаётся в очереди даже при повторе с другим содержимым.
         let inserted = transaction.execute(
             "INSERT INTO messenger_outbox (
                 account_id, server, organization_id, project_id, user_id,
-                canonical_id, public_id, stream_id, topic_id, markdown, state
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending')
+                canonical_id, public_id, stream_id, topic_id, markdown, state,
+                ciphertext, encryption_key_id, encryption_device_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?13)
              ON CONFLICT (account_id, server, organization_id, project_id, user_id, canonical_id)
              DO NOTHING",
             params![
@@ -262,7 +372,10 @@ impl Storage {
                 message.public_id.as_bytes(),
                 message.stream_id.as_bytes(),
                 message.topic_id.as_bytes(),
-                message.markdown
+                markdown,
+                ciphertext,
+                key_id,
+                device_id,
             ],
         )?;
         if inserted == 1
@@ -290,6 +403,34 @@ impl Storage {
         self.sends_by_claim(owner, true)
     }
 
+    /// Возвращает тот же снимок в очередь, сохраняя право принять прежнее подтверждение.
+    pub(crate) fn retry_encrypted_send(
+        &self,
+        owner: &OwnerContext,
+        canonical_id: Uuid,
+    ) -> Result<Option<PreparedSend>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        Ok(connection
+            .query_row(
+                "UPDATE messenger_outbox SET first_attempt_claimed = 0, final_status = 0
+             WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
+               AND project_id = ?4 AND user_id = ?5 AND canonical_id = ?6 AND ciphertext IS NOT NULL
+               AND (final_status IN (1, 2, 4) OR final_status BETWEEN 400 AND 499)
+             RETURNING canonical_id, public_id, stream_id, topic_id, markdown,
+                       ciphertext, encryption_key_id, encryption_device_id",
+                params![
+                    owner.account_id.0,
+                    owner.server,
+                    owner.organization_id,
+                    owner.project_id,
+                    owner.user_id,
+                    canonical_id.as_bytes()
+                ],
+                read_prepared_send,
+            )
+            .optional()?)
+    }
+
     /// Закрепляет первую попытку. Только выигравший вызов получает снимок для отправки.
     pub fn claim_first_send(
         &self,
@@ -301,11 +442,12 @@ impl Storage {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let snapshot = transaction
             .query_row(
-                "UPDATE messenger_outbox SET first_attempt_claimed = 1
+                "UPDATE messenger_outbox SET first_attempt_claimed = 1, confirmation_pending = 1
              WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
                AND project_id = ?4 AND user_id = ?5 AND canonical_id = ?6
                AND first_attempt_claimed = 0 AND final_status = 0
-             RETURNING canonical_id, public_id, stream_id, topic_id, markdown",
+             RETURNING canonical_id, public_id, stream_id, topic_id, markdown,
+                       ciphertext, encryption_key_id, encryption_device_id",
                 params![
                     owner.account_id.0,
                     owner.server,
@@ -330,6 +472,7 @@ impl Storage {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let mut statement = connection.prepare(
             "SELECT canonical_id, public_id, stream_id, topic_id, markdown,
+                    ciphertext, encryption_key_id, encryption_device_id,
                     first_attempt_claimed, final_status
              FROM messenger_outbox
              WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
@@ -352,8 +495,8 @@ impl Storage {
                 topic
             ],
             |row| {
-                let claimed = row.get::<_, bool>(5)?;
-                let status = match (claimed, row.get::<_, u16>(6)?) {
+                let claimed = row.get::<_, bool>(8)?;
+                let status = match (claimed, row.get::<_, u16>(9)?) {
                     (false, 0) => DeliveryStatus::Waiting,
                     (true, 0) => DeliveryStatus::Sending,
                     (_, 1) => DeliveryStatus::Unknown,
@@ -445,7 +588,8 @@ impl Storage {
     ) -> Result<Vec<PreparedSend>, StorageError> {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let mut statement = connection.prepare(
-            "SELECT canonical_id, public_id, stream_id, topic_id, markdown
+            "SELECT canonical_id, public_id, stream_id, topic_id, markdown,
+                    ciphertext, encryption_key_id, encryption_device_id
              FROM messenger_outbox
              WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
                AND project_id = ?4 AND user_id = ?5 AND first_attempt_claimed = ?6

@@ -20,7 +20,9 @@ use crate::{
 use super::rest::{RestClient, STREAMS_PATH, TOPICS_PATH};
 
 mod preview;
-pub use preview::SidebarPreview;
+pub use preview::{
+    ProtectedSidebarSummary, SidebarKeyServiceKind, SidebarPreview, SidebarPreviewBody,
+};
 pub(crate) use preview::{SidebarPreviews, attach as attach_previews};
 
 const USERS_PATH: &str = "/api/workspace/v1/users/";
@@ -49,17 +51,18 @@ pub struct Topic {
 #[derive(Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct ChatMetadata {
+    pub native_markdown: bool, // Сервер подтвердил обычный нативный разговор.
     pub default_topic_id: Option<Uuid>, // Доступная тема по умолчанию, если сервер её указал.
-    pub direct_peer_id: Option<Uuid>,   // Собеседник в личном чате.
+    pub direct_peer_id: Option<Uuid>, // Собеседник в личном чате.
     pub direct_peer_username: Option<String>, // Имя учётной записи собеседника для поиска.
     pub direct_peer_email: Option<String>, // Доступный адрес собеседника для поиска.
-    pub last_message_id: Option<Uuid>,  // Ссылка на последнее сообщение, если оно есть.
+    pub last_message_id: Option<Uuid>, // Ссылка на последнее сообщение, если оно есть.
     #[serde(skip)]
     pub preview: Option<SidebarPreview>, // Превью из фонового запроса текущего входа.
-    pub color: Option<u32>,             // Цвет в формате RGB, заданный сервером.
-    pub invite_only: bool,              // Вступление в канал требует приглашения.
+    pub color: Option<u32>,    // Цвет в формате RGB, заданный сервером.
+    pub invite_only: bool,     // Вступление в канал требует приглашения.
     pub notification_mode: Option<String>, // Режим уведомлений из ответа сервера.
-    pub unread_count: Option<u64>,      // Все непрочитанные сообщения, если известны.
+    pub unread_count: Option<u64>, // Все непрочитанные сообщения, если известны.
     pub active_unread_count: Option<u64>, // Непрочитанные, влияющие на уведомления.
     pub passive_unread_count: Option<u64>, // Остальные непрочитанные сообщения.
 }
@@ -318,6 +321,8 @@ impl Catalog {
                     direct,
                     topics,
                     metadata: ChatMetadata {
+                        native_markdown: chat.source_name.as_deref() == Some("native")
+                            && chat.encryption == Some(serde_json::Value::Bool(false)),
                         default_topic_id,
                         direct_peer_id: peer_id,
                         direct_peer_username: peer.map(|profile| profile.username.clone()),
@@ -372,22 +377,24 @@ impl Catalog {
 /// Поля разговора из REST, нужные для списка и проверки владельца.
 #[derive(Deserialize)]
 struct WireChat {
-    uuid: Uuid,                       // Идентификатор разговора.
-    project_id: Uuid,                 // Проект, которому принадлежит разговор.
-    user_uuid: Uuid,                  // Пользователь, от имени которого получен разговор.
-    name: String,                     // Название, сохранённое на сервере.
-    private: bool,                    // Признак личного разговора.
-    direct_user_uuid: Option<Uuid>,   // Собеседник. У канала его нет.
-    is_archived: bool,                // Архивный разговор скрыт из основного списка.
-    default_topic_uuid: Option<Uuid>, // Тема по умолчанию, указанная сервером.
-    last_message_uuid: Option<Uuid>,  // Последнее сообщение в разговоре.
-    color: Option<u32>,               // Цвет разговора в формате RGB.
+    uuid: Uuid,                            // Идентификатор разговора.
+    project_id: Uuid,                      // Проект, которому принадлежит разговор.
+    user_uuid: Uuid,                       // Пользователь, от имени которого получен разговор.
+    name: String,                          // Название, сохранённое на сервере.
+    private: bool,                         // Признак личного разговора.
+    direct_user_uuid: Option<Uuid>,        // Собеседник. У канала его нет.
+    is_archived: bool,                     // Архивный разговор скрыт из основного списка.
+    source_name: Option<String>,           // Источник разговора, если сервер его указал.
+    encryption: Option<serde_json::Value>, // Явное состояние шифрования от сервера.
+    default_topic_uuid: Option<Uuid>,      // Тема по умолчанию, указанная сервером.
+    last_message_uuid: Option<Uuid>,       // Последнее сообщение в разговоре.
+    color: Option<u32>,                    // Цвет разговора в формате RGB.
     #[serde(default)]
     invite_only: bool, // Вступление по приглашению.
-    notification_mode: Option<String>, // Режим уведомлений канала.
-    unread_count: Option<u64>,        // Все непрочитанные сообщения.
-    active_unread_count: Option<u64>, // Активные непрочитанные сообщения.
-    passive_unread_count: Option<u64>, // Пассивные непрочитанные сообщения.
+    notification_mode: Option<String>,     // Режим уведомлений канала.
+    unread_count: Option<u64>,             // Все непрочитанные сообщения.
+    active_unread_count: Option<u64>,      // Активные непрочитанные сообщения.
+    passive_unread_count: Option<u64>,     // Пассивные непрочитанные сообщения.
 }
 
 /// Поля темы из REST, нужные для вложенной строки и проверки владельца.

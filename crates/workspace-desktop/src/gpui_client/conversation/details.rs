@@ -1,5 +1,6 @@
 //! Управляет открытием, фокусом, загрузкой и действиями правой панели разговора.
 
+mod encryption;
 mod gallery;
 mod picker;
 mod presentation;
@@ -64,22 +65,33 @@ pub(super) struct Panel {
     state: Option<State>,                  // None, пока панель закрыта.
     avatars: AvatarImages,                 // Подписки панели на общие фото по UUID человека.
     snapshot: Option<Arc<SidebarDetails>>, // Последний снимок до закрытия или сброса.
-    catalog: Option<Arc<[Chat]>>,          // Превью для порядка тем из каталога того же входа.
-    reopen_on_access: bool, // Перенос открытой панели при переходе в другую тему канала.
-    topics_expanded: bool,  // Показ списка тем в текущей панели.
+    keys: encryption::KeyManagement, // Локальные ключи только подтверждённого защищённого чата.
+    catalog: Option<Arc<[Chat]>>,    // Превью для порядка тем из каталога того же входа.
+    reopen_on_access: bool,          // Перенос открытой панели при переходе в другую тему канала.
+    topics_expanded: bool,           // Показ списка тем в текущей панели.
     share_feedback: Option<Task<()>>, // Галочка после копирования ссылки.
     mutation: Option<PendingMutation>, // Текущее изменение, пока ждём подтверждение сервера.
     mutation_error: Option<MutationKind>, // Последняя ошибка рядом с действием.
-    picker: Option<Picker>, // Выбор участников внутри панели владельца.
-    gallery: Option<Gallery>, // Выбранный раздел вложений и его страницы.
+    picker: Option<Picker>,          // Выбор участников внутри панели владельца.
+    gallery: Option<Gallery>,        // Выбранный раздел вложений и его страницы.
     gallery_triggers: [FocusHandle; 4], // Кнопки категорий для возврата после галереи.
     refocus_gallery: Option<FocusHandle>, // Кнопка, с которой открыли галерею.
-    refocus_close: bool,    // После успеха или потери прав поле поиска исчезает.
-    trigger: FocusHandle,   // Кнопка сведений в шапке разговора.
-    retry: FocusHandle,     // Кнопка повтора после временного сбоя.
+    refocus_close: bool,             // После успеха или потери прав поле поиска исчезает.
+    trigger: FocusHandle,            // Кнопка сведений в шапке разговора.
+    retry: FocusHandle,              // Кнопка повтора после временного сбоя.
 }
 
 impl Panel {
+    /// Возвращает общий оверлей для диалогов текущего разговора.
+    pub(super) fn modal_host(&self) -> Entity<RightPanel> {
+        self.host.clone()
+    }
+
+    /// Даёт диалогу доступные чаты из каталога того же входа.
+    pub(super) fn catalog_chats(&self) -> &[Chat] {
+        self.catalog.as_deref().unwrap_or_default()
+    }
+
     /// Готовит закрытую панель без сетевого запроса.
     pub(super) fn new(
         host: Entity<RightPanel>,
@@ -120,6 +132,7 @@ impl Panel {
             state: None,
             avatars: AvatarImages::default(),
             snapshot: None,
+            keys: encryption::KeyManagement::default(),
             catalog: None,
             reopen_on_access: false,
             topics_expanded: true,
@@ -175,6 +188,7 @@ impl Panel {
         }
         self.state = None;
         self.snapshot = None;
+        self.keys = encryption::KeyManagement::default();
         self.avatars.clear();
         self.reopen_on_access = false;
         self.topics_expanded = true;
@@ -293,11 +307,22 @@ impl Panel {
             .flex_1()
             .overflow_hidden()
             .px_2()
+            .children(
+                (self.gallery.is_none() && self.picker.is_none() && self.snapshot.is_some())
+                    .then(|| view.protected_call_details(palette, cx))
+                    .flatten(),
+            )
             .child(content)
+            .children(
+                self.gallery
+                    .is_none()
+                    .then(|| self.keys.render(palette, cx))
+                    .flatten(),
+            )
     }
 
     /// Перерисовывает заголовок общей рамки после смены содержимого.
-    fn refresh_frame(&self, cx: &mut Context<Conversation>) {
+    pub(super) fn refresh_frame(&self, cx: &mut Context<Conversation>) {
         self.host.update(cx, |_, cx| cx.notify());
     }
 
@@ -566,6 +591,7 @@ impl Conversation {
                         panel.refresh_avatars(&details, &view.address, cx);
                         panel.snapshot = Some(details);
                         panel.state = Some(State::Ready);
+                        view.load_key_management(cx);
                     }
                     Err(Problem::AccessLost) => view.fail(Failure::AccessLost, cx),
                     Err(error) => {

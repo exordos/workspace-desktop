@@ -6,6 +6,7 @@ mod client;
 pub mod composer;
 pub mod contracts;
 pub mod conversation;
+mod i18n;
 mod notification_audio;
 pub mod platform_window;
 mod preferences;

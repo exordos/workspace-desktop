@@ -11,6 +11,8 @@ use crate::context::OwnerContext;
 
 use super::{Storage, StorageError};
 
+mod protected;
+
 #[cfg(test)]
 mod tests;
 
@@ -103,7 +105,7 @@ pub(super) fn initialize(connection: &Connection) -> Result<(), StorageError> {
     if !has_replies {
         connection.execute_batch("ALTER TABLE messenger_drafts ADD COLUMN reply_context TEXT;")?;
     }
-    Ok(())
+    protected::initialize(connection)
 }
 
 impl Storage {

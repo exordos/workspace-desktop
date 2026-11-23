@@ -1,11 +1,15 @@
 //! Подключает журнал мессенджера к фоновой синхронизации.
 //! Сначала источник догоняет журнал по HTTP, затем читает новые события через WebSocket.
 
+pub mod calls;
 pub mod catalog;
 pub mod details;
+pub mod encrypted_send;
+pub mod encryption;
 pub mod files;
 mod folder_sync;
 pub mod folders;
+pub mod forward;
 pub mod history;
 pub mod message_actions;
 mod outbox;
@@ -43,6 +47,7 @@ const NOTIFICATION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct MessengerSource {
     rest: Arc<RestClient>,        // Общий HTTP-клиент для чтения страниц журнала.
     connector: Option<Connector>, // Настройки TLS для сервера с частным центром сертификации.
+    chat_encryption: Option<encrypted_send::ChatEncryption>, // Локальные ключи этого профиля.
     catalog_refresh: Arc<catalog::RefreshGates>, // Общие запросы каталога одного владельца.
 }
 
@@ -67,6 +72,7 @@ impl MessengerSource {
         Ok(Self {
             rest: Arc::new(RestClient::new(None)?),
             connector: None,
+            chat_encryption: None,
             catalog_refresh: Arc::default(),
         })
     }
@@ -85,6 +91,7 @@ impl MessengerSource {
         Ok(Self {
             rest: Arc::new(RestClient::new(Some(certificate_der))?),
             connector: Some(Connector::Rustls(Arc::new(tls))),
+            chat_encryption: None,
             catalog_refresh: Arc::default(),
         })
     }
@@ -114,7 +121,7 @@ impl EventSource for MessengerSource {
         })
     }
 
-    /// Обрабатывает очередь и сверяет папки владельца рядом с потоком событий.
+    /// Обрабатывает очередь, папки и удаление черновиков рядом с потоком событий.
     fn run_session(
         &self,
         sync: Arc<Sync>,
@@ -124,7 +131,8 @@ impl EventSource for MessengerSource {
         Box::pin(async move {
             tokio::join!(
                 outbox::run(self, sync.clone(), session.clone(), ready.clone()),
-                folder_sync::run(self, sync.clone(), session, ready),
+                folder_sync::run(self, sync.clone(), session.clone(), ready.clone()),
+                encryption::fragments::run_protected_draft_purges(self, &sync, &session, ready),
                 sync.run_media_cleanup(),
             );
         })

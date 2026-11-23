@@ -3,6 +3,7 @@
 
 mod draft;
 mod editor;
+mod fragments;
 mod replies;
 mod source;
 mod toolbar;
@@ -13,17 +14,24 @@ use gpui::{
     SharedString, Subscription, Window, div, prelude::*, px,
 };
 use uuid::Uuid;
-use workspace_core::messenger::quote::{Source as QuoteSource, SourceCheckError};
+use workspace_core::{
+    messenger::{
+        encryption::{ProtectedMessage, fragments::FragmentEdit},
+        quote::{Source as QuoteSource, SourceCheckError},
+        send::PlainSendTarget,
+    },
+    storage::HistoryMessage,
+};
 
 pub(super) use self::draft::DraftBuffer;
 pub use self::editor::Editor;
-pub(super) use self::replies::{ReplyAction, ReplyQuote};
+pub(super) use self::replies::{ReplyAction, ReplyQuote, ReplyText, short_reply_text};
 pub(super) use self::source::{
     DestinationError, QueueWriteOutcome, ResolvedDestination, SendSource,
 };
 use self::{
     draft::{DraftSend, DraftSession},
-    editor::SubmitRequested,
+    editor::{EditPreviousRequested, SubmitRequested},
     replies::Replies,
 };
 use super::{
@@ -48,13 +56,14 @@ const SEND_SIZE: Pixels = px(40.);
 const FIELD_SEND_GAP: Pixels = px(12.);
 const COMPOSER_INSET: Pixels = px(8.);
 
-/// Точная тема, в которую сервер разрешил подготовить обычный текст.
+/// Точная тема и режим, которые подтвердили перед добавлением сообщения в очередь.
 enum Destination {
     Unchecked,      // Проверка ещё не запущена или доступ к истории изменился.
     Checking(Uuid), // Идентификатор текущей проверки темы.
     Ready {
-        topic: Uuid,    // UUID подтверждённой темы отправки.
-        check_id: Uuid, // Идентификатор проверки, которая подтвердила тему.
+        topic: Uuid,     // UUID подтверждённой темы отправки.
+        encrypted: bool, // Защищённый режим не использует локальный черновик открытого текста.
+        check_id: Uuid,  // Идентификатор проверки, которая подтвердила тему.
     },
     Unavailable(DestinationError), // Причина, по которой сообщение нельзя поставить в очередь.
 }
@@ -75,7 +84,12 @@ pub(super) struct Submission {
     pub attempt: Attempt,             // Идентификатор операции и версия исходного черновика.
     pub topic: Uuid,                  // Отдельная тема для отправки, подтверждённая сервером.
     pub markdown: String,             // Текст на момент нажатия; не попадает в журнал.
-    pub quote_sources: Vec<QuoteSource>, // Исходники структурированных ответов.
+    pub encrypted: bool,              // Истинно только после проверки защищённого режима Core.
+    pub fragment_new_key: Option<bool>, // Для смешанного Markdown задаёт выбор поколения отправки.
+    pub edit: Option<HistoryMessage>, // Исходный конверт и метаданные при правке.
+    pub fragment_edit: Option<std::sync::Arc<FragmentEdit>>, // Разрешение на правку смешанного Markdown.
+    pub quote_sources: Vec<QuoteSource>,                     // Исходники структурированных ответов.
+    pub protected_sources: Vec<HistoryMessage>, // Версии защищённых оригиналов для отправки.
     draft: Option<std::sync::Arc<DraftSend>>, // Локальная версия, которую получит исходящая очередь.
 }
 
@@ -83,7 +97,7 @@ pub(super) struct Submission {
 pub(super) enum ComposerEvent {
     Send(Box<Submission>), // Просьба сохранить подготовленный текст в очереди.
     DestinationChanged,    // Экрану нужно обновить нижнюю область и действия ответа.
-    DraftRestored,         // Истории нужно заполнить доступные предпросмотры восстановленных цитат.
+    EditPrevious,          // Пустой защищённый редактор просит точную версию последнего сообщения.
 }
 
 /// Пояснение к той попытке, которая не попала в очередь.
@@ -91,6 +105,7 @@ pub(super) enum ComposerEvent {
 enum WriteFailure {
     Queue,                   // Запись в хранилище не подтверждена.
     Quote(SourceCheckError), // Сервер не подтвердил источники.
+    Edit,                    // Правка не подтверждена сервером.
 }
 
 impl WriteFailure {
@@ -98,6 +113,7 @@ impl WriteFailure {
     fn text(self) -> &'static str {
         match self {
             Self::Queue => "Не удалось сохранить сообщение. Повторите отправку",
+            Self::Edit => "Не удалось сохранить правку. Проверьте сообщение",
             Self::Quote(SourceCheckError::Missing) => {
                 "Источник цитаты недоступен. Уберите цитату или выберите сообщение заново"
             }
@@ -111,6 +127,39 @@ impl WriteFailure {
     }
 }
 
+/// Открытая правка и доступ к той версии, с которой начал работать пользователь.
+struct ProtectedEdit {
+    expected: HistoryMessage, // Только шифротекст и метаданные исходной строки.
+    access: EditAccess,       // Отзывной доступ к исходному тексту и всем нужным поколениям.
+    draft: zeroize::Zeroizing<String>, // Незаконченный ввод до начала правки.
+    draft_replies: Option<Replies>, // Вкладки обычного черновика, временно убранные с поля.
+    _watch: Option<gpui::Task<()>>, // Для смешанной правки слушает отзыв ключа исходного чата.
+}
+
+/// Разрешение исходного сообщения, которое проверяется до продолжения правки.
+enum EditAccess {
+    Whole(std::sync::Arc<ProtectedMessage>), // Точный ключ целиком зашифрованного тела.
+    Fragments(std::sync::Arc<FragmentEdit>), // Все ключи исходных фрагментов.
+}
+
+impl EditAccess {
+    /// Проверяет права на дальнейшую работу с открытой строкой.
+    fn current(&self) -> bool {
+        match self {
+            Self::Whole(access) => access.with_current(|| ()).is_some(),
+            Self::Fragments(edit) => edit.with_markdown(|_| ()).is_some(),
+        }
+    }
+
+    /// Возвращает разрешение для соответствующей ветки рабочего запроса.
+    fn fragments(&self) -> Option<std::sync::Arc<FragmentEdit>> {
+        match self {
+            Self::Fragments(edit) => Some(edit.clone()),
+            Self::Whole(_) => None,
+        }
+    }
+}
+
 /// Редактор одного открытого разговора. Текст живёт в дочернем поле.
 pub(super) struct Composer {
     address: ConversationAddress, // Снимок адреса разговора на момент открытия.
@@ -119,18 +168,35 @@ pub(super) struct Composer {
     draft_runtime: Option<RuntimeClient>, // Рабочая запись есть у редактора штатного окна.
     draft_session: Option<DraftSession>, // Точная локальная версия открытого поля.
     draft_topic: Option<Uuid>,    // Последняя точная тема, к которой относился показанный ввод.
+    plain_target: Option<PlainSendTarget>, // Проверенный тип провайдера открытого Markdown.
     destination: Destination,     // Состояние проверки возможности отправки.
-    toolbar: Toolbar,             // Кнопка раскрытия, команды и их клавиатурный фокус.
-    writing: Option<Attempt>,     // Текущая запись; None позволяет начать следующую.
+    edit: Option<ProtectedEdit>,  // Правка защищённого сообщения до сохранения или отзыва.
+    fragment_new_key: bool, // Нужен свежий локальный ключ только для следующей смешанной отправки.
+    toolbar: Toolbar,       // Кнопка раскрытия, команды и их клавиатурный фокус.
+    writing: Option<Attempt>, // Текущая запись; None позволяет начать следующую.
     write_failure: Option<(u64, u64, WriteFailure)>, // Версии ввода и вкладок при отказе записи.
     _editor_observer: Subscription, // Обновляет доступность кнопки после редактирования.
+    #[cfg(all(test, feature = "gpui-test"))]
+    renders: usize, // Вызовы настоящего Render в проверках изоляции GPUI.
     _editor_submit: Subscription, // Связывает Enter с тем же действием, что и кнопку отправки.
+    _editor_edit: Subscription, // Запрашивает правку со стрелки вверх в пустом редакторе.
 }
 
 impl Composer {
+    /// Использует язык владельца этого разговора для подписей редактора.
+    fn language(&self, app: &App) -> super::preferences::Language {
+        super::preferences::Preferences::read_for(app, &self.address.route.owner).language
+    }
+
+    /// Возвращает число сборок настоящего GPUI-представления для проверки изоляции.
+    #[cfg(all(test, feature = "gpui-test"))]
+    pub(super) fn tested_render_count(&self) -> usize {
+        self.renders
+    }
+
     /// Переводит фокус на ввод, когда пользователь выбирает «Написать» в сведениях лички.
     pub(super) fn focus_editor(&self, window: &mut Window, app: &App) {
-        if self.reply_available() {
+        if self.is_available() {
             self.editor_focus(app).focus(window);
         }
     }
@@ -150,6 +216,13 @@ impl Composer {
         let submit = cx.subscribe(&editor, |composer, _, _: &SubmitRequested, cx| {
             composer.submit(cx);
         });
+        let edit = cx.subscribe(&editor, |composer, _, _: &EditPreviousRequested, cx| {
+            if (composer.can_edit_protected() || composer.fragment_edit_topic().is_some())
+                && composer.edit.is_none()
+            {
+                cx.emit(ComposerEvent::EditPrevious);
+            }
+        });
         Self {
             address,
             editor,
@@ -157,12 +230,18 @@ impl Composer {
             draft_runtime: None,
             draft_session: None,
             draft_topic: None,
+            plain_target: None,
             destination: Destination::Unchecked,
+            edit: None,
+            fragment_new_key: false,
             toolbar: Toolbar::new(cx),
             writing: None,
             write_failure: None,
             _editor_observer: observer,
             _editor_submit: submit,
+            _editor_edit: edit,
+            #[cfg(all(test, feature = "gpui-test"))]
+            renders: 0,
         }
     }
 
@@ -193,6 +272,12 @@ impl Composer {
         self.editor.clone()
     }
 
+    /// Проверяет, осталась ли правка открыта после подтверждения или смены версии.
+    #[cfg(all(test, feature = "gpui-test"))]
+    pub fn tested_edit_active(&self) -> bool {
+        self.edit.is_some()
+    }
+
     /// Возвращает причину завершённой проверки, если отправка заблокирована.
     pub(super) fn destination_error(&self) -> Option<DestinationError> {
         match self.destination {
@@ -201,10 +286,126 @@ impl Composer {
         }
     }
 
+    /// Проверяет доступность редактора в обычном или защищённом режиме.
+    pub(super) fn is_available(&self) -> bool {
+        matches!(self.destination, Destination::Ready { .. })
+            && (!matches!(
+                self.destination,
+                Destination::Ready {
+                    encrypted: true,
+                    ..
+                }
+            ) || self.replies.protected_current())
+    }
+
+    /// Возвращает точную тему, которой уже разрешена защищённая отправка.
+    pub(super) fn protected_send_topic(&self) -> Option<Uuid> {
+        match self.destination {
+            Destination::Ready {
+                topic,
+                encrypted: true,
+                ..
+            } => Some(topic),
+            _ => None,
+        }
+    }
+
+    /// Помнит подтверждённый защищённый режим и тогда, когда не найден ключ для новой отправки.
+    pub(super) fn known_protected_destination(&self) -> bool {
+        self.protected_send_topic().is_some()
+            || matches!(
+                self.destination,
+                Destination::Unavailable(DestinationError::KeyUnavailable)
+            )
+    }
+
+    /// Проверяет, что экран разрешил защищённую запись в этой теме.
+    pub(super) fn can_edit_protected(&self) -> bool {
+        self.writing.is_none()
+            && matches!(
+                self.destination,
+                Destination::Ready {
+                    encrypted: true,
+                    ..
+                }
+            )
+    }
+
+    /// Начинает правку с точного снимка строки и сохраняет незаконченный ввод до возврата.
+    pub(super) fn open_protected_edit(
+        &mut self,
+        expected: HistoryMessage,
+        access: std::sync::Arc<ProtectedMessage>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_edit_protected() || self.edit.is_some() {
+            return;
+        }
+        let Some(text) = access.with_body(|text| zeroize::Zeroizing::new(text.to_owned())) else {
+            return;
+        };
+        let draft = zeroize::Zeroizing::new(self.editor.read(cx).text().to_owned());
+        self.edit = Some(ProtectedEdit {
+            expected,
+            access: EditAccess::Whole(access),
+            draft,
+            draft_replies: None,
+            _watch: None,
+        });
+        self.editor
+            .update(cx, |editor, cx| editor.show_reply(&text, cx));
+        cx.notify();
+    }
+
+    /// Возвращает исходный ввод и закрывает правку при отмене или отзыве.
+    pub(super) fn cancel_protected_edit(&mut self, message: Option<Uuid>, cx: &mut Context<Self>) {
+        if message.is_some_and(|id| self.edit.as_ref().is_none_or(|edit| edit.expected.id != id)) {
+            return;
+        }
+        if let Some(edit) = self.edit.take() {
+            if let Some(replies) = edit.draft_replies {
+                self.replies = replies;
+            }
+            self.editor.update(cx, |editor, cx| {
+                editor.finish_fragment_edit();
+                editor.show_reply(&edit.draft, cx);
+            });
+            self.write_failure = None;
+            cx.notify();
+        }
+    }
+
+    /// Перепроверяет только редактор защищённого режима после смены локального ключа.
+    pub(super) fn refresh_encrypted_destination(
+        &mut self,
+        source: &SendSource,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(
+            self.destination,
+            Destination::Ready {
+                encrypted: true,
+                ..
+            } | Destination::Checking(_)
+                | Destination::Unavailable(DestinationError::KeyUnavailable)
+        ) {
+            if self
+                .edit
+                .as_ref()
+                .is_some_and(|edit| !edit.access.current())
+            {
+                self.cancel_protected_edit(None, cx);
+            }
+            self.invalidate_destination(cx);
+            self.check_destination(source, cx);
+        }
+    }
+
     /// Убирает разрешение на отправку, пока история проходит повторную проверку.
     pub fn invalidate_destination(&mut self, cx: &mut Context<Self>) {
         // Сохраняем текущий снимок, чтобы вернуть ввод после подтверждения области.
         self.persist_draft(cx);
+        self.plain_target = None;
         self.destination = Destination::Unchecked;
         cx.emit(ComposerEvent::DestinationChanged);
         cx.notify();
@@ -254,23 +455,31 @@ impl Composer {
         self.destination = match reply.value {
             Ok(resolved) => {
                 let topic = resolved.topic;
+                self.plain_target = resolved.plain_target;
+                if resolved.encrypted && self.draft_topic.is_some() {
+                    self.revoke_draft(cx);
+                }
                 if let Some((access, saved)) = resolved.draft {
                     self.draft_topic = Some(topic);
-                    self.hydrate_draft(access, saved, stamp, cx);
+                    self.hydrate_draft(access, saved, resolved.restored_protected, stamp, cx);
                 }
                 if resolved.closed {
                     Destination::Unavailable(DestinationError::TopicClosed)
                 } else {
                     Destination::Ready {
                         topic,
+                        encrypted: resolved.encrypted,
                         check_id: op_id,
                     }
                 }
             }
             Err(error) => {
+                self.plain_target = None;
                 if matches!(
                     error,
-                    DestinationError::EncryptionUnavailable | DestinationError::AccessLost
+                    DestinationError::EncryptionUnavailable
+                        | DestinationError::AccessLost
+                        | DestinationError::KeyUnavailable
                 ) && self.draft_topic.is_some()
                 {
                     self.revoke_draft(cx);
@@ -297,16 +506,36 @@ impl Composer {
     /// Проверяет, доступно ли действие для показанного текста.
     fn can_send(&self, app: &App) -> bool {
         let editor = self.editor.read(app);
+        let markdown = self.replies.markdown(editor.text());
+        let marked =
+            workspace_core::messenger::encryption::fragments::has_protected_draft(&markdown);
+        let markers_supported = !marked
+            || self.protected_send_topic().is_some()
+            || self.plain_target.as_ref().is_some_and(|target| {
+                target.fragments_allowed()
+                    || (target.literal_markers_allowed()
+                        && self
+                            .draft_session
+                            .as_ref()
+                            .is_none_or(|session| !session.protected))
+            });
         matches!(self.destination, Destination::Ready { .. })
+            && markers_supported
+            && self.edit.as_ref().is_none_or(|edit| edit.access.current())
             && self.writing.is_none()
             && !editor.composing()
             && self.replies.has_answer(editor.text())
-            && !over_limit(&self.replies.markdown(editor.text()))
+            && !over_limit(&markdown)
     }
 
     /// Блокирует повторное нажатие и передаёт экрану прежний текст и адрес.
     fn submit(&mut self, cx: &mut Context<Self>) {
-        let Destination::Ready { topic, check_id } = self.destination else {
+        let Destination::Ready {
+            topic,
+            check_id,
+            encrypted,
+        } = self.destination
+        else {
             return;
         };
         if !self.can_send(cx) {
@@ -319,15 +548,32 @@ impl Composer {
             replies_version: self.replies.revision,
             destination_check: check_id,
         };
-        let draft = self.prepare_draft_send(attempt.op_id, cx);
+        let draft = if encrypted || self.edit.is_some() {
+            None
+        } else {
+            self.prepare_draft_send(attempt.op_id, cx)
+        };
         let editor = self.editor.read(cx);
+        let markdown = self.replies.markdown(editor.text()).into_owned();
         let submission = Submission {
             draft,
             address: self.address.clone(),
             attempt,
             topic,
-            markdown: self.replies.markdown(editor.text()).into_owned(),
+            encrypted,
+            fragment_new_key: (self
+                .plain_target
+                .as_ref()
+                .is_some_and(PlainSendTarget::fragments_allowed)
+                && workspace_core::messenger::encryption::fragments::has_protected_draft(
+                    &markdown,
+                ))
+            .then_some(self.fragment_new_key),
+            edit: self.edit.as_ref().map(|edit| edit.expected.clone()),
+            fragment_edit: self.edit.as_ref().and_then(|edit| edit.access.fragments()),
+            markdown,
             quote_sources: self.replies.sources(),
+            protected_sources: self.replies.protected_sources(),
         };
         self.writing = Some(attempt);
         self.editor
@@ -350,8 +596,8 @@ impl Composer {
             && self.writing == Some(submission.attempt)
             && matches!(
                 self.destination,
-                Destination::Ready { topic, check_id }
-                    if topic == submission.topic && check_id == submission.attempt.destination_check
+                Destination::Ready { topic, check_id, encrypted }
+                    if topic == submission.topic && encrypted == submission.encrypted && check_id == submission.attempt.destination_check
             )
     }
 
@@ -369,7 +615,14 @@ impl Composer {
             && !editor.composing();
         let saved = matches!(outcome, QueueWriteOutcome::Saved(_));
         match outcome {
+            QueueWriteOutcome::Edited => self.cancel_protected_edit(None, cx),
+            QueueWriteOutcome::StaleEdit => self.cancel_protected_edit(None, cx),
+            QueueWriteOutcome::EditFailed if same_version => {
+                self.write_failure =
+                    Some((attempt.version, attempt.replies_version, WriteFailure::Edit));
+            }
             QueueWriteOutcome::Saved(_) if same_version => {
+                self.fragment_new_key = false;
                 self.replies.clear();
                 self.editor.update(cx, Editor::clear);
             }
@@ -419,6 +672,11 @@ impl EventEmitter<ComposerEvent> for Composer {}
 impl Render for Composer {
     /// Показывает поле, доступность отправки и причину, если сохранить текст не получилось.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(all(test, feature = "gpui-test"))]
+        {
+            self.renders += 1;
+        }
+
         let palette = Palette::for_window(window, cx);
         let locale = super::preferences::Preferences::read(cx).language;
         let editor = self.editor.read(cx);
@@ -456,7 +714,14 @@ impl Render for Composer {
             Icon::Send.element(px(24.), color)
         };
         let target = cx.entity().downgrade();
-        let toolbar = expanded.then(|| self.toolbar.row(palette, can_format, window, cx));
+        let edit_target = target.clone();
+        let toolbar = expanded.then(|| {
+            div()
+                .flex()
+                .items_center()
+                .child(self.toolbar.row(palette, can_format, window, cx))
+                .children(self.fragment_toolbar(palette, locale, can_format, cx))
+        });
         // Сетка сначала задаёт общую ширину поля и пояснения. От неё зависит высота переносов.
         div()
             .grid()
@@ -468,7 +733,28 @@ impl Render for Composer {
             .rounded(SURFACE_RADIUS)
             .bg(palette.surface)
             .debug_selector(|| "conversation-composer".into())
+            .children(self.edit.as_ref().map(|_| {
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .child(label(
+                        palette,
+                        TextRole::Caption,
+                        locale.text("Редактирование сообщения", "Editing message"),
+                    ))
+                    .child(
+                        Button::new("cancel-protected-edit", locale.text("Отменить", "Cancel"))
+                            .render(palette, None, move |_, cx| {
+                                let _ = edit_target.update(cx, |composer, cx| {
+                                    composer.cancel_protected_edit(None, cx)
+                                });
+                            })
+                            .debug_selector(|| "cancel-protected-edit".into()),
+                    )
+            }))
             .children(self.render_replies(palette, window, cx))
+            .children(self.fragment_key_option(palette, locale, cx))
             .child(
                 div()
                     .flex()

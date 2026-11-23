@@ -145,7 +145,7 @@ pub struct SidebarStreamMetadata {
 pub(in crate::messenger) enum SidebarStreamKind {
     Peer(Uuid),  // Личка с подтверждённым UUID собеседника.
     Channel,     // Стрим с темами и участниками.
-    Unsupported, // Стрим другого типа или с включённым шифрованием.
+    Unsupported, // Неизвестный тип стрима или неподтверждённый режим шифрования.
 }
 
 type SidebarKey = (OwnerContext, SessionGeneration, Uuid);

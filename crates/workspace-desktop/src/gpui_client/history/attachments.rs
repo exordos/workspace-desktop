@@ -2,7 +2,7 @@
 //! Здесь находятся карточка, состояние просмотра, загрузка и ограниченное декодирование.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     io::{Cursor, Read},
     rc::Rc,
@@ -10,27 +10,42 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, Context, Div, FocusHandle, ImageSource, IntoElement, MouseButton, ObjectFit,
-    RenderImage, SharedString, Stateful, Task, WeakEntity, Window, actions, anchored, deferred,
-    div, img, point, prelude::*, px, rgba,
+    AnyElement, App, Bounds, Context, Corners, Div, FocusHandle, ImageSource, IntoElement,
+    MouseButton, ObjectFit, RenderImage, SharedString, Stateful, Task, WeakEntity, Window, actions,
+    anchored, canvas, deferred, div, img, point, prelude::*, px, rgba, size,
 };
 use image::{DynamicImage, Frame, ImageFormat, ImageReader, Limits, RgbaImage, imageops};
 use uuid::Uuid;
 use workspace_core::{
-    messenger::{files::MediaFile, history::MediaAccess, references::MediaReference},
+    messenger::{
+        encryption::EncryptionActivation,
+        files::{MediaFile, ProtectedPreviewPermit},
+        history::MediaAccess,
+        references::MediaReference,
+    },
     storage::media::{MediaHistoryItem, MediaKind},
 };
 
+use super::super::contracts::ConversationAddress;
 use super::Conversation;
+#[path = "attachments/protected.rs"]
+mod protected;
 use crate::gpui_client::{
+    preferences::{Language, Preferences},
     runtime::RuntimeClient,
     ui::{Button, ButtonAppearance, Icon, Palette, SURFACE_RADIUS, TextRole, activate, label},
 };
+pub(super) use protected::ProtectedAttachment;
+use protected::{CardAddress, PreviewLoad, ProtectedThumbnails};
 
 const VIEWER_CONTEXT: &str = "WorkspacePhotoViewer";
 const MAX_ENCODED_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_SOURCE_SIDE: u32 = 4096;
 const MAX_VIEW_SIDE: u32 = 2048;
+
+/// Считает вызовы Canvas и кадры, допущенные к выводу изображений.
+#[cfg(all(test, feature = "gpui-test"))]
+type PaintCounts = Rc<Cell<(usize, usize)>>;
 
 actions!(attachment_viewer, [ClosePhoto, KeepPhotoFocus]);
 
@@ -45,6 +60,7 @@ pub(super) struct AttachmentKey {
 /// Источник открытия определяет способ проверки ссылки и возврат фокуса.
 enum PhotoTarget {
     History, // Карточка находится в текущем окне истории.
+    Protected(ProtectedAttachment, EncryptionActivation), // Точный оригинал и допуск среды чтения.
     Gallery {
         item: MediaHistoryItem, // Точное сообщение и вложение из локального списка.
         whole_stream: bool,     // Источник может быть в другой теме стрима.
@@ -55,13 +71,31 @@ enum PhotoTarget {
 pub(super) enum PhotoReturn {
     History(AttachmentKey, FocusHandle), // Карточка должна оставаться видимой в истории.
     Gallery(FocusHandle),                // Плитка из открытого раздела сведений.
+    Protected(Uuid, FocusHandle),        // Возвращает фокус карточке в том же видимом бабле.
     Conversation,                        // Источник исчез. Фокус вернётся в разговор.
 }
 
 /// Готовые пиксели для просмотра и маленькой карточки.
-struct Photo {
-    full: Arc<RenderImage>,  // Кадр для открытого просмотра.
-    thumb: Arc<RenderImage>, // Уменьшенная копия для истории.
+enum Photo {
+    Plain {
+        full: Arc<RenderImage>,  // Кадр для открытого просмотра.
+        thumb: Arc<RenderImage>, // Уменьшенная копия для обычной карточки.
+    },
+    Protected(ProtectedPicture), // Пиксели, связанные с точной проверенной версией файла.
+}
+
+/// Декодированный кадр живёт отдельно от временного файла и остаётся отзываемым.
+#[derive(Clone)]
+struct ProtectedPicture {
+    image: Arc<RenderImage>, // Пиксели для одного защищённого места в окне.
+    permit: ProtectedPreviewPermit, // Core проверяет файл, сообщения, ключи и поколение входа.
+}
+
+impl ProtectedPicture {
+    /// Проверяет возможность публикации готового кадра без диска и сети.
+    fn is_current(&self) -> bool {
+        self.permit.with_current(|| ()).is_some()
+    }
 }
 
 /// Как показать отказ чтения без подробностей запроса или имени на диске.
@@ -74,31 +108,36 @@ enum PictureError {
 
 impl PictureError {
     /// Даёт короткую причину рядом с кнопкой закрытия.
-    fn message(self) -> &'static str {
-        match self {
-            Self::Unavailable => "Не удалось открыть фото",
-            Self::Unsupported => "Не удалось прочитать изображение",
-            Self::TooLarge => "Изображение слишком большое для просмотра",
-        }
+    fn message(self, language: Language) -> &'static str {
+        language.tr(match self {
+            Self::Unavailable => "desktop.messenger.history.photoUnavailable",
+            Self::Unsupported => "desktop.messenger.history.photoUnsupported",
+            Self::TooLarge => "desktop.messenger.history.photoTooLarge",
+        })
     }
 }
 
 /// Видимое состояние оверлея для одной попытки.
 enum PictureState {
-    Loading,                 // Читаем копию или ждём файлы с сервера.
-    Ready(Arc<RenderImage>), // Декодированный кадр в пропорциях исходника.
-    Failed(PictureError),    // Сообщение об ошибке и кнопка закрытия.
+    Loading,                     // Читаем копию или ждём файлы с сервера.
+    Ready(Arc<RenderImage>),     // Декодированный кадр в пропорциях исходника.
+    Protected(ProtectedPicture), // Кадр рисуется под отзывным допуском к файлу.
+    Failed(PictureError),        // Сообщение об ошибке и кнопка закрытия.
 }
 
 /// Открытое намерение пользователя со своим источником возврата фокуса.
 struct Viewer {
-    key: AttachmentKey,   // Карточка, открывшая просмотр.
-    attempt: Uuid,        // Применим только ответ этой попытки.
-    title: SharedString,  // Подпись из сообщения.
-    source: FocusHandle,  // Фокус карточки при закрытии.
-    state: PictureState,  // Загрузка, кадр или отказ.
-    focus_on_mount: bool, // Фокус после появления панели в дереве окна.
-    from_gallery: bool,   // Открыто из правой панели, независимо от окна истории.
+    key: AttachmentKey,                  // Карточка, открывшая просмотр.
+    attempt: Uuid,                       // Применим только ответ этой попытки.
+    title: SharedString,                 // Подпись из сообщения.
+    source: FocusHandle,                 // Фокус карточки при закрытии.
+    state: PictureState,                 // Загрузка, кадр или отказ.
+    focus_on_mount: bool,                // Фокус после появления панели в дереве окна.
+    from_gallery: bool,                  // Открыто из правой панели, независимо от окна истории.
+    holder: Option<ProtectedAttachment>, // Разрешение исходного защищённого бабла или цитаты.
+    mounted: Rc<Cell<bool>>, // Закрытие запрещает использовать готовую раскладку старого кадра.
+    #[cfg(all(test, feature = "gpui-test"))]
+    protected_paints: PaintCounts, // Число попыток и допущенных выводов фото.
 }
 
 /// Память одного разговора. Оригинал хранит Core, экран держит последнее превью.
@@ -106,13 +145,15 @@ pub(super) struct Attachments {
     pub access: Option<MediaAccess>, // Допуск, полученный при успешном открытии истории.
     pub runtime: Option<RuntimeClient>, // Переносит загрузку на рабочий поток.
     close_focus: FocusHandle,        // Крестик получает фокус при показе оверлея.
+    save_focus: FocusHandle,         // Сохранение защищённого оригинала с клавиатуры.
     region: FocusHandle,             // Область клавиш и блокировки фона.
     viewer: Option<Viewer>,          // Открытое фото, по одному на разговор.
     task: Option<Task<()>>,          // Закрытие отменяет ожидание результата.
     preview: Option<(AttachmentKey, Arc<RenderImage>)>, // Последнее маленькое превью.
+    protected_thumbs: ProtectedThumbnails, // Кадры и запросы только для отрисованных защищённых ссылок.
     gallery_preview: Option<(AttachmentKey, Arc<RenderImage>)>, // Превью только что открытой плитки.
-    focus: Rc<RefCell<HashMap<AttachmentKey, FocusHandle>>>,    // Устойчивый фокус карточек.
-    restore: Option<PhotoReturn>,                               // Возврат после снятия оверлея.
+    focus: Rc<RefCell<HashMap<CardAddress, FocusHandle>>>, // Устойчивый фокус исходных и цитируемых карточек.
+    restore: Option<PhotoReturn>,                          // Возврат после снятия оверлея.
 }
 
 impl Attachments {
@@ -122,10 +163,12 @@ impl Attachments {
             access: None,
             runtime: None,
             close_focus: cx.focus_handle(),
+            save_focus: cx.focus_handle(),
             region: cx.focus_handle(),
             viewer: None,
             task: None,
             preview: None,
+            protected_thumbs: ProtectedThumbnails::default(),
             gallery_preview: None,
             focus: Rc::default(),
             restore: None,
@@ -148,11 +191,28 @@ impl Attachments {
     }
 
     /// Готовит возможности и превью для виртуальных строк списка.
-    pub(super) fn cards(&self, cx: &Context<Conversation>) -> Cards {
+    pub(super) fn cards(
+        &self,
+        address: &ConversationAddress,
+        activation: Option<&EncryptionActivation>,
+        cx: &Context<Conversation>,
+    ) -> Cards {
         Cards {
             target: cx.entity().downgrade(),
             enabled: self.runtime.is_some() && self.access.is_some(),
             preview: self.preview.clone(),
+            protected_thumbs: self.protected_thumbs.clone(),
+            protected_load: self
+                .runtime
+                .as_ref()
+                .zip(self.access.as_ref())
+                .zip(activation)
+                .map(|((runtime, access), activation)| PreviewLoad {
+                    runtime: runtime.clone(),
+                    access: access.clone(),
+                    activation: activation.clone(),
+                    address: address.clone(),
+                }),
             focus: self.focus.clone(),
         }
     }
@@ -161,16 +221,37 @@ impl Attachments {
     pub(super) fn close(&mut self, cx: &mut Context<Conversation>) {
         self.task = None;
         if let Some(viewer) = self.viewer.take() {
+            viewer.mounted.set(false);
             log::debug!("gpui_media op_id={} event=viewer_closed", viewer.attempt);
             self.restore = Some(if viewer.from_gallery {
                 PhotoReturn::Gallery(viewer.source)
+            } else if let Some(media) = viewer.holder {
+                PhotoReturn::Protected(media.row_id(), viewer.source)
             } else {
                 PhotoReturn::History(viewer.key, viewer.source)
             });
-            if let PictureState::Ready(image) = viewer.state {
+            let image = match viewer.state {
+                PictureState::Ready(image)
+                | PictureState::Protected(ProtectedPicture { image, .. }) => Some(image),
+                _ => None,
+            };
+            if let Some(image) = image {
                 cx.defer(move |app| app.drop_image(image, None));
             }
             cx.notify();
+        }
+    }
+
+    /// Снимает просмотр, который потерял ключ, даже если его загрузка ещё не завершилась.
+    pub(super) fn invalidate_revoked(&mut self, cx: &mut Context<Conversation>) {
+        self.protected_thumbs
+            .retain(|source| source.with_current(|| ()).is_some(), cx);
+        if self.viewer.as_ref().is_some_and(|viewer| {
+            viewer.holder.as_ref().is_some_and(|access| access.with_current(|| ()).is_none())
+                || matches!(&viewer.state, PictureState::Protected(picture) if !picture.is_current())
+        }) {
+            self.close(cx);
+            self.restore = Some(PhotoReturn::Conversation);
         }
     }
 
@@ -180,6 +261,8 @@ impl Attachments {
         affected: impl Fn(AttachmentKey) -> bool,
         cx: &mut Context<Conversation>,
     ) {
+        self.protected_thumbs
+            .retain(|source| !affected(source.key), cx);
         if self
             .viewer
             .as_ref()
@@ -221,13 +304,16 @@ impl Attachments {
     pub(super) fn retain(
         &mut self,
         contains: impl Fn(AttachmentKey) -> bool,
+        protected: impl Fn(&ProtectedAttachment) -> bool,
         cx: &mut Context<Conversation>,
     ) {
-        if self
-            .viewer
-            .as_ref()
-            .is_some_and(|viewer| !viewer.from_gallery && !contains(viewer.key))
-        {
+        if self.viewer.as_ref().is_some_and(|viewer| {
+            !viewer.from_gallery
+                && match &viewer.holder {
+                    Some(holder) => !protected(holder),
+                    None => !contains(viewer.key),
+                }
+        }) {
             self.close(cx);
         }
         if self
@@ -239,7 +325,10 @@ impl Attachments {
             cx.defer(move |app| app.drop_image(image, None));
             cx.notify();
         }
-        self.focus.borrow_mut().retain(|key, _| contains(*key));
+        self.focus
+            .borrow_mut()
+            .retain(|(key, quote), _| quote.is_some() || contains(*key));
+        self.protected_thumbs.retain(protected, cx);
     }
 
     /// Рисует самостоятельный слой фото поверх рабочего окна.
@@ -247,6 +336,7 @@ impl Attachments {
         &mut self,
         window: &mut Window,
         palette: Palette,
+        language: Language,
         cx: &Context<Conversation>,
     ) -> Option<AnyElement> {
         let viewer = self.viewer.as_mut()?;
@@ -261,7 +351,7 @@ impl Attachments {
             .bg(rgba(0x00000099))
             .occlude()
             .on_click(cx.listener(|view, _, _, cx| view.attachments.close(cx)));
-        let mut close = Button::new("media-viewer-close", "Закрыть");
+        let mut close = Button::new("media-viewer-close", language.tr("common.close"));
         close.appearance = ButtonAppearance::Ghost;
         close.icon = Some(Icon::Close);
         let contents = div()
@@ -273,10 +363,14 @@ impl Attachments {
             .items_center();
         let contents = match &viewer.state {
             PictureState::Loading => contents
-                .child(label(palette, TextRole::Body, "Открываем фото…"))
+                .child(label(
+                    palette,
+                    TextRole::Body,
+                    language.tr("desktop.messenger.history.photoOpening"),
+                ))
                 .debug_selector(|| "media-viewer-loading".into()),
             PictureState::Failed(error) => contents
-                .child(label(palette, TextRole::Body, error.message()))
+                .child(label(palette, TextRole::Body, error.message(language)))
                 .debug_selector(|| "media-viewer-error".into()),
             PictureState::Ready(image) => contents.child(
                 img(ImageSource::Render(image.clone()))
@@ -284,8 +378,41 @@ impl Attachments {
                     .object_fit(ObjectFit::Contain)
                     .debug_selector(|| "media-viewer-image".into()),
             ),
+            PictureState::Protected(picture) => contents.child(
+                div()
+                    .size_full()
+                    .child(protected_photo(
+                        picture.clone(),
+                        viewer.mounted.clone(),
+                        #[cfg(all(test, feature = "gpui-test"))]
+                        viewer.protected_paints.clone(),
+                    ))
+                    .debug_selector(|| "media-viewer-image".into()),
+            ),
         };
         let close_target = cx.entity().downgrade();
+        let save = viewer
+            .holder
+            .as_ref()
+            .filter(|holder| holder.with_current(|| ()).is_some())
+            .map(|holder| {
+                let target = cx.entity().downgrade();
+                let holder = holder.clone();
+                let focus = self.save_focus.clone();
+                let picker_focus = focus.clone();
+                Button::new("media-viewer-save", language.tr("common.save"))
+                    .render(palette, Some(&focus), move |window, app| {
+                        let _ = target.update(app, |view, cx| {
+                            view.save_protected_attachment(
+                                holder.clone(),
+                                picker_focus.clone(),
+                                window,
+                                cx,
+                            );
+                        });
+                    })
+                    .debug_selector(|| "media-viewer-save-protected".into())
+            });
         let panel = div()
             .id("media-viewer")
             .debug_selector(|| "media-viewer".into())
@@ -309,7 +436,18 @@ impl Attachments {
             }))
             .on_action(cx.listener(|view, _: &KeepPhotoFocus, window, cx| {
                 cx.stop_propagation();
-                window.focus(&view.attachments.close_focus);
+                let attachments = &view.attachments;
+                let can_save = attachments
+                    .viewer
+                    .as_ref()
+                    .and_then(|viewer| viewer.holder.as_ref())
+                    .is_some_and(|access| access.with_current(|| ()).is_some());
+                let focus = if can_save && attachments.close_focus.is_focused(window) {
+                    &attachments.save_focus
+                } else {
+                    &attachments.close_focus
+                };
+                window.focus(focus);
             }))
             .child(
                 div()
@@ -324,12 +462,14 @@ impl Attachments {
                             .overflow_hidden(),
                     )
                     .child(
-                        close
-                            .render(palette, Some(&self.close_focus), move |_, app| {
-                                let _ =
-                                    close_target.update(app, |view, cx| view.attachments.close(cx));
-                            })
-                            .debug_selector(|| "media-viewer-close".into()),
+                        div().flex().gap_1().children(save).child(
+                            close
+                                .render(palette, Some(&self.close_focus), move |_, app| {
+                                    let _ = close_target
+                                        .update(app, |view, cx| view.attachments.close(cx));
+                                })
+                                .debug_selector(|| "media-viewer-close".into()),
+                        ),
                     ),
             )
             .child(contents);
@@ -361,7 +501,9 @@ pub(super) struct Cards {
     target: WeakEntity<Conversation>, // Действие исчезает вместе с разговором.
     enabled: bool,                    // Только действующая область может открыть фото.
     preview: Option<(AttachmentKey, Arc<RenderImage>)>, // Изображение последнего открытия.
-    focus: Rc<RefCell<HashMap<AttachmentKey, FocusHandle>>>, // Фокус переживает перерисовку строки.
+    protected_thumbs: ProtectedThumbnails, // Независимое представление защищённой миниатюры.
+    protected_load: Option<PreviewLoad>, // Адрес загрузки и ключ только для открытой истории.
+    focus: Rc<RefCell<HashMap<CardAddress, FocusHandle>>>, // Фокус переживает перерисовку строки.
 }
 
 impl Cards {
@@ -371,6 +513,7 @@ impl Cards {
         key: AttachmentKey,
         reference: &MediaReference,
         palette: Palette,
+        language: Language,
         app: &mut App,
     ) -> Stateful<Div> {
         let is_photo = reference.kind == MediaKind::Image;
@@ -378,19 +521,66 @@ impl Cards {
             .name
             .as_deref()
             .or_else(|| (!reference.label.trim().is_empty()).then_some(reference.label.as_str()))
-            .unwrap_or(if is_photo {
-                "Фото"
-            } else {
-                "Вложение"
+            .unwrap_or_else(|| {
+                language.tr(if is_photo {
+                    "desktop.messenger.history.photo"
+                } else {
+                    "desktop.messenger.history.attachment"
+                })
             })
             .to_owned()
             .into();
+        self.render_card(key, is_photo, name, None, palette, app)
+    }
+
+    /// Показывает карточку защищённого файла без передачи имени, URL или превью общему кэшу.
+    pub(super) fn render_protected(
+        &self,
+        source: ProtectedAttachment,
+        kind: MediaKind,
+        palette: Palette,
+        language: Language,
+        app: &mut App,
+    ) -> Stateful<Div> {
+        let photo = kind == MediaKind::Image;
+        let name = language.tr(if photo {
+            "desktop.messenger.history.photo"
+        } else {
+            "desktop.messenger.history.attachment"
+        });
+        self.render_card(source.key, photo, name.into(), Some(source), palette, app)
+    }
+
+    /// Рисует общий внешний вид и подключает загрузку только для действующего источника.
+    fn render_card(
+        &self,
+        key: AttachmentKey,
+        is_photo: bool,
+        name: SharedString,
+        protected: Option<ProtectedAttachment>,
+        palette: Palette,
+        app: &mut App,
+    ) -> Stateful<Div> {
+        let thumbnail = protected
+            .as_ref()
+            .zip(self.protected_load.as_ref())
+            .filter(|(source, _)| is_photo && source.with_current(|| ()).is_some())
+            .map(|(source, load)| self.protected_thumbs.render(source, load, app));
+        let address = protected
+            .as_ref()
+            .map_or((key, None), ProtectedAttachment::card_address);
+        let selector: SharedString = match address.1 {
+            Some(slot) => format!(
+                "history-protected-quote-attachment-{}-{}-{}",
+                slot.message, slot.position, key.position
+            ),
+            None => format!("history-attachment-{}-{}", key.message, key.position),
+        }
+        .into();
+        let selector_name = selector.clone();
         let card = div()
-            .id(SharedString::from(format!(
-                "attachment-{}-{}",
-                key.message, key.position
-            )))
-            .debug_selector(move || format!("history-attachment-{}-{}", key.message, key.position))
+            .id(selector)
+            .debug_selector(move || selector_name.to_string())
             .w(px(242.))
             .max_w_full()
             .h(px(60.))
@@ -410,19 +600,26 @@ impl Cards {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .map(
-                        |slot| match self.preview.as_ref().filter(|(shown, _)| *shown == key) {
-                            Some((_, image)) => slot.child(
-                                img(ImageSource::Render(image.clone()))
-                                    .size_full()
-                                    .object_fit(ObjectFit::Contain)
-                                    .debug_selector(|| "history-attachment-preview".into()),
-                            ),
-                            None => {
-                                slot.child(Icon::Attach.element(px(20.), palette.text_secondary))
+                    .map(|slot| {
+                        if let Some(thumbnail) = thumbnail {
+                            slot.child(thumbnail)
+                        } else {
+                            match self
+                                .preview
+                                .as_ref()
+                                .filter(|(shown, _)| *shown == key && protected.is_none())
+                            {
+                                Some((_, image)) => slot.child(
+                                    img(ImageSource::Render(image.clone()))
+                                        .size_full()
+                                        .object_fit(ObjectFit::Contain)
+                                        .debug_selector(|| "history-attachment-preview".into()),
+                                ),
+                                None => slot
+                                    .child(Icon::Attach.element(px(20.), palette.text_secondary)),
                             }
-                        },
-                    ),
+                        }
+                    }),
             )
             .child(
                 label(palette, TextRole::Label, name.clone())
@@ -430,13 +627,13 @@ impl Cards {
                     .whitespace_nowrap()
                     .overflow_hidden(),
             );
-        if !self.enabled || !is_photo {
+        if !self.enabled || (!is_photo && protected.is_none()) {
             return card;
         }
         let focus = self
             .focus
             .borrow_mut()
-            .entry(key)
+            .entry(address)
             .or_insert_with(|| app.focus_handle().tab_stop(true))
             .clone();
         let mouse_focus = focus.clone();
@@ -446,9 +643,27 @@ impl Cards {
             card.hover(|style| style.bg(palette.card_hover)),
             Some(&focus),
             palette,
-            move |_, app| {
+            move |window, app| {
                 let _ = target.update(app, |view, cx| {
-                    view.open_attachment(key, name.clone(), trigger.clone(), cx);
+                    if let Some(holder) = &protected {
+                        if is_photo {
+                            view.open_protected_attachment(
+                                name.clone(),
+                                trigger.clone(),
+                                holder.clone(),
+                                cx,
+                            );
+                        } else {
+                            view.save_protected_attachment(
+                                holder.clone(),
+                                trigger.clone(),
+                                window,
+                                cx,
+                            );
+                        }
+                    } else {
+                        view.open_attachment(key, name.clone(), trigger.clone(), cx);
+                    }
                 });
             },
         )
@@ -495,12 +710,19 @@ impl Conversation {
             file: item.file_id,
             position: 0,
         };
-        let title = item.name.as_deref().unwrap_or("Фото").to_owned().into();
+        let language = Preferences::read_for(cx, &self.address.route.owner).language;
+        let title = item
+            .name
+            .as_deref()
+            .unwrap_or_else(|| language.tr("desktop.messenger.history.photo"))
+            .to_owned()
+            .into();
         self.show_photo(
             key,
             title,
             source,
             PhotoTarget::Gallery { item, whole_stream },
+            None,
             cx,
         );
     }
@@ -511,9 +733,46 @@ impl Conversation {
         let viewer = self.attachments.viewer.as_ref();
         (
             viewer.is_some(),
-            viewer.is_some_and(|viewer| matches!(viewer.state, PictureState::Ready(_))),
+            viewer.is_some_and(|viewer| {
+                matches!(
+                    viewer.state,
+                    PictureState::Ready(_) | PictureState::Protected(..)
+                )
+            }),
             self.attachments.preview.is_some() || self.attachments.gallery_preview.is_some(),
         )
+    }
+
+    /// Считает вывод защищённого изображения, пока оверлей остаётся открытым.
+    #[cfg(all(test, feature = "gpui-test"))]
+    pub(in crate::gpui_client) fn tested_protected_photo_paints(&self) -> Option<(usize, usize)> {
+        self.attachments
+            .viewer
+            .as_ref()
+            .map(|viewer| viewer.protected_paints.get())
+    }
+
+    /// Считает вывод первого защищённого вложения в бабле или в его первой цитате.
+    #[cfg(all(test, feature = "gpui-test"))]
+    pub(in crate::gpui_client) fn tested_protected_thumbnail_paints(
+        &self,
+        message: Uuid,
+        original: Uuid,
+        file: Uuid,
+        app: &App,
+    ) -> Option<(usize, usize)> {
+        let key = AttachmentKey {
+            message: original,
+            file,
+            position: 0,
+        };
+        let slot = (message != original).then_some(super::protected_quotes::QuoteSlot {
+            message,
+            position: 0,
+        });
+        self.attachments
+            .protected_thumbs
+            .tested_paints((key, slot), app)
     }
 
     /// Открывает одну попытку и читает фото через допуск от уже показанного окна.
@@ -527,7 +786,22 @@ impl Conversation {
         if !self.has_access() || !self.viewport.has_attachment(key) {
             return;
         }
-        self.show_photo(key, title, source, PhotoTarget::History, cx);
+        self.show_photo(key, title, source, PhotoTarget::History, None, cx);
+    }
+
+    /// Заново проверяет держатель точной строки, прежде чем передать загрузку в Core.
+    fn open_protected_attachment(
+        &mut self,
+        title: SharedString,
+        source: FocusHandle,
+        holder: ProtectedAttachment,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(encryption) = self.encryption.as_ref().filter(|_| holder.is_mounted(self)) else {
+            return;
+        };
+        let target = PhotoTarget::Protected(holder.clone(), encryption.activation.clone());
+        self.show_photo(holder.key, title, source, target, Some(holder), cx);
     }
 
     /// Запускает общий просмотр с выбранной проверкой источника.
@@ -537,6 +811,7 @@ impl Conversation {
         title: SharedString,
         source: FocusHandle,
         origin: PhotoTarget,
+        holder: Option<ProtectedAttachment>,
         cx: &mut Context<Self>,
     ) {
         let (Some(runtime), Some(access)) = (
@@ -559,16 +834,24 @@ impl Conversation {
             state: PictureState::Loading,
             focus_on_mount: true,
             from_gallery,
+            holder,
+            mounted: Rc::new(Cell::new(true)),
+            #[cfg(all(test, feature = "gpui-test"))]
+            protected_paints: Rc::default(),
         });
         self.attachments.task = Some(cx.spawn(async move |target, cx| {
             let reply = runtime
                 .conversation(address, move |services, _| async move {
+                    let protected = matches!(origin, PhotoTarget::Protected(..));
                     let file = match origin {
                         PhotoTarget::History => {
                             services
                                 .messenger
                                 .open_media(&services.sync, &access, key.message, key.file)
                                 .await
+                        }
+                        PhotoTarget::Protected(source, activation) => {
+                            source.open(&services, &access, &activation).await
                         }
                         PhotoTarget::Gallery { item, whole_stream } => {
                             services
@@ -579,7 +862,7 @@ impl Conversation {
                     }
                     .map_err(|_| PictureError::Unavailable)?;
                     log::debug!("gpui_media op_id={attempt} event=source_opened");
-                    tokio::task::spawn_blocking(move || decode(file))
+                    tokio::task::spawn_blocking(move || decode(file, protected))
                         .await
                         .map_err(|_| PictureError::Unavailable)?
                 })
@@ -588,7 +871,7 @@ impl Conversation {
                 let Some(result) = reply.for_current(Some(&view.address)) else {
                     return;
                 };
-                if !view.has_access() || (!from_gallery && !view.viewport.has_attachment(key)) {
+                if !view.has_access() {
                     return;
                 }
                 let Some(viewer) = view
@@ -599,18 +882,30 @@ impl Conversation {
                 else {
                     return;
                 };
+                let mounted = if let Some(holder) = &viewer.holder {
+                    holder.is_retained(view.encryption.as_ref())
+                } else {
+                    from_gallery || view.viewport.has_attachment(key)
+                };
+                if !mounted {
+                    return;
+                }
                 let preview = if from_gallery {
                     &mut view.attachments.gallery_preview
                 } else {
                     &mut view.attachments.preview
                 };
                 viewer.state = match result.unwrap_or(Err(PictureError::Unavailable)) {
-                    Ok(photo) => {
+                    Ok(Photo::Protected(picture)) if picture.is_current() => {
+                        PictureState::Protected(picture)
+                    }
+                    Ok(Photo::Protected(_)) => return,
+                    Ok(Photo::Plain { full, thumb }) => {
                         log::debug!("gpui_media op_id={attempt} event=viewer_ready");
-                        if let Some((_, image)) = preview.replace((key, photo.thumb)) {
+                        if let Some((_, image)) = preview.replace((key, thumb)) {
                             cx.defer(move |app| app.drop_image(image, None));
                         }
-                        PictureState::Ready(photo.full)
+                        PictureState::Ready(full)
                     }
                     Err(error) => {
                         log::debug!(
@@ -632,8 +927,8 @@ impl Conversation {
 }
 
 /// Читает ограниченный оригинал и принимает только поддерживаемый растровый формат.
-fn decode_original(file: MediaFile) -> Result<DynamicImage, PictureError> {
-    if file.size() > MAX_ENCODED_BYTES {
+fn decode_original(file: &mut MediaFile) -> Result<DynamicImage, PictureError> {
+    if file.size().map_err(|_| PictureError::Unavailable)? > MAX_ENCODED_BYTES {
         return Err(PictureError::TooLarge);
     }
     let mut bytes = Vec::new();
@@ -661,15 +956,23 @@ fn decode_original(file: MediaFile) -> Result<DynamicImage, PictureError> {
 }
 
 /// Возвращает маленький кадр для плитки, если локальное фото удалось прочитать.
-pub(super) fn decode_thumbnail(file: MediaFile) -> Option<Arc<RenderImage>> {
-    let decoded = decode_original(file).ok()?;
+pub(super) fn decode_thumbnail(mut file: MediaFile) -> Option<Arc<RenderImage>> {
+    let decoded = decode_original(&mut file).ok()?;
     Some(render_image(decoded.thumbnail(96, 91).into_rgba8()))
 }
 
+/// Уменьшает защищённое фото и переносит из файла только короткий отзывный допуск.
+fn decode_protected_thumbnail(mut file: MediaFile) -> Option<ProtectedPicture> {
+    let decoded = decode_original(&mut file).ok()?;
+    let image = render_image(decoded.thumbnail(96, 91).into_rgba8());
+    let permit = file.protected_preview_permit()?;
+    Some(ProtectedPicture { image, permit })
+}
+
 /// Готовит кадры для полного просмотра и карточки, декодируя оригинал один раз.
-fn decode(file: MediaFile) -> Result<Photo, PictureError> {
-    let decoded = decode_original(file)?;
-    let thumb = decoded.thumbnail(96, 84).into_rgba8();
+fn decode(mut file: MediaFile, protected: bool) -> Result<Photo, PictureError> {
+    let decoded = decode_original(&mut file)?;
+    let thumb = (!protected).then(|| render_image(decoded.thumbnail(96, 84).into_rgba8()));
     let full = decoded.into_rgba8();
     let full = if full.width().max(full.height()) > MAX_VIEW_SIDE {
         let factor = f64::from(MAX_VIEW_SIDE) / f64::from(full.width().max(full.height()));
@@ -681,10 +984,64 @@ fn decode(file: MediaFile) -> Result<Photo, PictureError> {
     } else {
         full
     };
-    Ok(Photo {
-        full: render_image(full),
-        thumb: render_image(thumb),
-    })
+    let full = render_image(full);
+    if let Some(thumb) = thumb {
+        return Ok(Photo::Plain { full, thumb });
+    }
+    let permit = file
+        .protected_preview_permit()
+        .ok_or(PictureError::Unavailable)?;
+    Ok(Photo::Protected(ProtectedPicture {
+        image: full,
+        permit,
+    }))
+}
+
+/// Рисует пиксели только внутри авторизованной операции paint.
+fn protected_photo(
+    picture: ProtectedPicture,
+    mounted: Rc<Cell<bool>>,
+    #[cfg(all(test, feature = "gpui-test"))] paints: PaintCounts,
+) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| {
+            if !mounted.get() {
+                return;
+            }
+            let image_size = picture.image.size(0);
+            let width = image_size.width.0 as f32;
+            let height = image_size.height.0 as f32;
+            let scale =
+                (f32::from(bounds.size.width) / width).min(f32::from(bounds.size.height) / height);
+            let size = size(px(width * scale), px(height * scale));
+            let origin = bounds.origin
+                + point(
+                    (bounds.size.width - size.width) / 2.,
+                    (bounds.size.height - size.height) / 2.,
+                );
+            #[cfg(all(test, feature = "gpui-test"))]
+            {
+                let (attempts, admitted) = paints.get();
+                paints.set((attempts + 1, admitted));
+            }
+            let _ = picture.permit.with_current(|| {
+                #[cfg(all(test, feature = "gpui-test"))]
+                {
+                    let (attempts, admitted) = paints.get();
+                    paints.set((attempts, admitted + 1));
+                }
+                window.paint_image(
+                    Bounds { origin, size },
+                    Corners::default(),
+                    picture.image.clone(),
+                    0,
+                    false,
+                )
+            });
+        },
+    )
+    .size_full()
 }
 
 /// Передаёт GPUI неподвижный кадр с его порядком каналов.

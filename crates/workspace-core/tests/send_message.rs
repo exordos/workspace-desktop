@@ -18,7 +18,7 @@ use uuid::Uuid;
 use workspace_core::{
     context::{AccountId, OwnerContext},
     messenger::{MessengerSource, send::SendError},
-    storage::PreparedSend,
+    storage::{PreparedSend, PreparedSendBody},
 };
 
 const CA: &[u8] = include_bytes!("../../../tests/fixtures/tls/ca.pem");
@@ -50,7 +50,7 @@ async fn sends_once_and_distinguishes_unknown_outcomes() {
         public_id: public,
         stream_id: stream,
         topic_id: topic,
-        markdown: "Привет **мир**\n".into(),
+        body: PreparedSendBody::Markdown("Привет **мир**\n".into()),
     };
     let expected = snapshot.clone();
     let (observed, mut requests) = mpsc::unbounded_channel();
@@ -86,7 +86,7 @@ async fn sends_once_and_distinguishes_unknown_outcomes() {
             let body: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(
                 body,
-                json!({"uuid": expected.canonical_id, "stream_uuid": expected.stream_id, "topic_uuid": expected.topic_id, "payload": {"kind":"markdown", "content": expected.markdown}})
+                json!({"uuid": expected.canonical_id, "stream_uuid": expected.stream_id, "topic_uuid": expected.topic_id, "payload": {"kind":"markdown", "content": expected.body.markdown().unwrap()}})
             );
             observed.send(()).unwrap();
             if mode == 6 {
@@ -95,14 +95,14 @@ async fn sends_once_and_distinguishes_unknown_outcomes() {
             let (status, body) = match mode {
                 0 => (
                     "201 Created",
-                    json!({"uuid": public, "stream_uuid": stream, "topic_uuid": topic, "project_id":"project", "user_uuid": author.to_string(), "author_uuid": author, "created_at":"2026-01-01T12:00:00Z", "payload":{"kind":"markdown", "content":expected.markdown}}),
+                    json!({"uuid": public, "stream_uuid": stream, "topic_uuid": topic, "project_id":"project", "user_uuid": author.to_string(), "author_uuid": author, "created_at":"2026-01-01T12:00:00Z", "payload":{"kind":"markdown", "content":expected.body.markdown().unwrap()}}),
                 ),
                 1 => ("201 Created", json!({"uuid": public})),
                 2 => ("400 Bad Request", json!({})),
                 4 => ("408 Request Timeout", json!({})),
                 5 => (
                     "201 Created",
-                    json!({"uuid": Uuid::from_u128(999), "stream_uuid": stream, "topic_uuid": topic, "author_uuid": author, "created_at":"2026-01-01T12:00:00Z", "payload":{"kind":"markdown", "content":expected.markdown}}),
+                    json!({"uuid": Uuid::from_u128(999), "stream_uuid": stream, "topic_uuid": topic, "author_uuid": author, "created_at":"2026-01-01T12:00:00Z", "payload":{"kind":"markdown", "content":expected.body.markdown().unwrap()}}),
                 ),
                 _ => ("500 Internal Server Error", json!({})),
             };
@@ -139,8 +139,13 @@ async fn sends_once_and_distinguishes_unknown_outcomes() {
         .await
         .unwrap();
     assert_eq!(
-        (result.id, result.stream_id, result.topic_id, result.text),
-        (public, stream, topic, snapshot.markdown.clone())
+        (
+            result.id,
+            result.stream_id,
+            result.topic_id,
+            result.body.markdown()
+        ),
+        (public, stream, topic, snapshot.body.markdown())
     );
     assert_eq!(
         source
@@ -213,7 +218,7 @@ async fn lookup_confirms_only_matching_delivery() {
         public_id: public,
         stream_id: stream,
         topic_id: topic,
-        markdown: "hello".into(),
+        body: PreparedSendBody::Markdown("hello".into()),
     };
     let worker = tokio::spawn(async move {
         for mode in 0..10 {
@@ -278,8 +283,13 @@ async fn lookup_confirms_only_matching_delivery() {
         .await
         .unwrap();
     assert_eq!(
-        (found.id, found.stream_id, found.topic_id, found.text),
-        (public, stream, topic, "hello".into())
+        (
+            found.id,
+            found.stream_id,
+            found.topic_id,
+            found.body.markdown()
+        ),
+        (public, stream, topic, Some("hello"))
     );
     for _ in 1..10 {
         assert_eq!(

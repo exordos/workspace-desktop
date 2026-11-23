@@ -30,6 +30,9 @@ use crate::{
 
 use super::{MessengerSource, history::MediaAccess, rest::RestClient};
 
+mod protected;
+pub use protected::ProtectedPreviewPermit;
+
 /// Причина отказа при открытии вложения.
 #[derive(Debug, Error)]
 pub enum OpenMediaError {
@@ -59,43 +62,82 @@ pub struct MediaFile {
     auth: Auth,                    // Авторизация профиля остаётся доступной в фоновом потоке.
     owner: OwnerContext,           // Владелец открытого объекта.
     generation: SessionGeneration, // Сессия, которой разрешено чтение.
-    reader: MediaReader,           // Дескриптор и версии ссылки и физической записи.
+    reader: MediaFileReader,       // Обычная копия или временный файл открытого сообщения.
+}
+
+/// Выбирает способ хранения и проверки байтов перед передачей читателю.
+enum MediaFileReader {
+    Cached(MediaReader), // Дескриптор и версии ссылки и физической записи.
+    Protected(protected::ProtectedMediaFile), // Временная копия и проверка ключа.
 }
 
 impl MediaFile {
     /// Возвращает длину завершённой копии.
-    pub fn size(&self) -> u64 {
-        self.reader.size()
+    pub fn size(&self) -> io::Result<u64> {
+        self.with_valid_access(|| match &self.reader {
+            MediaFileReader::Cached(reader) => reader.size(),
+            MediaFileReader::Protected(reader) => reader.size(),
+        })
     }
 
-    /// Возвращает сведения, полученные при авторизованной загрузке.
-    pub fn metadata(&self) -> &MediaMetadata {
-        self.reader.metadata()
+    /// Читает сведения только пока действует разрешение на файл.
+    pub fn with_metadata<T>(&self, read: impl FnOnce(&MediaMetadata) -> T) -> io::Result<T> {
+        self.with_valid_access(|| match &self.reader {
+            MediaFileReader::Cached(reader) => read(reader.metadata()),
+            MediaFileReader::Protected(reader) => read(reader.metadata()),
+        })
     }
+
+    /// Даёт декодированному защищённому превью проверять доступ после закрытия файла.
+    pub fn protected_preview_permit(&self) -> Option<ProtectedPreviewPermit> {
+        match &self.reader {
+            MediaFileReader::Protected(reader) => reader.preview_permit(),
+            MediaFileReader::Cached(_) => None,
+        }
+    }
+
+    /// Не даёт отзыву прервать короткую операцию между проверкой и публикацией файла.
+    /// Замыкание выполняет только завершающий локальный шаг и не обращается к Core.
+    pub fn with_valid_access<T>(&self, commit: impl FnOnce() -> T) -> io::Result<T> {
+        self.auth
+            .with_active_generation(&self.owner, self.generation, || match &self.reader {
+                MediaFileReader::Cached(reader)
+                    if reader.is_current().map_err(io::Error::other)? =>
+                {
+                    Ok(commit())
+                }
+                MediaFileReader::Cached(_) => Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "media copy revoked",
+                )),
+                MediaFileReader::Protected(reader) => reader.with_current(&self.owner, commit),
+            })
+            .map_err(media_session_revoked)?
+    }
+}
+
+/// Преобразует потерю входа в отказ доступа к байтам и метаданным.
+fn media_session_revoked(_: AuthError) -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, "media session revoked")
 }
 
 impl Read for MediaFile {
     /// Передаёт порцию байтов только пока сессия и копия действительны.
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let auth = &self.auth;
-        let revoked = |_| io::Error::new(io::ErrorKind::PermissionDenied, "media session revoked");
-        auth.with_active_generation(&self.owner, self.generation, || ())
-            .map_err(revoked)?;
+        self.auth
+            .with_active_generation(&self.owner, self.generation, || ())
+            .map_err(media_session_revoked)?;
         // Диск читаем вне блокировки сессии, затем выдаём только проверенную порцию.
         let mut chunk = [0; 64 * 1024];
         let limit = buffer.len().min(chunk.len());
-        let size = self.reader.read(&mut chunk[..limit])?;
-        auth.with_active_generation(&self.owner, self.generation, || {
-            if !self.reader.is_current().map_err(io::Error::other)? {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "media copy revoked",
-                ));
-            }
+        let size = match &mut self.reader {
+            MediaFileReader::Cached(reader) => reader.read(&mut chunk[..limit]),
+            MediaFileReader::Protected(reader) => reader.read(&mut chunk[..limit]),
+        }?;
+        self.with_valid_access(|| {
             buffer[..size].copy_from_slice(&chunk[..size]);
-            Ok(size)
+            size
         })
-        .map_err(revoked)?
     }
 }
 
@@ -275,7 +317,7 @@ impl MediaFile {
             auth: sync.auth().clone(),
             owner: access.owner.clone(),
             generation: access.generation,
-            reader,
+            reader: MediaFileReader::Cached(reader),
         }
     }
 }

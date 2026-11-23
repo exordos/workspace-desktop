@@ -14,14 +14,14 @@ use crate::{
     notification_target::NotificationTarget,
     runtime::SourceError,
     storage::{
-        HistoryDirection, HistoryEdge, HistoryPageEdges, HistoryPageOutcome, HistoryPageTarget,
-        HistoryScope, HistoryWindow,
+        HistoryDirection, HistoryEdge, HistoryMessage, HistoryPageEdges, HistoryPageOutcome,
+        HistoryPageTarget, HistoryScope, HistoryWindow,
         media::{
             LinkHistoryCursor, LinkHistoryPage, MediaCache, MediaHistoryCursor, MediaHistoryPage,
             MediaKind,
         },
     },
-    sync::{Sync, SyncError},
+    sync::{HistoryRequest, Sync, SyncError},
 };
 
 use super::{
@@ -356,12 +356,21 @@ impl MessengerSource {
         let token = auth
             .access_token_for_generation(owner, Service::Messenger, generation)
             .await?;
-        let guard = sync
+        let mut guard = sync
             .prepare_history_page(owner, generation, scope, HistoryPageTarget::New)?
             .ok_or(OpenHistoryError::StaleWindow)?;
         let fetched = self.rest.descending_page(owner, &token, scope, None).await;
         auth.with_active_generation(owner, generation, || ())?;
         let page = fetched?;
+        self.verify_legacy_encrypted_messages(
+            sync,
+            owner,
+            generation,
+            &token,
+            &mut guard,
+            &page.messages,
+        )
+        .await?;
         // Запрос без маркера начинается с конца истории. Маркер ответа ведёт к старым сообщениям.
         let outcome = sync.save_history_page(
             guard,
@@ -441,7 +450,7 @@ impl MessengerSource {
             window_id,
             direction,
         };
-        let Some(guard) = sync.prepare_history_page(owner, generation, scope, target)? else {
+        let Some(mut guard) = sync.prepare_history_page(owner, generation, scope, target)? else {
             let window = read_window()?;
             let edge = match direction {
                 HistoryDirection::Older => &window.older,
@@ -468,6 +477,15 @@ impl MessengerSource {
         };
         auth.with_active_generation(owner, generation, || ())?;
         let page = fetched?;
+        self.verify_legacy_encrypted_messages(
+            sync,
+            owner,
+            generation,
+            &token,
+            &mut guard,
+            &page.messages,
+        )
+        .await?;
         // SQLite проверит, что с начала запроса край не успела заменить другая страница.
         let outcome =
             sync.save_history_page(guard, &page.messages, HistoryPageEdges::Extend(page.edge))?;
@@ -562,7 +580,7 @@ impl MessengerSource {
         let token = auth
             .access_token_for_generation(owner, Service::Messenger, generation)
             .await?;
-        let guard = sync
+        let mut guard = sync
             .prepare_history_page(owner, generation, scope, HistoryPageTarget::New)?
             .ok_or(OpenHistoryError::StaleWindow)?;
         let verified = async {
@@ -595,7 +613,7 @@ impl MessengerSource {
                         message.id == anchor.id
                             && message.stream_id == anchor.stream_id
                             && message.topic_id == anchor.topic_id
-                            && message.text == anchor.text
+                            && message.body == anchor.body
                     })
             })
         {
@@ -621,6 +639,10 @@ impl MessengerSource {
                 .chain(newer.messages)
                 .filter(|message| seen.insert(message.id)),
         );
+        self.verify_legacy_encrypted_messages(
+            sync, owner, generation, &token, &mut guard, &messages,
+        )
+        .await?;
         let outcome = sync.save_history_page(
             guard,
             &messages,
@@ -648,5 +670,45 @@ impl MessengerSource {
             window,
             media_access,
         })
+    }
+
+    /// Перепроверяет старые удаления точным запросом владельца и запоминает совпавшие тела.
+    async fn verify_legacy_encrypted_messages(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        token: &str,
+        request: &mut HistoryRequest,
+        messages: &[HistoryMessage],
+    ) -> Result<(), OpenHistoryError> {
+        let pending = sync
+            .storage()
+            .legacy_encrypted_messages(owner, messages)
+            .map_err(SyncError::from)?;
+        for message in pending {
+            sync.auth()
+                .with_active_generation(owner, generation, || ())?;
+            let scope = HistoryScope {
+                stream_id: message.stream_id,
+                topic_id: Some(message.topic_id),
+            };
+            let checked = self
+                .rest
+                .history_anchor(owner, token, scope, message.id)
+                .await;
+            sync.auth()
+                .with_active_generation(owner, generation, || ())?;
+            match checked {
+                Ok(confirmed) if confirmed == *message => {
+                    request.verify_legacy_encrypted_message(message.id);
+                }
+                Ok(_) | Err(OpenHistoryError::MessageMissing) => {
+                    return Err(OpenHistoryError::StaleWindow);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 }

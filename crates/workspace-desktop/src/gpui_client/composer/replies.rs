@@ -2,14 +2,20 @@
 
 mod draft;
 
-use std::{borrow::Cow, cell::Cell, rc::Rc};
+use std::{borrow::Cow, cell::Cell, rc::Rc, sync::Arc};
 
 use gpui::{Context, Div, FocusHandle, Pixels, ScrollHandle, Window, div, prelude::*, px};
 use uuid::Uuid;
-use workspace_core::messenger::quote;
+use workspace_core::{
+    messenger::{encryption::ProtectedMessage, quote},
+    storage::HistoryMessage,
+};
 
 use super::Composer;
-use crate::gpui_client::ui::{Button, ButtonAppearance, Palette, quote_preview};
+use crate::gpui_client::{
+    preferences::Language,
+    ui::{Button, ButtonAppearance, Palette, quote_preview},
+};
 
 mod drag;
 
@@ -25,20 +31,62 @@ pub(in crate::gpui_client) enum ReplyAction {
 /// Снимок подтверждённого сообщения, выбранного в текущем разговоре.
 pub(in crate::gpui_client) struct ReplyQuote {
     pub id: Uuid,                 // Публичный UUID исходной строки.
-    pub author: String,           // Подпись автора из текущей истории.
-    pub preview: String,          // Фрагмент или краткий текст исходной строки.
+    pub author: ReplyText,        // Имя из истории или ключ запасной подписи.
+    pub preview: ReplyText,       // Фрагмент сообщения или ключ его состояния.
     pub fragment: Option<String>, // Выделенный фрагмент для параметра ссылки.
+}
+
+/// Текст цитаты из источника или подпись приложения для текущего языка.
+#[derive(PartialEq, Eq)]
+pub(in crate::gpui_client) enum ReplyText {
+    Source(String),      // Текст или имя из истории.
+    Label(&'static str), // Ключ подписи интерфейса.
+    Mixed(Vec<Self>),    // Текст с отдельными подписями защищённых фрагментов и пересылок.
+}
+
+impl ReplyText {
+    /// Использует язык текущего окна только для текста приложения.
+    pub(in crate::gpui_client) fn display(&self, language: Language) -> Cow<'_, str> {
+        match self {
+            Self::Source(text) => Cow::Borrowed(text),
+            Self::Label(key) => Cow::Borrowed(language.tr(key)),
+            Self::Mixed(parts) => {
+                let mut text = String::new();
+                for part in parts {
+                    text.push_str(&part.display(language));
+                }
+                Cow::Owned(short_reply_text(&text))
+            }
+        }
+    }
+}
+
+/// Ограничивает предпросмотр одним коротким фрагментом без разрезания UTF-8.
+pub(in crate::gpui_client) fn short_reply_text(text: &str) -> String {
+    const WIDTH: usize = 80;
+    let text = text.trim();
+    match text.char_indices().nth(WIDTH) {
+        Some((end, _)) => format!("{}…", text[..end].trim_end()),
+        None => text.to_owned(),
+    }
 }
 
 /// Одна вкладка с отдельным ответом.
 struct Tab {
-    id: Uuid,                  // Локальный ID для кнопок, сохраняется при смене и перестановке.
-    quote: ReplyQuote,         // Источник текущего ответа.
-    creation: u64,             // Порядок создания, который не меняется при перестановке.
-    restored: bool,            // Превью нужно заново сверять с показанным окном.
-    answer: String,            // Ввод, сохранённый при последнем уходе с вкладки.
-    focus: FocusHandle,        // Постоянный фокус кнопки выбора.
+    id: Uuid,          // Локальный ID для кнопок, сохраняется при смене и перестановке.
+    quote: ReplyQuote, // Источник текущего ответа.
+    creation: u64,     // Порядок создания, который не меняется при перестановке.
+    restored: bool,    // Превью нужно заново сверять с показанным окном.
+    protected: Option<ProtectedReply>, // Точная версия источника при защищённом ответе.
+    answer: String,    // Ввод, сохранённый при последнем уходе с вкладки.
+    focus: FocusHandle, // Постоянный фокус кнопки выбора.
     remove_focus: FocusHandle, // Отдельный фокус кнопки удаления.
+}
+
+/// Снимок и отзывный доступ к целому исходному сообщению для ответа.
+struct ProtectedReply {
+    original: HistoryMessage, // Версия конверта, которую Core сверит перед отправкой.
+    access: Arc<ProtectedMessage>, // После отзыва ответ не отправляется из прежней вкладки.
 }
 
 /// Ответы и отложенный обычный черновик одного открытого разговора.
@@ -74,9 +122,10 @@ impl Replies {
             if index > 0 {
                 markdown.push_str("\n\n");
             }
+            // Ссылка хранит совместимую подпись, а панель ответа рисуется на языке окна.
             markdown.push_str(&quote::reference(
                 tab.quote.id,
-                &tab.quote.author,
+                &tab.quote.author.display(Language::Ru),
                 tab.quote.fragment.as_deref(),
             ));
             let answer = if index == self.active {
@@ -103,6 +152,23 @@ impl Replies {
             .collect()
     }
 
+    /// Возвращает исходные конверты для авторитетной проверки перед защищённой записью.
+    pub(super) fn protected_sources(&self) -> Vec<HistoryMessage> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| Some(tab.protected.as_ref()?.original.clone()))
+            .collect()
+    }
+
+    /// Проверяет доступ к каждой выбранной цитате до создания попытки отправки.
+    pub(super) fn protected_current(&self) -> bool {
+        self.tabs.iter().all(|tab| {
+            tab.protected
+                .as_ref()
+                .is_some_and(|source| source.access.with_body(|_| ()).is_some())
+        })
+    }
+
     /// Запоминает текущий текст, прежде чем действие сможет сменить отображаемую вкладку.
     fn save_active(&mut self, current: &str) {
         if let Some(tab) = self.tabs.get_mut(self.active) {
@@ -123,6 +189,7 @@ impl Replies {
         &mut self,
         action: ReplyAction,
         quote: ReplyQuote,
+        protected: Option<ProtectedReply>,
         current: &str,
         cx: &Context<Composer>,
     ) -> String {
@@ -131,6 +198,7 @@ impl Replies {
             ReplyAction::Replace if !self.tabs.is_empty() => {
                 let tab = &mut self.tabs[self.active];
                 tab.quote = quote;
+                tab.protected = protected;
                 tab.restored = false;
             }
             action => {
@@ -149,6 +217,7 @@ impl Replies {
                     answer,
                     creation: self.revision,
                     restored: false,
+                    protected,
                     focus: cx.focus_handle(),
                     remove_focus: cx.focus_handle(),
                 });
@@ -267,13 +336,73 @@ impl Composer {
         if !self.reply_available() || editor.composing() {
             return;
         }
-        let text = self.replies.quote(action, quote, editor.text(), cx);
+        let text = self.replies.quote(action, quote, None, editor.text(), cx);
         self.show_reply_text(text, true, window, cx);
+    }
+
+    /// Ставит ссылку на целый исходник в композере подтверждённой защищённой темы.
+    pub(in crate::gpui_client) fn reply_protected(
+        &mut self,
+        original: HistoryMessage,
+        access: Arc<ProtectedMessage>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = self.editor.read(cx);
+        if !self.can_edit_protected()
+            || self.edit.is_some()
+            || editor.composing()
+            || access.with_body(|text| !text.trim().is_empty()) != Some(true)
+        {
+            return;
+        }
+        let quote = ReplyQuote {
+            id: original.id,
+            author: ReplyText::Label("desktop.messenger.participant"),
+            preview: ReplyText::Label("desktop.messenger.history.encryptedMessage"),
+            fragment: None,
+        };
+        let text = self.replies.quote(
+            ReplyAction::Replace,
+            quote,
+            Some(ProtectedReply { original, access }),
+            editor.text(),
+            cx,
+        );
+        self.show_reply_text(text, true, window, cx);
+    }
+
+    /// Снимает ссылки на изменившийся или отозванный оригинал, сохраняя написанный ответ.
+    pub(in crate::gpui_client) fn revoke_protected_replies(
+        &mut self,
+        changed: Option<Uuid>,
+        cx: &mut Context<Self>,
+    ) {
+        let invalid = |tab: &Tab| {
+            tab.protected.as_ref().is_some_and(|source| {
+                changed == Some(source.original.id) || source.access.with_body(|_| ()).is_none()
+            })
+        };
+        if self.replies.tabs.iter().any(invalid) {
+            let current = self.editor.read(cx).text().to_owned();
+            if let Some(text) = self.replies.cancel(&current) {
+                self.editor
+                    .update(cx, |editor, cx| editor.show_reply(&text, cx));
+                cx.notify();
+            }
+        }
     }
 
     /// Проверяет доступность цитирования для подтверждённой обычной темы.
     pub(in crate::gpui_client) fn reply_available(&self) -> bool {
-        matches!(self.destination, super::Destination::Ready { .. })
+        self.edit.is_none()
+            && matches!(
+                self.destination,
+                super::Destination::Ready {
+                    encrypted: false,
+                    ..
+                }
+            )
     }
 
     /// Проверяет, можно ли изменить вкладки, сохранив системную композицию нетронутой.
@@ -334,6 +463,7 @@ impl Composer {
         cx: &Context<Self>,
     ) -> Option<Div> {
         let current = self.replies.tabs.get(self.replies.active)?;
+        let language = self.language(cx);
         let multiple = self.replies.tabs.len() > 1;
         let reveal_index = self.replies.reveal_index(window);
         let revision = self.replies.revision;
@@ -385,7 +515,7 @@ impl Composer {
                     .child(
                         self.reply_button(
                             (gpui::ElementId::Uuid(tab.id), "reply-tab"),
-                            tab.quote.author.clone(),
+                            tab.quote.author.display(language).into_owned(),
                             TabAction::Select(tab.id),
                             Some(&tab.focus),
                             palette,
@@ -420,8 +550,11 @@ impl Composer {
             );
         let preview = quote_preview(
             palette,
-            format!("Ответить: {}", current.quote.author),
-            current.quote.preview.clone(),
+            language.tr_with(
+                "desktop.messenger.composer.replyToAuthor",
+                &[("author", &current.quote.author.display(language))],
+            ),
+            current.quote.preview.display(language).into_owned(),
         )
         .flex_1()
         .debug_selector(|| "composer-reply-preview".into());
@@ -468,11 +601,14 @@ impl Composer {
         cx: &Context<Self>,
     ) -> gpui::Stateful<Div> {
         let target = cx.entity().downgrade();
+        let language = self.language(cx);
         button
             .tooltip(move |_, app| {
                 crate::gpui_client::ui::popup::tooltip(
                     palette,
-                    "Shift+←/→ — переставить активный ответ".into(),
+                    language
+                        .tr("desktop.messenger.composer.reorderReply")
+                        .into(),
                     app,
                 )
             })

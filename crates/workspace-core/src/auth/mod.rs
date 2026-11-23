@@ -6,7 +6,7 @@ mod refresh;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -42,6 +42,24 @@ impl Clock for SystemClock {
 #[derive(Clone)]
 pub struct Auth {
     inner: Arc<Inner>, // Общие зависимости и состояния сессий.
+}
+
+/// Разрешение на короткое чтение, которое не удерживает рабочий профиль при закрытии окна.
+pub(crate) struct ActiveGeneration {
+    inner: Weak<Inner>,            // Состояние Auth до освобождения рабочего профиля.
+    owner: OwnerContext,           // Аккаунт, организация и проект подтверждённого доступа.
+    generation: SessionGeneration, // Точное поколение входа.
+}
+
+impl ActiveGeneration {
+    /// Выполняет чтение только если рабочий профиль и исходный вход ещё действуют.
+    pub(crate) fn with_current<T>(&self, read: impl FnOnce() -> T) -> Option<T> {
+        Auth {
+            inner: self.inner.upgrade()?,
+        }
+        .with_active_generation(&self.owner, self.generation, read)
+        .ok()
+    }
 }
 
 /// Данные, которые используют все копии Auth.
@@ -171,6 +189,19 @@ impl Auth {
             |state| state.status == SessionStatus::Active,
             commit,
         )
+    }
+
+    /// Даёт кадру отзываемую проверку поколения без владения рабочим профилем.
+    pub(crate) fn active_generation(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+    ) -> ActiveGeneration {
+        ActiveGeneration {
+            inner: Arc::downgrade(&self.inner),
+            owner: owner.clone(),
+            generation,
+        }
     }
 
     /// Разрешает чтение кэша во время временного сбоя у уже подтверждённого входа.

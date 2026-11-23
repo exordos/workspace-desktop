@@ -28,7 +28,7 @@ pub enum ShellEffect {
     ResolveNotification(NotificationRequest), // Проверить цель на рабочем потоке.
     ShowNotification(NotificationClick),   // Попросить ОС показать баннер без текста сообщения.
     ReloadConversation(ConversationAddress), // Перечитать историю после пропуска событий.
-    ConversationUpdated(ConversationAddress, SyncUpdate), // Передать событие владельцу экрана истории.
+    ConversationUpdated(ConversationAddress, Box<SyncUpdate>), // Передать событие владельцу экрана истории.
 }
 
 /// Хранит состояние окна независимо от фонового исполнителя и разметки GPUI.
@@ -287,6 +287,58 @@ impl Shell {
         })
     }
 
+    /// Открывает точную тему, которую Core подтвердил при создании защищённого канала.
+    pub(super) fn open_created_encrypted_channel(
+        &mut self,
+        session: &AccountSession,
+        stream_id: Uuid,
+        topic_id: Uuid,
+    ) -> Option<ShellEffect> {
+        if self.selected() != Some(session)
+            || !self.is_active(session)
+            || stream_id.is_nil()
+            || topic_id.is_nil()
+        {
+            return None;
+        }
+        self.begin_navigation();
+        Some(self.open_conversation(
+            ChatRoute {
+                owner: session.owner.clone(),
+                scope: HistoryScope {
+                    stream_id,
+                    topic_id: Some(topic_id),
+                },
+                entry: ChatEntry::Latest,
+            },
+            session.generation,
+        ))
+    }
+
+    /// Открывает оригинал пересылки из того же экрана и активного входа.
+    pub(super) fn open_forward_original(
+        &mut self,
+        source: &ConversationAddress,
+        scope: HistoryScope,
+        id: Uuid,
+    ) -> Option<ShellEffect> {
+        let session = self.selected()?;
+        if self.conversation() != Some(source)
+            || session.owner != source.route.owner
+            || session.generation != source.generation
+            || !self.is_active(session)
+        {
+            return None;
+        }
+        let route = ChatRoute {
+            owner: source.route.owner.clone(),
+            scope,
+            entry: ChatEntry::Around(id),
+        };
+        self.begin_navigation();
+        Some(self.open_conversation(route, source.generation))
+    }
+
     /// Открывает тему из проверенного снимка панели текущего разговора.
     pub(super) fn open_details_topic(
         &mut self,
@@ -408,7 +460,7 @@ impl Shell {
                 address.route.owner == update.context && address.generation == update.generation
             })
             .cloned()
-            .map(|address| ShellEffect::ConversationUpdated(address, update))
+            .map(|address| ShellEffect::ConversationUpdated(address, Box::new(update)))
     }
 }
 

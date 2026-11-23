@@ -2,6 +2,8 @@
 //! Сначала описаны команды и подписка окна, затем настройка профиля и фоновый цикл.
 
 mod folders;
+mod key_exchange;
+pub(super) use key_exchange::{IncomingKey, key_exchange_is_permanent};
 mod login;
 
 pub use login::{LoginAttempt, LoginError};
@@ -13,7 +15,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -31,7 +33,11 @@ use workspace_core::{
     context::{AccountId, OwnerContext, SessionGeneration},
     directory::{AvatarState, AvatarStore},
     iam_http::WorkspaceIamHttp,
-    messenger::{MessengerSource, folders::Folders},
+    messenger::{
+        MessengerSource,
+        encryption::{EncryptionActivation, EncryptionSession, MessageEncryption},
+        folders::Folders,
+    },
     runtime::{Runtime, RuntimeError},
     storage::{HistoryScope, Storage, media::MediaCachePolicy},
     sync::{Sync, SyncChange, SyncUpdate},
@@ -42,6 +48,7 @@ use super::contracts::{
     NotificationReply, NotificationRequest, NotificationRouteError, RuntimeEvent, RuntimeExit,
 };
 use super::test_profile::{MemorySecrets, TestLogin};
+use crate::platform::chat_keys::{ProfileChatKeys, device_id};
 use crate::platform::{JsonAccountStore, MacKeychain, state_directory};
 
 use folders::{FolderPreferenceStore, folder_snapshot, send_folder_state};
@@ -110,6 +117,52 @@ pub struct RuntimeClient {
     started: watch::Receiver<Option<Result<(), StartupError>>>, // Итог инициализации; None, пока она идёт.
     ended: watch::Receiver<Option<RuntimeExit>>, // Итог остановки; None, пока исполнитель работает.
     clear_cache: Arc<AtomicBool>, // После остановки убрать данные мессенджера под блокировкой профиля.
+    encryption: Arc<OnceLock<ProfileEncryption>>, // Ключи и устройство открытого профиля.
+}
+
+/// Шифрование рабочего профиля с постоянным UUID локального устройства.
+struct ProfileEncryption {
+    engine: Arc<MessageEncryption>, // Core проверяет сессию и ревизии локальных ключей.
+    device_id: Uuid,                // UUID сохраняется вместе с профилем.
+    active: Mutex<Option<EncryptionActivation>>, // Разрешение только на выбранный сейчас вход.
+    received_keys: key_exchange::ReceivedKeys, // Ответы обмена, проверяемые один раз за выбранный вход.
+}
+
+impl ProfileEncryption {
+    /// Использует отдельное хранилище для тестового запуска.
+    fn in_memory() -> Self {
+        Self {
+            engine: Arc::new(MessageEncryption::new(Arc::new(
+                ProfileChatKeys::temporary(),
+            ))),
+            device_id: Uuid::new_v4(),
+            active: Mutex::default(),
+            received_keys: key_exchange::ReceivedKeys::default(),
+        }
+    }
+
+    /// Добавляет UUID профиля к уже подтверждённому входу.
+    fn session(&self, account: &AccountSession) -> EncryptionSession {
+        EncryptionSession {
+            owner: account.owner.clone(),
+            generation: account.generation,
+            device_id: self.device_id,
+        }
+    }
+
+    /// Меняет подтверждённый выбор и сохраняет разрешение, которое заберут экраны.
+    fn select(&self, account: Option<&AccountSession>) -> Option<EncryptionActivation> {
+        let mut active = self.active.lock().unwrap();
+        let next = self
+            .engine
+            .select_session(account.map(|account| self.session(account)));
+        if *active == next {
+            return None;
+        }
+        self.received_keys.clear();
+        *active = next.clone();
+        next
+    }
 }
 
 impl RuntimeClient {
@@ -150,8 +203,10 @@ impl RuntimeClient {
             let auth = Auth::new(iam, Arc::new(accounts), secrets);
             let storage = Storage::open(directory.join("messenger.sqlite3"))
                 .map_err(|_| StartupError::Database)?;
-            let messenger =
-                MessengerSource::with_private_ca(&ca).map_err(|_| StartupError::Worker)?;
+            let encryption = ProfileEncryption::in_memory();
+            let messenger = MessengerSource::with_private_ca(&ca)
+                .map_err(|_| StartupError::Worker)?
+                .with_chat_encryption(encryption.engine.clone(), encryption.device_id);
             let storage = Arc::new(storage);
             let sync = Sync::with_media_cache(
                 auth.clone(),
@@ -165,6 +220,7 @@ impl RuntimeClient {
                     Runtime::new(services.sync.clone(), vec![services.messenger.clone()])
                 })?;
             parts.services.folder_preferences = Arc::new(FolderPreferenceStore::open(&directory));
+            parts.encryption = Some(encryption);
             parts.cache_directory = Some(directory);
             Ok((parts, released))
         })
@@ -187,6 +243,8 @@ impl RuntimeClient {
         let worker_drafts = drafts.clone();
         let clear_cache = Arc::new(AtomicBool::new(false));
         let worker_clear_cache = clear_cache.clone();
+        let encryption = Arc::new(OnceLock::new());
+        let worker_encryption = Arc::clone(&encryption);
         thread::Builder::new()
             .name("workspace-gpui-sync".into())
             .spawn(move || {
@@ -196,6 +254,9 @@ impl RuntimeClient {
                         .build()
                         .map_err(|_| StartupError::Worker)?;
                     let (mut parts, profile_released) = setup()?;
+                    if let Some(profile) = parts.encryption.take() {
+                        let _ = worker_encryption.set(profile);
+                    }
                     parts.services.drafts = worker_drafts;
                     let cache_directory = parts.cache_directory.take();
                     // Поздние ответы ещё должны уметь отменить попытку, пока Tokio ждёт
@@ -208,6 +269,10 @@ impl RuntimeClient {
                         wake_signals,
                         stopping,
                     ));
+                    if let Some(profile) = worker_encryption.get() {
+                        let _ = profile.select(None);
+                        profile.engine.wait_for_key_operations();
+                    }
                     drop(executor);
                     let reset_ok = !worker_clear_cache.load(Ordering::Acquire)
                         || cache_directory
@@ -239,6 +304,7 @@ impl RuntimeClient {
                 started,
                 ended: ended.clone(),
                 clear_cache,
+                encryption,
             },
             RuntimeEvents {
                 incoming,
@@ -246,6 +312,27 @@ impl RuntimeClient {
                 exit_delivered: false,
             },
         ))
+    }
+
+    /// Переключает вход шифрования вместе с оболочкой и отзывает результаты прежнего входа.
+    pub(super) fn select_encryption_session(
+        &self,
+        account: Option<&AccountSession>,
+    ) -> Option<EncryptionActivation> {
+        self.encryption.get()?.select(account)
+    }
+
+    /// Возвращает подготовку представлений для проверенного адреса разговора.
+    pub(super) fn message_encryption(
+        &self,
+        account: &AccountSession,
+    ) -> Option<(Arc<MessageEncryption>, EncryptionActivation)> {
+        let profile = self.encryption.get()?;
+        let active = profile.active.lock().unwrap();
+        let activation = active
+            .as_ref()
+            .filter(|activation| activation.session() == &profile.session(account))?;
+        Some((Arc::clone(&profile.engine), activation.clone()))
     }
 
     /// Ждёт открытия профиля и подготовки подписок. Запросы сервера после этого идут независимо.
@@ -268,6 +355,7 @@ impl RuntimeClient {
 
     /// Отменяет фоновую работу и ждёт Bootstrap, начатые записи и освобождение профиля.
     pub async fn shutdown(&self) -> RuntimeExit {
+        self.select_encryption_session(None);
         self.stop.send_replace(true);
         wait_for_exit(&mut self.ended.clone()).await
     }
@@ -499,10 +587,11 @@ pub struct WorkerServices {
 
 /// Настроенные зависимости одного запуска Bootstrap.
 struct WorkerParts {
-    services: WorkerServices,         // Входы для запросов окна и подписок.
-    runtime: Runtime,                 // Владелец задач синхронизации.
-    catalog: CatalogStartup,          // Владелец начальной загрузки каталога.
-    cache_directory: Option<PathBuf>, // Каталог для очистки после закрытия SQLite.
+    services: WorkerServices,              // Входы для запросов окна и подписок.
+    runtime: Runtime,                      // Владелец задач синхронизации.
+    catalog: CatalogStartup,               // Владелец начальной загрузки каталога.
+    cache_directory: Option<PathBuf>,      // Каталог для очистки после закрытия SQLite.
+    encryption: Option<ProfileEncryption>, // Передаётся окну до первого события рабочего профиля.
 }
 
 /// Удаляет только известные локальные данные мессенджера, сохраняя аккаунты и токены.
@@ -573,7 +662,8 @@ impl WorkerParts {
     ) -> Result<(Self, oneshot::Receiver<()>), StartupError> {
         let (accounts, released) =
             ProfileAccounts::open(&directory).map_err(|_| StartupError::Profile)?;
-        let secrets: Arc<dyn SecretStore> = if test_login.is_some() {
+        let isolated = test_login.is_some();
+        let secrets: Arc<dyn SecretStore> = if isolated {
             Arc::new(MemorySecrets::default())
         } else {
             Arc::new(MacKeychain)
@@ -585,7 +675,31 @@ impl WorkerParts {
         );
         let storage = Storage::open(directory.join("messenger.sqlite3"))
             .map_err(|_| StartupError::Database)?;
+        let encryption = if isolated {
+            Some(ProfileEncryption::in_memory())
+        } else {
+            match device_id(&directory) {
+                Ok(device_id) => Some(ProfileEncryption {
+                    engine: Arc::new(MessageEncryption::new(
+                        Arc::new(ProfileChatKeys::keychain()),
+                    )),
+                    device_id,
+                    active: Mutex::default(),
+                    received_keys: key_exchange::ReceivedKeys::default(),
+                }),
+                Err(_) => {
+                    log::warn!("event=chat_encryption_profile_unavailable");
+                    None
+                }
+            }
+        };
         let messenger = MessengerSource::new().map_err(|_| StartupError::Worker)?;
+        let messenger = match &encryption {
+            Some(profile) => {
+                messenger.with_chat_encryption(profile.engine.clone(), profile.device_id)
+            }
+            None => messenger,
+        };
         if let Some(login) = test_login {
             login.activate(&auth).map_err(|error| {
                 log::error!("event=workspace_test_login result=failed reason={error}");
@@ -608,6 +722,7 @@ impl WorkerParts {
             Runtime::new(services.sync.clone(), vec![services.messenger.clone()])
         })?;
         parts.services.folder_preferences = Arc::new(FolderPreferenceStore::open(&directory));
+        parts.encryption = encryption;
         parts.cache_directory = Some(directory);
         Ok((parts, released))
     }
@@ -651,6 +766,7 @@ impl WorkerParts {
             runtime,
             catalog: startup,
             cache_directory: None,
+            encryption: None,
         })
     }
 

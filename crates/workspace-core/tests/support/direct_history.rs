@@ -32,8 +32,8 @@ use workspace_core::{
     notification_target::NotificationTarget,
     runtime::{EventSource, SourceSession},
     storage::{
-        Cursor, HistoryEdge, HistoryPageEdges, HistoryPageOutcome, HistoryPageTarget, HistoryScope,
-        Storage,
+        Cursor, HistoryChange, HistoryEdge, HistoryPageEdges, HistoryPageOutcome,
+        HistoryPageTarget, HistoryScope, MessageBody, Storage,
     },
     sync::{Event, Sync, SyncChange},
 };
@@ -44,6 +44,8 @@ use super::Fixture;
 mod avatars;
 #[path = "folder_runtime.rs"]
 mod folder_runtime;
+#[path = "key_lifecycle.rs"]
+mod key_lifecycle;
 #[path = "media_cache.rs"]
 mod media_cache;
 #[path = "outgoing.rs"]
@@ -57,6 +59,7 @@ const NEWER: Uuid = Uuid::from_u128(14);
 const OTHER_TOPIC: Uuid = Uuid::from_u128(15);
 const LIVE: Uuid = Uuid::from_u128(16);
 const OUTSIDE: Uuid = Uuid::from_u128(17);
+const LEGACY_KEY: Uuid = Uuid::from_u128(42);
 const CA: &[u8] = include_bytes!("../../../../tests/fixtures/tls/ca.pem");
 const CERT: &[u8] = include_bytes!("../../../../tests/fixtures/tls/localhost.pem");
 const KEY: &[u8] = include_bytes!("../../../../tests/fixtures/tls/localhost-key.pem");
@@ -88,16 +91,18 @@ struct HistoryApi {
     deny: AtomicUsize,        // 0 — доступ есть, 1 — скрыт чат, 2 — скрыто сообщение.
     delay: Notify,            // Запрос страницы дошёл до сервера.
     latest_mode: AtomicUsize, // 0 — обычная страница, 1 — сбой, 2 — задержка, 3 — чужая тема, 4 — маркер и в теме.
-    older_mode: AtomicUsize,  // 0 — конец, 1 — сбой, 2 — задержать один ответ, 3 — продолжение.
+    legacy_encrypted_mode: AtomicUsize, // 0 — выключен, 1 — цель удалена, 2 — тело изменилось, 3 — подтверждено.
+    older_mode: AtomicUsize, // 0 — конец, 1 — сбой, 2 — задержать один ответ, 3 — продолжение.
     older_pages: AtomicUsize, // Число запросов к старому краю.
-    newer_mode: AtomicUsize,  // 0 — конец, 1 — сбой, 2 — задержка, 3 — продолжение темы.
+    newer_mode: AtomicUsize, // 0 — конец, 1 — сбой, 2 — задержка, 3 — продолжение темы.
     newer_pages: AtomicUsize, // Число запросов к новому краю.
-    release: Notify,          // Можно вернуть задержанный ответ.
+    release: Notify,         // Можно вернуть задержанный ответ.
     topic_realtime: AtomicUsize, // 1 — включить отдельный сценарий событий двух тем.
     outgoing: Option<Arc<outgoing::Api>>, // Подмена маршрутов очереди для теста отправки.
     folders: Option<Arc<folder_runtime::Api>>, // Подмена маршрутов папок и журнала.
     avatars: Option<Arc<avatars::Api>>, // Подмена профиля и файлов для тестов аватаров.
     media: Option<Arc<media_cache::Api>>, // Подмена истории, байтов и журнала для кэша вложений.
+    key_lifecycle: Option<Arc<key_lifecycle::Api>>, // Управление каналом и ротацией ключа.
 }
 
 /// Формирует серверное сообщение с одинаковыми UUID для обоих аккаунтов.
@@ -108,6 +113,13 @@ fn message(id: Uuid, user: &str) -> Value {
         "created_at": "2026-01-01T12:00:00Z",
         "payload": { "kind": "markdown", "content": user }
     })
+}
+
+/// Формирует зашифрованную запись, одинаковую для страницы и точного запроса.
+fn legacy_encrypted_message(user: &str, ciphertext: &str) -> Value {
+    let mut row = message(ANCHOR, user);
+    row["payload"] = json!({"kind": "e2ee", "key_uuid": LEGACY_KEY, "content": ciphertext});
+    row
 }
 
 /// Принимает один HTTPS-запрос и возвращает данные только для токена B.
@@ -146,6 +158,10 @@ async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
         media.reply(socket, request, &method, &headers).await;
         return;
     }
+    if let Some(lifecycle) = &api.key_lifecycle {
+        lifecycle.reply(socket, request, &method, &headers).await;
+        return;
+    }
     if api.topic_realtime.load(Relaxed) == 1 && request.path().ends_with("/events/ws") {
         let mut socket = upgrade(socket, &headers).await;
         for (version, id, created) in [
@@ -165,9 +181,16 @@ async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
         "first"
     };
     let mut marker = String::new();
-    let (status, body) = if api.topic_realtime.load(Relaxed) == 1
-        && request.path().ends_with("/events/")
-    {
+    let legacy_mode = api.legacy_encrypted_mode.load(Relaxed);
+    let (status, body) = if legacy_mode != 0 && request.path().ends_with("/messages/") {
+        ("200 OK", json!([legacy_encrypted_message(user, "YQ==")]))
+    } else if legacy_mode != 0 && request.path().ends_with(&format!("/messages/{ANCHOR}")) {
+        match legacy_mode {
+            1 => ("404 Not Found", Value::Null),
+            2 => ("200 OK", legacy_encrypted_message(user, "Yg==")),
+            _ => ("200 OK", legacy_encrypted_message(user, "YQ==")),
+        }
+    } else if api.topic_realtime.load(Relaxed) == 1 && request.path().ends_with("/events/") {
         ("200 OK", json!([]))
     } else if request.path().ends_with(&format!("/streams/{CHAT}")) {
         if api.deny.load(Relaxed) == 1 {
@@ -734,12 +757,17 @@ async fn direct_history_checks_access_and_isolates_sessions() {
             .collect::<Vec<_>>(),
         [OLDER, ANCHOR, NEWER]
     );
-    assert!(first_window.messages.iter().all(|row| row.text == "first"));
+    assert!(
+        first_window
+            .messages
+            .iter()
+            .all(|row| row.body.markdown() == Some("first"))
+    );
     assert!(
         second_window
             .messages
             .iter()
-            .all(|row| row.text == "second")
+            .all(|row| row.body.markdown() == Some("second"))
     );
     assert_eq!(second_window.older, HistoryEdge::More(OLDER.to_string()));
     assert_eq!(second_window.newer, HistoryEdge::End);
@@ -799,6 +827,82 @@ async fn direct_history_checks_access_and_isolates_sessions() {
             .unwrap(),
         [first_window]
     );
+    worker.abort();
+}
+
+/// После обновления профиля доверяет E2EE-строке со старой отметкой только после точного запроса.
+#[tokio::test]
+async fn rechecks_legacy_encrypted_edit_against_exact_message_endpoint() {
+    let api = Arc::new(HistoryApi::default());
+    let (server, worker) = serve(api.clone()).await;
+    let fixture = Fixture::new(|_, _| unreachable!());
+    let owner = fixture.login_at(&server, "first");
+    let generation = fixture.auth.snapshot()[0].generation;
+    let profile = tempfile::tempdir().unwrap();
+    let path = profile.path().join("workspace.sqlite");
+    let cursor = Cursor {
+        epoch_generation: "test".into(),
+        epoch_version: 12,
+    };
+    let old_sync = Sync::new(
+        fixture.auth.clone(),
+        Arc::new(Storage::open(&path).unwrap()),
+    );
+    old_sync
+        .apply(
+            &owner,
+            generation,
+            "messenger",
+            Event::HistoryChanged {
+                cursor: cursor.clone(),
+                change: HistoryChange::RemoveMessage(ANCHOR.to_string()),
+            },
+        )
+        .unwrap();
+    drop(old_sync);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE history_changes DROP COLUMN legacy_encryption_check;
+             ALTER TABLE sync_messages DROP COLUMN encryption_key_id;",
+        )
+        .unwrap();
+    let storage = Arc::new(Storage::open(&path).unwrap());
+    let sync = Sync::new(fixture.auth.clone(), storage.clone());
+    let source =
+        MessengerSource::with_private_ca(CertificateDer::from_pem_slice(CA).unwrap().as_ref())
+            .unwrap();
+    let scope = HistoryScope {
+        stream_id: CHAT,
+        topic_id: Some(TOPIC),
+    };
+    let latest = || source.load_latest_history(&sync, &owner, generation, scope);
+    for mode in [1, 2] {
+        api.legacy_encrypted_mode.store(mode, Relaxed);
+        assert!(matches!(latest().await, Err(OpenHistoryError::StaleWindow)));
+        assert!(
+            storage
+                .message(&owner, &ANCHOR.to_string())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    api.legacy_encrypted_mode.store(3, Relaxed);
+    let window = latest().await.unwrap();
+    assert_eq!(window.messages.len(), 1);
+    let message = &window.messages[0];
+    assert_eq!(message.id, ANCHOR);
+    assert_eq!(
+        message.body,
+        MessageBody::Encrypted {
+            key_id: LEGACY_KEY,
+            ciphertext: "YQ==".into()
+        }
+    );
+    assert_eq!(sync.cursor(&owner, "messenger").unwrap(), Some(cursor));
+    api.legacy_encrypted_mode.store(1, Relaxed);
+    assert_eq!(latest().await.unwrap().messages, window.messages);
     worker.abort();
 }
 
@@ -1302,12 +1406,17 @@ async fn topic_anchor_history_checks_scope_and_isolates_sessions() {
             .collect::<Vec<_>>(),
         [OLDER, ANCHOR, NEWER]
     );
-    assert!(first_window.messages.iter().all(|row| row.text == "first"));
+    assert!(
+        first_window
+            .messages
+            .iter()
+            .all(|row| row.body.markdown() == Some("first"))
+    );
     assert!(
         second_window
             .messages
             .iter()
-            .all(|row| row.text == "second")
+            .all(|row| row.body.markdown() == Some("second"))
     );
     assert_eq!(second_window.older, HistoryEdge::More(OLDER.to_string()));
     assert_eq!(second_window.newer, HistoryEdge::End);

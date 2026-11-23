@@ -6,6 +6,8 @@ mod catalog_counts;
 mod drafts;
 mod folders;
 mod history;
+mod key_lifecycle;
+mod key_messages;
 pub mod media;
 mod outbox;
 
@@ -15,13 +17,19 @@ pub use drafts::{
     DraftWriteOutcome, PlaintextDraft,
 };
 pub use folders::FolderChange;
-pub(crate) use history::HistoryPageGuard;
+pub(crate) use history::{ConfirmedEdit, EncryptedEditVersion, HistoryPageGuard};
 pub use history::{
     HistoryDirection, HistoryEdge, HistoryMessage, HistoryMetadata, HistoryPageEdges,
     HistoryPageOutcome, HistoryPageTarget, HistoryScope, HistoryTime, HistoryWindow,
 };
+pub use key_messages::{
+    KeyRequestCursor, KeyRequestHint, KeyRequestPage, KeyResponseCursor, KeyResponseHint,
+    KeyResponsePage, KeyResponseTarget, KeyServicePayload,
+};
 
-pub use outbox::{DeliveryStatus, OutboxEntry, PreparedSend, SendBlock};
+pub(crate) use key_lifecycle::{LifecyclePhase, StoredKeyLifecycle};
+
+pub use outbox::{DeliveryStatus, OutboxEntry, PreparedSend, PreparedSendBody, SendBlock};
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -43,11 +51,106 @@ pub struct Cursor {
     pub epoch_version: u64,       // Номер события внутри этого журнала.
 }
 
+/// Содержимое одного сообщения в журнале и локальной истории.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MessageBody {
+    Markdown(String), // Открытый текст обычного сообщения.
+    Encrypted {
+        key_id: Uuid,       // Поколение ключа, которым зашифровали сообщение.
+        ciphertext: String, // Непрозрачный зашифрованный конверт из API.
+    },
+    KeyService {
+        payload: KeyServicePayload, // Запрос ключа, выдача, отказ или объявление поколения.
+        canonical_id: Option<Uuid>, // UUID до размещения. `None`, если API оставил только публичный UUID.
+    },
+}
+
+impl MessageBody {
+    /// Даёт открытый текст обычного сообщения, пригодный для разбора ссылок.
+    pub fn markdown(&self) -> Option<&str> {
+        match self {
+            Self::Markdown(text) => Some(text),
+            Self::Encrypted { .. } | Self::KeyService { .. } => None,
+        }
+    }
+
+    /// Готовит Markdown или шифротекст для общих колонок кэша.
+    fn storage_parts(&self) -> (&str, Option<String>) {
+        match self {
+            Self::Markdown(text) => (text, None),
+            Self::Encrypted { key_id, ciphertext } => (ciphertext, Some(key_id.to_string())),
+            Self::KeyService { .. } => ("", None),
+        }
+    }
+
+    /// Хранит служебное тело и канонический UUID отдельно от Markdown и шифротекста.
+    fn key_service_parts(&self) -> Result<(Option<String>, Option<String>), StorageError> {
+        let Self::KeyService {
+            payload,
+            canonical_id,
+        } = self
+        else {
+            return Ok((None, None));
+        };
+        let data = serde_json::to_string(payload).map_err(StorageError::KeyServicePayload)?;
+        Ok((Some(data), canonical_id.map(|uuid| uuid.to_string())))
+    }
+
+    /// Восстанавливает тело из соседних колонок, включая текст из старого кэша.
+    fn from_storage(
+        row: &rusqlite::Row<'_>,
+        value: usize,
+        key: usize,
+        service: usize,
+        canonical: usize,
+    ) -> rusqlite::Result<Self> {
+        if let Some(data) = row.get::<_, Option<String>>(service)? {
+            let payload = serde_json::from_str(&data).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    service,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            let canonical_id = row
+                .get::<_, Option<String>>(canonical)?
+                .map(|value| Uuid::parse_str(&value))
+                .transpose()
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        canonical,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            return Ok(Self::KeyService {
+                payload,
+                canonical_id,
+            });
+        }
+        let body = row.get(value)?;
+        let Some(key_id) = row.get::<_, Option<String>>(key)? else {
+            return Ok(Self::Markdown(body));
+        };
+        let key_id = Uuid::parse_str(&key_id).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                key,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+        Ok(Self::Encrypted {
+            key_id,
+            ciphertext: body,
+        })
+    }
+}
+
 /// Сообщение мессенджера в локальной базе.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Message {
-    pub id: String,   // Серверный идентификатор сообщения.
-    pub text: String, // Текст сообщения.
+    pub id: String,        // Серверный идентификатор сообщения.
+    pub body: MessageBody, // Открытый Markdown или зашифрованный конверт.
 }
 
 /// Адрес сообщения в журнале. Старые записи могут не содержать этот адрес.
@@ -61,7 +164,7 @@ pub struct MessagePlacement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HistoryChange {
     Edit {
-        message: Message,                    // Новый текст существующего сообщения.
+        message: Message,                    // Новое содержимое существующего сообщения.
         placement: Option<MessagePlacement>, // Адрес из снимка, если сервер его передал.
     },
     RemoveMessage(String), // UUID удалённого или больше не поддерживаемого сообщения.
@@ -106,6 +209,7 @@ pub(crate) struct AppliedEvent {
     pub unread_changed: bool,      // Изменилось ли число непрочитанных.
     pub send_confirmed: bool,      // Закрыта ли строка очереди отправки.
     pub avatar_changed: Vec<Uuid>, // Пользователи, чьи фото или состояния сверки изменились.
+    pub history_changed: bool,     // Лента должна применить событие или сверить спорное тело.
 }
 
 /// Причины, по которым локальная база не смогла прочитать или записать данные.
@@ -119,6 +223,12 @@ pub enum StorageError {
     Poisoned, // Доступ к соединению потерян после паники под блокировкой.
     #[error("invalid messenger history page")]
     InvalidHistoryPage, // Страница не подходит по области, направлению или формату.
+    #[error("invalid prepared message in the outbox")]
+    InvalidPreparedSend, // Исходный снимок или его черновик не подходят для очереди.
+    #[error("invalid durable chat key operation")]
+    InvalidKeyLifecycle, // Параметры операции не удалось сохранить в журнале.
+    #[error("invalid key service history payload")]
+    KeyServicePayload(#[source] serde_json::Error), // Не удалось записать типизированное служебное тело.
     #[error("the catalog changed while the request was in flight")]
     StaleCatalog, // После начала запроса доступ к каналу изменился.
     #[error("the catalog was requested before the first event cursor")]
@@ -326,6 +436,8 @@ impl Storage {
         transaction.execute_batch("CREATE INDEX IF NOT EXISTS sync_messages_by_placement
             ON sync_messages (account_id, server, organization_id, project_id, user_id, stream_id, topic_id)")?;
         history::initialize(&transaction)?;
+        key_messages::initialize(&transaction)?;
+        key_lifecycle::initialize(&transaction)?;
         outbox::initialize(&transaction)?;
         drafts::initialize(&transaction)?;
         folders::initialize(&transaction)?;
@@ -387,7 +499,7 @@ impl Storage {
         let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         Ok(connection
             .query_row(
-                "SELECT message_id, text FROM sync_messages
+                "SELECT message_id, text, encryption_key_id, key_service_payload, key_service_canonical_id FROM sync_messages
                  WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
                    AND project_id = ?4 AND user_id = ?5 AND message_id = ?6",
                 params![
@@ -401,7 +513,7 @@ impl Storage {
                 |row| {
                     Ok(Message {
                         id: row.get(0)?,
-                        text: row.get(1)?,
+                        body: MessageBody::from_storage(row, 1, 2, 3, 4)?,
                     })
                 },
             )
@@ -559,6 +671,7 @@ impl Storage {
                     unread_changed: false,
                     send_confirmed: false,
                     avatar_changed: Vec::new(),
+                    history_changed: false,
                 });
             }
         }
@@ -569,14 +682,21 @@ impl Storage {
             catalog_counts::record_checkpoint(&transaction, owner, cursor)?;
         }
 
-        if let Some(history) = change.history
-            && history::before_change(&transaction, owner, history)?
-        {
-            apply_history(&transaction, owner, history)?;
-            if source == crate::messenger::SOURCE_ID {
-                apply_media_history(&transaction, owner, history)?;
+        let history_changed = if let Some(history) = change.history {
+            match history::before_change(&transaction, owner, history)? {
+                history::HistoryEventEffect::Write => {
+                    apply_history(&transaction, owner, history)?;
+                    if source == crate::messenger::SOURCE_ID {
+                        apply_media_history(&transaction, owner, history)?;
+                    }
+                    true
+                }
+                history::HistoryEventEffect::Reconcile => true,
+                history::HistoryEventEffect::Known => false,
             }
-        }
+        } else {
+            false
+        };
         if source == crate::messenger::SOURCE_ID
             && let Some(file_id) = change.media_invalidated
         {
@@ -636,12 +756,14 @@ impl Storage {
             false
         };
         let message_inserted = if let Some(message) = change.message
-            && history::can_create(&transaction, owner, &message.id)?
+            && history::before_creation(&transaction, owner, &message.id)?
         {
+            let (body, key_id) = message.body.storage_parts();
+            let (service, canonical) = message.body.key_service_parts()?;
             let inserted = transaction.execute(
                 "INSERT INTO sync_messages
-                 (account_id, server, organization_id, project_id, user_id, message_id, text, stream_id, topic_id, author_id, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 (account_id, server, organization_id, project_id, user_id, message_id, text, stream_id, topic_id, author_id, created_at, updated_at, encryption_key_id, key_service_payload, key_service_canonical_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT (account_id, server, organization_id, project_id, user_id, message_id)
              DO NOTHING",
                 params![
@@ -651,12 +773,15 @@ impl Storage {
                     owner.project_id,
                     owner.user_id,
                     message.id,
-                    message.text,
+                    body,
                     change.placement.map(|address| address.stream_id.as_str()).or(change.notification_conversation),
                     change.placement.map(|address| &address.topic_id),
                     change.metadata.and_then(|metadata| metadata.author_id).map(|id| id.to_string()),
                     change.metadata.map(|metadata| metadata.created_at.as_str()),
                     change.metadata.and_then(|metadata| metadata.updated_at.as_ref()).map(HistoryTime::as_str),
+                    key_id,
+                    service,
+                    canonical,
                 ],
             )? != 0;
             if inserted {
@@ -675,7 +800,7 @@ impl Storage {
         } else {
             false
         };
-        // Подтверждение очереди фиксируется вместе с сообщением и позицией события.
+        // Защищённую отправку закрывает только тот же зашифрованный снимок.
         let send_confirmed = if source == crate::messenger::SOURCE_ID
             && let (Some(message), Some(placement), Some(metadata)) =
                 (change.message, change.placement, change.metadata)
@@ -687,6 +812,7 @@ impl Storage {
                 &placement.stream_id,
                 &placement.topic_id,
                 metadata.author_id,
+                &message.body,
             )?
         } else {
             false
@@ -695,6 +821,7 @@ impl Storage {
         if message_inserted
             && let (Some(message), Some(conversation_id)) =
                 (change.message, change.notification_conversation)
+            && message.body.markdown().is_some()
         {
             transaction.execute(
                 "INSERT INTO messenger_notification_targets
@@ -764,6 +891,7 @@ impl Storage {
             unread_changed,
             send_confirmed,
             avatar_changed,
+            history_changed,
         })
     }
 }
@@ -985,7 +1113,7 @@ fn apply_media_history(
     Ok(())
 }
 
-/// Обновляет текст или удаляет затронутые строки и связанные цели уведомлений.
+/// Обновляет содержимое или удаляет затронутые строки и цели уведомлений.
 fn apply_history(
     connection: &Connection,
     owner: &OwnerContext,
@@ -993,15 +1121,35 @@ fn apply_history(
 ) -> Result<(), StorageError> {
     match history {
         HistoryChange::Edit { message, placement } => {
+            let (body, key_id) = message.body.storage_parts();
+            let (service, canonical) = message.body.key_service_parts()?;
             connection.execute(
-                "UPDATE sync_messages SET text = ?7, stream_id = COALESCE(?8, stream_id), topic_id = COALESCE(?9, topic_id)
+                "UPDATE sync_messages SET text = ?7, stream_id = COALESCE(?8, stream_id),
+                   topic_id = COALESCE(?9, topic_id), encryption_key_id = ?10, key_service_payload = ?11,
+                   key_service_canonical_id = CASE WHEN ?11 IS NULL THEN NULL ELSE COALESCE(?12, key_service_canonical_id) END
                  WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3 AND project_id = ?4
                    AND user_id = ?5 AND message_id = ?6",
-                params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id,
-                    message.id, message.text, placement.as_ref().map(|address| &address.stream_id),
-                    placement.as_ref().map(|address| &address.topic_id)],
+                params![
+                    owner.account_id.0,
+                    owner.server,
+                    owner.organization_id,
+                    owner.project_id,
+                    owner.user_id,
+                    message.id,
+                    body,
+                    placement.as_ref().map(|address| &address.stream_id),
+                    placement.as_ref().map(|address| &address.topic_id),
+                    key_id, service, canonical,
+                ],
             )?;
-            if let Some(address) = placement {
+            if service.is_some() {
+                connection.execute(
+                    "DELETE FROM messenger_notification_targets WHERE account_id = ?1 AND server = ?2
+                     AND organization_id = ?3 AND project_id = ?4 AND user_id = ?5 AND message_id = ?6",
+                    params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id,
+                        owner.user_id, message.id],
+                )?;
+            } else if let Some(address) = placement {
                 connection.execute(
                     "DELETE FROM messenger_notification_targets WHERE account_id = ?1 AND server = ?2
                      AND organization_id = ?3 AND project_id = ?4 AND user_id = ?5
@@ -1199,7 +1347,7 @@ mod tests {
     fn message(id: &str, text: &str) -> Message {
         Message {
             id: id.into(),
-            text: text.into(),
+            body: MessageBody::Markdown(text.into()),
         }
     }
 
@@ -1225,7 +1373,7 @@ mod tests {
             public_id: Uuid::from_u128(5),
             stream_id: scope.stream_id,
             topic_id: scope.topic_id,
-            markdown: "Ждёт отправки".into(),
+            body: PreparedSendBody::Markdown("Ждёт отправки".into()),
         };
         storage.save_prepared_send(&owner, &queued).unwrap();
         let source = crate::messenger::SOURCE_ID;
@@ -1295,13 +1443,13 @@ mod tests {
             public_id: Uuid::from_u128(2),
             stream_id: Uuid::from_u128(3),
             topic_id: Uuid::from_u128(4),
-            markdown: "**Привет**\n".into(),
+            body: PreparedSendBody::Markdown("**Привет**\n".into()),
         };
         let other = PreparedSend {
             public_id: Uuid::from_u128(5),
             stream_id: Uuid::from_u128(6),
             topic_id: Uuid::from_u128(7),
-            markdown: "Другая запись".into(),
+            body: PreparedSendBody::Markdown("Другая запись".into()),
             ..first.clone()
         };
 
@@ -1353,10 +1501,10 @@ mod tests {
             public_id: Uuid::from_u128(2),
             stream_id: Uuid::from_u128(3),
             topic_id: Uuid::from_u128(4),
-            markdown: "**Первая отправка**".into(),
+            body: PreparedSendBody::Markdown("**Первая отправка**".into()),
         };
         let other = PreparedSend {
-            markdown: "Другой владелец".into(),
+            body: PreparedSendBody::Markdown("Другой владелец".into()),
             ..first.clone()
         };
 
@@ -1379,7 +1527,7 @@ mod tests {
                 params![
                     owner.account_id.0, owner.server, owner.organization_id, owner.project_id,
                     owner.user_id, message.canonical_id.as_bytes(), message.public_id.as_bytes(),
-                    message.stream_id.as_bytes(), message.topic_id.as_bytes(), message.markdown,
+                    message.stream_id.as_bytes(), message.topic_id.as_bytes(), message.body.markdown().unwrap(),
                 ],
             ).unwrap();
         }
@@ -1439,13 +1587,13 @@ mod tests {
             public_id: Uuid::from_u128(2),
             stream_id: Uuid::from_u128(3),
             topic_id: Uuid::from_u128(4),
-            markdown: "sent".into(),
+            body: PreparedSendBody::Markdown("sent".into()),
         };
         let response = HistoryMessage {
             id: entry.public_id,
             stream_id: entry.stream_id,
             topic_id: entry.topic_id,
-            text: "sent".into(),
+            body: MessageBody::Markdown("sent".into()),
             metadata: HistoryMetadata {
                 author_id: Some(author),
                 created_at: HistoryTime::parse("2026-01-01T00:00:00Z").unwrap(),
@@ -1492,6 +1640,18 @@ mod tests {
         wrong = response.clone();
         wrong.metadata.author_id = Some(Uuid::from_u128(21));
         assert!(!storage.confirm_http_send(&owner, &wrong).unwrap());
+        wrong = response.clone();
+        wrong.body = MessageBody::Encrypted {
+            key_id: Uuid::from_u128(22),
+            ciphertext: "YQ==".into(),
+        };
+        assert!(!storage.confirm_http_send(&owner, &wrong).unwrap());
+        assert!(
+            storage
+                .message(&owner, &wrong.id.to_string())
+                .unwrap()
+                .is_none()
+        );
         assert!(storage.confirm_http_send(&owner, &response).unwrap());
         assert!(storage.cursor(&owner, SOURCE).unwrap().is_none());
         assert!(storage.claimed_sends(&owner).unwrap().is_empty());
@@ -1552,8 +1712,13 @@ mod tests {
             .unwrap();
         assert!(!storage.confirm_http_send(&owner, &response).unwrap());
         assert_eq!(
-            storage.message(&owner, &sent.id).unwrap().unwrap().text,
-            "edited"
+            storage
+                .message(&owner, &sent.id)
+                .unwrap()
+                .unwrap()
+                .body
+                .markdown(),
+            Some("edited")
         );
         let removed = HistoryChange::RemoveMessage(sent.id.clone());
         storage
@@ -1584,13 +1749,13 @@ mod tests {
             public_id: Uuid::from_u128(2),
             stream_id: Uuid::from_u128(3),
             topic_id: Uuid::from_u128(4),
-            markdown: "sent".into(),
+            body: PreparedSendBody::Markdown("sent".into()),
         };
         let response = HistoryMessage {
             id: entry.public_id,
             stream_id: entry.stream_id,
             topic_id: entry.topic_id,
-            text: "sent".into(),
+            body: MessageBody::Markdown("sent".into()),
             metadata: HistoryMetadata {
                 author_id: Some(author),
                 created_at: HistoryTime::parse("2026-01-01T00:00:00Z").unwrap(),
@@ -1686,8 +1851,13 @@ mod tests {
             .unwrap();
         assert!(storage.confirm_http_send(&owner, &response).unwrap());
         assert_eq!(
-            storage.message(&owner, &sent.id).unwrap().unwrap().text,
-            "edited"
+            storage
+                .message(&owner, &sent.id)
+                .unwrap()
+                .unwrap()
+                .body
+                .markdown(),
+            Some("edited")
         );
         let remove = HistoryChange::RemoveMessage(sent.id.clone());
         storage

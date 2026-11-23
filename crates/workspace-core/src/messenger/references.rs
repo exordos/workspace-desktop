@@ -145,7 +145,7 @@ fn clean_label(text: &str) -> Option<String> {
 }
 
 /// Собирает читаемую подпись, оставляя Markdown-разметку в исходной строке.
-fn display_label(node: &Node) -> String {
+pub(super) fn display_label(node: &Node) -> String {
     let mut label = String::new();
     let mut pending = vec![node];
     while let Some(node) = pending.pop() {

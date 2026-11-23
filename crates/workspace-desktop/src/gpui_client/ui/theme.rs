@@ -45,7 +45,7 @@ impl From<WindowAppearance> for ThemeMode {
 }
 
 /// Цвета активной палитры и видимость рамки фокуса для текущей отрисовки.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Palette {
     pub background: Hsla,       // Фон окна и нейтральная подложка аватара.
     pub surface: Hsla,          // Верхняя панель, сайдбар и внешняя поверхность редактора.

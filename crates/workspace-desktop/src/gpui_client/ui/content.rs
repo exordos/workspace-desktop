@@ -1,8 +1,8 @@
 //! Компоненты чатов: аватары, счётчики, строки каталога и пузыри сообщений.
 
 use gpui::{
-    App, Div, ElementId, FocusHandle, Hsla, ImageSource, ObjectFit, SharedString, Stateful, Window,
-    div, img, prelude::*, px,
+    AnyElement, App, Div, ElementId, FocusHandle, Hsla, ImageSource, ObjectFit, SharedString,
+    Stateful, Window, div, img, prelude::*, px,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -261,6 +261,18 @@ impl ChatRow {
         action: Option<Div>,
         on_activate: impl Fn(&mut Window, &mut App) + 'static,
     ) -> Stateful<Div> {
+        self.render_with_caption(palette, focus, action, None, on_activate)
+    }
+
+    /// Использует готовый элемент подписи в той же раскладке строки и её метаданных.
+    pub(in crate::gpui_client) fn render_with_caption(
+        self,
+        palette: Palette,
+        focus: Option<&FocusHandle>,
+        action: Option<Div>,
+        caption: Option<AnyElement>,
+        on_activate: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Stateful<Div> {
         let row = div()
             .id(self.id)
             .w_full()
@@ -285,7 +297,12 @@ impl ChatRow {
                     .items_start()
                     .child(self.avatar.render(palette)),
             )
-            .child(Self::text(palette, self.title, self.preview))
+            .child(Self::text_with_caption(
+                palette,
+                self.title,
+                self.preview,
+                caption,
+            ))
             .children(Self::metadata(
                 palette,
                 self.time,
@@ -308,6 +325,16 @@ impl ChatRow {
 
     /// Собирает сокращаемое название и превью для чата или вложенной темы.
     pub fn text(palette: Palette, title: SharedString, preview: Option<ChatRowPreview>) -> Div {
+        Self::text_with_caption(palette, title, preview, None)
+    }
+
+    /// Объединяет название с готовой подписью или стандартной строкой.
+    fn text_with_caption(
+        palette: Palette,
+        title: SharedString,
+        preview: Option<ChatRowPreview>,
+        caption: Option<AnyElement>,
+    ) -> Div {
         div()
             .flex()
             .flex_col()
@@ -318,13 +345,16 @@ impl ChatRow {
                 ellipsized_label(palette, TextRole::Label, one_line(&title))
                     .debug_selector(|| "chat-row-title".into()),
             )
-            .children(preview.map(|preview| {
-                let text = match preview.sender {
-                    Some(sender) => format!("{sender}: {}", preview.text),
-                    None => preview.text.to_string(),
-                };
-                ellipsized_label(palette, TextRole::Caption, one_line(&text))
-                    .debug_selector(|| "chat-row-preview".into())
+            .children(caption.or_else(|| {
+                preview.map(|preview| {
+                    let text = match preview.sender {
+                        Some(sender) => format!("{sender}: {}", preview.text),
+                        None => preview.text.to_string(),
+                    };
+                    ellipsized_label(palette, TextRole::Caption, one_line(&text))
+                        .debug_selector(|| "chat-row-preview".into())
+                        .into_any_element()
+                })
             }))
     }
 

@@ -341,7 +341,7 @@ async fn revoke_stream_updates_catalog_and_rejects_old_response() {
                     .iter()
                     .find_map(|chat| chat.topics.first()?.metadata.preview.as_ref());
                 if let Some(preview) = preview {
-                    assert_eq!(preview.text, "hello world");
+                    assert_eq!(preview.body().fallback_text(), "hello world");
                     assert_eq!(preview.author_name.as_deref(), Some("Вы"));
                     break;
                 }

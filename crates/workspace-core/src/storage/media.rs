@@ -425,6 +425,22 @@ fn access_key(scope: HistoryScope) -> String {
 }
 
 impl Storage {
+    /// Читает версию временной копии без создания индексированной ссылки.
+    pub(crate) fn media_file_revision(
+        &self,
+        owner: &OwnerContext,
+        scope: HistoryScope,
+        file_id: Uuid,
+    ) -> Result<i64, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        Ok(version(
+            &connection,
+            &owner_key(owner),
+            &file_id.to_string(),
+            scope,
+        )?)
+    }
+
     /// Читает версии сброса, отзыва стрима и точной темы одним локальным запросом.
     pub(crate) fn media_access_revision(
         &self,
@@ -836,6 +852,11 @@ impl Disk {
 }
 
 impl MediaTempFile {
+    /// Открывает принятую копию без публикации в индекс и без имени из сообщения.
+    pub(crate) fn open_read(&self) -> Result<File, MediaCacheError> {
+        Ok(File::open(&self.path)?)
+    }
+
     /// Возвращает число записанных байтов для проверки длины и целостности.
     pub(crate) fn size(&self) -> u64 {
         self.size

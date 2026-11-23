@@ -1,6 +1,9 @@
 //! Многострочное текстовое поле GPUI. Сначала состояние и действия, затем связь с системным вводом и разметка.
 
-use std::{cell::RefCell, ops::Range, rc::Rc};
+use std::{cell::RefCell, ops::Range, rc::Rc, sync::Arc};
+
+use workspace_core::messenger::encryption::fragments::FragmentEdit;
+use zeroize::Zeroize;
 
 use crate::gpui_client::{
     preferences::{Language, Preferences},
@@ -59,20 +62,26 @@ pub(super) struct SubmitRequested;
 
 impl EventEmitter<SubmitRequested> for Editor {}
 
+/// Стрелка вверх в пустом поле может открыть последнюю доступную правку.
+pub(super) struct EditPreviousRequested;
+
+impl EventEmitter<EditPreviousRequested> for Editor {}
+
 /// Черновик разговора и локальное состояние выделения. Индексы считаются в байтах UTF-8.
 pub struct Editor {
     version: u64,        // Меняется при каждом изменении текста, даже если его восстановили.
     framed_probe: bool,  // Демонстрационные окна сохраняют нейтральную рамку прототипа.
     send_on_enter: bool, // В рабочем поле Enter передаёт намерение отправки.
     text: String,        // Текст с системными переводами строк, приведёнными к LF.
-    anchor: usize,       // Неподвижный конец выделения.
-    caret: usize,        // Положение курсора или подвижный конец выделения.
-    marked: Option<Range<usize>>, // Незавершённая композиция IME.
-    focus: FocusHandle,  // Связь состояния редактора с фокусом GPUI.
-    layout: Option<TextLayout>, // Последняя нарисованная геометрия для мыши и IME.
-    layout_current: bool, // Геометрия относится к текущей версии текста.
-    dragging: bool,      // Зажата кнопка мыши при выделении текста.
-    text_menu: TextMenu, // Доступность и фокус контекстных команд поля.
+    fragment_edit: Option<Arc<FragmentEdit>>, // Разрешение на показ и экспорт текста смешанной правки.
+    anchor: usize,                            // Неподвижный конец выделения.
+    caret: usize,                             // Положение курсора или подвижный конец выделения.
+    marked: Option<Range<usize>>,             // Незавершённая композиция IME.
+    focus: FocusHandle,                       // Связь состояния редактора с фокусом GPUI.
+    layout: Option<TextLayout>,               // Последняя нарисованная геометрия для мыши и IME.
+    layout_current: bool,                     // Геометрия относится к текущей версии текста.
+    dragging: bool,                           // Зажата кнопка мыши при выделении текста.
+    text_menu: TextMenu,                      // Доступность и фокус контекстных команд поля.
 }
 
 impl Editor {
@@ -83,6 +92,7 @@ impl Editor {
             framed_probe: true,
             send_on_enter: false,
             text: String::new(),
+            fragment_edit: None,
             anchor: 0,
             caret: 0,
             marked: None,
@@ -128,6 +138,38 @@ impl Editor {
     /// Показывает снимок выбранной вкладки ответа.
     pub(in crate::gpui_client) fn show_reply(&mut self, text: &str, cx: &mut Context<Self>) {
         self.replace(0..self.text.len(), text, cx);
+    }
+
+    /// Показывает открытые фрагменты под разрешением всех исходных ключей.
+    pub(super) fn show_fragment_edit(
+        &mut self,
+        text: &str,
+        access: Arc<FragmentEdit>,
+        cx: &mut Context<Self>,
+    ) {
+        self.fragment_edit = Some(access);
+        self.layout = None;
+        self.show_reply(text, cx);
+    }
+
+    /// Сразу убирает текст и его геометрию, прежде чем вернуть прежний черновик.
+    pub(super) fn finish_fragment_edit(&mut self) {
+        if self.fragment_edit.take().is_some() {
+            self.text.zeroize();
+            self.anchor = 0;
+            self.caret = 0;
+            self.layout = None;
+            self.layout_current = false;
+            self.version = self.version.wrapping_add(1);
+        }
+    }
+
+    /// Выполняет чтение отредактированного текста до отзыва исходного доступа.
+    fn with_current_text<T>(&self, read: impl FnOnce() -> T) -> Option<T> {
+        match &self.fragment_edit {
+            Some(edit) => edit.with_markdown(|_| read()),
+            None => Some(read()),
+        }
     }
 
     /// Подключает клавиши редактора. Регистрируется один раз при запуске приложения.
@@ -324,10 +366,12 @@ impl Editor {
     fn copy(&mut self, cut: bool, cx: &mut Context<Self>) {
         let selection = self.selection();
         if !selection.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.text[selection.clone()].into(),
-            ));
-            if cut {
+            let copied = self.with_current_text(|| {
+                cx.write_to_clipboard(ClipboardItem::new_string(
+                    self.text[selection.clone()].into(),
+                ))
+            });
+            if cut && copied.is_some() {
                 self.replace(selection, "", cx);
             }
         }
@@ -366,6 +410,15 @@ impl Editor {
         cx.stop_propagation();
         if !event.is_held && !self.composing() && !self.text_menu.is_open() {
             cx.emit(SubmitRequested);
+        }
+    }
+
+    /// В непустом редакторе перемещает каретку, в пустом просит открыть правку.
+    fn move_up(&mut self, cx: &mut Context<Self>) {
+        if self.text.is_empty() && !self.composing() && !self.text_menu.is_open() {
+            cx.emit(EditPreviousRequested);
+        } else {
+            self.vertical(false, cx);
         }
     }
 }
@@ -432,10 +485,12 @@ impl EntityInputHandler for Editor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        let bytes = utf8_range(&self.text, range);
-        *adjusted =
-            Some(utf16_offset(&self.text, bytes.start)..utf16_offset(&self.text, bytes.end));
-        Some(self.text[bytes].into())
+        self.with_current_text(|| {
+            let bytes = utf8_range(&self.text, range);
+            *adjusted =
+                Some(utf16_offset(&self.text, bytes.start)..utf16_offset(&self.text, bytes.end));
+            self.text[bytes].into()
+        })
     }
 
     /// Передаёт системе выделение и направление курсора.
@@ -592,7 +647,7 @@ impl Render for Editor {
             .on_action(
                 cx.listener(|editor, _: &keys::Right, _, cx| editor.horizontal(true, false, cx)),
             )
-            .on_action(cx.listener(|editor, _: &keys::Up, _, cx| editor.vertical(false, cx)))
+            .on_action(cx.listener(|editor, _: &keys::Up, _, cx| editor.move_up(cx)))
             .on_action(cx.listener(|editor, _: &keys::Down, _, cx| editor.vertical(true, cx)))
             .on_action(
                 cx.listener(|editor, _: &keys::SelectLeft, _, cx| {
@@ -701,6 +756,27 @@ type LayoutMeasurement = Rc<RefCell<Option<SurfaceMeasurement>>>;
 
 /// Накладывает оформление и разбивает текст по ширине видимой поверхности.
 fn measure_text(
+    editor: &Editor,
+    style: &TextStyle,
+    palette: Palette,
+    locale: Language,
+    width: Pixels,
+    line_height: Pixels,
+    window: &Window,
+) -> SurfaceMeasurement {
+    editor
+        .with_current_text(|| {
+            measure_current_text(editor, style, palette, locale, width, line_height, window)
+        })
+        .unwrap_or_else(|| SurfaceMeasurement {
+            width,
+            height: line_height,
+            lines: Vec::new(),
+        })
+}
+
+/// Вычисляет строки для уже допущенного текста редактора.
+fn measure_current_text(
     editor: &Editor,
     style: &TextStyle,
     palette: Palette,
@@ -921,43 +997,54 @@ impl Element for EditorSurface {
         } else {
             Palette::for_window(window, cx).accent
         };
-        window.handle_input(&focus, ElementInputHandler::new(bounds, self.0.clone()), cx);
-        window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            for line in &layout.lines {
-                let origin = layout.line_origin(line);
-                if origin.y >= bounds.bottom()
-                    || origin.y + line.shape.size(layout.line_height).height <= bounds.top()
-                {
-                    continue;
+        let permission = editor.fragment_edit.clone();
+        let mut draw = || {
+            window.handle_input(&focus, ElementInputHandler::new(bounds, self.0.clone()), cx);
+            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                for line in &layout.lines {
+                    let origin = layout.line_origin(line);
+                    if origin.y >= bounds.bottom()
+                        || origin.y + line.shape.size(layout.line_height).height <= bounds.top()
+                    {
+                        continue;
+                    }
+                    line.shape
+                        .paint_background(
+                            origin,
+                            layout.line_height,
+                            TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        )
+                        .expect("Не удалось нарисовать выделение");
+                    line.shape
+                        .paint(
+                            origin,
+                            layout.line_height,
+                            TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        )
+                        .expect("Не удалось нарисовать строку");
                 }
-                line.shape
-                    .paint_background(
-                        origin,
-                        layout.line_height,
-                        TextAlign::Left,
-                        None,
-                        window,
-                        cx,
-                    )
-                    .expect("Не удалось нарисовать выделение");
-                line.shape
-                    .paint(
-                        origin,
-                        layout.line_height,
-                        TextAlign::Left,
-                        None,
-                        window,
-                        cx,
-                    )
-                    .expect("Не удалось нарисовать строку");
+                if focused && let Some(caret) = caret {
+                    window.paint_quad(fill(
+                        Bounds::new(caret, size(px(1.5), layout.line_height)),
+                        caret_color,
+                    ));
+                }
+            });
+        };
+        if let Some(permission) = permission {
+            if permission.with_markdown(|_| draw()).is_none() {
+                layout.lines.clear();
+                return;
             }
-            if focused && let Some(caret) = caret {
-                window.paint_quad(fill(
-                    Bounds::new(caret, size(px(1.5), layout.line_height)),
-                    caret_color,
-                ));
-            }
-        });
+        } else {
+            draw();
+        }
         self.0.update(cx, |editor, _| {
             editor.layout_current = true;
             editor.layout = Some(TextLayout {

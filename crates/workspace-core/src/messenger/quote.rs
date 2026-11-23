@@ -1,6 +1,13 @@
 //! Проверяет источники ответа, кодирует ссылки цитирования и читает их в Markdown.
 
-use std::{collections::HashMap, fmt::Write};
+mod protected;
+mod resolved;
+
+pub(in crate::messenger) use protected::{ProtectedReferences, project_owned, project_protected};
+pub(in crate::messenger) use resolved::ProtectedQuoteMediaPermit;
+pub use resolved::{ProtectedQuote, ResolvedProtectedQuote};
+
+use std::{collections::HashMap, fmt::Write, ops::Range};
 
 use thiserror::Error;
 use uuid::Uuid;
@@ -8,11 +15,11 @@ use uuid::Uuid;
 use crate::{
     auth::Service,
     context::{OwnerContext, SessionGeneration},
-    storage::HistoryScope,
-    sync::Sync,
+    storage::{HistoryMessage, HistoryScope, MessageBody, Storage},
+    sync::{Sync, SyncError},
 };
 
-use super::{MessengerSource, history::OpenHistoryError};
+use super::{MessengerSource, encryption::EncryptionActivation, history::OpenHistoryError};
 
 const ESCAPED: &str = "\\`*_{()[]#+.!|>~-";
 
@@ -46,7 +53,180 @@ impl From<OpenHistoryError> for SourceCheckError {
     }
 }
 
+/// Версии оригинала и права чтения, которые должен пережить запрос.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct QuoteSourceFence {
+    state: (i64, i64), // Поколение истории и последняя известная правка оригинала.
+    access: i64,       // Версия отзыва доступа к стриму или теме.
+}
+
+impl QuoteSourceFence {
+    /// Сверяет отзыв в точной теме перед записью пересылки.
+    pub(crate) fn scope_still_accessible(
+        &self,
+        storage: &Storage,
+        owner: &OwnerContext,
+        original: &HistoryMessage,
+    ) -> Result<bool, SyncError> {
+        let scope = HistoryScope {
+            stream_id: original.stream_id,
+            topic_id: Some(original.topic_id),
+        };
+        Ok(storage.media_access_revision(owner, scope)? == self.access)
+    }
+
+    /// Читает локальные версии при действующем поколении авторизации.
+    pub(super) fn capture(
+        storage: &Storage,
+        owner: &OwnerContext,
+        scope: HistoryScope,
+        message_id: Uuid,
+    ) -> Result<Self, OpenHistoryError> {
+        let state = storage
+            .quote_source_revision(owner, message_id)
+            .map_err(SyncError::from)?
+            .ok_or(OpenHistoryError::MessageMissing)?;
+        let access = storage
+            .media_access_revision(owner, scope)
+            .map_err(SyncError::from)?;
+        Ok(Self { state, access })
+    }
+}
+
 impl MessengerSource {
+    /// Подтверждает точные версии целых защищённых оригиналов перед записью ответа.
+    pub async fn verify_protected_reply_sources(
+        &self,
+        sync: &Sync,
+        activation: &EncryptionActivation,
+        scope: HistoryScope,
+        originals: &[HistoryMessage],
+    ) -> Result<(), SourceCheckError> {
+        if originals.is_empty() {
+            return Ok(());
+        }
+        let session = activation.session();
+        let engine = &self
+            .encryption_profile(activation)
+            .map_err(|_| SourceCheckError::Unavailable)?
+            .keys;
+        for expected in originals {
+            let current = self
+                .load_quote_original(sync, &session.owner, session.generation, scope, expected.id)
+                .await?;
+            if &current != expected {
+                return Err(SourceCheckError::Changed);
+            }
+            let MessageBody::Encrypted { key_id, ciphertext } = current.body else {
+                return Err(SourceCheckError::Missing);
+            };
+            let engine = engine.clone();
+            let activation = activation.clone();
+            tokio::task::spawn_blocking(move || {
+                let result = engine
+                    .prepare(&activation, current.stream_id, key_id)
+                    .map_err(|_| SourceCheckError::Unavailable)?
+                    .decrypt(&ciphertext);
+                engine
+                    .accept(result)
+                    .ok()
+                    .and_then(|body| body.with_body(|text| !text.trim().is_empty()))
+                    .filter(|readable| *readable)
+                    .map(|_| ())
+                    .ok_or(SourceCheckError::Missing)
+            })
+            .await
+            .map_err(|_| SourceCheckError::Unavailable)??;
+        }
+        Ok(())
+    }
+
+    /// Загружает оригинал из подтверждённой области без переноса текста в историю ответа.
+    pub async fn load_quote_original(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        scope: HistoryScope,
+        message_id: Uuid,
+    ) -> Result<HistoryMessage, OpenHistoryError> {
+        self.quote_original_with_fence(sync, owner, generation, Some(scope), message_id)
+            .await
+            .map(|(message, _)| message)
+    }
+
+    /// Находит исходный адрес цитаты по UUID и сверяет право чтения оригинала.
+    pub async fn resolve_quote_original(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        message_id: Uuid,
+    ) -> Result<HistoryMessage, OpenHistoryError> {
+        self.quote_original_with_fence(sync, owner, generation, None, message_id)
+            .await
+            .map(|(message, _)| message)
+    }
+
+    /// Читает оригинал и сохраняет локальную версию для незавершённой загрузки вложения.
+    pub(super) async fn quote_original_with_fence(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        expected_scope: Option<HistoryScope>,
+        message_id: Uuid,
+    ) -> Result<(HistoryMessage, QuoteSourceFence), OpenHistoryError> {
+        if message_id.is_nil()
+            || expected_scope.is_some_and(|scope| {
+                scope.stream_id.is_nil() || scope.topic_id.is_some_and(|id| id.is_nil())
+            })
+        {
+            return Err(OpenHistoryError::InvalidTarget);
+        }
+        let auth = sync.auth();
+        let storage = sync.storage();
+        let revision = auth
+            .with_active_generation(owner, generation, || {
+                storage.quote_source_revision(owner, message_id)
+            })?
+            .map_err(SyncError::from)?
+            .ok_or(OpenHistoryError::MessageMissing)?;
+        let token = auth
+            .access_token_for_generation(owner, Service::Messenger, generation)
+            .await?;
+        let original = self
+            .rest
+            .presentation_anchor(owner, &token, expected_scope, message_id)
+            .await?;
+        let scope = HistoryScope {
+            stream_id: original.stream_id,
+            topic_id: Some(original.topic_id),
+        };
+        let verify = || -> Result<QuoteSourceFence, OpenHistoryError> {
+            let current = QuoteSourceFence::capture(storage, owner, scope, message_id)?;
+            if current.state != revision
+                || !storage
+                    .quote_source_matches(owner, &original)
+                    .map_err(SyncError::from)?
+            {
+                return Err(OpenHistoryError::StaleWindow);
+            }
+            Ok(current)
+        };
+        let fence = auth.with_active_generation(owner, generation, verify)??;
+        if let Some(direct) = expected_scope.filter(|scope| scope.topic_id.is_none()) {
+            self.rest.check_history_scope(owner, &token, direct).await?;
+        }
+        self.rest
+            .check_presentation_topic(owner, &token, original.stream_id, original.topic_id)
+            .await?;
+        if auth.with_active_generation(owner, generation, verify)?? != fence {
+            return Err(OpenHistoryError::StaleWindow);
+        }
+        Ok((original, fence))
+    }
+
     /// Подтверждает видимость и фрагменты цитат по исходному владельцу перед записью снимка.
     pub async fn verify_reply_sources(
         &self,
@@ -81,12 +261,16 @@ impl MessengerSource {
             auth.with_active_generation(owner, generation, || ())
                 .map_err(|_| SourceCheckError::Unavailable)?;
             let source = checked?;
-            if source.text.trim().is_empty() {
+            let Some(text) = source
+                .body
+                .markdown()
+                .filter(|text| !text.trim().is_empty())
+            else {
                 return Err(SourceCheckError::Missing);
-            }
+            };
             if fragments
                 .iter()
-                .any(|fragment| fragment.trim().is_empty() || !source.text.contains(fragment))
+                .any(|fragment| fragment.trim().is_empty() || !text.contains(fragment))
             {
                 return Err(SourceCheckError::Changed);
             }
@@ -209,16 +393,11 @@ fn fence(line: &str) -> Option<(u8, usize, bool)> {
     (count >= 3).then(|| (marker, count, stripped[count..].trim().is_empty()))
 }
 
-/// Выделяет самостоятельные цитаты между пустыми строками. Ссылки внутри кода остаются текстом.
-pub fn blocks(markdown: &str) -> Vec<Block<'_>> {
-    if !markdown.contains("](urn:quote:") {
-        return vec![Block::Text(markdown)];
-    }
-
+/// Находит те же самостоятельные цитаты вместе с их точными позициями в исходном Markdown.
+fn quote_lines(markdown: &str) -> impl Iterator<Item = (Range<usize>, Reference)> + '_ {
     let mut result = Vec::new();
     let mut code = None;
     let mut boundary = true;
-    let mut text_start = 0;
     let mut line_start = 0;
     let mut lines = markdown.split_inclusive('\n').peekable();
     while let Some(raw) = lines.next() {
@@ -235,15 +414,29 @@ pub fn blocks(markdown: &str) -> Vec<Block<'_>> {
             && lines.peek().is_none_or(|next| next.trim().is_empty())
             && let Some(reference) = parse(line)
         {
-            let text = markdown[text_start..line_start].trim_matches(['\r', '\n']);
-            if !text.is_empty() {
-                result.push(Block::Text(text));
-            }
-            result.push(Block::Quote(reference));
-            text_start = line_end;
+            result.push((line_start..line_start + line.len(), reference));
         }
         boundary = line.trim().is_empty();
         line_start = line_end;
+    }
+    result.into_iter()
+}
+
+/// Выделяет самостоятельные цитаты между пустыми строками. Ссылки внутри кода остаются текстом.
+pub fn blocks(markdown: &str) -> Vec<Block<'_>> {
+    if !markdown.contains("](urn:quote:") {
+        return vec![Block::Text(markdown)];
+    }
+
+    let mut result = Vec::new();
+    let mut text_start = 0;
+    for (line, reference) in quote_lines(markdown) {
+        let text = markdown[text_start..line.start].trim_matches(['\r', '\n']);
+        if !text.is_empty() {
+            result.push(Block::Text(text));
+        }
+        result.push(Block::Quote(reference));
+        text_start = line.end;
     }
 
     if result.is_empty() {
@@ -259,6 +452,23 @@ pub fn blocks(markdown: &str) -> Vec<Block<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Цитаты теряют снимок текста, а разметка, пробелы, код и адрес оригинала остаются.
+    #[test]
+    fn protected_projection_removes_only_structural_quote_excerpts() {
+        let id = Uuid::from_u128(4);
+        let first = reference(id, "Тест ?text=", Some("old-secret Ъ"));
+        let link = reference(id, "Тест ?text=", None);
+        let code = format!("```\r\n{first}\r\n```");
+        let original = format!("**ответ**  \r\n\r\n{first}\r\n\r\n{code}\r\n\r\n{first}\r\n");
+        let expected = format!("**ответ**  \r\n\r\n{link}\r\n\r\n{code}\r\n\r\n{link}\r\n");
+        let (safe, _) = project_protected(&original);
+        assert_eq!(safe, expected);
+        assert!(matches!(
+            project_protected(&safe).0,
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
 
     /// Сверяет литералы Markdown и percent-encoding по формату Electron.
     #[test]

@@ -14,18 +14,18 @@ use crate::messenger::details::{
     StreamRole,
 };
 
-const BINDINGS_PATH: &str = "/api/workspace/v1/messenger/stream_bindings/";
+pub(super) const BINDINGS_PATH: &str = "/api/workspace/v1/messenger/stream_bindings/";
 const USERS_PATH: &str = "/api/workspace/v1/users/";
 const MAX_PROFILE_REQUESTS: usize = 8;
 
 /// Привязка участника к стриму и роль в нём.
 #[derive(Deserialize)]
-struct WireBinding {
-    uuid: Uuid,         // Идентификатор привязки.
-    project_id: String, // Проект, к которому относится привязка.
-    stream_uuid: Uuid,  // Стрим, состав которого загружен.
-    user_uuid: Uuid,    // Пользователь, которому принадлежит привязка.
-    role: StreamRole,   // Роль привязки в ответе сервера.
+pub(super) struct WireBinding {
+    pub(super) uuid: Uuid,         // Идентификатор привязки.
+    pub(super) project_id: String, // Проект, к которому относится привязка.
+    pub(super) stream_uuid: Uuid,  // Стрим, состав которого загружен.
+    pub(super) user_uuid: Uuid,    // Пользователь, которому принадлежит привязка.
+    pub(super) role: StreamRole,   // Роль привязки в ответе сервера.
 }
 
 /// Часть ответа справочника, необходимая для загрузки аватара.
@@ -311,9 +311,12 @@ impl RestClient {
 }
 
 impl WireStream {
-    /// Проверяет тип стрима и доступность данных обычного разговора.
+    /// Проверяет тип стрима для сведений, включая явно защищённый нативный разговор.
     fn sidebar_kind(&self) -> SidebarStreamKind {
-        if !matches!(self.encryption, Some(Value::Bool(false))) {
+        if !matches!(self.encryption, Some(Value::Bool(false)))
+            && !(self.encryption == Some(Value::Bool(true))
+                && self.source_name.as_deref() == Some("native"))
+        {
             return SidebarStreamKind::Unsupported;
         }
         match (self.private, self.direct_user_uuid.as_deref()) {

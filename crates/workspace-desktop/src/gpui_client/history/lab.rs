@@ -67,7 +67,7 @@ impl HistoryLab {
     fn new() -> Self {
         let (history, position) = initial_history(Scene::Older);
         let mut viewport = Viewport::with_page_ahead(MAX_AHEAD);
-        viewport.replace(&history, &[], None, position, Uuid::new_v4());
+        viewport.replace(&history, &[], None, position, Uuid::new_v4(), None);
         Self {
             viewport,
             history,
@@ -88,7 +88,7 @@ impl HistoryLab {
         self.expanded.clear();
         self.viewport.clear();
         self.viewport
-            .replace(&self.history, &[], None, position, Uuid::new_v4());
+            .replace(&self.history, &[], None, position, Uuid::new_v4(), None);
         cx.notify();
     }
 
@@ -178,7 +178,7 @@ impl HistoryLab {
         };
         extend_history(&mut self.history, flight.need.direction);
         self.viewport
-            .replace(&self.history, &[], None, position, id);
+            .replace(&self.history, &[], None, position, id, None);
         self.last_page = Some(flight);
         eprintln!(
             "history_lab op_id={id} event=page_applied direction={:?} rows={}",

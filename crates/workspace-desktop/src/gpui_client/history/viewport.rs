@@ -3,28 +3,40 @@
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
-    ops::Range,
     rc::Rc,
+    sync::Arc,
 };
 
 use gpui::{
     AnyElement, App, Bounds, Div, ImageSource, IntoElement, ListAlignment, ListOffset, ListState,
-    Pixels, StyledText, TextLayout, WeakEntity, canvas, div, list, prelude::*, px,
+    Pixels, SharedString, StyledText, TextLayout, WeakEntity, canvas, div, list, prelude::*, px,
 };
 use uuid::Uuid;
 use workspace_core::{
     messenger::{
-        quote::{self, Block},
+        calls::JitsiSettings,
         references::{MediaReference, media_references},
     },
-    storage::{DeliveryStatus, HistoryWindow, OutboxEntry, SendBlock},
+    storage::{
+        DeliveryStatus, HistoryWindow, KeyServicePayload, MessageBody, OutboxEntry, SendBlock,
+    },
 };
 
 use super::{
     Conversation, ReadingAnchor,
     attachments::{AttachmentKey, Cards},
-    reply::{ReplyControls, Selection, excerpt, history_quote},
+    calls::join_card,
+    encryption::{EncryptedPresentation, HistoryEncryption},
+    fragments::{FragmentRuntime, FragmentViews},
+    key_exchange::{KeyAction, KeyActionState, KeyPermission},
+    protected_body::ProtectedLayout,
+    protected_quotes::{QuotePresentation, QuoteSlot, render_quote},
+    reply::{ReplyControls, Selection, history_quote},
 };
+
+#[path = "body.rs"]
+mod body;
+use body::{Body, BodyPart, ForwardBody};
 
 #[path = "paging.rs"]
 mod paging;
@@ -33,9 +45,18 @@ pub(super) use paging::PageNeed;
 #[path = "text_anchor.rs"]
 mod text_anchor;
 use text_anchor::{LineTarget, ReadingLine};
+#[path = "protected_text.rs"]
+mod protected_text;
+pub(in crate::gpui_client) use protected_text::GuardedText;
+pub(super) use protected_text::ProtectedText;
+#[path = "text_rows.rs"]
+mod text_rows;
+use text_rows::{BubbleInput, TextRows};
 
-use crate::gpui_client::ui::{
-    Avatar, DeliveryMark, MessageBubble, Palette, TextRole, label, text_role,
+use crate::gpui_client::{
+    composer::ReplyText,
+    preferences::Language,
+    ui::{Avatar, Button, DeliveryMark, Icon, MessageBubble, Palette, TextRole, label, text_role},
 };
 
 const DATE_SPACE: Pixels = px(32.);
@@ -44,18 +65,90 @@ const BOTTOM_PADDING: Pixels = px(12.);
 /// Строка, которую можно рисовать после переноса снимка на поток UI.
 #[derive(Clone, Eq, PartialEq)]
 struct Row {
-    id: Uuid,                       // UUID сообщения или публичный UUID очереди.
-    own: bool,                      // Сообщение текущего пользователя.
-    author: Option<Uuid>,           // UUID для группировки, неизвестные авторы не объединяются.
-    topic: Uuid,                    // Смена темы начинает новую группу.
-    date: Option<String>,           // День создания UTC, если сообщение принято сервером.
-    body: String,                   // Текст, полученный из истории или очереди.
-    media: Vec<MediaReference>,     // Прямые вложения подтверждённой строки.
-    time: Option<String>,           // Время сервера или пояснение рядом со статусом очереди.
+    id: Uuid,                                 // UUID сообщения или публичный UUID очереди.
+    own: bool,                                // Сообщение текущего пользователя.
+    author: Option<Uuid>, // UUID для группировки, неизвестные авторы не объединяются.
+    topic: Uuid,          // Смена темы начинает новую группу.
+    date: Option<String>, // День создания UTC, если сообщение принято сервером.
+    body: Rc<Body>,       // Данные обычного тела из снимка; не зависят от координаты строки.
+    encrypted: Option<EncryptedPresentation>, // Состояние E2EE; None для обычной строки.
+    service: Option<KeyServiceRow>, // Видимая часть служебного сообщения без криптографического тела.
+    retry_send: Option<Uuid>, // Канонический UUID защищённой попытки, которую можно повторить.
+    plain_text: bool,         // Обычное текстовое содержимое без зависимости от других строк.
+    media: Vec<MediaReference>, // Прямые вложения подтверждённой строки.
+    time: RowTime,            // Время сервера или ключ пояснения очереди.
     delivery: Option<DeliveryMark>, // Состояние отправки исходящей строки.
-    starts_day: bool,               // Над этой строкой виден новый день.
-    starts_group: bool,             // Имя автора и отступ перед началом группы.
-    ends_group: bool,               // Аватар собеседника рядом с последней строкой группы.
+    starts_day: bool,         // Над этой строкой виден новый день.
+    starts_group: bool,       // Имя автора и отступ перед началом группы.
+    ends_group: bool,         // Аватар собеседника рядом с последней строкой группы.
+}
+
+/// Подпись рядом с отметкой доставки.
+#[derive(Clone, Eq, PartialEq)]
+enum RowTime {
+    Sent(String),          // Время сервера для принятого сообщения.
+    Pending(&'static str), // Ключ пояснения для локального сообщения.
+}
+
+impl RowTime {
+    /// Подставляет текст очереди на языке видимой истории.
+    fn caption(&self, language: Language) -> SharedString {
+        match self {
+            Self::Sent(time) => time.clone().into(),
+            Self::Pending(key) => language.tr(key).into(),
+        }
+    }
+}
+
+/// Служебная строка истории без шифротекста, секретов и ключевого материала.
+#[derive(Clone, Eq, PartialEq)]
+enum KeyServiceRow {
+    Request {
+        device: String, // Публичный UUID устройства получателя.
+        name: String,   // Имя устройства из запроса.
+    },
+    Grant,     // Опубликована выдача ключа.
+    Reject,    // Опубликован отказ.
+    Announced, // Опубликована смена ключа.
+}
+
+/// Готовые подписи входящего аватара и автора для всех баблов окна.
+#[derive(Clone, Eq, PartialEq)]
+struct PeerLabel {
+    name: SharedString,     // Имя собеседника из текущего каталога.
+    initials: SharedString, // Тот же запасной аватар для всех его строк.
+}
+
+impl From<String> for PeerLabel {
+    /// Подготавливает подписи один раз до обхода списка.
+    fn from(name: String) -> Self {
+        let initials = name
+            .chars()
+            .next()
+            .map(|initial| initial.to_uppercase().collect::<String>())
+            .unwrap_or_default();
+        Self {
+            name: name.into(),
+            initials: initials.into(),
+        }
+    }
+}
+
+/// Действия строки, связанные с текущим экраном и выбранным языком.
+#[derive(Default)]
+pub(super) struct HistoryControls {
+    pub reply: Option<ReplyControls>, // Меню и выделение разрешённых обычных строк.
+    pub conversation: Option<WeakEntity<Conversation>>, // Повтор расшифровки в открытом экране.
+    pub edit_protected: bool,         // Штатный редактор подтвердил защищённую запись в этой теме.
+    pub key_device: Option<String>,   // Устройство активного обмена ключами.
+    pub key_actions: HashMap<Uuid, KeyActionState>, // Ход действий по публичному UUID.
+    pub key_permissions: HashMap<Uuid, KeyPermission>, // Права точных запросов после проверки Core.
+    pub protected: HashMap<Uuid, Arc<ProtectedLayout>>, // Безопасная структура конкретных раскрытых баблов.
+    pub quotes: HashMap<QuoteSlot, QuotePresentation>, // Отдельный доступ к разрешённым оригиналам.
+    pub fragments: Option<FragmentRuntime>, // Рабочая сессия для спойлеров обычного Markdown.
+    pub fragment_edit_topic: Option<Uuid>,  // Тема обычного редактора, где доступна правка.
+    pub jitsi: Option<Arc<JitsiSettings>>, // Проверенный сервер конференций для карточек этой истории.
+    pub locale: Language,                  // Язык подписей открытой истории.
 }
 
 impl Row {
@@ -111,6 +204,14 @@ struct ReflowAnchor {
     target: LineTarget, // Байтовая позиция фрагмента и высота его строки.
 }
 
+/// Разобранное тело одного UUID, которое может вернуться при перечитывании окна.
+struct CachedBody {
+    body: Rc<Body>,             // Обычное тело или пустой оформитель закрытой строки.
+    media: Vec<MediaReference>, // Только обычные прямые вложения подтверждённой строки.
+    confirmed: bool,            // История и очередь по-разному показывают вложения.
+    encrypted: bool,            // Вид тела, который может поменяться после правки.
+}
+
 /// Снимок виртуального списка и реально нарисованные границы последнего кадра.
 pub(super) struct Viewport {
     rows: Rc<Vec<Row>>, // Состав списка для отложенного построения видимых элементов.
@@ -123,6 +224,9 @@ pub(super) struct Viewport {
     measure: Option<Measurement>,                 // Следующее измерение после замены снимка.
     edit_anchor: Option<EditAnchor>, // Поправка внутри текста опоры для следующего кадра.
     reflow_anchor: Rc<Cell<Option<ReflowAnchor>>>, // Опора между сменами ширины без жеста.
+    ordinary_views: Rc<RefCell<TextRows>>, // Представления обычных баблов рядом с E2EE.
+    pub(super) fragment_views: FragmentViews, // Отдельные элементы спойлеров со своим состоянием.
+    prepared_bodies: HashMap<Uuid, CachedBody>, // Подготовка последних снимков текущего разговора.
 }
 
 impl Viewport {
@@ -139,12 +243,22 @@ impl Viewport {
             measure: None,
             edit_anchor: None,
             reflow_anchor: Rc::default(),
+            ordinary_views: Rc::default(),
+            fragment_views: FragmentViews::default(),
+            prepared_bodies: HashMap::new(),
         }
     }
 
     /// Возвращает состояние для подключения обработчика прокрутки.
     pub(super) fn list(&self) -> &ListState {
         &self.list
+    }
+
+    /// Сообщает рабочей области, что история может получить точечную дельту ключа.
+    pub(super) fn has_encrypted_rows(&self) -> bool {
+        self.rows
+            .iter()
+            .any(|row| row.encrypted.is_some() || row.body.has_fragments)
     }
 
     /// Проверяет, читает ли пользователь хвост, к которому можно прикрепить новые строки.
@@ -163,6 +277,12 @@ impl Viewport {
 
     /// Очищает список и координаты доступных раньше сообщений.
     pub(super) fn clear(&mut self) {
+        self.reset_for_reopen();
+        self.prepared_bodies.clear();
+    }
+
+    /// Сбрасывает позицию перед загрузкой того же разговора, оставляя сверяемый по телу кеш.
+    pub(super) fn reset_for_reopen(&mut self) {
         self.rows = Rc::default();
         self.index = Rc::default();
         *self.selection.borrow_mut() = Selection::default();
@@ -173,6 +293,8 @@ impl Viewport {
         self.measure = None;
         self.edit_anchor = None;
         self.reflow_anchor.set(None);
+        self.ordinary_views.borrow_mut().retain(|_| false);
+        self.fragment_views.retain(|_, _, _| false);
     }
 
     /// Сверяет последний отрисованный кадр с текущим смещением списка.
@@ -228,14 +350,27 @@ impl Viewport {
         user: Option<Uuid>,
         position: Position,
         op_id: Uuid,
+        encryption: Option<&HistoryEncryption>,
     ) {
-        let rows = build_rows(history, outbox, user);
+        let rows = build_rows(history, outbox, user, encryption, &mut self.prepared_bodies);
         let previous_count = self.rows.len();
         let index: HashMap<_, _> = rows
             .iter()
             .enumerate()
             .map(|(i, row)| (row.id, i))
             .collect();
+        self.fragment_views.retain(|id, position, reference| {
+            index.get(&id).is_some_and(|&next| {
+                self.index
+                    .get(&id)
+                    .is_some_and(|&previous| self.rows[previous].body == rows[next].body)
+                    && rows[next].body.fragment(position) == Some(reference)
+            })
+        });
+        // Допускаем краткое исчезновение соседней строки из снимка, но ограничиваем кэш одного окна.
+        if self.prepared_bodies.len() > rows.len().saturating_mul(2).max(256) {
+            self.prepared_bodies.retain(|id, _| index.contains_key(id));
+        }
         let anchor = match position {
             Position::Reading => self.anchor(&index),
             Position::Restore(anchor) => index.contains_key(&anchor.id).then_some(anchor),
@@ -277,7 +412,11 @@ impl Viewport {
         }
         self.selection.borrow_mut().retain_current(|id| {
             let row = self.rows.get(*index.get(&id)?)?;
-            (row.date.is_some() && !row.body.trim().is_empty()).then_some(row.body.as_str())
+            (row.date.is_some()
+                && row.service.is_none()
+                && row.encrypted.is_none()
+                && !row.body.text.trim().is_empty())
+            .then_some(row.body.text.as_ref())
         });
         self.index = Rc::new(index);
         self.measure = anchor.map(|anchor| Measurement { op_id, anchor });
@@ -324,6 +463,55 @@ impl Viewport {
         }
     }
 
+    /// Меняет только представления указанных UUID и сохраняет читаемую строку или хвост списка.
+    pub(super) fn apply_encryption(
+        &mut self,
+        changes: impl IntoIterator<Item = (Uuid, EncryptedPresentation)>,
+    ) -> bool {
+        let tail = self.at_tail();
+        let scroll = self.list.logical_scroll_top();
+        let anchor = (!tail).then(|| self.saved_anchor()).flatten();
+        let mut changed = false;
+        for (id, presentation) in changes {
+            let Some(&index) = self.index.get(&id) else {
+                continue;
+            };
+            let row = &self.rows[index];
+            if row.encrypted.is_none() || row.encrypted.as_ref() == Some(&presentation) {
+                continue;
+            }
+            Rc::make_mut(&mut self.rows)[index].encrypted = Some(presentation);
+            self.painted_text.borrow_mut().remove(&id);
+            if self
+                .reflow_anchor
+                .get()
+                .is_some_and(|anchor| anchor.id == id)
+            {
+                self.reflow_anchor.set(None);
+            }
+            self.list.splice(index..index + 1, 1);
+            changed = true;
+        }
+        if changed {
+            let offset = if tail {
+                ListOffset {
+                    item_ix: self.rows.len(),
+                    offset_in_item: px(0.),
+                }
+            } else if let Some(anchor) = anchor {
+                let item_ix = self.index[&anchor.id];
+                ListOffset {
+                    item_ix,
+                    offset_in_item: self.rows[item_ix].inset() - anchor.y,
+                }
+            } else {
+                scroll
+            };
+            self.list.scroll_to(offset);
+        }
+        changed
+    }
+
     /// Берёт строку из показанного кадра или держит её до кадра при нескольких быстрых ответах.
     fn reading_line(&mut self, id: Uuid, next: &Row) -> Option<ReadingLine> {
         let offset = self.list.logical_scroll_top();
@@ -347,10 +535,18 @@ impl Viewport {
     }
 
     /// Даёт имя известного автора из окна и каталога обычной лички.
-    pub(super) fn source_author(&self, id: Uuid, peer: Option<&str>) -> Option<String> {
+    pub(super) fn source_author(&self, id: Uuid, peer: Option<&str>) -> Option<ReplyText> {
         self.index
             .get(&id)
             .and_then(|&index| row_author(&self.rows[index], peer))
+    }
+
+    /// Проверяет, осталась ли ссылка на оригинал в той же подтверждённой строке.
+    pub(super) fn has_forward_source(&self, row: Uuid, source: Uuid) -> bool {
+        self.index.get(&row).is_some_and(|&index| {
+            let row = &self.rows[index];
+            row.date.is_some() && row.body.contains_forward(source)
+        })
     }
 
     /// Проверяет присутствие той же ссылки в текущем окне разговора.
@@ -365,12 +561,15 @@ impl Viewport {
 
     /// Проверяет, есть ли у карточки показанная строка, куда можно вернуть фокус.
     pub(super) fn has_visible_attachment(&self, key: AttachmentKey) -> bool {
-        self.has_attachment(key)
-            && self
-                .painted
-                .borrow()
-                .get(&key.message)
-                .is_some_and(|bounds| bounds.intersects(&self.list.viewport_bounds()))
+        self.has_attachment(key) && self.has_visible_message(key.message)
+    }
+
+    /// Проверяет, осталась ли строка видимой после закрытия защищённого просмотра.
+    pub(super) fn has_visible_message(&self, id: Uuid) -> bool {
+        self.painted
+            .borrow()
+            .get(&id)
+            .is_some_and(|bounds| bounds.intersects(&self.list.viewport_bounds()))
     }
 
     /// Просит GPUI заново измерить строку, сохраняя текущий индекс и смещение внутри него.
@@ -379,6 +578,18 @@ impl Viewport {
             let position = self.list.logical_scroll_top();
             self.list.splice(index..index + 1, 1);
             self.list.scroll_to(position);
+        }
+    }
+
+    /// Закрывает устаревшие фрагменты до нового подтверждённого окна.
+    pub(super) fn invalidate_fragment_row(&self, id: Uuid, cx: &mut gpui::Context<Conversation>) {
+        if self
+            .index
+            .get(&id)
+            .is_some_and(|&index| self.rows[index].body.has_fragments)
+        {
+            self.fragment_views.invalidate_row(id, cx);
+            self.invalidate_row_height(id);
         }
     }
 
@@ -399,7 +610,14 @@ impl Viewport {
         peer: String,
         accessory: impl Fn(Uuid) -> Option<AnyElement> + 'static,
     ) -> impl IntoElement {
-        self.render_rows(palette, Some(peer), None, HashMap::new(), None, accessory)
+        self.render_rows(
+            palette,
+            Some(peer),
+            HistoryControls::default(),
+            HashMap::new(),
+            None,
+            accessory,
+        )
     }
 
     /// Рисует список и пишет фактическую координату опоры, когда GPUI дойдёт до её строки.
@@ -407,11 +625,11 @@ impl Viewport {
         &mut self,
         palette: Palette,
         peer: Option<String>,
-        reply: Option<ReplyControls>,
+        controls: HistoryControls,
         images: HashMap<Uuid, ImageSource>,
         cards: Option<Cards>,
     ) -> impl IntoElement {
-        self.render_rows(palette, peer, reply, images, cards, |_| None)
+        self.render_rows(palette, peer, controls, images, cards, |_| None)
     }
 
     /// Собирает один виртуальный список для рабочего чата и окна стенда.
@@ -419,7 +637,7 @@ impl Viewport {
         &mut self,
         palette: Palette,
         peer: Option<String>,
-        reply: Option<ReplyControls>,
+        controls: HistoryControls,
         images: HashMap<Uuid, ImageSource>,
         cards: Option<Cards>,
         accessory: impl Fn(Uuid) -> Option<AnyElement> + 'static,
@@ -432,6 +650,11 @@ impl Viewport {
             .flatten();
         let reflow_anchor = self.reflow_anchor.clone();
         let edit_anchor = self.edit_anchor.take();
+        let memoize = controls.conversation.is_some() && self.has_encrypted_rows();
+        let ordinary_views = self.ordinary_views.clone();
+        ordinary_views
+            .borrow_mut()
+            .retain(|id| memoize && self.index.contains_key(&id));
         self.painted.borrow_mut().clear();
         self.painted_text.borrow_mut().clear();
         self.painted_offset.set(None);
@@ -442,29 +665,43 @@ impl Viewport {
         let painted_offset = self.painted_offset.clone();
         let measurement = Rc::new(RefCell::new(self.measure.take()));
         let list_state = self.list.clone();
-        let message = Rc::new(move |row: &Row, app: &mut App| {
-            let photo = row.avatar_author().and_then(|id| images.get(&id).cloned());
-            message_row(
-                row,
-                palette,
-                peer.as_deref(),
-                (&rows, &row_index),
-                reply.as_ref(),
-                photo,
-                RowBodyExtras {
-                    media: cards.as_ref().map(|cards| (cards, app)),
-                    accessory: accessory(row.id),
-                },
-            )
-        });
+        let controls = Rc::new(controls);
+        let peer = peer.map(PeerLabel::from);
+        let images = Rc::new(images);
+        let current_width = Rc::new(Cell::new(previous_width));
+        let message = {
+            let peer = peer.clone();
+            let controls = controls.clone();
+            let images = images.clone();
+            let fragments = self.fragment_views.clone();
+            Rc::new(move |row: &Row, app: &mut App| {
+                let photo = row.avatar_author().and_then(|id| images.get(&id).cloned());
+                message_row(
+                    row,
+                    palette,
+                    peer.as_ref(),
+                    (&rows, &row_index),
+                    &controls,
+                    photo,
+                    RowBodyExtras {
+                        media: cards.as_ref(),
+                        accessory: accessory(row.id),
+                        fragments: Some(&fragments),
+                        app: Some(app),
+                    },
+                )
+            })
+        };
         let measured_line = Rc::new(Cell::new(None::<(Uuid, Uuid, LineTarget)>));
         let correction = {
             let list = list_state.clone();
             let rows = self.rows.clone();
             let message = message.clone();
             let measured_line = measured_line.clone();
+            let current_width = current_width.clone();
             canvas(
                 move |bounds, window, app| {
+                    current_width.set(bounds.size.width);
                     let scroll = list.logical_scroll_top();
                     let row = rows.get(scroll.item_ix);
                     let retained = reflow_anchor.get().filter(|anchor| {
@@ -476,10 +713,10 @@ impl Viewport {
                     let resized = bounds.size.width != previous_width;
                     let edit = edit_anchor.filter(|edit| row.id == edit.id && same_offset(scroll, edit.scroll));
                     let (op_id, target) = if let Some(edit) = &edit {
-                        (edit.op_id, edit.source.target(&row.body))
+                        (edit.op_id, edit.source.target(&row.body.text))
                     } else if resized && !following_tail && same_offset(scroll, previous_scroll) {
                         let target = retained.map(|anchor| anchor.target)
-                            .or_else(|| reading?.target(&row.body));
+                            .or_else(|| reading?.target(&row.body.text));
                         (Uuid::new_v4(), target)
                     } else {
                         return;
@@ -528,11 +765,20 @@ impl Viewport {
             let measurement = measurement.clone();
             let measured_line = measured_line.clone();
             let list_state = list_state.clone();
-            let (message, text_layout) = message(row, app);
+            let (message, text_layout) = if memoize && row.plain_text {
+                let photo = row.avatar_author().and_then(|id| images.get(&id).cloned());
+                let bubble = ordinary_views.borrow_mut().bubble(BubbleInput {
+                    row, palette, peer: peer.as_ref(), photo, controls: controls.clone(), width: current_width.clone(),
+                }, app);
+                (bubble.element, RenderedText::Cached(bubble.layout))
+            } else {
+                let (message, layout) = message(row, app);
+                (message.into_any_element(), RenderedText::Fresh(layout))
+            };
             row_container(row, palette)
-                .child(message.relative().child(canvas(|_, _, _| (), move |bounds, (), _, _| {
+                .child(div().relative().w_full().child(message).child(canvas(|_, _, _| (), move |bounds, (), _, _| {
                     painted.borrow_mut().insert(id, bounds);
-                    if let Some(layout) = text_layout {
+                    if let Some(layout) = text_layout.layout() {
                         if let Some((_, op_id, target)) = measured_line.get().filter(|(anchor, _, _)| *anchor == id)
                             && let Some(point) = layout.position_for_index(target.byte)
                         {
@@ -565,6 +811,30 @@ impl Viewport {
             .w_full()
             .child(correction)
             .child(items)
+    }
+
+    /// Считает сборки обычного бабла средствами GPUI во время теста обновления ключа.
+    #[cfg(all(test, feature = "gpui-test"))]
+    pub(super) fn tested_bubble_renders(&self, id: Uuid, cx: &App) -> Option<usize> {
+        self.ordinary_views.borrow().renders(id, cx)
+    }
+
+    /// Считывает идентичность подготовленного тела, чтобы проверить повторное использование на сдвиге.
+    #[cfg(all(test, feature = "gpui-test"))]
+    pub(super) fn tested_body_identity(&self, id: Uuid) -> Option<usize> {
+        Some(Rc::as_ptr(&self.rows.get(*self.index.get(&id)?)?.body) as usize)
+    }
+
+    /// Проверяет состояние доступности по видимой модели, не читая сам текст.
+    #[cfg(all(test, feature = "gpui-test"))]
+    pub(super) fn tested_encryption_state(&self, id: Uuid) -> Option<&'static str> {
+        match self.rows.get(*self.index.get(&id)?)?.encrypted.as_ref()? {
+            EncryptedPresentation::Ready(text) if text.with_current(|| ()).is_some() => {
+                Some("readable")
+            }
+            EncryptedPresentation::Failed => Some("failed"),
+            _ => Some("locked"),
+        }
     }
 
     /// После отрисовки строк собирает аватары тех групп, что действительно пересекли область списка.
@@ -650,6 +920,22 @@ impl Viewport {
     }
 }
 
+/// Разметка обычного текста приходит из нового прохода либо из переиспользованного вида.
+enum RenderedText {
+    Fresh(Option<TextLayout>), // Простая строка без кеша или только что измеренная сложная строка.
+    Cached(Rc<RefCell<Option<TextLayout>>>), // Разметка постоянного GPUI-вида.
+}
+
+impl RenderedText {
+    /// Берёт фактическую геометрию, когда GPUI уже выполнил подготовку кадра.
+    fn layout(self) -> Option<TextLayout> {
+        match self {
+            Self::Fresh(layout) => layout,
+            Self::Cached(layout) => layout.borrow().clone(),
+        }
+    }
+}
+
 /// Отбирает авторов по реально нарисованным строкам, исключая запас списка за границами окна.
 fn visible_avatar_users(
     rows: &[Row],
@@ -712,21 +998,26 @@ fn date_separator(palette: Palette, date: &str, id: Uuid) -> Div {
 
 /// Передаёт дополнительные элементы содержимого при отрисовке одного бабла.
 struct RowBodyExtras<'a> {
-    media: Option<(&'a Cards, &'a mut App)>, // Карточки вложений рабочего чата.
+    media: Option<&'a Cards>,             // Карточки вложений рабочего чата.
     accessory: Option<AnyElement>, // Управляемый блок, который появляется внутри бабла на стенде.
+    fragments: Option<&'a FragmentViews>, // Кэш спойлеров этого списка.
+    app: Option<&'a mut App>,      // Контекст для создания элементов видимой строки.
 }
 
 /// Рисует сообщение с общим пузырём и оставляет место аватару в группе собеседника.
 fn message_row(
     row: &Row,
     palette: Palette,
-    peer: Option<&str>,
+    peer: Option<&PeerLabel>,
     history: (&[Row], &HashMap<Uuid, usize>),
-    reply: Option<&ReplyControls>,
+    controls: &HistoryControls,
     photo: Option<ImageSource>,
-    extras: RowBodyExtras<'_>,
+    mut extras: RowBodyExtras<'_>,
 ) -> (Div, Option<TextLayout>) {
-    let author = peer.unwrap_or("Участник");
+    let author = peer.map_or_else(
+        || controls.locale.tr("desktop.messenger.participant").into(),
+        |peer| peer.name.clone(),
+    );
     let id = row.id;
     // Время и пояснения должны читаться и на более тёмной подложке исходящего.
     let bubble_palette = if row.own {
@@ -741,34 +1032,127 @@ fn message_row(
             ..palette
         }
     };
-    let reply = reply.filter(|_| row.date.is_some() && !row.body.trim().is_empty());
+    let reply = controls.reply.as_ref().filter(|_| {
+        row.date.is_some()
+            && row.service.is_none()
+            && row.encrypted.is_none()
+            && !row.body.text.trim().is_empty()
+    });
     let bubble = MessageBubble {
-        author: (!row.own && row.starts_group).then(|| author.to_owned().into()),
-        body: row.body.clone().into(),
-        time: row.time.clone().map(Into::into),
+        author: (!row.own && row.starts_group).then_some(author),
+        body: row.body.text.clone(),
+        time: Some(row.time.caption(controls.locale)),
         own: row.own,
         delivery: row.delivery,
     };
     let (rows, index) = history;
     let mut text_layout = None;
-    let content = if let Some((cards, app)) = extras.media.filter(|_| !row.media.is_empty()) {
-        let caption = div().flex().flex_col().min_w_0().max_w_full().gap_1();
-        let caption = if let Some(reply) =
-            reply.filter(|_| matches!(quote::blocks(&row.body).as_slice(), [Block::Text(_)]))
-        {
-            caption.children(
-                media_caption_spans(row)
-                    .into_iter()
-                    .map(|span| reply.selectable_span(id, &row.body, span, bubble_palette)),
+    let mut readable = false;
+    let content = if let Some(state) = &row.encrypted {
+        let text = match state {
+            EncryptedPresentation::Ready(text) if text.with_current(|| ()).is_some() => {
+                let body = if let Some(layout) = controls.protected.get(&id) {
+                    layout.render(
+                        id,
+                        text,
+                        bubble_palette,
+                        row.own,
+                        extras
+                            .media
+                            .zip(extras.app)
+                            .map(|(cards, app)| (cards, app, controls.locale)),
+                        |position, palette, own, media| {
+                            let slot = QuoteSlot {
+                                message: id,
+                                position,
+                            };
+                            render_quote(
+                                controls.quotes.get(&slot),
+                                palette,
+                                own,
+                                slot,
+                                controls.locale,
+                                media,
+                            )
+                        },
+                    )
+                } else {
+                    text_role(bubble_palette, TextRole::Body)
+                        .min_w_0()
+                        .max_w_full()
+                        .child(ProtectedText(text.clone()))
+                };
+                let call = row
+                    .date
+                    .is_some()
+                    .then(|| {
+                        join_card(
+                            id,
+                            text,
+                            controls.jitsi.as_deref(),
+                            controls.conversation.as_ref(),
+                            bubble_palette,
+                            controls.locale,
+                        )
+                    })
+                    .flatten();
+                Some(if let Some(call) = call {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(body)
+                        .child(call)
+                        .into_any_element()
+                } else {
+                    body.into_any_element()
+                })
+            }
+            _ => None,
+        };
+        readable = text.is_some();
+        Some(text.unwrap_or_else(|| {
+            encrypted_placeholder(
+                id,
+                matches!(state, EncryptedPresentation::Failed),
+                row.date.is_some(),
+                bubble_palette,
+                controls,
             )
+        }))
+    } else if let Some(service) = &row.service {
+        Some(key_service_body(id, service, bubble_palette, controls))
+    } else if let Some(cards) = extras.media.filter(|_| !row.media.is_empty()) {
+        let caption = div().flex().flex_col().min_w_0().max_w_full().gap_1();
+        let prepared = row
+            .body
+            .caption
+            .as_ref()
+            .expect("подпись для строки с медиа");
+        let caption = if let Some(reply) = reply.filter(|_| row.body.plain()) {
+            caption.children(prepared.spans.iter().map(|(span, visible)| {
+                reply.selectable_span(
+                    id,
+                    &row.body.text,
+                    span.clone(),
+                    visible.clone(),
+                    bubble_palette,
+                )
+            }))
         } else {
-            let body = caption_without_media(row);
-            let content =
-                quote_content(row, quote::blocks(&body), bubble_palette, peer, rows, index)
-                    .or_else(|| {
-                        (!body.trim().is_empty())
-                            .then(|| label(bubble_palette, TextRole::Body, body).into_any_element())
-                    });
+            let content = quote_content(
+                row,
+                &prepared.parts,
+                bubble_palette,
+                peer,
+                (rows, index),
+                FragmentContent::new(controls, extras.fragments, extras.app.as_deref_mut()),
+            )
+            .or_else(|| {
+                (!prepared.text.trim().is_empty()).then(|| {
+                    label(bubble_palette, TextRole::Body, prepared.text.clone()).into_any_element()
+                })
+            });
             caption.children(content)
         };
         Some(
@@ -782,19 +1166,22 @@ fn message_row(
                         },
                         reference,
                         bubble_palette,
-                        app,
+                        controls.locale,
+                        extras
+                            .app
+                            .as_deref_mut()
+                            .expect("контекст карточек истории"),
                     )
                 }))
                 .into_any_element(),
         )
     } else {
-        let blocks = quote::blocks(&row.body);
-        if matches!(blocks.as_slice(), [Block::Text(_)]) && !row.body.trim().is_empty() {
+        if row.body.plain() && !row.body.text.trim().is_empty() {
             let (body, layout) = if let Some(controls) = reply {
-                let (body, layout) = controls.selectable(id, &row.body, bubble_palette);
+                let (body, layout) = controls.selectable(id, &row.body.text, bubble_palette);
                 (body.min_w_0().max_w_full().into_any_element(), layout)
             } else {
-                let text = StyledText::new(row.body.clone());
+                let text = StyledText::new(row.body.text.clone());
                 let layout = text.layout().clone();
                 (
                     text_role(bubble_palette, TextRole::Body)
@@ -808,10 +1195,131 @@ fn message_row(
             text_layout = Some(layout);
             Some(body)
         } else {
-            quote_content(row, blocks, bubble_palette, peer, rows, index)
+            quote_content(
+                row,
+                &row.body.parts,
+                bubble_palette,
+                peer,
+                (rows, index),
+                FragmentContent::new(controls, extras.fragments, extras.app.as_deref_mut()),
+            )
         }
     };
-    let mut bubble = match (content, extras.accessory) {
+    let accessory = extras
+        .accessory
+        .or_else(|| {
+            if row.encrypted.is_some() || row.service.is_some() || row.date.is_none() {
+                return None;
+            }
+            let conversation = controls.conversation.clone()?;
+            let edit = controls.fragment_edit_topic == Some(row.topic)
+                && row.own
+                && !row.body.text.trim().is_empty();
+            let forward = row.body.can_forward && controls.fragments.is_some();
+            let edit_button = edit.then(|| {
+                let conversation = conversation.clone();
+                Button::new(
+                    (gpui::ElementId::from(id), "edit-fragments"),
+                    controls.locale.tr("message.edit"),
+                )
+                .render(bubble_palette, None, move |window, cx| {
+                    let _ = conversation
+                        .update(cx, |view, cx| view.edit_fragments(id, Some(window), cx));
+                })
+                .debug_selector(move || format!("edit-fragments-{id}"))
+            });
+            let forward_button = forward.then(|| {
+                Button::new(
+                    (gpui::ElementId::from(id), "forward-fragments"),
+                    controls.locale.tr("message.forward"),
+                )
+                .render(bubble_palette, None, move |window, cx| {
+                    cx.stop_propagation();
+                    let _ = conversation
+                        .update(cx, |view, cx| view.open_fragment_forward(id, window, cx));
+                })
+                .occlude()
+                .debug_selector(move || format!("forward-fragments-{id}"))
+            });
+            (edit || forward).then(|| {
+                div()
+                    .flex()
+                    .gap_1()
+                    .children(edit_button)
+                    .children(forward_button)
+                    .into_any_element()
+            })
+        })
+        .or_else(|| {
+            if row.date.is_none() || !readable {
+                return None;
+            }
+            let Some(EncryptedPresentation::Ready(access)) = &row.encrypted else {
+                return None;
+            };
+            let conversation = controls.conversation.clone()?;
+            let (copy, copy_access) = (conversation.clone(), access.clone());
+            let copy_button = Button::new(
+                (gpui::ElementId::from(id), "copy-protected-message"),
+                controls.locale.tr("composer.copy"),
+            )
+            .render(bubble_palette, None, move |_, cx| {
+                let _ = copy.update(cx, |view, cx| {
+                    view.copy_protected_body(id, &copy_access, cx)
+                });
+            })
+            .debug_selector(move || format!("copy-protected-message-{id}"));
+            let reply = controls.edit_protected.then(|| {
+                let (reply, reply_access) = (conversation.clone(), access.clone());
+                Button::new(
+                    (gpui::ElementId::from(id), "reply-protected-message"),
+                    controls.locale.tr("message.reply"),
+                )
+                .render(bubble_palette, None, move |window, cx| {
+                    let _ = reply.update(cx, |view, cx| {
+                        view.reply_to_protected_body(id, reply_access.clone(), window, cx)
+                    });
+                })
+                .debug_selector(move || format!("reply-protected-message-{id}"))
+            });
+            let edit = (controls.edit_protected && row.own).then(|| {
+                Button::new(
+                    (gpui::ElementId::from(id), "edit-protected-message"),
+                    controls.locale.tr("message.edit"),
+                )
+                .render(bubble_palette, None, move |window, cx| {
+                    let _ = conversation.update(cx, |view, cx| {
+                        view.open_protected_edit(id, Some(window), cx)
+                    });
+                })
+                .debug_selector(move || format!("edit-protected-message-{id}"))
+            });
+            Some(
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(copy_button)
+                    .children(reply)
+                    .children(edit)
+                    .into_any_element(),
+            )
+        })
+        .or_else(|| {
+            let canonical = row.retry_send?;
+            let conversation = controls.conversation.clone()?;
+            Some(
+                Button::new(
+                    (gpui::ElementId::from(id), "retry-protected-send"),
+                    controls.locale.tr("message.retrySend"),
+                )
+                .render(bubble_palette, None, move |_, cx| {
+                    let _ = conversation
+                        .update(cx, |view, cx| view.retry_protected_send(canonical, cx));
+                })
+                .into_any_element(),
+            )
+        });
+    let mut bubble = match (content, accessory) {
         (content, Some(accessory)) => {
             bubble.render_with_accessory(bubble_palette, content, row.ends_group, accessory)
         }
@@ -822,8 +1330,13 @@ fn message_row(
     if row.delivery == Some(DeliveryMark::Unknown) {
         bubble = bubble.debug_selector(|| "history-delivery-unknown".into());
     }
+    if readable {
+        bubble = bubble.debug_selector(move || format!("history-encrypted-{id}-readable"));
+    }
     let bubble = match reply {
-        Some(controls) => controls.row(id, bubble, palette).into_any_element(),
+        Some(reply) => reply
+            .row(id, bubble, palette, controls.locale)
+            .into_any_element(),
         None => bubble.into_any_element(),
     };
     let message = div()
@@ -832,10 +1345,7 @@ fn message_row(
         .items_end()
         .gap_2()
         .when(!row.own, |view| {
-            let avatar = peer
-                .and_then(|name| name.chars().next())
-                .map(|initial| initial.to_uppercase().collect::<String>())
-                .unwrap_or_default();
+            let avatar = peer.map(|peer| peer.initials.clone()).unwrap_or_default();
             view.child(div().w(px(40.)).flex_none().when(row.ends_group, |slot| {
                 let mut avatar = Avatar::from_initials(avatar);
                 avatar.image = photo;
@@ -850,105 +1360,472 @@ fn message_row(
     (message, text_layout)
 }
 
-/// Выбирает подписанного автора, не выдавая имя собеседника за участника канала.
-fn row_author(row: &Row, peer: Option<&str>) -> Option<String> {
-    if row.own {
-        Some("Вы".into())
+/// Показывает безопасную заглушку, сохраняя общее оформление и UUID пузыря.
+fn encrypted_placeholder(
+    id: Uuid,
+    failed: bool,
+    confirmed: bool,
+    palette: Palette,
+    controls: &HistoryControls,
+) -> AnyElement {
+    let locale = controls.locale;
+    let (icon, caption, retry) = if failed {
+        (
+            Icon::Error,
+            locale.tr("e2ee.messageDecryptError"),
+            controls.conversation.clone(),
+        )
     } else {
-        peer.map(str::to_owned)
-    }
-}
-
-/// Возвращает фрагменты подписи с исходными координатами для точного цитирования.
-fn media_caption_spans(row: &Row) -> Vec<Range<usize>> {
-    let mut previous = 0;
-    row.media
-        .iter()
-        .map(|reference| reference.range.clone())
-        .chain(std::iter::once(row.body.len()..row.body.len()))
-        .filter_map(|range| {
-            let start = previous;
-            previous = range.end;
-            let text = row.body.get(start..range.start)?;
-            let trimmed_start = text.trim_start();
-            let visible = trimmed_start.trim_end();
-            let start = start + text.len() - trimmed_start.len();
-            (!visible.is_empty()).then_some(start..start + visible.len())
+        (
+            Icon::Info,
+            locale.tr("desktop.messenger.history.encryptedMessage"),
+            None,
+        )
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .debug_selector(move || {
+            format!(
+                "history-encrypted-{id}-{}",
+                if failed { "failed" } else { "locked" }
+            )
         })
-        .collect()
+        .child(
+            div()
+                .flex()
+                .items_start()
+                .gap_1()
+                .child(icon.element(px(16.), palette.text_secondary))
+                .child(label(palette, TextRole::Body, caption)),
+        )
+        .children(retry.map(|conversation| {
+            Button::new(
+                (gpui::ElementId::from(id), "retry-encrypted"),
+                locale.tr("e2ee.retry"),
+            )
+            .render(palette, None, move |_, cx| {
+                let _ = conversation.update(cx, |view, cx| view.retry_encrypted(id, cx));
+            })
+        }))
+        .children((confirmed && controls.key_device.is_some()).then(|| {
+            let (action, caption) = if failed {
+                (
+                    KeyAction::Recover,
+                    locale.tr("desktop.messenger.history.requestReplacementKey"),
+                )
+            } else {
+                (KeyAction::Request, locale.tr("e2ee.requestAccess"))
+            };
+            key_action_row(id, &[(action, caption)], palette, controls)
+        }))
+        .into_any_element()
 }
 
-/// Скрывает в подписи только ссылки, которые уже отображены отдельными карточками.
-fn caption_without_media(row: &Row) -> String {
-    let mut caption = String::new();
-    let mut offset = 0;
-    for reference in &row.media {
-        if let Some(text) = row.body.get(offset..reference.range.start) {
-            caption.push_str(text);
-            offset = reference.range.end;
+/// Показывает действие и результат на той строке, где пользователь его начал.
+fn key_action_row(
+    id: Uuid,
+    actions: &[(KeyAction, &'static str)],
+    palette: Palette,
+    controls: &HistoryControls,
+) -> Div {
+    let locale = controls.locale;
+    let status = controls.key_actions.get(&id);
+    let terminal = matches!(
+        status,
+        Some(
+            KeyActionState::Running(_) | KeyActionState::Waiting(_) | KeyActionState::ReplySent(_)
+        )
+    );
+    let mut row = div().flex().flex_wrap().gap_1();
+    if let Some(conversation) = &controls.conversation {
+        for (action, caption) in actions.iter().copied() {
+            let target = conversation.clone();
+            let name = match action {
+                KeyAction::Request => "request-protected-key",
+                KeyAction::Recover => "recover-protected-key",
+                KeyAction::Grant => "grant-protected-key",
+                KeyAction::Reject => "reject-protected-key",
+            };
+            let mut button = Button::new((gpui::ElementId::from(id), name), caption);
+            button.disabled = terminal;
+            row = row.child(
+                button
+                    .render(palette, None, move |_, cx| {
+                        let _ = target.update(cx, |view, cx| view.key_action(id, action, cx));
+                    })
+                    .debug_selector(move || format!("{name}-{id}")),
+            );
         }
     }
-    caption.push_str(&row.body[offset..]);
-    caption
+    let explanation = match status {
+        Some(KeyActionState::Running(_)) => Some(locale.tr("message.sending")),
+        Some(KeyActionState::Waiting(_)) => {
+            Some(locale.tr("desktop.messenger.history.waitingForKeyReply"))
+        }
+        Some(KeyActionState::Rejected) => Some(locale.tr("e2ee.keyRejectTitle")),
+        Some(KeyActionState::ReplySent(
+            workspace_core::messenger::encryption::key_exchange::KeyRequestOutcome::Granted,
+        )) => Some(locale.tr("e2ee.serviceRequestGranted")),
+        Some(KeyActionState::ReplySent(
+            workspace_core::messenger::encryption::key_exchange::KeyRequestOutcome::Rejected,
+        )) => Some(locale.tr("desktop.messenger.history.requestDeclined")),
+        Some(KeyActionState::Unavailable) => {
+            Some(locale.tr("desktop.messenger.history.keyActionUnavailable"))
+        }
+        Some(KeyActionState::Failed) => {
+            Some(locale.tr("desktop.messenger.history.keyActionFailed"))
+        }
+        None => None,
+    };
+    row.children(explanation.map(|text| label(palette, TextRole::Caption, text)))
 }
 
-/// Показывает отдельные цитаты по контракту, сохраняя обычный пузырь для прочего текста.
+/// Подписывает служебную историю и предлагает ответ только на открытые запросы другого устройства.
+fn key_service_body(
+    id: Uuid,
+    service: &KeyServiceRow,
+    palette: Palette,
+    controls: &HistoryControls,
+) -> AnyElement {
+    let locale = controls.locale;
+    let caption = match service {
+        KeyServiceRow::Request { .. } => locale.tr("e2ee.keyRequestTitle"),
+        KeyServiceRow::Grant => locale.tr("e2ee.serviceRequestGranted"),
+        KeyServiceRow::Reject => locale.tr("e2ee.keyRejectTitle"),
+        KeyServiceRow::Announced => locale.tr("desktop.messenger.history.chatKeyUpdated"),
+    };
+    let mut body = div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .min_w_0()
+        .child(label(palette, TextRole::Body, caption))
+        .debug_selector(move || format!("history-key-service-{id}"));
+    if let KeyServiceRow::Request { device, name } = service {
+        body = body.child(label(palette, TextRole::Caption, name.clone()));
+        if controls
+            .key_device
+            .as_ref()
+            .is_some_and(|local| local != device)
+            && let Some(permission) = controls.key_permissions.get(&id)
+        {
+            let mut actions = Vec::new();
+            if permission.grant {
+                actions.push((KeyAction::Grant, locale.tr("e2ee.serviceTransferKey")));
+            }
+            if permission.reject {
+                actions.push((KeyAction::Reject, locale.tr("e2ee.rejectAccess")));
+            }
+            body = body.child(key_action_row(id, &actions, palette, controls));
+        }
+    }
+    body.into_any_element()
+}
+
+/// Выбирает подписанного автора, не выдавая имя собеседника за участника канала.
+fn row_author(row: &Row, peer: Option<&str>) -> Option<ReplyText> {
+    if row.own {
+        Some(ReplyText::Label("common.you"))
+    } else {
+        peer.map(|name| ReplyText::Source(name.to_owned()))
+    }
+}
+
+/// Передаёт только возможности текущего экрана и кэш видимых элементов.
+struct FragmentContent<'a> {
+    views: Option<&'a FragmentViews>, // Ячейки с отдельным состоянием спойлеров.
+    runtime: Option<&'a FragmentRuntime>, // Действующий владелец рабочего запроса.
+    app: Option<&'a mut App>,         // Контекст при создании элемента из строки списка.
+    locale: Language,                 // Язык нейтрального заполнителя.
+    conversation: Option<&'a WeakEntity<Conversation>>, // Владелец переходов к оригиналам.
+}
+
+impl<'a> FragmentContent<'a> {
+    /// Связывает одну раскладку тела с её рабочим экраном.
+    fn new(
+        controls: &'a HistoryControls,
+        views: Option<&'a FragmentViews>,
+        app: Option<&'a mut App>,
+    ) -> Self {
+        Self {
+            views,
+            runtime: controls.fragments.as_ref(),
+            app,
+            locale: controls.locale,
+            conversation: controls.conversation.as_ref(),
+        }
+    }
+
+    /// Показывает один спойлер, скрывая адрес даже в истории без исполнительного процесса.
+    fn render(
+        &mut self,
+        slot: (Uuid, usize),
+        reference: Option<&workspace_core::messenger::encryption::fragments::FragmentReference>,
+        palette: Palette,
+    ) -> AnyElement {
+        if let Some(views) = self.views {
+            return views.element(
+                slot,
+                reference,
+                self.runtime,
+                palette,
+                self.locale,
+                self.app.as_deref_mut(),
+            );
+        }
+        label(
+            palette,
+            TextRole::Caption,
+            self.locale.tr("e2ee.secretFragment"),
+        )
+        .into_any_element()
+    }
+}
+
+/// Ставит спойлеры рядом с открытыми кусками и оставляет цитаты отдельными блоками.
 fn quote_content(
     row: &Row,
-    blocks: Vec<Block<'_>>,
+    blocks: &[BodyPart],
     palette: Palette,
-    peer: Option<&str>,
-    rows: &[Row],
-    index: &HashMap<Uuid, usize>,
+    peer: Option<&PeerLabel>,
+    (rows, index): (&[Row], &HashMap<Uuid, usize>),
+    mut fragments: FragmentContent<'_>,
 ) -> Option<gpui::AnyElement> {
-    if matches!(blocks.as_slice(), [Block::Text(_)]) {
+    if !row.body.has_fragments && matches!(blocks, [BodyPart::Text(_)]) {
         return None;
     }
-    Some(
-        div()
-            .flex()
-            .flex_col()
-            .min_w_0()
-            // Заголовок цитаты рисуется внутри canvas и не задаёт собственную ширину.
-            // Даём ему место даже рядом с коротким ответом или фрагментом.
-            .w(px(312.))
-            .max_w_full()
-            .gap_1()
-            .children(
-                blocks
-                    .into_iter()
-                    .enumerate()
-                    .map(|(position, block)| match block {
-                        Block::Text(text) => label(palette, TextRole::Body, text.to_owned()),
-                        Block::Quote(reference) => {
-                            let source = index
-                                .get(&reference.message_id)
-                                .map(|&index| &rows[index])
-                                .filter(|source| source.id != row.id && source.date.is_some());
-                            let author = source
-                                .and_then(|source| row_author(source, peer))
-                                .unwrap_or(reference.author);
-                            let snippet = reference.fragment.unwrap_or_else(|| {
-                                source.map_or_else(String::new, |source| excerpt(&source.body))
-                            });
-                            let id = row.id;
-                            history_quote(palette, row.own, author, snippet, source.is_some())
-                                .debug_selector(move || format!("history-quote-{id}-{position}"))
+    let mut body = div()
+        .flex()
+        .flex_col()
+        .min_w_0()
+        .w(px(312.))
+        .max_w_full()
+        .gap_1();
+    let mut inline = Vec::new();
+    let id = row.id;
+    for (position, block) in blocks.iter().enumerate() {
+        match block {
+            BodyPart::Text(text) if row.body.has_fragments => inline.push(
+                label(palette, TextRole::Body, text.clone())
+                    .min_w_0()
+                    .into_any_element(),
+            ),
+            BodyPart::Text(text) => body = body.child(label(palette, TextRole::Body, text.clone())),
+            BodyPart::Fragment { slot, reference } => {
+                inline.push(fragments.render((id, *slot), reference.as_ref(), palette))
+            }
+            BodyPart::Forward(forward) => {
+                if !inline.is_empty() {
+                    body = body.child(fragment_line(std::mem::take(&mut inline)));
+                }
+                body = body.child(forward_card(
+                    id,
+                    position,
+                    forward.as_ref(),
+                    palette,
+                    &mut fragments,
+                ));
+            }
+            BodyPart::Quote {
+                id: source_id,
+                author,
+                fragment,
+            } => {
+                if !inline.is_empty() {
+                    body = body.child(fragment_line(std::mem::take(&mut inline)));
+                }
+                let source = index
+                    .get(source_id)
+                    .map(|&index| &rows[index])
+                    .filter(|source| {
+                        source.id != id
+                            && source.date.is_some()
+                            && source.encrypted.is_none()
+                            && source.service.is_none()
+                    });
+                let author = source
+                    .and_then(|source| {
+                        if source.own {
+                            Some(fragments.locale.tr("common.you").into())
+                        } else {
+                            peer.map(|peer| peer.name.clone())
                         }
-                    }),
-            )
-            .into_any_element(),
-    )
+                    })
+                    .unwrap_or_else(|| author.clone());
+                let snippet = fragment
+                    .clone()
+                    .filter(|text| {
+                        workspace_core::messenger::encryption::fragments::fragment_display_spans(
+                            text,
+                        )
+                        .is_empty()
+                            && workspace_core::messenger::forward::forward_spans(text).is_empty()
+                    })
+                    .or_else(|| source.map(|source| source.body.excerpt(fragments.locale)))
+                    .unwrap_or_default();
+                body = body.child(
+                    history_quote(
+                        palette,
+                        row.own,
+                        author,
+                        snippet,
+                        source.is_some(),
+                        fragments.locale,
+                    )
+                    .debug_selector(move || format!("history-quote-{id}-{position}")),
+                );
+            }
+        }
+    }
+    if !inline.is_empty() {
+        body = body.child(fragment_line(inline));
+    }
+    Some(body.into_any_element())
+}
+
+/// Рисует снимок пересылки. Спойлеры сохраняют исходные чаты и свои отдельные слоты.
+fn forward_card(
+    id: Uuid,
+    position: usize,
+    reference: Option<&ForwardBody>,
+    palette: Palette,
+    fragments: &mut FragmentContent<'_>,
+) -> gpui::Stateful<Div> {
+    let mut card = div()
+        .id(("forward-card", position))
+        .flex()
+        .flex_col()
+        .min_w_0()
+        .gap_1()
+        .px_2()
+        .py_1()
+        .border_l_2()
+        .border_color(palette.accent)
+        .child(label(
+            palette,
+            TextRole::Caption,
+            fragments.locale.tr("message.forwarded"),
+        ));
+    let Some(reference) = reference else {
+        return card;
+    };
+    if !reference.author.is_empty() {
+        card = card.child(label(palette, TextRole::Label, reference.author.clone()));
+    }
+    if let Some(source) = &reference.source {
+        card = card.child(label(palette, TextRole::Caption, source.clone()));
+    }
+    if let Some(conversation) = fragments.conversation.cloned() {
+        let target = reference.id;
+        let mut open = Button::new(
+            (gpui::ElementId::from(target), "open-forward-original"),
+            fragments.locale.tr("message.openForwardOriginal"),
+        );
+        open.appearance = crate::gpui_client::ui::ButtonAppearance::Ghost;
+        card = card.child(
+            open.render(palette, None, move |_, cx| {
+                cx.stop_propagation();
+                let _ =
+                    conversation.update(cx, |view, cx| view.open_forward_original(id, target, cx));
+            })
+            .occlude()
+            .debug_selector(move || format!("forward-original-{id}-{target}")),
+        );
+    }
+    let mut inline = Vec::new();
+    for (position, part) in reference.parts.iter().enumerate() {
+        match part {
+            BodyPart::Text(text) => {
+                inline.push(
+                    label(palette, TextRole::Body, text.clone())
+                        .min_w_0()
+                        .into_any_element(),
+                );
+            }
+            BodyPart::Fragment { slot, reference } => {
+                inline.push(fragments.render((id, *slot), reference.as_ref(), palette));
+            }
+            BodyPart::Quote { author, .. } => {
+                inline.push(label(palette, TextRole::Caption, author.clone()).into_any_element());
+            }
+            BodyPart::Forward(reference) => {
+                if !inline.is_empty() {
+                    card = card.child(fragment_line(std::mem::take(&mut inline)));
+                }
+                card = card.child(forward_card(
+                    id,
+                    position,
+                    reference.as_ref(),
+                    palette,
+                    fragments,
+                ));
+            }
+        }
+    }
+    if !inline.is_empty() {
+        card = card.child(fragment_line(inline));
+    }
+    card
+}
+
+/// Укладывает открытый текст и фрагменты в строки доступной ширины бабла.
+fn fragment_line(children: Vec<AnyElement>) -> Div {
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .min_w_0()
+        .gap_1()
+        .children(children)
 }
 
 /// Готовит историю и добавляет уникальные строки очереди только после подтверждённого хвоста.
-fn build_rows(history: &HistoryWindow, outbox: &[OutboxEntry], user: Option<Uuid>) -> Vec<Row> {
+fn build_rows(
+    history: &HistoryWindow,
+    outbox: &[OutboxEntry],
+    user: Option<Uuid>,
+    encryption: Option<&HistoryEncryption>,
+    prepared: &mut HashMap<Uuid, CachedBody>,
+) -> Vec<Row> {
     let mut rows: Vec<_> = history
         .messages
         .iter()
         .map(|message| {
             let own = user.is_some() && message.metadata.author_id == user;
+            let (encrypted, text) = match &message.body {
+                MessageBody::Markdown(text) => (None, text.as_str()),
+                MessageBody::Encrypted { .. } => {
+                    let state = encryption
+                        .and_then(|encryption| encryption.presentation(message.id))
+                        .cloned()
+                        .unwrap_or(EncryptedPresentation::Locked);
+                    (Some(state), "")
+                }
+                MessageBody::KeyService { .. } => (None, ""),
+            };
+            let service = match &message.body {
+                MessageBody::KeyService { payload, .. } => Some(match payload {
+                    KeyServicePayload::Request {
+                        device_id,
+                        device_name,
+                        ..
+                    } => KeyServiceRow::Request {
+                        device: device_id.clone(),
+                        name: device_name.clone(),
+                    },
+                    KeyServicePayload::Grant { .. } => KeyServiceRow::Grant,
+                    KeyServicePayload::Reject(_) => KeyServiceRow::Reject,
+                    KeyServicePayload::Announced { .. } => KeyServiceRow::Announced,
+                }),
+                _ => None,
+            };
             let stamp = message.metadata.created_at.as_str();
+            let (body, media) =
+                prepare_row_body(prepared, message.id, text, true, encrypted.is_some());
+            let plain_text =
+                encrypted.is_none() && service.is_none() && media.is_empty() && body.plain();
             Row {
                 id: message.id,
                 own,
@@ -960,9 +1837,13 @@ fn build_rows(history: &HistoryWindow, outbox: &[OutboxEntry], user: Option<Uuid
                     &stamp[5..7],
                     &stamp[0..4]
                 )),
-                body: message.text.clone(),
-                media: media_references(&message.text),
-                time: Some(stamp[11..16].to_owned()),
+                body,
+                encrypted,
+                service,
+                retry_send: None,
+                plain_text,
+                media,
+                time: RowTime::Sent(stamp[11..16].to_owned()),
                 delivery: own.then_some(DeliveryMark::Sent),
                 starts_day: false,
                 starts_group: false,
@@ -976,25 +1857,56 @@ fn build_rows(history: &HistoryWindow, outbox: &[OutboxEntry], user: Option<Uuid
             outbox
                 .iter()
                 .filter(|entry| seen.insert(entry.snapshot.public_id))
-                .map(|entry| Row {
-                    id: entry.snapshot.public_id,
-                    own: true,
-                    author: user,
-                    topic: entry.snapshot.topic_id,
-                    date: None,
-                    body: entry.snapshot.markdown.clone(),
-                    media: Vec::new(),
-                    time: Some(delivery_caption(entry.status).into()),
-                    delivery: Some(match entry.status {
-                        DeliveryStatus::Waiting | DeliveryStatus::Sending => DeliveryMark::Pending,
-                        DeliveryStatus::Unknown => DeliveryMark::Unknown,
-                        DeliveryStatus::Blocked(_) | DeliveryStatus::Rejected(_) => {
-                            DeliveryMark::Failed
-                        }
-                    }),
-                    starts_day: false,
-                    starts_group: false,
-                    ends_group: false,
+                .map(|entry| {
+                    let id = entry.snapshot.public_id;
+                    let encrypted = entry.snapshot.body.markdown().is_none();
+                    let state = encrypted.then(|| {
+                        encryption
+                            .and_then(|scope| scope.presentation(id))
+                            .cloned()
+                            .unwrap_or(EncryptedPresentation::Locked)
+                    });
+                    let retry_send = (encrypted
+                        && matches!(
+                            entry.status,
+                            DeliveryStatus::Unknown
+                                | DeliveryStatus::Blocked(_)
+                                | DeliveryStatus::Rejected(_)
+                        ))
+                    .then_some(entry.snapshot.canonical_id);
+                    Row {
+                        id,
+                        own: true,
+                        author: user,
+                        topic: entry.snapshot.topic_id,
+                        date: None,
+                        body: prepare_row_body(
+                            prepared,
+                            entry.snapshot.public_id,
+                            entry.snapshot.body.markdown().unwrap_or_default(),
+                            false,
+                            encrypted,
+                        )
+                        .0,
+                        encrypted: state,
+                        service: None,
+                        retry_send,
+                        plain_text: false,
+                        media: Vec::new(),
+                        time: RowTime::Pending(delivery_caption_key(entry.status)),
+                        delivery: Some(match entry.status {
+                            DeliveryStatus::Waiting | DeliveryStatus::Sending => {
+                                DeliveryMark::Pending
+                            }
+                            DeliveryStatus::Unknown => DeliveryMark::Unknown,
+                            DeliveryStatus::Blocked(_) | DeliveryStatus::Rejected(_) => {
+                                DeliveryMark::Failed
+                            }
+                        }),
+                        starts_day: false,
+                        starts_group: false,
+                        ends_group: false,
+                    }
                 }),
         );
     }
@@ -1013,16 +1925,49 @@ fn build_rows(history: &HistoryWindow, outbox: &[OutboxEntry], user: Option<Uuid
     rows
 }
 
-/// Подписывает временную строку до подтверждения, чтобы ожидание и неизвестный исход различались.
-fn delivery_caption(status: DeliveryStatus) -> &'static str {
+/// Переиспользует разбор того же UUID, тела и вида строки после новой страницы или события.
+fn prepare_row_body(
+    cache: &mut HashMap<Uuid, CachedBody>,
+    id: Uuid,
+    text: &str,
+    confirmed: bool,
+    encrypted: bool,
+) -> (Rc<Body>, Vec<MediaReference>) {
+    if let Some(previous) = cache.get(&id).filter(|row| {
+        row.confirmed == confirmed && row.encrypted == encrypted && row.body.text.as_ref() == text
+    }) {
+        return (previous.body.clone(), previous.media.clone());
+    }
+    let media = if confirmed && !encrypted {
+        media_references(text)
+    } else {
+        Vec::new()
+    };
+    let body = Rc::new(Body::new(text, &media));
+    cache.insert(
+        id,
+        CachedBody {
+            body: body.clone(),
+            media: media.clone(),
+            confirmed,
+            encrypted,
+        },
+    );
+    (body, media)
+}
+
+/// Определяет подпись очереди, чтобы ожидание и неизвестный исход различались.
+fn delivery_caption_key(status: DeliveryStatus) -> &'static str {
     match status {
-        DeliveryStatus::Waiting => "В очереди",
-        DeliveryStatus::Sending => "Отправляется…",
-        DeliveryStatus::Unknown => "Исход неизвестен. Ищем сообщение",
-        DeliveryStatus::Blocked(SendBlock::AccessLost) => "Чат или тема недоступны",
-        DeliveryStatus::Blocked(SendBlock::EncryptionUnavailable) => {
-            "Отправка открытого текста недоступна"
+        DeliveryStatus::Waiting => "desktop.messenger.history.deliveryQueued",
+        DeliveryStatus::Sending => "message.sending",
+        DeliveryStatus::Unknown => "desktop.messenger.history.deliveryUnknown",
+        DeliveryStatus::Blocked(SendBlock::AccessLost) => {
+            "desktop.messenger.history.deliveryNoAccess"
         }
-        DeliveryStatus::Rejected(_) => "Не отправлено",
+        DeliveryStatus::Blocked(SendBlock::EncryptionUnavailable) => {
+            "desktop.messenger.history.deliveryPlaintextUnavailable"
+        }
+        DeliveryStatus::Rejected(_) => "desktop.messenger.history.deliveryRejected",
     }
 }

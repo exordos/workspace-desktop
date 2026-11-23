@@ -23,7 +23,7 @@ pub struct MessageTarget {
 
 impl MessageTarget {
     /// Проверяет, что указаны все UUID и что тема входит в область истории.
-    fn is_valid(self) -> bool {
+    pub(super) fn is_valid(self) -> bool {
         !self.scope.stream_id.is_nil()
             && !self.topic_id.is_nil()
             && !self.message_id.is_nil()

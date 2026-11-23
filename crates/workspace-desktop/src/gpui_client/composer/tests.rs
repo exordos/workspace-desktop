@@ -11,7 +11,9 @@ use gpui::{
 };
 use workspace_core::{
     context::{AccountId, OwnerContext, SessionGeneration},
-    storage::{DeliveryStatus, HistoryMessage, HistoryMetadata, HistoryTime, PreparedSend},
+    storage::{
+        DeliveryStatus, HistoryMessage, HistoryMetadata, HistoryTime, MessageBody, PreparedSend,
+    },
 };
 
 use crate::gpui_client::{
@@ -148,7 +150,7 @@ fn conversation(
         drop(cache);
         send_request(&history, (address, load))
     });
-    let mut view = Conversation::with_source(address, source, None, cx);
+    let mut view = Conversation::with_source(address, source, None, None, cx);
     view.attach_composer(
         SendSource {
             resolve: Arc::new(move |address, _| {
@@ -159,8 +161,11 @@ fn conversation(
                         address: reply.address,
                         value: reply.value.map(|topic| {
                             crate::gpui_client::composer::ResolvedDestination {
+                                encrypted: false,
                                 topic,
                                 closed: false,
+                                plain_target: None,
+                                restored_protected: false,
                                 draft: None,
                             }
                         }),
@@ -631,7 +636,7 @@ fn editor_growth_preserves_reading_anchor_and_tail(cx: &mut TestAppContext) {
             id: Uuid::from_u128(index),
             stream_id,
             topic_id: TOPIC,
-            text: "Синтетическая строка".into(),
+            body: MessageBody::Markdown("Синтетическая строка".into()),
             metadata: HistoryMetadata {
                 author_id: Some(Uuid::from_u128(900)),
                 created_at: HistoryTime::parse("2026-11-17T07:10:30Z").unwrap(),
@@ -807,7 +812,7 @@ fn keeps_unknown_delivery_and_deduplicates_after_confirmation(cx: &mut TestAppCo
         public_id: MESSAGE,
         stream_id: scope.stream_id,
         topic_id: TOPIC,
-        markdown: request.input.markdown.clone(),
+        body: workspace_core::storage::PreparedSendBody::Markdown(request.input.markdown.clone()),
     };
     saved(request, Some(MESSAGE), ui);
     let waiting = OutboxEntry {
@@ -836,7 +841,7 @@ fn keeps_unknown_delivery_and_deduplicates_after_confirmation(cx: &mut TestAppCo
         id: MESSAGE,
         stream_id: scope.stream_id,
         topic_id: TOPIC,
-        text: "Проверка отправки".into(),
+        body: MessageBody::Markdown("Проверка отправки".into()),
         metadata: HistoryMetadata {
             author_id: Some(Uuid::from_u128(900)),
             created_at: HistoryTime::parse("2026-11-17T07:10:30Z").unwrap(),

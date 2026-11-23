@@ -2,9 +2,13 @@
 //! Также разбирает общий формат событий, который используют HTTP и WebSocket.
 
 mod folders;
+mod fragments;
+mod key_lifecycle;
+mod key_service;
 mod message_actions;
 pub(super) mod mutations;
 mod own_profile;
+mod protected_drafts;
 pub(super) mod sidebar;
 
 use std::{collections::HashSet, time::Duration};
@@ -22,7 +26,8 @@ use crate::{
     runtime::SourceError,
     storage::{
         Cursor, FolderChange, HistoryChange, HistoryEdge, HistoryMessage, HistoryMetadata,
-        HistoryScope, HistoryTime, Message, MessagePlacement,
+        HistoryScope, HistoryTime, KeyServicePayload, Message, MessageBody, MessagePlacement,
+        PreparedSendBody,
     },
     sync::{AvatarUpdate, Event},
 };
@@ -31,7 +36,7 @@ use super::catalog::CatalogCounts;
 use super::details::{DetailsError, StreamNotificationMode, TopicNotificationMode};
 use super::history::OpenHistoryError;
 use super::read::ReadError;
-use super::send::{DirectSendError, SendError};
+use super::send::{DirectSendError, MarkdownOrigin, SendError};
 use crate::storage::PreparedSend;
 
 const MESSAGES_PATH: &str = "/api/workspace/v1/messenger/messages/";
@@ -127,11 +132,15 @@ impl RestClient {
             || row.stream_uuid != snapshot.stream_id
             || row.topic_uuid != snapshot.topic_id
             || row.author_uuid != author
+            || (snapshot.body.markdown().is_none()
+                && check_explicit_owner(owner, row.project_id.as_deref(), row.user_uuid.as_deref())
+                    .is_err())
         {
             return Err(SendError::Unknown);
         }
         row.into_history(owner, snapshot.stream_id)
             .map_err(|_| SendError::Unknown)?
+            .filter(|message| snapshot.body.matches_message(&message.body))
             .ok_or(SendError::Unknown)
     }
 
@@ -152,6 +161,40 @@ impl RestClient {
             return Err(SendError::InvalidInput);
         }
         url.set_path(MESSAGES_PATH);
+        if matches!(&snapshot.body, PreparedSendBody::Markdown(text) if super::encryption::fragments::has_protected_draft(text))
+        {
+            let stream = self
+                .stream_access(owner, token, snapshot.stream_id)
+                .await
+                .map_err(|_| SendError::InvalidInput)?;
+            if stream.check_plain_send().is_err()
+                || stream.markdown_origin(owner) != MarkdownOrigin::External
+            {
+                return Err(SendError::InvalidInput);
+            }
+        }
+        if matches!(&snapshot.body, PreparedSendBody::Markdown(text) if super::forward::has_forwarded_fragment(text))
+        {
+            let scope = HistoryScope {
+                stream_id: snapshot.stream_id,
+                topic_id: Some(snapshot.topic_id),
+            };
+            match self.fragment_send_topic(owner, token, scope).await {
+                Ok(topic_id) if topic_id == snapshot.topic_id => {}
+                Err(DirectSendError::Source(SourceError::Temporary)) => {
+                    return Err(SendError::Unknown);
+                }
+                _ => return Err(SendError::InvalidInput),
+            }
+        }
+        let payload = match &snapshot.body {
+            PreparedSendBody::Markdown(text) => {
+                serde_json::json!({"kind": "markdown", "content": text})
+            }
+            PreparedSendBody::Encrypted {
+                key_id, ciphertext, ..
+            } => encrypted_payload(*key_id, ciphertext),
+        };
         let response = self
             .send
             .post(url)
@@ -161,7 +204,7 @@ impl RestClient {
                 "uuid": snapshot.canonical_id,
                 "stream_uuid": snapshot.stream_id,
                 "topic_uuid": snapshot.topic_id,
-                "payload": { "kind": "markdown", "content": snapshot.markdown },
+                "payload": payload,
             }))
             .send()
             .await
@@ -178,13 +221,18 @@ impl RestClient {
             return Err(SendError::Unknown);
         }
         let row: WireHistoryMessage = response.json().await.map_err(|_| SendError::Unknown)?;
-        if row.uuid != snapshot.public_id {
+        if row.uuid != snapshot.public_id
+            || (snapshot.body.markdown().is_none()
+                && check_explicit_owner(owner, row.project_id.as_deref(), row.user_uuid.as_deref())
+                    .is_err())
+        {
             return Err(SendError::Unknown);
         }
         // Маршрут ответа сохраняем как пришёл: сообщение могло быть перенесено.
         let stream = row.stream_uuid;
         row.into_history(owner, stream)
             .map_err(|_| SendError::Unknown)?
+            .filter(|message| snapshot.body.matches_message(&message.body))
             .ok_or(SendError::Unknown)
     }
 
@@ -222,14 +270,18 @@ impl RestClient {
         &self,
         server: &str,
     ) -> Result<Option<String>, SourceError> {
-        let mut url = https_origin(server)?;
-        url.set_path(SERVER_SETTINGS_PATH);
-        let settings: Value =
-            get_json(self.read.get(url).header(ACCEPT, "application/json")).await?;
+        let settings = self.public_settings(server).await?;
         Ok(settings
             .get("registration_url")
             .and_then(Value::as_str)
             .and_then(registration_target))
+    }
+
+    /// Читает публичную конфигурацию организации без передачи токена.
+    pub(super) async fn public_settings(&self, server: &str) -> Result<Value, SourceError> {
+        let mut url = https_origin(server)?;
+        url.set_path(SERVER_SETTINGS_PATH);
+        get_json(self.read.get(url).header(ACCEPT, "application/json")).await
     }
 
     /// Получает текущую позицию журнала, с которой начинается первый запуск.
@@ -392,6 +444,18 @@ impl RestClient {
         token: &str,
         stream: Uuid,
     ) -> Result<Uuid, DirectSendError> {
+        self.direct_markdown_target(owner, token, stream)
+            .await
+            .map(|(topic, _)| topic)
+    }
+
+    /// Читает ту же тему лички и определяет происхождение Markdown.
+    pub(super) async fn direct_markdown_target(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        stream: Uuid,
+    ) -> Result<(Uuid, MarkdownOrigin), DirectSendError> {
         let row = self.direct_stream(owner, token, stream).await?;
         row.check_plain_send()?;
         row.default_topic_uuid
@@ -399,6 +463,7 @@ impl RestClient {
             .and_then(Value::as_str)
             .and_then(parse_uuid)
             .filter(|topic| !topic.is_nil())
+            .map(|topic| (topic, row.markdown_origin(owner)))
             .ok_or(DirectSendError::TopicUnavailable)
     }
 
@@ -411,6 +476,20 @@ impl RestClient {
         topic: Uuid,
         queued: bool,
     ) -> Result<(), DirectSendError> {
+        self.check_markdown_topic(owner, token, stream, topic, queued)
+            .await
+            .map(|_| ())
+    }
+
+    /// Проверяет обычную отправку и сообщает происхождение того же стрима.
+    pub(super) async fn check_markdown_topic(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        stream: Uuid,
+        topic: Uuid,
+        queued: bool,
+    ) -> Result<MarkdownOrigin, DirectSendError> {
         if topic.is_nil() {
             return Err(DirectSendError::TopicUnavailable);
         }
@@ -420,7 +499,7 @@ impl RestClient {
         if row.is_direct() {
             // Сохранённую тему лички перепроверяем без пересчёта темы по умолчанию.
             return if queued {
-                row.check_plain_send()
+                row.check_plain_send().map(|()| row.markdown_origin(owner))
             } else {
                 Err(DirectSendError::AccessLost)
             };
@@ -435,10 +514,69 @@ impl RestClient {
         }
         row.check_plain_send()?;
         match topic.is_done {
-            Some(false) => Ok(()),
+            Some(false) => Ok(row.markdown_origin(owner)),
             Some(true) => Err(DirectSendError::TopicClosed),
             None => Err(SourceError::InvalidResponse.into()),
         }
+    }
+
+    /// Подтверждает принадлежность и защищённый режим цели перед работой с локальным ключом.
+    pub(super) async fn encrypted_send_target(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        scope: HistoryScope,
+    ) -> Result<(Uuid, Uuid), DirectSendError> {
+        let stream = self.stream_access(owner, token, scope.stream_id).await?;
+        check_explicit_owner(
+            owner,
+            stream.project_id.as_deref(),
+            stream.user_uuid.as_deref(),
+        )?;
+        if stream.is_archived {
+            return Err(DirectSendError::AccessLost);
+        }
+        if stream.source_name.as_deref() != Some("native")
+            || stream.encryption != Some(Value::Bool(true))
+        {
+            return Err(DirectSendError::EncryptionUnavailable);
+        }
+        let direct = stream.is_direct();
+        if stream.direct_user_uuid.is_some() && !direct {
+            return Err(SourceError::InvalidResponse.into());
+        }
+        let default_topic = stream
+            .default_topic_uuid
+            .as_ref()
+            .and_then(Value::as_str)
+            .and_then(parse_uuid);
+        let topic_id = scope
+            .topic_id
+            .or(default_topic.filter(|_| direct))
+            .filter(|id| !id.is_nil())
+            .ok_or(DirectSendError::TopicUnavailable)?;
+        let topic = self
+            .topic_access(owner, token, scope.stream_id, topic_id)
+            .await?;
+        check_explicit_owner(
+            owner,
+            topic.project_id.as_deref(),
+            topic.user_uuid.as_deref(),
+        )?;
+        match topic.is_done {
+            Some(false) => {}
+            Some(true) => return Err(DirectSendError::TopicClosed),
+            None if direct => {}
+            None => return Err(SourceError::InvalidResponse.into()),
+        }
+        let current = stream
+            .current_encryption_key_uuid
+            .as_ref()
+            .and_then(Value::as_str)
+            .and_then(parse_uuid)
+            .filter(|id| !id.is_nil())
+            .ok_or(DirectSendError::EncryptionUnavailable)?;
+        Ok((topic_id, current))
     }
 
     /// Подтверждает, что тема нужного стрима видна владельцу токена.
@@ -490,7 +628,7 @@ impl RestClient {
     }
 
     /// Повторно проверяет доступ к выбранной области после ошибки сообщения.
-    async fn check_history_scope(
+    pub(super) async fn check_history_scope(
         &self,
         owner: &OwnerContext,
         token: &str,
@@ -508,7 +646,7 @@ impl RestClient {
         }
     }
 
-    /// Проверяет, что целевое текстовое сообщение ещё доступно в этом разговоре.
+    /// Проверяет, что целевое сообщение ещё доступно в этом разговоре.
     pub(super) async fn history_anchor(
         &self,
         owner: &OwnerContext,
@@ -516,13 +654,81 @@ impl RestClient {
         scope: HistoryScope,
         anchor: Uuid,
     ) -> Result<HistoryMessage, OpenHistoryError> {
-        let stream = scope.stream_id;
+        self.history_anchor_row(owner, token, Some(scope), anchor)
+            .await?
+            .into_history(owner, scope.stream_id)?
+            .ok_or(OpenHistoryError::MessageMissing)
+    }
+
+    /// Читает оригинал для превью на экране с обязательным подтверждением его владельца.
+    pub(super) async fn presentation_anchor(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        scope: Option<HistoryScope>,
+        anchor: Uuid,
+    ) -> Result<HistoryMessage, OpenHistoryError> {
+        self.history_anchor_row(owner, token, scope, anchor)
+            .await?
+            .into_presentation(owner)?
+            .ok_or(OpenHistoryError::MessageMissing)
+    }
+
+    /// Подтверждает явную проекцию точной темы оригинала для прочтения вне открытой ленты.
+    pub(super) async fn check_presentation_topic(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        stream_id: Uuid,
+        topic_id: Uuid,
+    ) -> Result<(), OpenHistoryError> {
+        let topic = self.topic_access(owner, token, stream_id, topic_id).await?;
+        check_explicit_owner(
+            owner,
+            topic.project_id.as_deref(),
+            topic.user_uuid.as_deref(),
+        )?;
+        Ok(())
+    }
+
+    /// Определяет вид подтверждённого разговора для открытия точного сообщения.
+    pub(super) async fn presentation_scope(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        message: &HistoryMessage,
+    ) -> Result<HistoryScope, OpenHistoryError> {
+        let stream = self.stream_access(owner, token, message.stream_id).await?;
+        check_explicit_owner(
+            owner,
+            stream.project_id.as_deref(),
+            stream.user_uuid.as_deref(),
+        )?;
+        if stream.is_archived || (stream.direct_user_uuid.is_some() && !stream.is_direct()) {
+            return Err(OpenHistoryError::AccessLost);
+        }
+        Ok(HistoryScope {
+            stream_id: message.stream_id,
+            topic_id: (!stream.is_direct()).then_some(message.topic_id),
+        })
+    }
+
+    /// Загружает точное размещение сообщения и проверяет его до разбора тела.
+    async fn history_anchor_row(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        scope: Option<HistoryScope>,
+        anchor: Uuid,
+    ) -> Result<WireHistoryMessage, OpenHistoryError> {
         let request = self.request(owner, token, &format!("{MESSAGES_PATH}{anchor}"))?;
         let response = request.send().await.map_err(request_error)?;
         match response.status() {
             StatusCode::NOT_FOUND => {
                 // API скрывает недоступные сообщения за 404. Перечитываем доступ к чату.
-                self.check_history_scope(owner, token, scope).await?;
+                if let Some(scope) = scope {
+                    self.check_history_scope(owner, token, scope).await?;
+                }
                 return Err(OpenHistoryError::MessageMissing);
             }
             StatusCode::FORBIDDEN => return Err(OpenHistoryError::AccessLost),
@@ -530,13 +736,14 @@ impl RestClient {
         }
         let row: WireHistoryMessage = response.json().await.map_err(request_error)?;
         if row.uuid != anchor
-            || row.stream_uuid != stream
-            || scope.topic_id.is_some_and(|topic| row.topic_uuid != topic)
+            || scope.is_some_and(|scope| {
+                row.stream_uuid != scope.stream_id
+                    || scope.topic_id.is_some_and(|topic| row.topic_uuid != topic)
+            })
         {
             return Err(OpenHistoryError::MessageMissing);
         }
-        row.into_history(owner, stream)?
-            .ok_or(OpenHistoryError::MessageMissing)
+        Ok(row)
     }
 
     /// Читает соседние страницы по публичному UUID и сохраняет маркер каждого края.
@@ -902,8 +1109,9 @@ struct WireEnvelope {
 /// Вложенные данные события из JSON.
 #[derive(Deserialize)]
 struct WirePayload {
-    kind: String,                      // Название события, например `message.created`.
-    uuid: Option<String>,              // Идентификатор объекта. Для нового сообщения обязателен.
+    kind: String,                           // Название события, например `message.created`.
+    uuid: Option<String>, // Идентификатор объекта. Для нового сообщения обязателен.
+    canonical_message_uuid: Option<String>, // Внутренний UUID, если источник передал его вместе с размещением.
     project_id: Option<String>, // Идентификатор проекта, если сервер повторил его во вложенных данных.
     user_uuid: Option<String>, // Идентификатор пользователя, если сервер повторил его во вложенных данных.
     payload: Option<Value>, // Тело объекта. Для нового сообщения здесь лежат формат и содержимое.
@@ -923,7 +1131,7 @@ struct WirePayload {
     updated_at: Option<String>, // Серверное время последней правки.
 }
 
-/// Текстовые записи и серверная граница одной страницы.
+/// Записи поддерживаемого формата и серверная граница одной страницы.
 pub(super) struct HistoryPage {
     pub(super) messages: Vec<HistoryMessage>, // Сообщения поддерживаемого формата.
     pub(super) edge: HistoryEdge,             // Серверный маркер продолжения или конец истории.
@@ -931,21 +1139,40 @@ pub(super) struct HistoryPage {
 
 /// Поля ответа ресурса messages, используемые для записи истории.
 #[derive(Deserialize)]
-struct WireHistoryMessage {
-    uuid: Uuid,                  // Публичный идентификатор сообщения.
-    stream_uuid: Uuid,           // Разговор сообщения.
-    topic_uuid: Uuid,            // Тема внутри разговора.
-    project_id: Option<String>,  // Проект из ответа.
-    user_uuid: Option<String>,   // Владелец проекции из ответа.
-    author_uuid: Uuid,           // Автор сообщения.
-    created_at: String,          // Серверное время создания.
-    updated_at: Option<String>,  // Серверное время последней правки.
-    source_name: Option<String>, // Серверный носитель сообщения, если он известен.
-    payload: WireMessageBody,    // Формат и содержимое сообщения.
+pub(super) struct WireHistoryMessage {
+    uuid: Uuid,                             // Публичный идентификатор сообщения.
+    canonical_message_uuid: Option<String>, // Первоначальный UUID, который публичный сервер обычно скрывает.
+    stream_uuid: Uuid,                      // Разговор сообщения.
+    topic_uuid: Uuid,                       // Тема внутри разговора.
+    project_id: Option<String>,             // Проект из ответа.
+    user_uuid: Option<String>,              // Владелец проекции из ответа.
+    author_uuid: Uuid,                      // Автор сообщения.
+    created_at: String,                     // Серверное время создания.
+    updated_at: Option<String>,             // Серверное время последней правки.
+    source_name: Option<String>,            // Серверный носитель сообщения, если он известен.
+    payload: WireMessageBody,               // Формат и содержимое сообщения.
 }
 
 impl WireHistoryMessage {
-    /// Проверяет область ответа и преобразует обычный Markdown в запись истории.
+    /// Строит исходную строку для превью или цитаты только из подтверждённой проекции.
+    pub(super) fn into_presentation(
+        self,
+        owner: &OwnerContext,
+    ) -> Result<Option<HistoryMessage>, SourceError> {
+        check_explicit_owner(owner, self.project_id.as_deref(), self.user_uuid.as_deref())?;
+        if self.uuid.is_nil()
+            || self.stream_uuid.is_nil()
+            || self.topic_uuid.is_nil()
+            || self.author_uuid.is_nil()
+            || (self.payload.kind == "e2ee" && self.source_name.as_deref() != Some("native"))
+        {
+            return Err(SourceError::InvalidResponse);
+        }
+        let stream = self.stream_uuid;
+        self.into_history(owner, stream)
+    }
+
+    /// Проверяет область ответа и преобразует поддерживаемое сообщение в запись истории.
     fn into_history(
         self,
         owner: &OwnerContext,
@@ -956,12 +1183,24 @@ impl WireHistoryMessage {
         {
             return Err(SourceError::InvalidResponse);
         }
-        if self.payload.kind != "markdown" {
+        let canonical = if self.payload.is_key_service() {
+            check_explicit_owner(owner, self.project_id.as_deref(), self.user_uuid.as_deref())?;
+            if self.source_name.as_deref() != Some("native")
+                || self.author_uuid.is_nil()
+                || self.stream_uuid.is_nil()
+            {
+                return Err(SourceError::InvalidResponse);
+            }
+            key_service_canonical(
+                self.canonical_message_uuid.as_deref(),
+                self.uuid,
+                self.topic_uuid,
+            )?
+        } else {
+            None
+        };
+        let Some(body) = self.payload.into_message_body(canonical)? else {
             return Ok(None);
-        }
-        let text = match self.payload.content {
-            Some(Value::String(text)) => text,
-            _ => return Err(SourceError::InvalidResponse),
         };
         let created_at =
             HistoryTime::parse(&self.created_at).ok_or(SourceError::InvalidResponse)?;
@@ -974,7 +1213,7 @@ impl WireHistoryMessage {
             id: self.uuid,
             stream_id: self.stream_uuid,
             topic_id: self.topic_uuid,
-            text,
+            body,
             metadata: HistoryMetadata {
                 author_id: Some(self.author_uuid),
                 created_at,
@@ -987,8 +1226,78 @@ impl WireHistoryMessage {
 /// Тело сообщения в ответе сервера.
 #[derive(Deserialize)]
 struct WireMessageBody {
-    kind: String,           // Формат содержимого. Текст сохраняется для формата `markdown`.
-    content: Option<Value>, // Содержимое сообщения. Для Markdown это обязательная строка.
+    kind: String,            // Формат содержимого из ответа.
+    content: Option<Value>,  // Текст или зашифрованный конверт для поддерживаемого формата.
+    key_uuid: Option<Value>, // Идентификатор поколения ключа у формата `e2ee`.
+    #[serde(flatten)]
+    fields: serde_json::Map<String, Value>, // Устройство, запрос и остальные поля служебного тела.
+}
+
+impl WireMessageBody {
+    /// Распознаёт типы, для которых нужны проверенное размещение и отдельная проекция.
+    fn is_key_service(&self) -> bool {
+        matches!(
+            self.kind.as_str(),
+            "key_request" | "key_grant" | "key_reject" | "key_announced"
+        )
+    }
+
+    /// Разбирает общий формат REST и журнала, сохраняя зашифрованный конверт как есть.
+    fn into_message_body(
+        self,
+        canonical_id: Option<Uuid>,
+    ) -> Result<Option<MessageBody>, SourceError> {
+        if self.is_key_service() {
+            let mut fields = self.fields;
+            fields.insert("kind".to_owned(), Value::String(self.kind));
+            if let Some(key) = self.key_uuid {
+                fields.insert("key_uuid".to_owned(), key);
+            }
+            if let Some(content) = self.content {
+                fields.insert("content".to_owned(), content);
+            }
+            let payload = KeyServicePayload::deserialize(Value::Object(fields))
+                .map_err(|_| SourceError::InvalidResponse)?;
+            return Ok(Some(MessageBody::KeyService {
+                payload,
+                canonical_id,
+            }));
+        }
+        match (self.kind.as_str(), self.content) {
+            ("markdown", Some(Value::String(text))) => Ok(Some(MessageBody::Markdown(text))),
+            ("e2ee", Some(Value::String(ciphertext))) => {
+                let key_id = self
+                    .key_uuid
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .and_then(parse_uuid)
+                    .filter(|id| !id.is_nil())
+                    .ok_or(SourceError::InvalidResponse)?;
+                Ok(Some(MessageBody::Encrypted { key_id, ciphertext }))
+            }
+            ("markdown" | "e2ee", _) => Err(SourceError::InvalidResponse),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Принимает только точный публичный UUID указанного канонического сообщения в исходной теме.
+fn key_service_canonical(
+    canonical: Option<&str>,
+    public: Uuid,
+    topic: Uuid,
+) -> Result<Option<Uuid>, SourceError> {
+    if public.is_nil() || topic.is_nil() {
+        return Err(SourceError::InvalidResponse);
+    }
+    let Some(canonical) = canonical else {
+        return Ok(None);
+    };
+    let id = Uuid::parse_str(canonical).map_err(|_| SourceError::InvalidResponse)?;
+    if id.is_nil() || Uuid::new_v5(&topic, id.to_string().as_bytes()) != public {
+        return Err(SourceError::InvalidResponse);
+    }
+    Ok(Some(id))
 }
 
 /// Данные для проверки права на баннер по живому сообщению.
@@ -1076,10 +1385,26 @@ struct WireStream {
     direct_user_uuid: Option<String>, // Идентификатор собеседника для личного разговора.
     default_topic_uuid: Option<Value>, // Тема отправки, её формат проверяем отдельно от чтения.
     encryption: Option<Value>,   // Только JSON false разрешает подготовить открытый текст.
-    notification_mode: StreamNotificationMode, // Настройка уведомлений разговора.
+    current_encryption_key_uuid: Option<Value>, // Текущее поколение из снимка стрима.
+    allow_key_sharing_by_holders: Option<bool>, // `None` у сервера со старой политикой выдачи ключей.
+    notification_mode: StreamNotificationMode,  // Настройка уведомлений разговора.
 }
 
 impl WireStream {
+    /// Различает нативный и явно внешний Markdown для указанного владельца.
+    fn markdown_origin(&self, owner: &OwnerContext) -> MarkdownOrigin {
+        if check_explicit_owner(owner, self.project_id.as_deref(), self.user_uuid.as_deref())
+            .is_err()
+        {
+            return MarkdownOrigin::Unknown;
+        }
+        match self.source_name.as_deref() {
+            Some("native") => MarkdownOrigin::Native,
+            Some(source) if !source.trim().is_empty() => MarkdownOrigin::External,
+            _ => MarkdownOrigin::Unknown,
+        }
+    }
+
     /// Определяет личку по признаку приватности и подтверждённому UUID собеседника.
     fn is_direct(&self) -> bool {
         self.private
@@ -1210,6 +1535,11 @@ fn folder_event(
 /// Разбирает серверный UUID для сравнения идентификаторов и построения URL.
 fn parse_uuid(value: &str) -> Option<Uuid> {
     Uuid::parse_str(value).ok()
+}
+
+/// Формирует DTO зашифрованного тела для создания и правки.
+pub(super) fn encrypted_payload(key_id: Uuid, ciphertext: &str) -> Value {
+    serde_json::json!({ "kind": "e2ee", "key_uuid": key_id, "content": ciphertext })
 }
 
 /// Различает подтверждённую ссылку, отсутствие фото и необходимость сверки профиля.
@@ -1465,7 +1795,28 @@ pub(super) fn wire_event(
     if !nonempty(&body.kind) {
         return Err(SourceError::InvalidResponse);
     }
-    if body.kind != "markdown" {
+    let canonical = if body.is_key_service() {
+        if payload.source_name.as_deref() != Some("native")
+            || metadata
+                .as_ref()
+                .and_then(|value| value.author_id)
+                .is_none_or(|id| id.is_nil())
+        {
+            return Err(SourceError::InvalidResponse);
+        }
+        let placement = placement.as_ref().ok_or(SourceError::InvalidResponse)?;
+        if parse_uuid(&placement.stream_id).is_none_or(|id| id.is_nil()) {
+            return Err(SourceError::InvalidResponse);
+        }
+        key_service_canonical(
+            payload.canonical_message_uuid.as_deref(),
+            parse_uuid(&id).ok_or(SourceError::InvalidResponse)?,
+            parse_uuid(&placement.topic_id).ok_or(SourceError::InvalidResponse)?,
+        )?
+    } else {
+        None
+    };
+    let Some(body) = body.into_message_body(canonical)? else {
         if message_updated {
             return Ok((
                 Event::HistoryChanged {
@@ -1476,11 +1827,10 @@ pub(super) fn wire_event(
             ));
         }
         return Ok((Event::Checkpoint(cursor), None));
-    }
-    let Some(Value::String(text)) = body.content else {
-        return Err(SourceError::InvalidResponse);
     };
-    let message = Message { id, text };
+    // Уведомления для защищённых тел подключаются вместе с поддержкой защищённых чатов.
+    let incoming = incoming.filter(|_| body.markdown().is_some());
+    let message = Message { id, body };
     if message_updated {
         return Ok((
             Event::HistoryChanged {
@@ -1768,7 +2118,7 @@ mod tests {
                     cursor: cursor(20),
                     message: Message {
                         id: "message-uuid".to_owned(),
-                        text: "hello".to_owned(),
+                        body: MessageBody::Markdown("hello".to_owned()),
                     },
                     placement: None,
                     metadata: None,
@@ -1778,12 +2128,145 @@ mod tests {
                     change: HistoryChange::Edit {
                         message: Message {
                             id: "message-uuid".to_owned(),
-                            text: "hello".to_owned()
+                            body: MessageBody::Markdown("hello".to_owned())
                         },
                         placement: None,
                     },
                 }
             ]
+        );
+    }
+
+    /// Сохраняет зашифрованное тело и точный UUID ключа из истории, создания и правки.
+    #[test]
+    fn history_and_events_decode_the_same_encrypted_message() {
+        let id = Uuid::from_u128(20);
+        let stream = Uuid::from_u128(21);
+        let topic = Uuid::from_u128(22);
+        let key_id = Uuid::from_u128(23);
+        let author = Uuid::from_u128(24);
+        // Повреждение конверта проверяется при расшифровке. Сообщение должно попасть в историю.
+        let ciphertext = "not valid Base64";
+        let payload = json!({"kind": "e2ee", "key_uuid": key_id, "content": ciphertext});
+        let row: WireHistoryMessage = serde_json::from_value(json!({
+            "uuid": id, "stream_uuid": stream, "topic_uuid": topic,
+            "project_id": "project", "user_uuid": "recipient",
+            "author_uuid": author, "created_at": "2026-01-01T10:00:00Z",
+            "payload": payload
+        }))
+        .unwrap();
+        let expected = MessageBody::Encrypted {
+            key_id,
+            ciphertext: ciphertext.to_owned(),
+        };
+        let parsed = row.into_history(&owner(), stream).unwrap().unwrap();
+        assert_eq!((parsed.id, parsed.body), (id, expected.clone()));
+
+        let mut create = message(1);
+        create["payload"]["uuid"] = json!(id);
+        create["payload"]["payload"] = payload;
+        let mut edit = create.clone();
+        edit["epoch_version"] = json!(2);
+        edit["action"] = json!("updated");
+        edit["payload"]["kind"] = json!("message.updated");
+        let events = decode_page(vec![create, edit], &owner(), &cursor(0)).unwrap();
+        let message = Message {
+            id: id.to_string(),
+            body: expected,
+        };
+        assert_eq!(
+            events,
+            [
+                Event::MessageCreated {
+                    cursor: cursor(1),
+                    message: message.clone(),
+                    placement: None,
+                    metadata: None,
+                },
+                Event::HistoryChanged {
+                    cursor: cursor(2),
+                    change: HistoryChange::Edit {
+                        message,
+                        placement: None
+                    },
+                },
+            ],
+        );
+    }
+
+    /// Сверяет типизированный ответ в истории и realtime. Служебной записи баннер не положен.
+    #[test]
+    fn key_service_placement_is_typed_and_never_uses_public_id_as_canonical() {
+        use crate::storage::KeyResponseTarget;
+
+        let mut owner = owner();
+        owner.user_id = Uuid::from_u128(110).to_string();
+        let stream = Uuid::from_u128(111);
+        let topic = Uuid::from_u128(112);
+        let canonical = Uuid::from_u128(113);
+        let public = Uuid::new_v5(&topic, canonical.to_string().as_bytes());
+        let author = Uuid::from_u128(114);
+        let target = KeyResponseTarget {
+            key_uuid: Uuid::from_u128(115),
+            request_message_uuid: Uuid::from_u128(116),
+            sender_device_id: "old-electron-device".into(),
+            recipient_device_id: "desktop-device".into(),
+        };
+        let payload = KeyServicePayload::Grant {
+            target,
+            content: "opaque envelope".into(),
+        };
+        let row = json!({
+            "uuid": public, "stream_uuid": stream, "topic_uuid": topic,
+            "project_id": owner.project_id, "user_uuid": owner.user_id,
+            "author_uuid": author, "created_at": "2026-01-01T10:00:00Z",
+            "source_name": "native", "payload": payload,
+        });
+        let history: WireHistoryMessage = serde_json::from_value(row.clone()).unwrap();
+        assert_eq!(
+            history.into_history(&owner, stream).unwrap().unwrap().body,
+            MessageBody::KeyService {
+                payload: payload.clone(),
+                canonical_id: None
+            }
+        );
+
+        let mut snapshot = row;
+        snapshot["kind"] = json!("message.created");
+        snapshot["canonical_message_uuid"] = json!(canonical);
+        snapshot["is_own"] = json!(false);
+        snapshot["read"] = json!(false);
+        let mut create = message(1);
+        create["user_uuid"] = json!(owner.user_id);
+        create["payload"] = snapshot;
+        let (event, incoming) = wire_event(create.clone(), &owner, "epoch").unwrap();
+        assert!(incoming.is_none());
+        assert!(
+            matches!(event, Event::MessageCreated { message, placement: Some(placement), .. }
+            if message.id == public.to_string() && placement.topic_id == topic.to_string()
+                && message.body == MessageBody::KeyService { payload, canonical_id: Some(canonical) })
+        );
+        create["payload"]["topic_uuid"] = json!(Uuid::from_u128(117));
+        assert_eq!(
+            wire_event(create, &owner, "epoch").map(|(event, _)| event),
+            Err(SourceError::InvalidResponse)
+        );
+    }
+
+    /// Отклоняет неверный ключ E2EE и пропускает поля ещё неизвестных форматов.
+    #[test]
+    fn encryption_fields_only_affect_the_encrypted_format() {
+        let mut create = message(1);
+        create["payload"]["payload"] =
+            json!({"kind": "e2ee", "key_uuid": "invalid", "content": "YQ=="});
+        assert_eq!(
+            wire_event(create.clone(), &owner(), "epoch").map(|(event, _)| event),
+            Err(SourceError::InvalidResponse)
+        );
+        create["payload"]["payload"]["kind"] = json!("unsupported");
+        assert_eq!(
+            wire_event(create, &owner(), "epoch").map(|(event, _)| event),
+            Ok(Event::Checkpoint(cursor(1)))
         );
     }
 
@@ -1893,7 +2376,10 @@ mod tests {
             ("read", json!(true)),
             ("source_name", json!("zulip")),
             ("author_uuid", json!(owner.user_id)),
-            ("payload", json!({"kind": "e2ee"})),
+            (
+                "payload",
+                json!({"kind": "e2ee", "key_uuid": Uuid::from_u128(1), "content": "YQ=="}),
+            ),
         ] {
             let mut excluded = value.clone();
             excluded["payload"][field] = unsupported;

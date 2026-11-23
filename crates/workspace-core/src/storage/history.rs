@@ -1,10 +1,12 @@
 //! Хранит окна истории стримов и тем, их края и ссылки на общие записи сообщений.
 //! Типы описывают снимок страницы, а операции SQLite защищают его от запоздавшей записи.
 
+use std::collections::HashSet;
+
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use uuid::Uuid;
 
-use super::{Cursor, Message, Storage, StorageError, read_cursor};
+use super::{Cursor, Message, MessageBody, Storage, StorageError, read_cursor};
 use crate::{
     context::OwnerContext,
     messenger::{
@@ -78,7 +80,7 @@ impl HistoryTime {
     }
 }
 
-/// Серверные поля текстового сообщения, которые нужны для истории.
+/// Серверные поля сообщения, которые нужны для истории.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HistoryMetadata {
     pub author_id: Option<Uuid>,         // Автор, если сервер передал UUID.
@@ -92,8 +94,23 @@ pub struct HistoryMessage {
     pub id: Uuid,                  // Публичный UUID сообщения.
     pub stream_id: Uuid,           // Стрим сообщения из ответа сервера.
     pub topic_id: Uuid,            // Тема сообщения внутри стрима.
-    pub text: String,              // Содержимое Markdown.
+    pub body: MessageBody,         // Открытый Markdown или зашифрованный конверт.
     pub metadata: HistoryMetadata, // Автор и серверное время.
+}
+
+/// Локальные версии канонической строки, полученные перед подтверждённой серверной правкой.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct EncryptedEditVersion {
+    generation: i64, // Версия сброса журнала или отзыва доступа.
+    revision: i64,   // Последнее изменение именно этой строки.
+}
+
+/// Результат применения проверенной квитанции PUT.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ConfirmedEdit {
+    Applied, // SQLite обновлён. Можно сообщить ленте о новой версии.
+    Present, // Такая версия уже сохранена.
+    Stale,   // Версия, с которой начал редактор, больше не действует.
 }
 
 /// Состав окна и отдельные состояния его краёв.
@@ -130,19 +147,25 @@ pub enum HistoryPageTarget {
 /// Снимок условий записи, полученный до обращения к серверу.
 #[derive(Debug)]
 pub(crate) struct HistoryPageGuard {
-    scope: HistoryScope,       // Область запроса страницы.
-    target: HistoryPageTarget, // Новое окно или конкретный край.
-    marker: Option<String>,    // Маркер края. Для нового окна его нет.
-    edge_revision: i64,        // Версия края на момент старта.
-    revision: i64,             // Последняя локальная версия сообщений на момент запроса.
-    generation: i64,           // Версия сброса кэша и отзыва доступа.
-    cursor: Option<Cursor>,    // Позиция событий перед запросом. Она не описывает сам снимок.
+    scope: HistoryScope,              // Область запроса страницы.
+    target: HistoryPageTarget,        // Новое окно или конкретный край.
+    marker: Option<String>,           // Маркер края. Для нового окна его нет.
+    edge_revision: i64,               // Версия края на момент старта.
+    revision: i64,                    // Последняя локальная версия сообщений на момент запроса.
+    generation: i64,                  // Версия сброса кэша и отзыва доступа.
+    cursor: Option<Cursor>, // Позиция событий перед запросом. Она не описывает сам снимок.
+    verified_messages: HashSet<Uuid>, // Старые отметки, для которых REST подтвердил наличие сообщения.
 }
 
 impl HistoryPageGuard {
     /// Возвращает маркер, который нужно передать серверу для догрузки.
     pub(crate) fn marker(&self) -> Option<&str> {
         self.marker.as_deref()
+    }
+
+    /// Запоминает UUID, для которого точный запрос подтвердил ту же запись, что и страница.
+    pub(crate) fn verify_legacy_encrypted_message(&mut self, id: Uuid) {
+        self.verified_messages.insert(id);
     }
 }
 
@@ -225,6 +248,26 @@ pub(super) fn initialize(connection: &Connection) -> Result<(), StorageError> {
              ALTER TABLE sync_messages ADD COLUMN updated_at TEXT;",
         )?;
     }
+    let has_encryption: bool = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('sync_messages') WHERE name = 'encryption_key_id')",
+        [], |row| row.get(0),
+    )?;
+    if !has_encryption {
+        connection.execute(
+            "ALTER TABLE sync_messages ADD COLUMN encryption_key_id TEXT",
+            [],
+        )?;
+    }
+    let has_key_service: bool = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('sync_messages') WHERE name = 'key_service_payload')",
+        [], |row| row.get(0),
+    )?;
+    if !has_key_service {
+        connection.execute_batch(
+            "ALTER TABLE sync_messages ADD COLUMN key_service_payload TEXT;
+             ALTER TABLE sync_messages ADD COLUMN key_service_canonical_id TEXT;",
+        )?;
+    }
     connection.execute_batch(
         "CREATE INDEX IF NOT EXISTS history_messages_stream_order
             ON sync_messages(account_id, server, organization_id, project_id, user_id, stream_id, created_at, message_id);
@@ -278,6 +321,29 @@ pub(super) fn initialize(connection: &Connection) -> Result<(), StorageError> {
     if !has_media_flag {
         connection.execute_batch(
             "ALTER TABLE history_changes ADD COLUMN media_projection INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    let has_legacy_encryption_flag: bool = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('history_changes') WHERE name = 'legacy_encryption_check')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_legacy_encryption_flag {
+        // Старый клиент записывал удаление и правку неподдерживаемого формата одинаково.
+        // У отметок уже нет адреса сообщения, поэтому сверяем все окна затронутого владельца.
+        connection.execute_batch(
+            "ALTER TABLE history_changes ADD COLUMN legacy_encryption_check INTEGER NOT NULL DEFAULT 0;
+             UPDATE history_changes SET legacy_encryption_check = 1 WHERE deleted = 1;
+             UPDATE history_windows SET needs_refresh = 1
+             WHERE (account_id, server, organization_id, project_id, user_id) IN (
+                 SELECT account_id, server, organization_id, project_id, user_id
+                 FROM history_changes WHERE legacy_encryption_check = 1
+             );
+             UPDATE history_state SET generation = generation + 1
+             WHERE (account_id, server, organization_id, project_id, user_id) IN (
+                 SELECT account_id, server, organization_id, project_id, user_id
+                 FROM history_changes WHERE legacy_encryption_check = 1
+             );",
         )?;
     }
     Ok(())
@@ -389,9 +455,20 @@ fn order_key(message: &HistoryMessage) -> OrderKey {
 /// Хранит версию UUID, включая удаления без локального тела.
 #[derive(Default)]
 struct MessageRevision {
-    revision: i64,  // Локальная версия последней записи.
-    deleted: bool,  // Запись удалена событием.
-    snapshot: bool, // Последнее подтверждённое тело пришло со страницы истории.
+    revision: i64,                 // Локальная версия последней записи.
+    deleted: bool,                 // Запись удалена событием.
+    snapshot: bool,                // Последнее подтверждённое тело пришло со страницы истории.
+    legacy_encryption_check: bool, // Старая отметка может скрывать поддержанный теперь формат.
+    media_projection: i64,         // Конфликт известного тела со свежим событием журнала.
+}
+
+impl MessageRevision {
+    /// Разрешает сверку только для старой отметки и зашифрованного тела.
+    fn needs_encryption_check(&self, message: &HistoryMessage) -> bool {
+        self.deleted
+            && self.legacy_encryption_check
+            && matches!(message.body, MessageBody::Encrypted { .. })
+    }
 }
 
 /// Читает состояние сообщения перед применением снимка или события.
@@ -401,10 +478,13 @@ fn message_revision(
     id: &str,
 ) -> Result<MessageRevision, StorageError> {
     Ok(connection.query_row(
-        "SELECT revision, deleted, snapshot FROM history_changes WHERE account_id = ?1 AND server = ?2
+        "SELECT revision, deleted, snapshot, legacy_encryption_check, media_projection FROM history_changes WHERE account_id = ?1 AND server = ?2
          AND organization_id = ?3 AND project_id = ?4 AND user_id = ?5 AND message_id = ?6",
         params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id, id],
-        |row| Ok(MessageRevision { revision: row.get(0)?, deleted: row.get(1)?, snapshot: row.get(2)? }),
+        |row| Ok(MessageRevision {
+            revision: row.get(0)?, deleted: row.get(1)?, snapshot: row.get(2)?,
+            legacy_encryption_check: row.get(3)?, media_projection: row.get(4)?,
+        }),
     ).optional()?.unwrap_or_default())
 }
 
@@ -429,7 +509,8 @@ fn record_revision(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT (account_id, server, organization_id, project_id, user_id, message_id)
          DO UPDATE SET revision = excluded.revision, deleted = excluded.deleted, snapshot = excluded.snapshot,
-                       snapshot_epoch = excluded.snapshot_epoch, snapshot_position = excluded.snapshot_position",
+                       snapshot_epoch = excluded.snapshot_epoch, snapshot_position = excluded.snapshot_position,
+                       legacy_encryption_check = 0",
         params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id, id,
             revision, deleted, snapshot.is_some(), cursor.map(|position| &position.epoch_generation),
             position],
@@ -438,6 +519,211 @@ fn record_revision(
 }
 
 impl Storage {
+    /// Подтверждает точное тело доставленного сообщения по владельцу, автору и размещению.
+    pub(crate) fn matches_delivered_body(
+        &self,
+        owner: &OwnerContext,
+        prepared: &super::PreparedSend,
+    ) -> Result<bool, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let state = message_revision(&connection, owner, &prepared.public_id.to_string())?;
+        if state.deleted || state.media_projection == MEDIA_PROJECTION_CONFLICT {
+            return Ok(false);
+        }
+        Ok(
+            history_message(&connection, owner, prepared.public_id)?.is_some_and(|message| {
+                message.stream_id == prepared.stream_id
+                    && message.topic_id == prepared.topic_id
+                    && message.metadata.author_id.is_some()
+                    && message.metadata.author_id == owner.user_id.parse().ok()
+                    && match (&prepared.body, &message.body) {
+                        (
+                            super::PreparedSendBody::Markdown(sent),
+                            MessageBody::Markdown(received),
+                        ) => sent == received,
+                        _ => prepared.body.matches_message(&message.body),
+                    }
+            }),
+        )
+    }
+
+    /// Закрепляет действующую строку редактора непосредственно перед отправкой PUT.
+    pub(crate) fn prepare_encrypted_edit(
+        &self,
+        owner: &OwnerContext,
+        expected: &HistoryMessage,
+    ) -> Result<Option<EncryptedEditVersion>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        encrypted_edit_version(&connection, owner, expected)
+    }
+
+    /// Применяет подтверждённое тело, пока строка и её доступ совпадают с началом операции.
+    pub(crate) fn confirm_encrypted_edit(
+        &self,
+        owner: &OwnerContext,
+        expected: &HistoryMessage,
+        version: EncryptedEditVersion,
+        confirmed: &HistoryMessage,
+    ) -> Result<ConfirmedEdit, StorageError> {
+        let (
+            MessageBody::Encrypted {
+                key_id: old_key, ..
+            },
+            MessageBody::Encrypted {
+                key_id: new_key, ..
+            },
+        ) = (&expected.body, &confirmed.body)
+        else {
+            return Ok(ConfirmedEdit::Stale);
+        };
+        if expected.id != confirmed.id
+            || expected.stream_id != confirmed.stream_id
+            || expected.topic_id != confirmed.topic_id
+            || expected.metadata.author_id != confirmed.metadata.author_id
+            || expected.metadata.created_at != confirmed.metadata.created_at
+            || confirmed.metadata.updated_at.is_none()
+            || confirmed.metadata.updated_at < expected.metadata.updated_at
+            || old_key != new_key
+        {
+            return Ok(ConfirmedEdit::Stale);
+        }
+        let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if encrypted_edit_version(&transaction, owner, confirmed)?
+            .is_some_and(|present| present.generation == version.generation)
+        {
+            return Ok(ConfirmedEdit::Present);
+        }
+        if encrypted_edit_version(&transaction, owner, expected)? != Some(version) {
+            return Ok(ConfirmedEdit::Stale);
+        }
+        let revision = advance(&transaction, owner, false)?;
+        let cursor = read_cursor(&transaction, owner, SOURCE_ID)?;
+        save_snapshot(
+            &transaction,
+            owner,
+            &confirmed.stream_id.to_string(),
+            confirmed,
+            revision,
+            cursor.as_ref(),
+        )?;
+        project_media_message(&transaction, owner, &confirmed.id.to_string())?;
+        transaction.commit()?;
+        Ok(ConfirmedEdit::Applied)
+    }
+
+    /// Метка оригинала цитаты до запроса. Подтверждённое удаление не позволяет его показать.
+    pub(crate) fn quote_source_revision(
+        &self,
+        owner: &OwnerContext,
+        message_id: Uuid,
+    ) -> Result<Option<(i64, i64)>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let state = read_state(&connection, owner)?;
+        let source = message_revision(&connection, owner, &message_id.to_string())?;
+        Ok((!source.deleted || source.legacy_encryption_check)
+            .then_some((state.generation, source.revision)))
+    }
+
+    /// Сверяет оригинал со свежим локальным телом и отметкой конфликта журнала.
+    pub(crate) fn quote_source_matches(
+        &self,
+        owner: &OwnerContext,
+        response: &HistoryMessage,
+    ) -> Result<bool, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let revision = message_revision(&connection, owner, &response.id.to_string())?;
+        if revision.deleted {
+            return Ok(revision.needs_encryption_check(response));
+        }
+        if revision.media_projection == MEDIA_PROJECTION_CONFLICT {
+            return Ok(false);
+        }
+        let Some(current) = history_message(&connection, owner, response.id)? else {
+            // Событие правки могло прийти до загрузки самого оригинала.
+            return Ok(revision.revision == 0);
+        };
+        if current.stream_id != response.stream_id
+            || current.topic_id != response.topic_id
+            || current.metadata.created_at != response.metadata.created_at
+            || current
+                .metadata
+                .author_id
+                .is_some_and(|id| Some(id) != response.metadata.author_id)
+        {
+            return Ok(false);
+        }
+        let previous_time = current.metadata.updated_at.as_ref();
+        let response_time = response.metadata.updated_at.as_ref();
+        Ok(if current.body == response.body {
+            response_time >= previous_time
+        } else {
+            // Сам журнал мог не передать время правки. Исходной строке из REST можно
+            // предпочесть лишь новый снимок с известным, более поздним временем.
+            revision.snapshot && response_time > previous_time
+        })
+    }
+
+    /// Проверяет каноническую строку и отсутствие более свежей неподтверждённой правки.
+    pub(crate) fn matches_encrypted_edit(
+        &self,
+        owner: &OwnerContext,
+        message: &HistoryMessage,
+    ) -> Result<bool, StorageError> {
+        Ok(matches!(&message.body, MessageBody::Encrypted { .. })
+            && self.matches_edit_source(owner, message)?)
+    }
+
+    /// Сверяет полный обычный Markdown, включая исходные зашифрованные ссылки.
+    pub(crate) fn matches_markdown_edit(
+        &self,
+        owner: &OwnerContext,
+        message: &HistoryMessage,
+    ) -> Result<bool, StorageError> {
+        Ok(message.body.markdown().is_some() && self.matches_edit_source(owner, message)?)
+    }
+
+    /// Подтверждает принадлежность, время и тип сохранённого редактируемого сообщения.
+    fn matches_edit_source(
+        &self,
+        owner: &OwnerContext,
+        message: &HistoryMessage,
+    ) -> Result<bool, StorageError> {
+        let (body, key_id) = message.body.storage_parts();
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        Ok(connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_messages LEFT JOIN history_changes
+             USING (account_id, server, organization_id, project_id, user_id, message_id)
+             WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3 AND project_id = ?4
+               AND user_id = ?5 AND message_id = ?6 AND stream_id = ?7 AND topic_id = ?8
+               AND text = ?9 AND encryption_key_id IS ?10 AND key_service_payload IS NULL AND author_id IS ?11
+               AND created_at = ?12 AND updated_at IS ?13
+               AND COALESCE(history_changes.deleted, 0) = 0
+               AND COALESCE(history_changes.media_projection, 0) <> ?14)",
+            params![
+                owner.account_id.0,
+                owner.server,
+                owner.organization_id,
+                owner.project_id,
+                owner.user_id,
+                message.id.to_string(),
+                message.stream_id.to_string(),
+                message.topic_id.to_string(),
+                body,
+                key_id,
+                message.metadata.author_id.map(|author| author.to_string()),
+                message.metadata.created_at.as_str(),
+                message
+                    .metadata
+                    .updated_at
+                    .as_ref()
+                    .map(HistoryTime::as_str),
+                MEDIA_PROJECTION_CONFLICT,
+            ],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Запоминает версию данных и маркер до запроса страницы.
     pub(crate) fn prepare_history_page(
         &self,
@@ -471,7 +757,27 @@ impl Storage {
             revision: state.revision,
             generation: state.generation,
             cursor: read_cursor(&connection, owner, SOURCE_ID)?,
+            verified_messages: HashSet::new(),
         }))
+    }
+
+    /// Находит записи страницы, для которых старая отметка требует точного запроса.
+    pub(crate) fn legacy_encrypted_messages<'a>(
+        &self,
+        owner: &OwnerContext,
+        messages: &'a [HistoryMessage],
+    ) -> Result<Vec<&'a HistoryMessage>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut pending = Vec::new();
+        for message in messages {
+            if matches!(message.body, MessageBody::Encrypted { .. })
+                && message_revision(&connection, owner, &message.id.to_string())?
+                    .needs_encryption_check(message)
+            {
+                pending.push(message);
+            }
+        }
+        Ok(pending)
     }
 
     /// Возвращает поколение истории, после смены которого прежний доступ нужно подтвердить заново.
@@ -575,7 +881,16 @@ impl Storage {
         for message in messages {
             let id = message.id.to_string();
             let stored = message_revision(&transaction, owner, &id)?;
-            if stored.deleted || stored.revision > guard.revision {
+            let verified = stored.needs_encryption_check(message)
+                && guard.verified_messages.contains(&message.id);
+            if (stored.deleted && !verified) || stored.revision > guard.revision {
+                return Ok(HistoryPageOutcome::Stale);
+            }
+            if matches!(message.body, MessageBody::Encrypted { .. })
+                && let Some(current) = history_message(&transaction, owner, message.id)?
+                && current.metadata.updated_at > message.metadata.updated_at
+            {
+                // После подтверждённого PUT реплика чтения ещё может вернуть прежнюю правку.
                 return Ok(HistoryPageOutcome::Stale);
             }
             let conflicting_address: bool = transaction.query_row(
@@ -711,7 +1026,7 @@ impl Storage {
                     topic_id: Some(message.topic_id),
                 },
                 message.metadata.created_at.as_str(),
-                &message.text,
+                message.body.markdown(),
             )?;
             transaction.execute(
                 "INSERT OR IGNORE INTO history_members VALUES (?6, ?1, ?2, ?3, ?4, ?5, ?7)",
@@ -785,9 +1100,11 @@ pub(super) fn project_media_message(
     let Ok(id) = Uuid::parse_str(message_id) else {
         return Ok(());
     };
-    let row: Option<(String, String, String, String)> = connection
+    let row: Option<(String, String, String, Option<String>)> = connection
         .query_row(
-            "SELECT stream_id, topic_id, created_at, text FROM sync_messages
+            "SELECT stream_id, topic_id, created_at,
+                    CASE WHEN encryption_key_id IS NULL AND key_service_payload IS NULL THEN text END
+             FROM sync_messages
              WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3 AND project_id = ?4
                AND user_id = ?5 AND message_id = ?6
                AND stream_id IS NOT NULL AND topic_id IS NOT NULL AND created_at IS NOT NULL",
@@ -810,22 +1127,25 @@ pub(super) fn project_media_message(
                 stream_id,
                 topic_id: Some(topic_id),
             };
-            project_message_refs(connection, owner, id, scope, &created_at, &text)
+            project_message_refs(connection, owner, id, scope, &created_at, text.as_deref())
         }
         _ => super::media::remove_message_refs(connection, owner, id),
     }?;
     mark_media_indexed(connection, owner, message_id)
 }
 
-/// Обновляет оба индекса из одного подтверждённого текста и размещения сообщения.
+/// Обновляет оба индекса по Markdown и очищает ссылки для зашифрованного тела.
 fn project_message_refs(
     connection: &Connection,
     owner: &OwnerContext,
     message_id: Uuid,
     scope: HistoryScope,
     created_at: &str,
-    text: &str,
+    text: Option<&str>,
 ) -> Result<(), StorageError> {
+    let Some(text) = text else {
+        return super::media::remove_message_refs(connection, owner, message_id);
+    };
     super::media::replace_message_refs(
         connection,
         owner,
@@ -901,17 +1221,24 @@ fn save_snapshot(
     cursor: Option<&Cursor>,
 ) -> Result<(), StorageError> {
     let id = message.id.to_string();
+    let (body, key_id) = message.body.storage_parts();
+    let (service, canonical) = message.body.key_service_parts()?;
     connection.execute(
         "INSERT INTO sync_messages (account_id, server, organization_id, project_id, user_id,
-            message_id, text, stream_id, topic_id, author_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            message_id, text, stream_id, topic_id, author_id, created_at, updated_at, encryption_key_id,
+            key_service_payload, key_service_canonical_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT (account_id, server, organization_id, project_id, user_id, message_id) DO UPDATE SET
             text = excluded.text, stream_id = excluded.stream_id, topic_id = excluded.topic_id,
             author_id = COALESCE(excluded.author_id, sync_messages.author_id), created_at = excluded.created_at,
-            updated_at = COALESCE(excluded.updated_at, sync_messages.updated_at)",
+            updated_at = COALESCE(excluded.updated_at, sync_messages.updated_at),
+            encryption_key_id = excluded.encryption_key_id, key_service_payload = excluded.key_service_payload,
+            key_service_canonical_id = CASE WHEN excluded.key_service_payload IS NULL THEN NULL
+                ELSE COALESCE(excluded.key_service_canonical_id, sync_messages.key_service_canonical_id) END",
         params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id,
-            id, message.text, stream, message.topic_id.to_string(), message.metadata.author_id.map(|id| id.to_string()),
-            message.metadata.created_at.0, message.metadata.updated_at.as_ref().map(|time| &time.0)],
+            id, body, stream, message.topic_id.to_string(), message.metadata.author_id.map(|id| id.to_string()),
+            message.metadata.created_at.0, message.metadata.updated_at.as_ref().map(|time| &time.0), key_id,
+            service, canonical],
     )?;
     record_revision(connection, owner, &id, revision, false, Some(cursor))?;
     mark_media_indexed(connection, owner, &id)
@@ -924,7 +1251,8 @@ fn read_members(
     id: i64,
 ) -> Result<Vec<HistoryMessage>, StorageError> {
     let mut query = connection.prepare(
-        "SELECT message_id, stream_id, topic_id, text, author_id, created_at, updated_at
+        "SELECT message_id, stream_id, topic_id, text, author_id, created_at, updated_at, encryption_key_id,
+                key_service_payload, key_service_canonical_id
          FROM history_members JOIN sync_messages USING (account_id, server, organization_id, project_id, user_id, message_id)
          WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3 AND project_id = ?4 AND user_id = ?5
            AND window_id = ?6 ORDER BY created_at, message_id",
@@ -938,39 +1266,94 @@ fn read_members(
             owner.user_id,
             id
         ],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
-            ))
-        },
+        history_record,
     )?;
-    records
-        .map(|record| {
-            let (id, stream, topic, text, author, created, updated) = record?;
-            Ok(HistoryMessage {
-                id: Uuid::parse_str(&id).map_err(|_| StorageError::InvalidHistoryPage)?,
-                stream_id: Uuid::parse_str(&stream)
-                    .map_err(|_| StorageError::InvalidHistoryPage)?,
-                topic_id: Uuid::parse_str(&topic).map_err(|_| StorageError::InvalidHistoryPage)?,
-                text,
-                metadata: HistoryMetadata {
-                    author_id: author
-                        .as_deref()
-                        .map(Uuid::parse_str)
-                        .transpose()
-                        .map_err(|_| StorageError::InvalidHistoryPage)?,
-                    created_at: HistoryTime(created),
-                    updated_at: updated.map(HistoryTime),
-                },
-            })
+    records.map(|record| record?.try_into()).collect()
+}
+
+/// Поля размещённого сообщения со строковыми идентификаторами SQLite.
+struct HistoryRecord {
+    id: String,              // Публичный UUID.
+    stream: String,          // UUID стрима.
+    topic: String,           // UUID темы.
+    body: MessageBody,       // Типизированное сохранённое тело.
+    author: Option<String>,  // UUID автора, если известен.
+    created: String,         // Нормализованное время создания.
+    updated: Option<String>, // Нормализованное время последней правки.
+}
+
+impl TryFrom<HistoryRecord> for HistoryMessage {
+    type Error = StorageError;
+
+    /// Проверяет UUID и собирает каноническую строку истории.
+    fn try_from(record: HistoryRecord) -> Result<Self, Self::Error> {
+        let parse =
+            |value: &str| Uuid::parse_str(value).map_err(|_| StorageError::InvalidHistoryPage);
+        Ok(Self {
+            id: parse(&record.id)?,
+            stream_id: parse(&record.stream)?,
+            topic_id: parse(&record.topic)?,
+            body: record.body,
+            metadata: HistoryMetadata {
+                author_id: record.author.as_deref().map(parse).transpose()?,
+                created_at: HistoryTime(record.created),
+                updated_at: record.updated.map(HistoryTime),
+            },
         })
-        .collect()
+    }
+}
+
+/// Разбирает общий набор полей строки и безопасный формат сохранённого тела.
+fn history_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryRecord> {
+    Ok(HistoryRecord {
+        id: row.get(0)?,
+        stream: row.get(1)?,
+        topic: row.get(2)?,
+        body: MessageBody::from_storage(row, 3, 7, 8, 9)?,
+        author: row.get(4)?,
+        created: row.get(5)?,
+        updated: row.get(6)?,
+    })
+}
+
+/// Читает точное размещённое сообщение из локальной истории того же владельца.
+fn history_message(
+    connection: &Connection,
+    owner: &OwnerContext,
+    id: Uuid,
+) -> Result<Option<HistoryMessage>, StorageError> {
+    let current = connection.query_row(
+        "SELECT message_id, stream_id, topic_id, text, author_id, created_at, updated_at, encryption_key_id,
+                key_service_payload, key_service_canonical_id
+         FROM sync_messages WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
+           AND project_id = ?4 AND user_id = ?5 AND message_id = ?6
+           AND stream_id IS NOT NULL AND topic_id IS NOT NULL AND created_at IS NOT NULL",
+        params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id, id.to_string()],
+        history_record,
+    ).optional()?;
+    current.map(TryInto::try_into).transpose()
+}
+
+/// Сверяет точный зашифрованный снимок и возвращает его версии под блокировкой базы.
+fn encrypted_edit_version(
+    connection: &Connection,
+    owner: &OwnerContext,
+    expected: &HistoryMessage,
+) -> Result<Option<EncryptedEditVersion>, StorageError> {
+    if !matches!(expected.body, MessageBody::Encrypted { .. }) {
+        return Ok(None);
+    }
+    let revision = message_revision(connection, owner, &expected.id.to_string())?;
+    if revision.deleted
+        || revision.media_projection == MEDIA_PROJECTION_CONFLICT
+        || history_message(connection, owner, expected.id)?.as_ref() != Some(expected)
+    {
+        return Ok(None);
+    }
+    Ok(Some(EncryptedEditVersion {
+        generation: read_state(connection, owner)?.generation,
+        revision: revision.revision,
+    }))
 }
 
 /// Удаляет окна и отметки владельца при сбросе источника. Старые запросы теряют право записи.
@@ -1022,12 +1405,19 @@ pub(super) fn record_creation(
     Ok(())
 }
 
-/// Проверяет, может ли событие изменить общую строку. Готовит окна к удалению или сверке.
+/// Как сохранённое событие должно повлиять на тело и наблюдателей строки.
+pub(super) enum HistoryEventEffect {
+    Write,     // Заменяем или удаляем общую строку и публикуем изменение.
+    Reconcile, // Тело остаётся до сверки, экран должен перечитать окно.
+    Known,     // Уже записали тот же конверт, курсор продвигается без обновления строки.
+}
+
+/// Проверяет эффект события в общей строке. Готовит окна к удалению или сверке.
 pub(super) fn before_change(
     connection: &Connection,
     owner: &OwnerContext,
     change: &super::HistoryChange,
-) -> Result<bool, StorageError> {
+) -> Result<HistoryEventEffect, StorageError> {
     use super::HistoryChange;
     match change {
         HistoryChange::RemoveStream(stream) => {
@@ -1049,27 +1439,34 @@ pub(super) fn before_change(
         HistoryChange::Edit { message, placement } => {
             let stored = message_revision(connection, owner, &message.id)?;
             if stored.deleted {
-                return Ok(false);
+                if stored.legacy_encryption_check {
+                    let revision = advance(connection, owner, false)?;
+                    set_message_revision(connection, owner, &message.id, revision)?;
+                }
+                return Ok(HistoryEventEffect::Reconcile);
             }
-            let revision = advance(connection, owner, false)?;
             if stored.snapshot {
-                // REST-снимок мог уже учесть более позднюю правку. Сохраняем его до сверки,
-                // но новая локальная версия блокирует страницы, которые начали читать раньше.
-                connection.execute(
-                    "UPDATE history_changes SET revision = ?7 WHERE account_id = ?1 AND server = ?2
-                     AND organization_id = ?3 AND project_id = ?4 AND user_id = ?5 AND message_id = ?6",
-                    params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id,
-                        message.id, revision],
-                )?;
+                let (body, key_id) = message.body.storage_parts();
+                let (service, canonical) = message.body.key_service_parts()?;
                 let same_body: bool = connection.query_row(
                     "SELECT EXISTS(SELECT 1 FROM sync_messages WHERE account_id = ?1 AND server = ?2
                      AND organization_id = ?3 AND project_id = ?4 AND user_id = ?5 AND message_id = ?6
-                     AND text = ?7 AND (?8 IS NULL OR (stream_id = ?8 AND topic_id = ?9)))",
+                     AND text = ?7 AND (?8 IS NULL OR (stream_id = ?8 AND topic_id = ?9))
+                     AND encryption_key_id IS ?10 AND key_service_payload IS ?11
+                     AND (?12 IS NULL OR key_service_canonical_id IS ?12))",
                     params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id,
-                        message.id, message.text, placement.as_ref().map(|address| &address.stream_id),
-                        placement.as_ref().map(|address| &address.topic_id)],
+                        message.id, body, placement.as_ref().map(|address| &address.stream_id),
+                        placement.as_ref().map(|address| &address.topic_id), key_id, service, canonical],
                     |row| row.get(0),
                 )?;
+                if same_body && matches!(message.body, MessageBody::Encrypted { .. }) {
+                    // Журнал подтвердил уже сохранённое тело. Действующие чтения остаются пригодны.
+                    return Ok(HistoryEventEffect::Known);
+                }
+                // REST-снимок мог уже учесть более позднюю правку. Сохраняем его до сверки,
+                // но новая локальная версия блокирует страницы, которые начали читать раньше.
+                let revision = advance(connection, owner, false)?;
+                set_message_revision(connection, owner, &message.id, revision)?;
                 if !same_body {
                     // До получения согласованной страницы старые файловые ссылки нельзя открыть.
                     connection.execute(
@@ -1106,15 +1503,16 @@ pub(super) fn before_change(
                         params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id, message.id],
                     )?;
                 }
-                return Ok(false);
+                return Ok(HistoryEventEffect::Reconcile);
             }
+            let revision = advance(connection, owner, false)?;
             record_revision(connection, owner, &message.id, revision, false, None)?;
             if let Some(address) = placement {
                 drop_incompatible_members(connection, owner, &message.id, address, revision)?;
             }
         }
     }
-    Ok(true)
+    Ok(HistoryEventEffect::Write)
 }
 
 /// Проверяет, менялось ли сообщение после начала отправки или уже сохранялось в истории.
@@ -1126,13 +1524,41 @@ pub(super) fn has_message_revision(
     Ok(message_revision(connection, owner, id)?.revision != 0)
 }
 
-/// Проверяет отметку удаления перед повторным созданием того же публичного UUID.
-pub(super) fn can_create(
+/// Проверяет удаление и отменяет ожидающую сверку при более новом событии создания.
+pub(super) fn before_creation(
     connection: &Connection,
     owner: &OwnerContext,
     id: &str,
 ) -> Result<bool, StorageError> {
-    Ok(!message_revision(connection, owner, id)?.deleted)
+    let stored = message_revision(connection, owner, id)?;
+    if stored.legacy_encryption_check {
+        let revision = advance(connection, owner, false)?;
+        set_message_revision(connection, owner, id, revision)?;
+    }
+    Ok(!stored.deleted)
+}
+
+/// Повышает локальную версию UUID, сохраняя подтверждённое тело или отметку удаления.
+fn set_message_revision(
+    connection: &Connection,
+    owner: &OwnerContext,
+    id: &str,
+    revision: i64,
+) -> Result<(), StorageError> {
+    connection.execute(
+        "UPDATE history_changes SET revision = ?7 WHERE account_id = ?1 AND server = ?2
+         AND organization_id = ?3 AND project_id = ?4 AND user_id = ?5 AND message_id = ?6",
+        params![
+            owner.account_id.0,
+            owner.server,
+            owner.organization_id,
+            owner.project_id,
+            owner.user_id,
+            id,
+            revision
+        ],
+    )?;
+    Ok(())
 }
 
 /// Помечает края, если удалённый UUID был маркером продолжения.
@@ -1227,7 +1653,7 @@ mod tests {
     use super::*;
     use crate::{
         context::AccountId,
-        storage::{EventWrite, HistoryChange, MessagePlacement},
+        storage::{EventWrite, HistoryChange, MessagePlacement, PreparedSendBody},
     };
 
     /// Создаёт независимый ключ для тестового аккаунта.
@@ -1262,7 +1688,7 @@ mod tests {
             id: Uuid::from_u128(id),
             stream_id: scope.stream_id,
             topic_id: scope.topic_id.unwrap(),
-            text: format!("текст {id}"),
+            body: MessageBody::Markdown(format!("текст {id}")),
             metadata: HistoryMetadata {
                 author_id: Some(Uuid::from_u128(3)),
                 created_at: HistoryTime::parse(timestamp).unwrap(),
@@ -1314,6 +1740,499 @@ mod tests {
             .unwrap();
     }
 
+    /// Отклоняет правку при изменении зашифрованной ссылки, даже пока старый снимок виден.
+    #[test]
+    fn fragment_edit_requires_exact_live_markdown_source() {
+        let storage = Storage::in_memory().unwrap();
+        let a = owner("A");
+        let b = owner("B");
+        let (_, topic) = scopes();
+        let mut original = message(topic, 18, "2026-01-02T03:04:05Z");
+        original.body = MessageBody::Markdown("[secret](urn:secret:v1:original)".into());
+        new_window(&storage, &a, topic, std::slice::from_ref(&original));
+        assert!(storage.matches_markdown_edit(&a, &original).unwrap());
+        assert!(!storage.matches_markdown_edit(&b, &original).unwrap());
+        let change = HistoryChange::Edit {
+            message: Message {
+                id: original.id.to_string(),
+                body: MessageBody::Markdown("[secret](urn:secret:v1:changed)".into()),
+            },
+            placement: Some(MessagePlacement {
+                stream_id: original.stream_id.to_string(),
+                topic_id: original.topic_id.to_string(),
+            }),
+        };
+        event(
+            &storage,
+            &a,
+            1,
+            EventWrite {
+                history: Some(&change),
+                ..Default::default()
+            },
+        );
+        assert!(!storage.matches_markdown_edit(&a, &original).unwrap());
+    }
+
+    /// Подтверждение PUT не заменяет более свежую строку или отозванный доступ.
+    #[test]
+    fn confirmed_encrypted_edit_keeps_newer_snapshot() {
+        let storage = Storage::in_memory().unwrap();
+        let owner = owner("A");
+        let (_, topic) = scopes();
+        let mut original = message(topic, 18, "2026-01-02T03:04:05Z");
+        let key_id = Uuid::from_u128(42);
+        original.body = MessageBody::Encrypted {
+            key_id,
+            ciphertext: "first".into(),
+        };
+        new_window(&storage, &owner, topic, std::slice::from_ref(&original));
+        let start = storage
+            .prepare_encrypted_edit(&owner, &original)
+            .unwrap()
+            .unwrap();
+        let mut confirmed = original.clone();
+        confirmed.body = MessageBody::Encrypted {
+            key_id,
+            ciphertext: "confirmed".into(),
+        };
+        confirmed.metadata.updated_at = HistoryTime::parse("2026-01-02T03:04:06Z");
+        let mut newer = confirmed.clone();
+        newer.body = MessageBody::Encrypted {
+            key_id,
+            ciphertext: "newer".into(),
+        };
+        newer.metadata.updated_at = HistoryTime::parse("2026-01-02T03:04:07Z");
+        let change = HistoryChange::Edit {
+            message: Message {
+                id: original.id.to_string(),
+                body: newer.body.clone(),
+            },
+            placement: None,
+        };
+        event(
+            &storage,
+            &owner,
+            1,
+            EventWrite {
+                history: Some(&change),
+                ..Default::default()
+            },
+        );
+        new_window(&storage, &owner, topic, std::slice::from_ref(&newer));
+        assert!(matches!(
+            storage
+                .confirm_encrypted_edit(&owner, &original, start, &confirmed)
+                .unwrap(),
+            ConfirmedEdit::Stale
+        ));
+        assert_eq!(
+            storage
+                .message(&owner, &newer.id.to_string())
+                .unwrap()
+                .unwrap()
+                .body,
+            newer.body
+        );
+        let post = storage
+            .prepare_encrypted_edit(&owner, &newer)
+            .unwrap()
+            .unwrap();
+        event(
+            &storage,
+            &owner,
+            2,
+            EventWrite {
+                history: Some(&HistoryChange::RemoveStream(topic.stream_id.to_string())),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            storage
+                .confirm_encrypted_edit(&owner, &newer, post, &newer)
+                .unwrap(),
+            ConfirmedEdit::Stale
+        ));
+    }
+
+    /// Проверяет снимок, живую правку и чтение после перезапуска без индексации конвертов.
+    #[test]
+    fn encrypted_history_survives_reopen_without_projecting_links() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.sqlite");
+        let a = owner("A");
+        let b = owner("B");
+        let (stream, topic) = scopes();
+        let storage = Storage::open(&path).unwrap();
+        let ciphertext = "[ссылка](https://workspace.test/secret)".to_owned();
+        let key_id = Uuid::from_u128(40);
+        let mut first = message(topic, 10, "2026-01-01T10:00:00Z");
+        first.body = MessageBody::Encrypted {
+            key_id,
+            ciphertext: ciphertext.clone(),
+        };
+        let latest = message(topic, 12, "2026-01-01T12:00:00Z");
+        let window_id = new_window(&storage, &a, stream, &[first.clone(), latest.clone()]);
+        let other_owner_row = message(topic, 10, "2026-01-01T10:00:00Z");
+        let b_window_id = new_window(&storage, &b, stream, std::slice::from_ref(&other_owner_row));
+        let live = message(topic, 11, "2026-01-01T11:00:00Z");
+        let address = MessagePlacement {
+            stream_id: live.stream_id.to_string(),
+            topic_id: live.topic_id.to_string(),
+        };
+        let mut created = Message {
+            id: live.id.to_string(),
+            body: first.body.clone(),
+        };
+        event(
+            &storage,
+            &a,
+            1,
+            EventWrite {
+                message: Some(&created),
+                placement: Some(&address),
+                metadata: Some(&live.metadata),
+                ..Default::default()
+            },
+        );
+        created.body = MessageBody::Encrypted {
+            key_id: Uuid::from_u128(41),
+            ciphertext,
+        };
+        event(
+            &storage,
+            &a,
+            2,
+            EventWrite {
+                history: Some(&HistoryChange::Edit {
+                    message: created.clone(),
+                    placement: Some(address),
+                }),
+                ..Default::default()
+            },
+        );
+        drop(storage);
+
+        let storage = Storage::open(&path).unwrap();
+        let history = storage
+            .history_window(&a, stream, window_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            history.messages,
+            [
+                first,
+                HistoryMessage {
+                    body: created.body.clone(),
+                    ..live
+                },
+                latest
+            ]
+        );
+        assert_eq!(storage.message(&a, &created.id).unwrap(), Some(created));
+        let other_window = storage
+            .history_window(&b, stream, b_window_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(other_window.messages, [other_owner_row]);
+        let connection = storage.connection.lock().unwrap();
+        let references: u32 = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM messenger_web_links) +
+                        (SELECT COUNT(*) FROM messenger_media_refs)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(references, 0);
+    }
+
+    /// Хранит служебное размещение за владельцем и сохраняет канонический UUID при неполном снимке.
+    #[test]
+    fn key_service_placement_is_durable_without_media_or_notification_projection() {
+        use crate::storage::{KeyResponseTarget, KeyServicePayload};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("service-history.sqlite");
+        let a = owner("A");
+        let b = owner("B");
+        let (stream, topic) = scopes();
+        let storage = Storage::open(&path).unwrap();
+        let canonical = Uuid::from_u128(61);
+        let payload = KeyServicePayload::Grant {
+            target: KeyResponseTarget {
+                key_uuid: Uuid::from_u128(62),
+                request_message_uuid: Uuid::from_u128(63),
+                sender_device_id: "old-device".into(),
+                recipient_device_id: "new-device".into(),
+            },
+            content: "[служебный конверт](https://workspace.test/opaque)".into(),
+        };
+        let initial = message(topic, 10, "2026-01-01T10:00:00Z");
+        new_window(&storage, &a, stream, std::slice::from_ref(&initial));
+        let mut service = message(topic, 11, "2026-01-01T11:00:00Z");
+        service.id = Uuid::new_v5(&service.topic_id, canonical.to_string().as_bytes());
+        service.body = MessageBody::KeyService {
+            payload: payload.clone(),
+            canonical_id: Some(canonical),
+        };
+        let wire_id = service.id.to_string();
+        let placement = MessagePlacement {
+            stream_id: service.stream_id.to_string(),
+            topic_id: service.topic_id.to_string(),
+        };
+        event(
+            &storage,
+            &a,
+            1,
+            EventWrite {
+                message: Some(&Message {
+                    id: wire_id.clone(),
+                    body: service.body.clone(),
+                }),
+                placement: Some(&placement),
+                metadata: Some(&service.metadata),
+                notification_conversation: Some(&placement.stream_id),
+                ..Default::default()
+            },
+        );
+        let incomplete = HistoryMessage {
+            body: MessageBody::KeyService {
+                payload,
+                canonical_id: None,
+            },
+            ..service.clone()
+        };
+        let window_id = new_window(&storage, &a, stream, &[initial, incomplete]);
+        drop(storage);
+
+        let reopened = Storage::open(&path).unwrap();
+        assert_eq!(
+            reopened.message(&a, &wire_id).unwrap().unwrap().body,
+            service.body
+        );
+        assert!(reopened.message(&b, &wire_id).unwrap().is_none());
+        assert_eq!(
+            reopened
+                .history_window(&a, stream, window_id)
+                .unwrap()
+                .unwrap()
+                .messages
+                .last(),
+            Some(&service)
+        );
+        assert_eq!(
+            reopened
+                .cursor(&a, SOURCE_ID)
+                .unwrap()
+                .unwrap()
+                .epoch_version,
+            1
+        );
+        let count: u32 = reopened
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM messenger_web_links) +
+                    (SELECT COUNT(*) FROM messenger_media_refs) +
+                    (SELECT COUNT(*) FROM messenger_notification_targets)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// Перепроверяет только старую отметку, оставленную клиентом после правки E2EE.
+    #[test]
+    fn legacy_encrypted_edit_requires_new_scoped_history_confirmation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy.sqlite");
+        let a = owner("A");
+        let b = owner("B");
+        let (stream, topic) = scopes();
+        let ordinary = message(topic, 14, "2026-01-01T10:00:00Z");
+        let mut encrypted = ordinary.clone();
+        encrypted.body = MessageBody::Encrypted {
+            key_id: Uuid::from_u128(40),
+            ciphertext: "YQ==".into(),
+        };
+        let plaintext_removed = message(topic, 15, "2026-01-01T11:00:00Z");
+        let stored = Storage::open(&path).unwrap();
+        let a_window = new_window(
+            &stored,
+            &a,
+            stream,
+            std::slice::from_ref(&plaintext_removed),
+        );
+        let b_window = new_window(&stored, &b, stream, std::slice::from_ref(&ordinary));
+        for (position, id) in [(1, encrypted.id), (2, plaintext_removed.id)] {
+            // До поддержки E2EE правка такого сообщения шла по пути обычного удаления.
+            event(
+                &stored,
+                &a,
+                position,
+                EventWrite {
+                    history: Some(&HistoryChange::RemoveMessage(id.to_string())),
+                    ..Default::default()
+                },
+            );
+        }
+        let outbox = super::super::PreparedSend {
+            canonical_id: Uuid::from_u128(19),
+            public_id: Uuid::from_u128(20),
+            stream_id: stream.stream_id,
+            topic_id: topic.topic_id.unwrap(),
+            body: PreparedSendBody::Markdown("готовое сообщение".into()),
+        };
+        assert!(stored.save_prepared_send(&a, &outbox).unwrap());
+        let prepare = |storage: &Storage| {
+            storage
+                .prepare_history_page(&a, stream, HistoryPageTarget::New)
+                .unwrap()
+                .unwrap()
+        };
+        let mut pre_migration_request = prepare(&stored);
+        pre_migration_request.verify_legacy_encrypted_message(encrypted.id);
+        drop(stored);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE history_changes DROP COLUMN legacy_encryption_check;
+                 ALTER TABLE sync_messages DROP COLUMN encryption_key_id;",
+            )
+            .unwrap();
+
+        let stored = Storage::open(&path).unwrap();
+        assert!(
+            stored
+                .history_window(&a, stream, a_window)
+                .unwrap()
+                .unwrap()
+                .needs_refresh
+        );
+        assert!(
+            !stored
+                .history_window(&b, stream, b_window)
+                .unwrap()
+                .unwrap()
+                .needs_refresh
+        );
+        assert_eq!(stored.pending_sends(&a).unwrap(), [outbox]);
+        let cursor = stored.cursor(&a, SOURCE_ID).unwrap().unwrap();
+        assert_eq!(
+            (&*cursor.epoch_generation, cursor.epoch_version),
+            ("test", 2)
+        );
+        let save = |guard, message| {
+            stored
+                .save_history_page(
+                    &a,
+                    guard,
+                    std::slice::from_ref(message),
+                    HistoryPageEdges::New {
+                        older: HistoryEdge::End,
+                        newer: HistoryEdge::End,
+                    },
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            save(pre_migration_request, &encrypted),
+            HistoryPageOutcome::Stale
+        );
+        assert_eq!(
+            save(prepare(&stored), &encrypted),
+            HistoryPageOutcome::Stale
+        );
+        let mut wrong_proof = prepare(&stored);
+        wrong_proof.verify_legacy_encrypted_message(plaintext_removed.id);
+        assert_eq!(
+            save(wrong_proof, &plaintext_removed),
+            HistoryPageOutcome::Stale
+        );
+        assert_eq!(
+            stored
+                .legacy_encrypted_messages(&a, std::slice::from_ref(&encrypted))
+                .unwrap(),
+            [&encrypted]
+        );
+        assert!(
+            stored
+                .legacy_encrypted_messages(&b, std::slice::from_ref(&encrypted))
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut stale_request = prepare(&stored);
+        stale_request.verify_legacy_encrypted_message(encrypted.id);
+        let creation = Message {
+            id: encrypted.id.to_string(),
+            body: encrypted.body.clone(),
+        };
+        for position in [2, 3] {
+            event(
+                &stored,
+                &a,
+                position,
+                EventWrite {
+                    message: Some(&creation),
+                    ..Default::default()
+                },
+            );
+            assert!(stored.message(&a, &creation.id).unwrap().is_none());
+        }
+        assert_eq!(save(stale_request, &encrypted), HistoryPageOutcome::Stale);
+        let mut stale_request = prepare(&stored);
+        stale_request.verify_legacy_encrypted_message(encrypted.id);
+        event(
+            &stored,
+            &a,
+            4,
+            EventWrite {
+                history: Some(&HistoryChange::Edit {
+                    message: creation.clone(),
+                    placement: None,
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(stored.message(&a, &creation.id).unwrap().is_none());
+        assert_eq!(save(stale_request, &encrypted), HistoryPageOutcome::Stale);
+
+        let mut verified_request = prepare(&stored);
+        verified_request.verify_legacy_encrypted_message(encrypted.id);
+        assert!(matches!(
+            save(verified_request, &encrypted),
+            HistoryPageOutcome::Saved(_)
+        ));
+        assert_eq!(
+            stored.message(&a, &creation.id).unwrap(),
+            Some(creation.clone())
+        );
+        assert_eq!(
+            stored.message(&b, &creation.id).unwrap().unwrap().body,
+            ordinary.body
+        );
+        event(
+            &stored,
+            &a,
+            5,
+            EventWrite {
+                history: Some(&HistoryChange::RemoveMessage(creation.id.clone())),
+                ..Default::default()
+            },
+        );
+        let mut wrong_proof = prepare(&stored);
+        wrong_proof.verify_legacy_encrypted_message(encrypted.id);
+        assert_eq!(save(wrong_proof, &encrypted), HistoryPageOutcome::Stale);
+        assert!(stored.message(&a, &creation.id).unwrap().is_none());
+        let before_reset = prepare(&stored);
+        stored.reset_source(&a, SOURCE_ID).unwrap();
+        assert_eq!(save(before_reset, &encrypted), HistoryPageOutcome::Stale);
+    }
+
     /// Проверяет общие тела, независимые окна и чтение по владельцу после повторного открытия.
     #[test]
     fn windows_share_messages_and_keep_independent_edges() {
@@ -1331,7 +2250,7 @@ mod tests {
         let id = new_window(&storage, &owner_a, stream, &[tie.clone(), base.clone()]);
         new_window(&storage, &owner_a, topic, std::slice::from_ref(&base));
         let mut changed = base.clone();
-        changed.text = "снимок темы обновил общее тело".into();
+        changed.body = MessageBody::Markdown("снимок темы обновил общее тело".into());
         new_window(&storage, &owner_a, topic, &[changed.clone()]);
         new_window(
             &storage,
@@ -1449,7 +2368,7 @@ mod tests {
         let stale_edit = HistoryChange::Edit {
             message: Message {
                 id: base.id.to_string(),
-                text: "более старый текст из журнала".into(),
+                body: MessageBody::Markdown("более старый текст из журнала".into()),
             },
             placement: None,
         };
@@ -1573,7 +2492,7 @@ mod tests {
         for (position, item) in [(1, &inside), (2, &outside)] {
             let body = Message {
                 id: item.id.to_string(),
-                text: item.text.clone(),
+                body: item.body.clone(),
             };
             event(
                 &storage,

@@ -130,7 +130,7 @@ fn narrow_toolbar_scrolls_focused_actions_and_keeps_reading_anchor(cx: &mut Test
             id: Uuid::from_u128(index),
             stream_id,
             topic_id: TOPIC,
-            text: "Синтетическая строка".into(),
+            body: MessageBody::Markdown("Синтетическая строка".into()),
             metadata: HistoryMetadata {
                 author_id: Some(Uuid::from_u128(900)),
                 created_at: HistoryTime::parse("2026-11-17T07:10:30Z").unwrap(),

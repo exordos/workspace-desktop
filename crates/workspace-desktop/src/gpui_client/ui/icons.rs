@@ -109,6 +109,7 @@ workspace_icons! {
     Draw => ("draw.svg", "Внешний вид приложения."),
     DoneAll => ("done_all.svg", "Подтверждённая отправка."),
     Error => ("error.svg", "Ошибка действия."),
+    EncryptedSpoiler => ("encrypted_spoiler.svg", "Защищённый фрагмент сообщения."),
     Envelope => ("mail.svg", "Раздел почты."),
     Folder => ("folder.svg", "Папка разговоров."),
     FolderOpen => ("folder_open.svg", "Выбранная папка."),

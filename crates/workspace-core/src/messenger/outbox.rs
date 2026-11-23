@@ -17,7 +17,7 @@ use crate::{
     auth::{Service, SessionSnapshot},
     context::{OwnerContext, SessionGeneration},
     runtime::SourceError,
-    storage::{DeliveryStatus, PreparedSend, SendBlock},
+    storage::{DeliveryStatus, HistoryScope, PreparedSend, PreparedSendBody, SendBlock},
     sync::{Sync, SyncChange, SyncError},
 };
 
@@ -191,11 +191,27 @@ impl OutboxWorker<'_> {
         let Some(token) = self.token().await else {
             return Ok(false);
         };
-        let preflight = self
-            .source
-            .rest
-            .check_send_topic(owner, &token, snapshot.stream_id, snapshot.topic_id, true)
-            .await;
+        let preflight = match &snapshot.body {
+            PreparedSendBody::Markdown(_) => {
+                self.source
+                    .rest
+                    .check_send_topic(owner, &token, snapshot.stream_id, snapshot.topic_id, true)
+                    .await
+            }
+            PreparedSendBody::Encrypted { .. } => self
+                .source
+                .rest
+                .encrypted_send_target(
+                    owner,
+                    &token,
+                    HistoryScope {
+                        stream_id: snapshot.stream_id,
+                        topic_id: Some(snapshot.topic_id),
+                    },
+                )
+                .await
+                .map(|_| ()),
+        };
         let blocked = match preflight {
             Ok(()) => None,
             Err(DirectSendError::Source(SourceError::Unauthorized)) => {
@@ -225,10 +241,24 @@ impl OutboxWorker<'_> {
         if !*ready.borrow() {
             return Ok(false);
         }
-        let Some(claimed) = self
-            .sync
-            .claim_send(owner, generation, snapshot.canonical_id)?
-        else {
+        let claimed = self.source.authorize_outbox_dispatch(owner, snapshot, || {
+            self.sync
+                .claim_send(owner, generation, snapshot.canonical_id)
+        });
+        let claimed = match claimed {
+            Ok(result) => result?,
+            Err(_) => {
+                self.sync.set_send_status(
+                    owner,
+                    generation,
+                    snapshot,
+                    false,
+                    DeliveryStatus::Blocked(SendBlock::EncryptionUnavailable),
+                )?;
+                return Ok(true);
+            }
+        };
+        let Some(claimed) = claimed else {
             return Ok(true);
         };
         self.sync
@@ -236,7 +266,8 @@ impl OutboxWorker<'_> {
             .with_active_generation(owner, generation, || ())?;
         let status = match self
             .source
-            .post_prepared_message(owner, &token, &claimed)
+            .rest
+            .post_prepared(owner, &token, &claimed)
             .await
         {
             Ok(message) if confirms_snapshot(owner, &claimed, &message) => {
@@ -245,6 +276,9 @@ impl OutboxWorker<'_> {
             }
             Err(SendError::Rejected(code)) => DeliveryStatus::Rejected(Some(code)),
             Err(SendError::InvalidInput) => DeliveryStatus::Rejected(None),
+            Err(SendError::EncryptionUnavailable) => {
+                DeliveryStatus::Blocked(SendBlock::EncryptionUnavailable)
+            }
             Ok(_) | Err(SendError::Unknown) => DeliveryStatus::Unknown,
         };
         self.sync
@@ -312,4 +346,5 @@ fn confirms_snapshot(
         && message.topic_id == snapshot.topic_id
         && message.metadata.author_id == owner.user_id.parse().ok()
         && message.metadata.author_id.is_some()
+        && snapshot.body.matches_message(&message.body)
 }

@@ -23,14 +23,16 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 block2 = { version = "0.5", optional = true }
 objc2 = { version = "0.5", optional = true }
 objc2-app-kit = { version = "0.2", features = ["NSAppearance", "NSApplication", "NSResponder", "NSSound", "NSWorkspace"], optional = true }
-objc2-foundation = { version = "0.2", features = ["NSBundle", "NSUUID", "NSOperation", "block2"], optional = true }
+objc2-foundation = { version = "0.2", features = ["NSBundle", "NSDate", "NSDateFormatter", "NSFormatter", "NSUUID", "NSOperation", "block2"], optional = true }
 objc2-user-notifications = { version = "0.2", features = ["UNError", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationSettings", "UNNotificationTrigger", "UNUserNotificationCenter", "block2"], optional = true }
+rust-i18n = { version = "4.2.4", optional = true }
 security-framework = "3"
+zeroize = { version = "1", optional = true }
 
 [features]
 default = ["gpui"]
 macos-adapters = ["dep:block2", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:objc2-user-notifications"]
-gpui = ["dep:base64", "dep:gpui", "dep:image", "dep:unicode-segmentation", "macos-adapters"]
+gpui = ["dep:base64", "dep:gpui", "dep:image", "dep:rust-i18n", "dep:unicode-segmentation", "dep:zeroize", "macos-adapters"]
 gpui-test = ["gpui", "gpui/test-support"]
 
 [dev-dependencies]

@@ -8,11 +8,16 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
-use workspace_core::messenger::quote::{self, Block};
+use workspace_core::messenger::{
+    encryption::fragments::{FragmentDisplayKind, fragment_display_spans},
+    forward::forward_spans,
+    quote::{self, Block},
+};
 
 use super::{Conversation, State};
 use crate::gpui_client::{
-    composer::{ReplyAction, ReplyQuote},
+    composer::{ReplyAction, ReplyQuote, ReplyText, short_reply_text},
+    preferences::{Language, Preferences},
     ui::{
         Button, ButtonAppearance, Icon, Palette, QuoteSurface, TextRole, label,
         popup::{MenuInput, menu_layer, menu_navigation, menu_surface},
@@ -92,33 +97,34 @@ impl ReplyControls {
     pub(super) fn selectable(
         &self,
         id: Uuid,
-        body: &str,
+        body: &SharedString,
         palette: Palette,
     ) -> (Stateful<Div>, TextLayout) {
-        self.selectable_text(id, body, 0..body.len(), palette)
+        self.selectable_text(id, body, 0..body.len(), body.clone(), palette)
     }
 
     /// Показывает часть тела и сохраняет выделение в координатах исходного сообщения.
     pub(super) fn selectable_span(
         &self,
         id: Uuid,
-        body: &str,
+        body: &SharedString,
         span: Range<usize>,
+        visible: SharedString,
         palette: Palette,
     ) -> Stateful<Div> {
-        self.selectable_text(id, body, span, palette).0
+        self.selectable_text(id, body, span, visible, palette).0
     }
 
     /// Возвращает текст и его фактическую разметку для выделения и фиксации позиции.
     fn selectable_text(
         &self,
         id: Uuid,
-        body: &str,
+        body: &SharedString,
         span: Range<usize>,
+        visible: SharedString,
         palette: Palette,
     ) -> (Stateful<Div>, TextLayout) {
-        let body: SharedString = body.to_owned().into();
-        let visible: SharedString = body[span.clone()].to_owned().into();
+        let body = body.clone();
         let start = span.start;
         let end = span.end;
         let range = self
@@ -185,7 +191,13 @@ impl ReplyControls {
     }
 
     /// Добавляет быстрый ответ и открывает меню по правому клику той же строки.
-    pub(super) fn row(&self, id: Uuid, inner: Div, palette: Palette) -> Stateful<Div> {
+    pub(super) fn row(
+        &self,
+        id: Uuid,
+        inner: Div,
+        palette: Palette,
+        language: Language,
+    ) -> Stateful<Div> {
         let target = self.conversation.clone();
         let menu = self.conversation.clone();
         let select = self.selection.clone();
@@ -216,7 +228,9 @@ impl ReplyControls {
                 {
                     selection.fragment = None;
                 }
-                window.focus(&focus);
+                if !window.default_prevented() {
+                    window.focus(&focus);
+                }
                 window.refresh();
             })
             .on_mouse_down(MouseButton::Right, move |event, window, cx| {
@@ -241,7 +255,11 @@ impl ReplyControls {
                             button.focus(|style| style.opacity(1.).border_color(palette.focus))
                         })
                         .tooltip(move |_, app| {
-                            crate::gpui_client::ui::popup::tooltip(palette, "Ответить".into(), app)
+                            crate::gpui_client::ui::popup::tooltip(
+                                palette,
+                                language.tr("message.reply").into(),
+                                app,
+                            )
                         })
                         .debug_selector(move || format!("history-reply-{id}")),
                 ),
@@ -366,31 +384,30 @@ impl Conversation {
     }
 
     /// Ищет подтверждённую непустую строку этого окна.
-    fn reply_message(&self, id: Uuid) -> Option<&workspace_core::storage::HistoryMessage> {
+    fn reply_text(&self, id: Uuid) -> Option<&str> {
         let State::Ready(history) = &self.state else {
             return None;
         };
         history
             .messages
             .iter()
-            .find(|message| message.id == id && !id.is_nil() && !message.text.trim().is_empty())
+            .find(|message| message.id == id && !id.is_nil())
+            .and_then(|message| message.body.markdown())
+            .filter(|text| !text.trim().is_empty())
     }
 
     /// Получает автора и фрагмент только из актуального окна подтверждённой истории.
     fn reply_quote(&self, id: Uuid) -> Option<ReplyQuote> {
-        let message = self.reply_message(id)?;
+        let text = self.reply_text(id)?;
         let author = self
             .viewport
             .source_author(id, self.reply_peer())
-            .unwrap_or_else(|| "Участник".into());
-        let fragment = self
-            .viewport
-            .selection()
-            .borrow()
-            .fragment(id, &message.text);
-        let preview = fragment
-            .as_deref()
-            .map_or_else(|| excerpt(&message.text), short_text);
+            .unwrap_or(ReplyText::Label("desktop.messenger.participant"));
+        let fragment = self.viewport.selection().borrow().fragment(id, text);
+        let preview = fragment.as_deref().map_or_else(
+            || reply_preview(text, true),
+            |text| reply_preview(text, false),
+        );
         Some(ReplyQuote {
             id,
             author,
@@ -405,13 +422,15 @@ impl Conversation {
         id: Uuid,
         fragment: Option<&str>,
     ) -> Option<ReplyQuote> {
-        let message = self.reply_message(id)?;
-        if fragment.is_some_and(|fragment| !message.text.contains(fragment)) {
+        let text = self.reply_text(id)?;
+        if fragment.is_some_and(|fragment| !text.contains(fragment)) {
             return None;
         }
         let mut quote = self.reply_quote(id)?;
         quote.fragment = fragment.map(str::to_owned);
-        quote.preview = fragment.map_or_else(|| excerpt(&message.text), short_text);
+        if let Some(fragment) = fragment {
+            quote.preview = reply_preview(fragment, false);
+        }
         Some(quote)
     }
 
@@ -431,7 +450,7 @@ impl Conversation {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(message) = self.reply_message(id) else {
+        let Some(text) = self.reply_text(id) else {
             return;
         };
         if !self
@@ -444,7 +463,7 @@ impl Conversation {
         self.reply_menu.item = Some(MenuTarget {
             id,
             anchor,
-            body: message.text.clone(),
+            body: text.to_owned(),
         });
         self.reply_menu.selected = false;
         window.focus(&self.reply_menu.focus);
@@ -490,8 +509,8 @@ impl Conversation {
     /// Принимает пункт меню только для исходной, по-прежнему доступной версии строки.
     fn current_menu_reply(&self) -> Option<&MenuTarget> {
         let target = self.reply_menu.item.as_ref()?;
-        let current = self.reply_message(target.id)?;
-        (current.text == target.body).then_some(target)
+        let current = self.reply_text(target.id)?;
+        (current == target.body).then_some(target)
     }
 
     /// Показывает меню через общий слой GPUI, без второго меню на каждую строку.
@@ -507,17 +526,22 @@ impl Conversation {
             return None;
         };
         let viewport = window.viewport_size();
+        let language = Preferences::read_for(cx, &self.address.route.owner).language;
         let surface = menu_surface("history-reply-menu", palette, viewport, px(190.), px(100.))
             .on_mouse_down_out(cx.listener(|view, _, window, cx| view.close_reply_menu(window, cx)))
             .children(
                 [
-                    ("history-reply-replace", "Ответить", ReplyAction::Replace),
-                    ("history-reply-add", "Добавить ответ", ReplyAction::Add),
+                    (
+                        "history-reply-replace",
+                        "message.reply",
+                        ReplyAction::Replace,
+                    ),
+                    ("history-reply-add", "message.addReply", ReplyAction::Add),
                 ]
                 .into_iter()
                 .enumerate()
-                .map(|(index, (id, title, action))| {
-                    let mut button = Button::new(id, title);
+                .map(|(index, (id, key, action))| {
+                    let mut button = Button::new(id, language.tr(key));
                     button.appearance = ButtonAppearance::Ghost;
                     let target = cx.entity().downgrade();
                     button
@@ -543,9 +567,10 @@ impl Conversation {
 pub(super) fn history_quote(
     palette: Palette,
     own: bool,
-    author: String,
-    snippet: String,
+    author: SharedString,
+    snippet: SharedString,
     available: bool,
+    language: Language,
 ) -> Div {
     let body = div()
         .flex()
@@ -558,7 +583,7 @@ pub(super) fn history_quote(
             body.child(label(
                 palette,
                 TextRole::Caption,
-                "Исходное сообщение недоступно",
+                language.tr("desktop.messenger.history.sourceUnavailable"),
             ))
         });
     quote_frame(
@@ -573,23 +598,97 @@ pub(super) fn history_quote(
     )
 }
 
-/// Берёт краткий текст текущей строки, пропуская уже оформленные ссылки цитирования.
-pub(super) fn excerpt(markdown: &str) -> String {
-    quote::blocks(markdown)
+/// Оставляет открытый текст и ключи подписей, чтобы превью меняло язык вместе с вкладкой.
+fn reply_preview(markdown: &str, skip_quotes: bool) -> ReplyText {
+    let mut spans: Vec<_> = fragment_display_spans(markdown)
         .into_iter()
-        .find_map(|part| match part {
-            Block::Text(text) if !text.trim().is_empty() => Some(short_text(text)),
-            _ => None,
+        .map(|span| {
+            (
+                span.range,
+                (span.kind != FragmentDisplayKind::Definition).then_some("e2ee.secretFragment"),
+            )
         })
-        .unwrap_or_else(|| "Цитата".into())
+        .chain(
+            forward_spans(markdown)
+                .into_iter()
+                .map(|span| (span.range, Some("message.forwarded"))),
+        )
+        .collect();
+    spans.sort_by_key(|(range, _)| (range.start, std::cmp::Reverse(range.end)));
+    let blocks = if skip_quotes {
+        quote::blocks(markdown)
+    } else {
+        vec![Block::Text(markdown)]
+    };
+    blocks
+        .into_iter()
+        .find_map(|part| {
+            let Block::Text(text) = part else {
+                return None;
+            };
+            // Блок ссылается на тот же Markdown, в котором найдены служебные ссылки.
+            let start = text.as_ptr().addr() - markdown.as_ptr().addr();
+            preview_block(text, start, &spans)
+        })
+        .unwrap_or(ReplyText::Label("composer.quote"))
 }
 
-/// Ограничивает предпросмотр одним коротким фрагментом без разрезания UTF-8.
-fn short_text(text: &str) -> String {
-    const WIDTH: usize = 80;
-    let text = text.trim();
-    match text.char_indices().nth(WIDTH) {
-        Some((end, _)) => format!("{}…", text[..end].trim_end()),
-        None => text.to_owned(),
+/// Превращает размеченные ссылки в подписи, оставляя авторский текст дословно.
+fn preview_block(
+    text: &str,
+    start: usize,
+    spans: &[(Range<usize>, Option<&'static str>)],
+) -> Option<ReplyText> {
+    let end = start + text.len();
+    let mut cursor = start;
+    let mut parts = Vec::new();
+    for (range, key) in spans {
+        let visible_start = range.start.max(start);
+        let visible_end = range.end.min(end);
+        if visible_start >= visible_end || visible_end <= cursor {
+            continue;
+        }
+        if visible_start >= cursor {
+            parts.push(ReplyText::Source(
+                text[cursor - start..visible_start - start].to_owned(),
+            ));
+            if let Some(key) = key {
+                parts.push(ReplyText::Label(key));
+            }
+        }
+        cursor = visible_end;
+    }
+    if parts.is_empty() {
+        return (!text.trim().is_empty()).then(|| ReplyText::Source(short_reply_text(text)));
+    }
+    parts.push(ReplyText::Source(text[cursor - start..].to_owned()));
+    parts
+        .iter()
+        .any(|part| match part {
+            ReplyText::Source(text) => !text.trim().is_empty(),
+            _ => true,
+        })
+        .then_some(ReplyText::Mixed(parts))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Переводит только служебные вставки, даже если автор набрал такую же русскую строку.
+    #[test]
+    fn reply_preview_translates_service_spans_only() {
+        let markdown = "Зашифрованный фрагмент [ключ](urn:secret:v9:bad) [снимок](urn:forward:bad)";
+        for skip_quotes in [false, true] {
+            let preview = reply_preview(markdown, skip_quotes);
+            assert_eq!(
+                preview.display(Language::En),
+                "Зашифрованный фрагмент Encrypted fragment Forwarded message"
+            );
+            assert_eq!(
+                preview.display(Language::Ru),
+                "Зашифрованный фрагмент Зашифрованный фрагмент Пересланное сообщение"
+            );
+        }
     }
 }

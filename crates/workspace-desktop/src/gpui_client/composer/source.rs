@@ -5,7 +5,13 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use uuid::Uuid;
 use workspace_core::{
-    messenger::{quote::SourceCheckError, send::DirectSendError},
+    messenger::{
+        encrypted_send::EncryptedMessageError,
+        encryption::{EncryptionActivation, EncryptionError},
+        message_actions::MessageTarget,
+        quote::SourceCheckError,
+        send::{DirectSendError, PlainSendTarget},
+    },
     runtime::SourceError,
     storage::{DraftAccess, DraftScope, PlaintextDraft},
 };
@@ -20,6 +26,7 @@ use crate::gpui_client::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::gpui_client) enum DestinationError {
     AccessLost,            // Стрим или тема недоступны исходному входу.
+    KeyUnavailable,        // Защищённая запись требует локального ключа точного чата.
     EncryptionUnavailable, // Сервер не разрешил отправку открытого текста.
     TopicUnavailable,      // Сервер не предоставил пригодный UUID темы.
     TopicClosed,           // Отправку ограничивает завершённая тема канала.
@@ -41,10 +48,25 @@ impl From<DirectSendError> for DestinationError {
     }
 }
 
-/// Проверенная тема открытого текста и её локальный черновик.
+impl From<EncryptedMessageError> for DestinationError {
+    /// Оставляет только состояние, которое можно показать пользователю защищённого чата.
+    fn from(error: EncryptedMessageError) -> Self {
+        match error {
+            EncryptedMessageError::Destination(error) => error.into(),
+            EncryptedMessageError::Key(EncryptionError::MissingKey) => Self::KeyUnavailable,
+            EncryptedMessageError::TopicChanged => Self::TopicChanged,
+            _ => Self::Unavailable,
+        }
+    }
+}
+
+/// Проверенная цель отправки. Локальный открытый черновик есть только у обычной темы.
 pub(in crate::gpui_client) struct ResolvedDestination {
-    pub topic: Uuid,  // Проверенная тема обычного текста.
+    pub topic: Uuid,                           // Проверенная тема отправки.
+    pub encrypted: bool,                       // Нужен конверт E2EE и ввод только в памяти.
     pub closed: bool, // Для чтения черновика доступ есть, а отправка запрещена.
+    pub plain_target: Option<PlainSendTarget>, // Происхождение Markdown, подтверждённое сервером.
+    pub restored_protected: bool, // Черновик пришёл из защищённого буфера этого входа.
     pub draft: Option<(DraftAccess, Option<PlaintextDraft>)>, // Проверка доступа и снимок поля.
 }
 
@@ -61,6 +83,9 @@ type Resolve = Arc<
 #[derive(Clone, Copy, Debug)]
 pub(in crate::gpui_client) enum QueueWriteOutcome {
     Saved(Uuid),                              // Публичный UUID подготовленного сообщения.
+    Edited,                                   // Сервер подтвердил правку прежнего сообщения.
+    StaleEdit,                                // Прежняя версия стала недоступна.
+    EditFailed,                               // Сервер не подтвердил правку.
     DestinationUnavailable(DestinationError), // Заново проверяем цель перед повторной отправкой.
     WriteFailed,                              // Запись снимка не подтверждена.
     QuoteUnavailable(SourceCheckError),       // Источники ответа не прошли проверку.
@@ -77,11 +102,13 @@ pub(in crate::gpui_client) struct SendSource {
 
 impl SendSource {
     /// Связывает отправку с тем же исполнителем, на котором работает мессенджер.
-    pub fn runtime(runtime: RuntimeClient) -> Self {
+    pub fn runtime(runtime: RuntimeClient, activation: Option<EncryptionActivation>) -> Self {
         let worker = runtime.clone();
+        let resolve_activation = activation.clone();
         Self {
             resolve: Arc::new(move |address, op_id| {
                 let worker = worker.clone();
+                let activation = resolve_activation.clone();
                 Box::pin(async move {
                     let reply = worker
                         .conversation(address, move |services, address| async move {
@@ -90,27 +117,36 @@ impl SendSource {
                             let generation = address.generation;
                             let stream_id = address.route.scope.stream_id;
                             let opening = services.sync.prepare_draft_opening(owner, generation, stream_id);
-                            let (topic, closed) = match resolve_destination(&services, &address).await {
-                                Ok(topic) => (topic, false),
+                            let (topic, plain_target, closed) = match resolve_destination(&services, &address).await {
+                                Ok(target) => (target.topic_id(), Some(target), false),
                                 // Этот ответ появляется после проверки владельца, темы и encryption=false.
-                                Err(DirectSendError::TopicClosed) if let Some(topic) = address.route.scope.topic_id => (topic, true),
+                                Err(DirectSendError::TopicClosed) if let Some(topic) = address.route.scope.topic_id => (topic, None, true),
+                                Err(DirectSendError::EncryptionUnavailable) if let Some(activation) = activation.as_ref() => {
+                                    let target = services.messenger.encrypted_send_key(&services.sync, activation, address.route.scope).await?;
+                                    return Ok(ResolvedDestination { topic: target.topic_id, encrypted: true, closed: false, plain_target: None, restored_protected: false, draft: None });
+                                }
                                 Err(error) => return Err(DestinationError::from(error)),
                             };
                             let scope = DraftScope { stream_id, topic_id: topic };
                             services.drafts.wait_for_send(&address, scope).await;
                             let pending = services.drafts.current(&address, scope);
-                            let draft = opening.and_then(|opening| services.sync.open_draft(owner, generation, opening, scope));
-                            let draft = match draft {
+                            let draft = opening.and_then(|opening| {
+                                services.sync.open_draft(owner, generation, opening, scope)
+                            });
+                            let (draft, restored_protected) = match draft {
                                 Ok((access, saved)) => {
                                     let pending = pending
-                                        .filter(|(pending_access, _)| *pending_access == access)
-                                        .map(|(_, pending)| pending);
-                                    let latest = match (saved, pending) {
-                                        (Some(saved), Some(pending)) if saved.id == pending.id && pending.version > saved.version => Some(pending),
-                                        (Some(saved), _) => Some(saved),
-                                        (None, pending) => pending,
+                                        .filter(|(pending_access, _, _)| {
+                                            *pending_access == access
+                                        })
+                                        .map(|(_, pending, protected)| (pending, protected));
+                                    let (latest, protected) = match (saved, pending) {
+                                        (Some(saved), Some((pending, protected))) if saved.id == pending.id && pending.version > saved.version => (Some(pending), protected),
+                                        (Some(saved), _) => (Some(saved), false),
+                                        (None, Some((pending, protected))) => (Some(pending), protected),
+                                        (None, None) => (None, false),
                                     };
-                                    Some((access, latest))
+                                    (Some((access, latest)), protected)
                                 }
                                 Err(error) => {
                                     let stale = matches!(
@@ -125,7 +161,7 @@ impl SendSource {
                                     return Err(DestinationError::DraftUnavailable);
                                 }
                             };
-                            Ok(ResolvedDestination { topic, closed, draft })
+                            Ok(ResolvedDestination { topic, encrypted: false, closed, plain_target, restored_protected, draft })
                         })
                         .await;
                     ConversationReply {
@@ -136,15 +172,58 @@ impl SendSource {
             }),
             save: Arc::new(move |submission| {
                 let worker = runtime.clone();
+                let activation = activation.clone();
                 Box::pin(async move {
                     let op_id = submission.attempt.op_id;
                     let draft = submission.draft.clone();
                     let reply = worker
                         .conversation(submission.address, move |services, address| async move {
                             log::debug!("gpui_send op_id={op_id} event=queue_write_started");
+                            if let Some(edit) = submission.fragment_edit.as_ref() {
+                                return match services.messenger.edit_fragment_message(
+                                    &services.sync, edit, submission.markdown,
+                                ).await {
+                                    Ok(_) => QueueWriteOutcome::Edited,
+                                    Err(workspace_core::messenger::encryption::fragments::FragmentMessageError::StaleEdit) =>
+                                        QueueWriteOutcome::StaleEdit,
+                                    Err(_) => QueueWriteOutcome::EditFailed,
+                                };
+                            }
+                            if submission.encrypted {
+                                let Some(activation) = activation.as_ref() else {
+                                    return QueueWriteOutcome::DestinationUnavailable(DestinationError::EncryptionUnavailable);
+                                };
+                                if let Some(expected) = submission.edit {
+                                    let target = MessageTarget {
+                                        scope: address.route.scope,
+                                        topic_id: expected.topic_id,
+                                        message_id: expected.id,
+                                    };
+                                    return match services.messenger.edit_encrypted_message(
+                                        &services.sync, activation, target, &expected, submission.markdown,
+                                    ).await {
+                                        Ok(_) => QueueWriteOutcome::Edited,
+                                        Err(EncryptedMessageError::StaleEdit | EncryptedMessageError::NotEditable) => QueueWriteOutcome::StaleEdit,
+                                        Err(_) => QueueWriteOutcome::EditFailed,
+                                    };
+                                }
+                                if let Err(error) = services.messenger.verify_protected_reply_sources(
+                                    &services.sync, activation, address.route.scope, &submission.protected_sources,
+                                ).await {
+                                    return QueueWriteOutcome::QuoteUnavailable(error);
+                                }
+                                let protected = services.messenger.prepare_encrypted_send_to_expected(
+                                    &services.sync, activation, address.route.scope, submission.topic, submission.markdown,
+                                ).await;
+                                return match protected {
+                                    Ok(record) => QueueWriteOutcome::Saved(record.public_id),
+                                    Err(EncryptedMessageError::Queue(_)) => QueueWriteOutcome::WriteFailed,
+                                    Err(error) => QueueWriteOutcome::DestinationUnavailable(error.into()),
+                                };
+                            }
                             // Тема могла смениться или закрыться, пока пользователь набирал текст.
-                            match resolve_destination(&services, &address).await {
-                                Ok(topic) if topic == submission.topic => {}
+                            let plain_target = match resolve_destination(&services, &address).await {
+                                Ok(target) if target.topic_id() == submission.topic => Some(target),
                                 Ok(_) => {
                                     return QueueWriteOutcome::DestinationUnavailable(
                                         DestinationError::TopicChanged,
@@ -158,11 +237,12 @@ impl SendSource {
                                     log::debug!(
                                         "gpui_send op_id={op_id} event=queue_frozen_topic_after_temporary_failure"
                                     );
+                                    None
                                 }
                                 Err(error) => {
                                     return QueueWriteOutcome::DestinationUnavailable(error.into());
                                 }
-                            }
+                            };
                             if let Err(error) = services.messenger.verify_reply_sources(
                                 &services.sync,
                                 &address.route.owner,
@@ -171,6 +251,34 @@ impl SendSource {
                                 &submission.quote_sources,
                             ).await {
                                 return QueueWriteOutcome::QuoteUnavailable(error);
+                            }
+                            if let Some(new_key) = submission.fragment_new_key {
+                                let Some(activation) = activation.as_ref() else {
+                                    return QueueWriteOutcome::DestinationUnavailable(DestinationError::EncryptionUnavailable);
+                                };
+                                if submission.draft.as_ref().is_some_and(|draft| !draft.flush_protection(&services.sync)) {
+                                    return QueueWriteOutcome::WriteFailed;
+                                }
+                                let prepared = services.messenger.prepare_fragment_send(
+                                    &services.sync, activation, address.route.scope, submission.topic, submission.markdown, new_key,
+                                ).await;
+                                return match prepared {
+                                    Ok(record) => QueueWriteOutcome::Saved(record.public_id),
+                                    Err(workspace_core::messenger::encryption::fragments::FragmentMessageError::Destination(error)) =>
+                                        QueueWriteOutcome::DestinationUnavailable(error.into()),
+                                    Err(workspace_core::messenger::encryption::fragments::FragmentMessageError::TopicChanged) =>
+                                        QueueWriteOutcome::DestinationUnavailable(DestinationError::TopicChanged),
+                                    Err(_) => QueueWriteOutcome::WriteFailed,
+                                };
+                            }
+                            if workspace_core::messenger::encryption::fragments::has_protected_draft(&submission.markdown) {
+                                let Some(target) = plain_target.as_ref().filter(|target| target.literal_markers_allowed()) else {
+                                    return QueueWriteOutcome::WriteFailed;
+                                };
+                                return services.sync.prepare_external_send(target, submission.markdown,
+                                    submission.draft.as_ref().map(|draft| (&draft.access, draft.version)))
+                                    .map(|record| QueueWriteOutcome::Saved(record.public_id))
+                                    .unwrap_or(QueueWriteOutcome::WriteFailed);
                             }
                             services
                                 .sync
@@ -212,20 +320,14 @@ impl SendSource {
 async fn resolve_destination(
     services: &WorkerServices,
     address: &ConversationAddress,
-) -> Result<Uuid, DirectSendError> {
-    let scope = address.route.scope;
-    let owner = &address.route.owner;
-    let generation = address.generation;
-    if let Some(topic) = scope.topic_id {
-        services
-            .messenger
-            .check_topic_send(&services.sync, owner, generation, scope.stream_id, topic)
-            .await
-            .map(|()| topic)
-    } else {
-        services
-            .messenger
-            .resolve_direct_send(&services.sync, owner, generation, scope.stream_id)
-            .await
-    }
+) -> Result<PlainSendTarget, DirectSendError> {
+    services
+        .messenger
+        .resolve_plain_send(
+            &services.sync,
+            &address.route.owner,
+            address.generation,
+            address.route.scope,
+        )
+        .await
 }

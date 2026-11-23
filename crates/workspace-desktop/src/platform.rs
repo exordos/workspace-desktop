@@ -123,6 +123,9 @@ mod keychain;
 #[cfg(target_os = "macos")]
 pub use keychain::MacKeychain;
 
+#[cfg(all(target_os = "macos", feature = "gpui"))]
+pub(crate) mod chat_keys;
+
 #[cfg(feature = "macos-adapters")]
 pub mod notifications;
 

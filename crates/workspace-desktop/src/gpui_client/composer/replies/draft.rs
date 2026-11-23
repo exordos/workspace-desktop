@@ -5,7 +5,7 @@ use gpui::Context;
 use uuid::Uuid;
 use workspace_core::storage::{DraftReplies, DraftReply, PlaintextDraft};
 
-use super::{Composer, Replies, ReplyQuote, Tab};
+use super::{Composer, Replies, ReplyQuote, ReplyText, Tab};
 
 impl Replies {
     /// Снимает видимый порядок и берёт последний ввод активной вкладки прямо из поля.
@@ -57,12 +57,13 @@ impl Replies {
                 id: saved.id,
                 quote: ReplyQuote {
                     id: saved.message_id,
-                    author: "Сообщение".into(),
-                    preview: "Источник недоступен".into(),
+                    author: ReplyText::Label("desktop.messenger.composer.draftMessage"),
+                    preview: ReplyText::Label("desktop.messenger.composer.draftSourceUnavailable"),
                     fragment: saved.fragment,
                 },
                 creation: saved.creation,
                 restored: true,
+                protected: None,
                 answer: saved.answer,
                 focus: cx.focus_handle(),
                 remove_focus: cx.focus_handle(),
@@ -88,10 +89,15 @@ impl Composer {
         for tab in self.replies.tabs.iter_mut().filter(|tab| tab.restored) {
             let quote = quote_source(tab.quote.id, tab.quote.fragment.as_deref());
             let (author, preview) = quote.map_or_else(
-                || ("Сообщение".into(), "Источник недоступен".into()),
+                || {
+                    (
+                        ReplyText::Label("desktop.messenger.composer.draftMessage"),
+                        ReplyText::Label("desktop.messenger.composer.draftSourceUnavailable"),
+                    )
+                },
                 |quote| (quote.author, quote.preview),
             );
-            if (tab.quote.author.as_str(), tab.quote.preview.as_str()) != (&author, &preview) {
+            if (&tab.quote.author, &tab.quote.preview) != (&author, &preview) {
                 tab.quote.author = author;
                 tab.quote.preview = preview;
                 changed = true;
