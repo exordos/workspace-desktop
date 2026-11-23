@@ -4,6 +4,7 @@
 mod folders;
 mod message_actions;
 pub(super) mod mutations;
+mod own_profile;
 pub(super) mod sidebar;
 
 use std::{collections::HashSet, time::Duration};

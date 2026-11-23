@@ -20,6 +20,15 @@ pub struct UserProfile {
 }
 
 impl UserProfile {
+    /// Собирает ручной статус из эмодзи и текста для шапки и карточки.
+    pub fn status_label(&self) -> Option<String> {
+        match (&self.status_emoji, &self.status_text) {
+            (Some(emoji), Some(text)) => Some(format!("{emoji} {text}")),
+            (Some(value), None) | (None, Some(value)) => Some(value.clone()),
+            (None, None) => None,
+        }
+    }
+
     /// Возвращает UUID файла, если аватар хранится внутри Workspace.
     pub fn avatar_file_id(&self) -> Option<Uuid> {
         self.avatar.as_deref().and_then(avatar_file_id)

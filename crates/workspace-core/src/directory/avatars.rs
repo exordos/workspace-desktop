@@ -35,6 +35,21 @@ pub enum AvatarFormat {
 }
 
 impl AvatarFormat {
+    /// Распознаёт поддерживаемый аватар по началу файла, независимо от имени.
+    pub fn sniff(bytes: &[u8]) -> Option<Self> {
+        if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            Some(Self::Png)
+        } else if bytes.starts_with(b"\xff\xd8\xff") {
+            Some(Self::Jpeg)
+        } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+            Some(Self::Gif)
+        } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+            Some(Self::Webp)
+        } else {
+            None
+        }
+    }
+
     /// Возвращает канонический MIME для сохранения формата в базе.
     fn mime(self) -> &'static str {
         match self {

@@ -150,7 +150,7 @@ impl RestClient {
     }
 
     /// Читает публичный профиль. Для ещё не зарегистрированного участника сервер вернёт 404.
-    async fn sidebar_profile(
+    pub(in crate::messenger) async fn sidebar_profile(
         &self,
         owner: &OwnerContext,
         token: &str,

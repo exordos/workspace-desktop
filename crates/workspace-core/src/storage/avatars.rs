@@ -79,6 +79,29 @@ pub(super) fn initialize(connection: &Connection) -> Result<(), StorageError> {
 }
 
 impl Storage {
+    /// Захватывает версии перед запросом изменения фото.
+    pub(crate) fn avatar_fence(
+        &self,
+        owner: &OwnerContext,
+        user_id: Uuid,
+    ) -> Result<AvatarFence, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        read_fence(&connection, owner, user_id)
+    }
+
+    /// Применяет подтверждение правки, если событие из журнала его ещё не обогнало.
+    pub(crate) fn save_avatar_edit(
+        &self,
+        owner: &OwnerContext,
+        user_id: Uuid,
+        fence: AvatarFence,
+        reference: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        Ok(self
+            .save_avatar_reference(owner, user_id, fence, reference, unix_seconds())?
+            .is_some_and(|snapshot| snapshot.fence != fence))
+    }
+
     /// Читает фото и его версии. Обращение к готовому фото учитывается при вытеснении.
     pub(crate) fn avatar_snapshot(
         &self,

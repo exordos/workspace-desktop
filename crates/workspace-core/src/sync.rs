@@ -970,7 +970,7 @@ impl Sync {
     }
 
     /// Сообщает подписчикам аватара об изменении после записи в базу в действующей сессии.
-    fn publish_avatar_change(
+    pub(crate) fn publish_avatar_change(
         &self,
         owner: &OwnerContext,
         generation: SessionGeneration,
