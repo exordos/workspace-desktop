@@ -104,7 +104,7 @@ async fn fetch(
     let source = &services.messenger;
     let sync = &services.sync;
     let (window, media_access) = match load {
-        Load::Open(ChatEntry::Latest) => {
+        Load::Open(ChatEntry::Latest | ChatEntry::Archived) => {
             let mut opening = source
                 .open_latest_history(sync, owner, generation, scope)
                 .await?;
@@ -178,10 +178,14 @@ async fn fetch(
 /// Читает очередь перед историей. Если подтверждение придёт между чтениями, UI сверит UUID.
 fn read(services: &WorkerServices, address: &ConversationAddress, id: i64) -> LoadResult {
     let route = &address.route;
-    let outbox = services
-        .sync
-        .outbox(&route.owner, address.generation, route.scope)
-        .ok();
+    let outbox = if route.entry == ChatEntry::Archived {
+        None
+    } else {
+        services
+            .sync
+            .outbox(&route.owner, address.generation, route.scope)
+            .ok()
+    };
     let window = services
         .sync
         .refresh_history_window(&route.owner, address.generation, route.scope, id)

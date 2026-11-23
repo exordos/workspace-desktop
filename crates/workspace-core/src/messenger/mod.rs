@@ -2,6 +2,7 @@
 //! Сначала источник догоняет журнал по HTTP, затем читает новые события через WebSocket.
 
 pub mod catalog;
+pub mod creation;
 pub mod details;
 pub mod files;
 mod folder_sync;

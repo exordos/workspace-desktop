@@ -9,9 +9,9 @@ use std::{
 };
 
 use gpui::{
-    App, AppContext, Context, Div, FocusHandle, FontWeight, Hsla, Image, ImageFormat, ImageSource,
-    ObjectFit, PathBuilder, PathPromptOptions, Pixels, Render, Stateful, StyledImage, Task,
-    WeakEntity, Window, canvas, div, img, point, prelude::*, px,
+    App, AppContext, Context, Div, FocusHandle, FontWeight, Image, ImageFormat, ImageSource,
+    ObjectFit, PathPromptOptions, Render, Stateful, StyledImage, Task, WeakEntity, Window, div,
+    img, prelude::*, px,
 };
 use workspace_core::storage::HistoryScope;
 
@@ -22,7 +22,10 @@ use crate::gpui_client::{
         appearance::{Background, BackgroundPreset},
     },
     right_panel::RightPanel,
-    ui::{Button, ButtonAppearance, Icon, Palette, SURFACE_RADIUS, TextRole, activate, label},
+    ui::{
+        Button, ButtonAppearance, Icon, Palette, SURFACE_RADIUS, TextRole, activate, label,
+        rounded_surface_corners,
+    },
 };
 
 use super::Appearance;
@@ -507,7 +510,7 @@ impl Render for BackgroundDialog {
                                 .size_full()
                                 .object_fit(ObjectFit::Cover),
                         )
-                        .child(preview_corners(px(6.), palette.surface)),
+                        .child(rounded_surface_corners(px(6.), palette.surface)),
                 ),
                 None => dialog.child(
                     label(
@@ -585,36 +588,6 @@ impl Render for BackgroundDialog {
                     ),
             )
     }
-}
-
-/// Скругляет видимые углы после центральной обрезки картинки.
-fn preview_corners(radius: Pixels, surface: Hsla) -> impl IntoElement {
-    canvas(
-        |_, _, _| (),
-        move |bounds, (), window, _| {
-            // Cover скругляет саму картинку, до обрезки. Закрываем углы рамки цветом диалога.
-            let control = radius * 0.447_715_25;
-            let mut shape = PathBuilder::fill();
-            for (corner, dx, dy) in [
-                (bounds.origin, 1., 1.),
-                (bounds.top_right(), -1., 1.),
-                (bounds.bottom_left(), 1., -1.),
-                (bounds.bottom_right(), -1., -1.),
-            ] {
-                let at = |x: Pixels, y: Pixels| point(corner.x + x * dx, corner.y + y * dy);
-                shape.move_to(corner);
-                shape.line_to(at(radius, px(0.)));
-                shape.cubic_bezier_to(at(px(0.), radius), at(control, px(0.)), at(px(0.), control));
-                shape.close();
-            }
-            if let Ok(path) = shape.build() {
-                window.paint_path(path, surface);
-            }
-        },
-    )
-    .absolute()
-    .inset_0()
-    .size_full()
 }
 
 /// Причина отказа от файла, которую можно показать рядом с выбором.

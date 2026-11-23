@@ -1,8 +1,8 @@
 //! Кнопка и оболочка поля с общей геометрией, фокусом и состояниями оформления.
 
 use gpui::{
-    App, Div, ElementId, FocusHandle, IntoElement, SharedString, Stateful, Window, div, prelude::*,
-    px,
+    App, Div, ElementId, FocusHandle, Hsla, IntoElement, PathBuilder, Pixels, SharedString,
+    Stateful, Window, canvas, div, point, prelude::*, px,
 };
 
 use super::{
@@ -197,4 +197,37 @@ pub fn field(palette: Palette, appearance: FieldAppearance, control: impl IntoEl
         })
         .overflow_hidden()
         .child(control)
+}
+
+/// Закрывает четыре внешних угла цветом окружающей поверхности.
+pub(in crate::gpui_client) fn rounded_surface_corners(
+    radius: Pixels,
+    surface: Hsla,
+) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| {
+            // GPUI ограничивает переполнение прямоугольником, поэтому закрываем углы отдельно.
+            let control = radius * 0.447_715_25;
+            let mut shape = PathBuilder::fill();
+            for (corner, dx, dy) in [
+                (bounds.origin, 1., 1.),
+                (bounds.top_right(), -1., 1.),
+                (bounds.bottom_left(), 1., -1.),
+                (bounds.bottom_right(), -1., -1.),
+            ] {
+                let at = |x: Pixels, y: Pixels| point(corner.x + x * dx, corner.y + y * dy);
+                shape.move_to(corner);
+                shape.line_to(at(radius, px(0.)));
+                shape.cubic_bezier_to(at(px(0.), radius), at(control, px(0.)), at(px(0.), control));
+                shape.close();
+            }
+            if let Ok(path) = shape.build() {
+                window.paint_path(path, surface);
+            }
+        },
+    )
+    .absolute()
+    .inset_0()
+    .size_full()
 }

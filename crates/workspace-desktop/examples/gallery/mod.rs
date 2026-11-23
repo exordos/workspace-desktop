@@ -1,6 +1,8 @@
 //! Собирает две палитры из общих компонентов и показывает переходы фокуса, выбор и ввод.
 
 mod conversation_notices;
+#[path = "../parity/new_chat_components.rs"]
+mod new_chat_components;
 mod quotes;
 
 use std::time::Duration;
@@ -15,7 +17,7 @@ use workspace_desktop::gpui_client::{
     contracts::AccountSession,
     ui::{
         Avatar, AvatarPresence, AvatarSize, BadgeTone, Button, ButtonAppearance, ChatRow,
-        ChatRowPreview, DeliveryMark, FieldAppearance, Icon, MessageBubble, Palette,
+        ChatRowPreview, DeliveryMark, FieldAppearance, FilterGroup, Icon, MessageBubble, Palette,
         SEARCH_ICON_SIZE, TextRole, ThemeMode, TopBar, TopBarAccount, TopBarSelection,
         WorkspaceAssets, field, label, track_focus_input,
     },
@@ -26,11 +28,14 @@ gpui::actions!(gallery, [NextControl, PreviousControl]);
 
 /// Состояние демонстрационной панели в одной палитре.
 struct Panel {
-    mode: ThemeMode,       // Палитра, которую показывает панель.
-    id: &'static str,      // Префикс ключей элементов панели.
-    selected: u8,          // Номер выбранной строки каталога.
-    draft: Entity<Editor>, // Общий редактор с локальным черновиком.
-    retrying_notice: bool, // Пример плашки временно показывает повторную проверку.
+    mode: ThemeMode,              // Палитра, которую показывает панель.
+    id: &'static str,             // Префикс ключей элементов панели.
+    person_selected: [bool; 3],   // Видимые отметки выбора людей.
+    channel_filters: FilterGroup, // Прокрутка и фокус демонстрационного ряда.
+    channel_filter: usize,        // Активный фильтр в карточке каналов.
+    selected: u8,                 // Номер выбранной строки каталога.
+    draft: Entity<Editor>,        // Общий редактор с локальным черновиком.
+    retrying_notice: bool,        // Пример плашки временно показывает повторную проверку.
 }
 
 impl Panel {
@@ -39,6 +44,9 @@ impl Panel {
         Self {
             mode,
             id,
+            person_selected: [false, true, false],
+            channel_filters: FilterGroup::new(4, cx),
+            channel_filter: 2,
             selected: 0,
             draft: cx.new(Editor::for_conversation),
             retrying_notice: false,
@@ -62,7 +70,7 @@ impl Panel {
     }
 
     /// Рисует панель с каталогом, сообщениями, полями и кнопками.
-    fn body(&self, palette: Palette, cx: &mut Context<Self>) -> Div {
+    fn body(&self, palette: Palette, window: &Window, cx: &mut Context<Self>) -> Div {
         let theme = match self.mode {
             ThemeMode::Light => "Светлая тема",
             ThemeMode::Dark => "Тёмная тема",
@@ -75,6 +83,9 @@ impl Panel {
         disabled.disabled = true;
         let target = cx.entity().downgrade();
         let notice_target = target.clone();
+
+        let people_target = target.clone();
+        let filter_target = target.clone();
 
         div()
             .flex()
@@ -110,6 +121,29 @@ impl Panel {
                     .child(label(palette, TextRole::Body, "Поиск по чатам")),
             ))
             .child(self.chat_row(palette, 0, cx))
+            .child(new_chat_components::people(
+                palette,
+                self.person_selected,
+                move |index, _, app| {
+                    let _ = people_target.update(app, |panel, cx| {
+                        panel.person_selected[index] = !panel.person_selected[index];
+                        cx.notify();
+                    });
+                },
+            ))
+            .child(new_chat_components::channels(
+                palette,
+                self.channel_filter,
+                &self.channel_filters,
+                window,
+                move |index, _, app| {
+                    let _ = filter_target.update(app, |panel, cx| {
+                        panel.channel_filter = index;
+                        cx.notify();
+                    });
+                },
+            ))
+            .child(new_chat_components::modal(palette, window))
             .child(self.chat_row(palette, 1, cx))
             .child(self.chat_row(palette, 2, cx))
             .child(
@@ -213,7 +247,7 @@ impl Render for Panel {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .child(self.body(palette, cx)),
+                    .child(self.body(palette, window, cx)),
             )
             .child(
                 div()

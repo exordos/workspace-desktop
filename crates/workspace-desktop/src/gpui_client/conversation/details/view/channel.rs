@@ -7,8 +7,8 @@ use super::{
     PanelAction, SelectedTopicView, TopicView,
 };
 use crate::gpui_client::ui::{
-    BadgeTone, Button, ButtonAppearance, Icon, Palette, TextRole, activate, ellipsized_label,
-    label, mention_badge, popup::tooltip, unread_badge,
+    BadgeTone, Button, ButtonAppearance, Icon, Palette, PersonRow, TextRole, activate,
+    ellipsized_label, label, mention_badge, popup::tooltip, unread_badge,
 };
 
 /// Рисует сведения о канале с закреплённым аватаром и счётчиками.
@@ -405,63 +405,33 @@ fn render_members(channel: &ChannelView, palette: Palette, dispatch: &Dispatch) 
 
 /// Рисует карточку участника и отдельное разрешённое действие рядом.
 fn render_member(member: &MemberView, palette: Palette, dispatch: &Dispatch) -> Div {
-    let name = div()
-        .flex()
-        .items_center()
-        .gap(px(6.))
-        .child(div().min_w_0().flex_1().child(ellipsized_label(
-            palette,
-            TextRole::Body,
-            member.name.clone(),
-        )))
-        .children(member.role.iter().map(|role| {
-            label(palette, TextRole::Caption, role.clone())
-                .text_size(px(10.))
-                .line_height(px(14.))
-                .flex_none()
-        }));
-    div()
-        .flex()
-        .items_center()
-        .gap(px(12.))
-        .px(px(12.))
-        .py(px(8.))
-        .rounded_md()
-        .bg(palette.card)
-        .group("details-member")
-        .hover(|style| style.bg(palette.card_hover))
-        .child(
-            member
-                .avatar
-                .avatar()
-                .render_at(palette, px(32.), palette.surface),
-        )
-        .child(
-            div().flex_1().min_w_0().child(name).children(
-                member
-                    .secondary
-                    .iter()
-                    .map(|text| ellipsized_label(palette, TextRole::Caption, text.clone())),
-            ),
-        )
-        .when(member.remove != Availability::Hidden, |row| {
-            row.child(
-                icon_button(
-                    format!("details-remove-member-{}", member.id).into(),
-                    Icon::Close,
-                    "Удалить участника",
-                    member.remove,
-                    PanelAction::RemoveMember(member.id),
-                    palette,
-                    dispatch,
-                )
-                .opacity(0.)
-                .group_hover("details-member", |style| style.opacity(1.))
-                .when(palette.keyboard_focus_visible(), |button| {
-                    button.focus(|style| style.border_color(palette.focus).opacity(1.))
-                }),
+    PersonRow {
+        avatar: member.avatar.avatar(),
+        name: member.name.clone(),
+        secondary: member.secondary.clone(),
+        role: member.role.clone(),
+        selected: false,
+    }
+    .render(palette)
+    .group("details-member")
+    .when(member.remove != Availability::Hidden, |row| {
+        row.child(
+            icon_button(
+                format!("details-remove-member-{}", member.id).into(),
+                Icon::Close,
+                "Удалить участника",
+                member.remove,
+                PanelAction::RemoveMember(member.id),
+                palette,
+                dispatch,
             )
-        })
+            .opacity(0.)
+            .group_hover("details-member", |style| style.opacity(1.))
+            .when(palette.keyboard_focus_visible(), |button| {
+                button.focus(|style| style.border_color(palette.focus).opacity(1.))
+            }),
+        )
+    })
 }
 
 /// Использует кнопку UI-кита для действий над участниками.

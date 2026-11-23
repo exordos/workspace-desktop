@@ -25,6 +25,7 @@ use gpui::{
 use uuid::Uuid;
 use workspace_core::{
     bootstrap::ChatList,
+    messenger::catalog::Chat,
     storage::{HistoryDirection, HistoryEdge, HistoryScope, HistoryWindow, OutboxEntry},
     sync::{HistoryRevocation, SyncChange, SyncUpdate},
 };
@@ -92,6 +93,25 @@ struct Heading {
     direct_peer_id: Option<Uuid>, // UUID собеседника из каталога этого входа, если он известен.
 }
 
+impl Heading {
+    /// Берёт имя и фото из строки каталога для указанной темы.
+    fn from_chat(chat: &Chat, scope: HistoryScope) -> Self {
+        Self {
+            chat: Some(chat.name.clone()),
+            topic: chat
+                .topics
+                .iter()
+                .find(|topic| Some(topic.id) == scope.topic_id)
+                .map(|topic| topic.name.clone()),
+            direct: chat.direct,
+            direct_peer_id: chat
+                .metadata
+                .direct_peer_id
+                .filter(|id| chat.direct && !id.is_nil()),
+        }
+    }
+}
+
 /// Переход из правой панели, который должна подтвердить оболочка.
 pub(super) struct OpenDetailsTopic {
     pub address: ConversationAddress, // Полный адрес панели, откуда пришло действие.
@@ -154,7 +174,15 @@ impl Conversation {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut view = Self::with_source(address, runtime_source(runtime.clone()), restore, cx);
-        view.attach_composer(SendSource::runtime(runtime.clone()), cx);
+        if !view.is_archived() {
+            view.attach_composer(SendSource::runtime(runtime.clone()), cx);
+            view.details = Some(Panel::new(
+                right_panel,
+                view.address.clone(),
+                runtime.clone(),
+                cx,
+            ));
+        }
         view.attachments.runtime = Some(runtime.clone());
         view.avatar_runtime = Some(runtime.clone());
         if let Some(sending) = &view.sending {
@@ -162,7 +190,6 @@ impl Conversation {
                 .view
                 .update(cx, |composer, _| composer.attach_drafts(runtime.clone()));
         }
-        view.details = Some(Panel::new(right_panel, view.address.clone(), runtime, cx));
         view
     }
 
@@ -173,7 +200,10 @@ impl Conversation {
         restore: Option<ReadingAnchor>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let entry = address.route.entry;
+        let entry = match address.route.entry {
+            ChatEntry::Archived => ChatEntry::Latest,
+            entry => entry,
+        };
         let mut conversation = Self {
             address,
             entry,
@@ -342,24 +372,9 @@ impl Conversation {
             .and_then(|catalog| catalog.chats.as_ref());
         let heading = chats
             .and_then(|chats| chats.iter().find(|chat| chat.id == scope.stream_id))
-            .map(|chat| Heading {
-                chat: Some(chat.name.clone()),
-                topic: chat
-                    .topics
-                    .iter()
-                    .find(|topic| Some(topic.id) == scope.topic_id)
-                    .map(|topic| topic.name.clone()),
-                direct: chat.direct,
-                direct_peer_id: chat
-                    .metadata
-                    .direct_peer_id
-                    .filter(|id| chat.direct && !id.is_nil()),
-            })
-            .unwrap_or_default();
-        if heading != self.heading {
-            self.heading = heading;
-            self.refresh_heading_avatar(cx);
-            cx.notify();
+            .map(|chat| Heading::from_chat(chat, scope));
+        if !self.is_archived() || heading.is_some() {
+            self.set_heading(heading.unwrap_or_default(), cx);
         }
         if self
             .details
@@ -368,6 +383,28 @@ impl Conversation {
         {
             cx.notify();
         }
+    }
+
+    /// Показывает подтверждённое название разговора из панели создания или архива.
+    pub(super) fn set_new_chat_heading(&mut self, chat: &Chat, cx: &mut Context<Self>) {
+        let scope = self.address.route.scope;
+        if scope.stream_id == chat.id && !matches!(self.state, State::Failed(Failure::AccessLost)) {
+            self.set_heading(Heading::from_chat(chat, scope), cx);
+        }
+    }
+
+    /// Обновляет оформление шапки и подписку на фото, только если изменились данные.
+    fn set_heading(&mut self, heading: Heading, cx: &mut Context<Self>) {
+        if heading != self.heading {
+            self.heading = heading;
+            self.refresh_heading_avatar(cx);
+            cx.notify();
+        }
+    }
+
+    /// Различает архивный просмотр и рабочую историю того же разговора.
+    fn is_archived(&self) -> bool {
+        self.address.route.entry == ChatEntry::Archived
     }
 
     /// Включает фото, только пока разговор виден в рабочем разделе окна.
@@ -539,6 +576,9 @@ impl Conversation {
         self.state = State::Failed(error);
         if matches!(error, Failure::AccessLost | Failure::MissingMessage) {
             self.restore = None;
+        }
+        if error == Failure::AccessLost && self.is_archived() {
+            self.set_heading(Heading::default(), cx);
         }
         self.active = None;
         self.read_pending = false;
@@ -729,7 +769,7 @@ impl Conversation {
             State::Ready(_) => Position::Reading,
             _ if self.restore.is_some() => Position::Restore(self.restore.take().unwrap()),
             _ => match self.entry {
-                ChatEntry::Latest => Position::Tail,
+                ChatEntry::Latest | ChatEntry::Archived => Position::Tail,
                 ChatEntry::Around(id) => Position::Around(id),
             },
         };
@@ -1401,6 +1441,16 @@ impl Conversation {
                         .as_ref()
                         .map(|sending| self.render_chat_footer(sending, palette, cx)),
                 )
+                .children(self.is_archived().then(|| {
+                    ConversationNotice {
+                        text: locale
+                            .text("Разговор в архиве", "Archived conversation")
+                            .into(),
+                        action: None,
+                    }
+                    .render(palette, |_, _| {})
+                    .debug_selector(|| "conversation-archive-notice".into())
+                }))
             }
         }
     }

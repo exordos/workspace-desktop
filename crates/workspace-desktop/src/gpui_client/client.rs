@@ -2,6 +2,7 @@
 //! Здесь также собирается основная разметка окна из готовых компонентов.
 
 mod history_positions;
+mod new_chats;
 mod notification_banner;
 mod preference_runtime;
 
@@ -128,6 +129,7 @@ impl Client {
     pub(super) fn new(options: Options, runtime: RuntimeClient, cx: &mut Context<Self>) -> Self {
         let sidebar = cx.new(|cx| Sidebar::with_runtime(runtime.clone(), cx));
         cx.observe(&sidebar, |_, _, cx| cx.notify()).detach();
+        new_chats::subscribe(&sidebar, cx);
         cx.subscribe(&sidebar, |client, _, intent: &FolderIntent, cx| {
             client.handle_folder_intent(intent.clone(), cx);
         })
@@ -308,6 +310,14 @@ impl Client {
             }
             RuntimeEvent::Sync(update) => {
                 use workspace_core::sync::{HistoryRevocation, SyncChange};
+                if matches!(
+                    update.change,
+                    SyncChange::HistoryAccessRevoked(_) | SyncChange::MessengerReset
+                ) {
+                    self.sidebar.read(cx).new_chats().update(cx, |view, cx| {
+                        view.reload_after_access_change(update, cx);
+                    });
+                }
                 match update.change {
                     SyncChange::HistoryAccessRevoked(HistoryRevocation::Stream(stream)) => {
                         self.runtime.drafts.revoke(
@@ -884,6 +894,7 @@ impl Render for Client {
         self.sync_profile_avatar(cx);
         self.sync_profile_details(cx);
         RightPanel::restore_focus(&self.right_panel, window, cx);
+        self.open_requested_new_channel(window, cx);
         self.open_requested_profile(window, cx);
         let palette = Palette::for_window(window, cx);
         let locale = super::preferences::Preferences::read(cx).language;

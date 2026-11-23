@@ -3,6 +3,8 @@
 
 mod folders;
 mod login;
+mod new_chat_catalog;
+mod new_chat_creation;
 
 pub use login::{LoginAttempt, LoginError};
 

@@ -1,6 +1,8 @@
 //! Работает с HTTPS API мессенджера: читает настройки, журнал и историю, отправляет сообщения.
 //! Также разбирает общий формат событий, который используют HTTP и WebSocket.
 
+mod archive;
+mod creation;
 mod folders;
 mod message_actions;
 pub(super) mod mutations;

@@ -103,6 +103,27 @@ fn open_sidebar(shell: &mut Shell, session: &AccountSession) -> ConversationAddr
     }
 }
 
+/// Подтверждённый новый канал открывается до снимка каталога. Поздний ответ входа отбрасывается.
+#[test]
+fn opens_confirmed_new_chat_only_in_its_active_session() {
+    let (mut shell, a, b) = setup();
+    let scope = HistoryScope {
+        stream_id: Uuid::from_u128(150),
+        topic_id: Some(Uuid::from_u128(151)),
+    };
+    assert!(matches!(
+        shell.open_confirmed_chat(&a.session, scope, ChatEntry::Latest),
+        Some(ShellEffect::OpenConversation(address)) if address.route.scope == scope
+    ));
+    shell.handle_action(ShellAction::SelectAccount(b.session.clone()));
+    assert!(
+        shell
+            .open_confirmed_chat(&a.session, scope, ChatEntry::Latest)
+            .is_none()
+    );
+    assert!(shell.conversation().is_none());
+}
+
 /// При открытии темы оболочка использует тот же актуальный снимок, что и сайдбар.
 #[test]
 fn sidebar_route_uses_live_catalog_before_folder_cache() {

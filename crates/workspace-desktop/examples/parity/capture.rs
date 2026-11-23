@@ -23,7 +23,7 @@ use objc2::{msg_send, runtime::AnyObject};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use serde_json::{Value, json};
 
-use super::{CHECK_SHIFT, Config, ID, INSET, Result, View};
+use super::{CHECK_SHIFT, Config, INSET, Result, View};
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -79,7 +79,11 @@ fn window_number(window: &Window) -> Result<isize> {
 }
 
 /// Ждёт, пока AppKit активирует окно и WindowServer закончит оформление первого кадра.
-async fn wait_for_activation(window: WindowHandle<View>, cx: &mut AsyncApp) -> Result<()> {
+async fn wait_for_activation(
+    id: &str,
+    window: WindowHandle<View>,
+    cx: &mut AsyncApp,
+) -> Result<()> {
     for _ in 0..100 {
         if window.update(cx, |_, window, _| window.is_window_active())? {
             // На macOS 27 первые кадры после isKeyWindow ещё могут содержать переход.
@@ -92,11 +96,12 @@ async fn wait_for_activation(window: WindowHandle<View>, cx: &mut AsyncApp) -> R
             .timer(Duration::from_millis(25))
             .await;
     }
-    Err(format!("Сцена {ID}: за 2,5 секунды не дождались активации окна").into())
+    Err(format!("Сцена {id}: за 2,5 секунды не дождались активации окна").into())
 }
 
 /// Сдвигает только контейнер сцены и ждёт кадр, в котором GPUI его нарисовала.
 async fn prepare(
+    id: &str,
     window: WindowHandle<View>,
     cx: &mut AsyncApp,
     painted: &Cell<Option<Bounds<Pixels>>>,
@@ -122,7 +127,7 @@ async fn prepare(
     {
         return Ok(bounds);
     }
-    Err(format!("Сцена {ID}, прогон {pass}: за 5 секунд не дождались отрисовки ChatRow").into())
+    Err(format!("Сцена {id}, прогон {pass}: за 5 секунд не дождались отрисовки компонента").into())
 }
 
 /// Кадр области содержимого после проверки системного канта.
@@ -253,7 +258,8 @@ async fn capture(
     pass: &str,
     inset: f32,
 ) -> Result<Frame> {
-    let bounds = prepare(window, cx, painted, inset, pass).await?;
+    let id = config.scene.id();
+    let bounds = prepare(id, window, cx, painted, inset, pass).await?;
     let (viewport, scale, number) = window.update(cx, |_, window, _| {
         (
             window.viewport_size(),
@@ -264,7 +270,7 @@ async fn capture(
     let number = number?;
     if viewport != config.viewport {
         return Err(format!(
-            "Сцена {ID}, прогон {pass}: окно имеет размер {viewport:?}, запрошен {:?}",
+            "Сцена {id}, прогон {pass}: окно имеет размер {viewport:?}, запрошен {:?}",
             config.viewport
         )
         .into());
@@ -283,13 +289,13 @@ async fn capture(
         })
         .await?;
     let data = json!({
-        "scene": ID,
+        "scene": id,
         "sha": config.sha,
         "dirty": config.dirty,
         "pass": pass,
         "theme": config.theme_name(),
-        "palette": "blue-mist",
-        "fixture": "UI-02",
+        "palette": config.scene.palette(),
+        "fixture": config.scene.fixture(),
         "locale": "ru",
         "content_size_px": [f32::from(viewport.width), f32::from(viewport.height)],
         "scale": scale,
@@ -297,7 +303,7 @@ async fn capture(
         "native_capture_size_px": pixels.source_size,
         "crop_inset_px": pixels.crop_inset,
         "window_number": number,
-        "row": row_geometry(bounds),
+        "row": row_geometry(id, bounds),
     });
     std::fs::write(dir.join("run.json"), serde_json::to_vec_pretty(&data)?)?;
     println!("{}", dir.display());
@@ -309,9 +315,9 @@ async fn capture(
 }
 
 /// Формирует JSON с расположением строки в логических пикселях.
-fn row_geometry(bounds: Bounds<Pixels>) -> Value {
+fn row_geometry(id: &str, bounds: Bounds<Pixels>) -> Value {
     json!({
-        "id": ID,
+        "id": id,
         "x": f32::from(bounds.origin.x),
         "y": f32::from(bounds.origin.y),
         "width": f32::from(bounds.size.width),
@@ -326,7 +332,8 @@ pub async fn run(
     painted: Rc<Cell<Option<Bounds<Pixels>>>>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
-    wait_for_activation(window, cx).await?;
+    let id = config.scene.id();
+    wait_for_activation(id, window, cx).await?;
     let first = capture(config, window, &painted, cx, "baseline", INSET).await?;
     if !config.verify {
         return Ok(());
@@ -341,15 +348,15 @@ pub async fn run(
     )?;
     let delta = f32::from(shifted.bounds.origin.x - first.bounds.origin.x);
     let report = json!({
-        "scene": ID,
+        "scene": id,
         "sha": config.sha,
         "repeat_changed_pixels": repeated.pixels,
         "shift_changed_pixels": changed.pixels,
         "shift_changed_bounds_physical_px": changed.rect,
         "shift_dx_logical_px": delta,
-        "baseline_row": row_geometry(first.bounds),
-        "repeat_row": row_geometry(repeat.bounds),
-        "shift_row": row_geometry(shifted.bounds),
+        "baseline_row": row_geometry(id, first.bounds),
+        "repeat_row": row_geometry(id, repeat.bounds),
+        "shift_row": row_geometry(id, shifted.bounds),
     });
     std::fs::write(
         config.out.join("diff.json"),
