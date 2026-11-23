@@ -306,6 +306,31 @@ fn saved(
     ui.run_until_parked();
 }
 
+/// При блокировке отправки пояснение и кнопка занимают компактную плашку под историей.
+#[gpui::test]
+fn blocked_composer_keeps_footer_compact(cx: &mut TestAppContext) {
+    let (_, ui, requests) = start(cx);
+    publish(&requests, Load::Open(ChatEntry::Latest), vec![], vec![], ui);
+    allow(&requests, Err(DestinationError::EncryptionUnavailable), ui);
+    assert!(ui.debug_bounds("workspace-composer-editor").is_none());
+
+    for (width, max_height) in [(650., 48.), (340., 72.), (220., 72.)] {
+        ui.simulate_resize(size(px(width), px(530.)));
+        ui.run_until_parked();
+        let notice = ui.debug_bounds("conversation-send-notice").unwrap();
+        let text = ui.debug_bounds("conversation-send-notice-text").unwrap();
+        let button = ui.debug_bounds("conversation-send-retry").unwrap();
+        assert!(notice.size.height <= px(max_height), "{notice:?}");
+        assert!(text.size.width > px(140.), "{text:?}");
+        assert!(notice.contains(&button.origin), "{notice:?}, {button:?}");
+        assert!(button.bottom() <= notice.bottom() && button.right() <= notice.right());
+    }
+
+    click(ui, "conversation-send-retry");
+    allow(&requests, Ok(TOPIC), ui);
+    assert!(ui.debug_bounds("workspace-composer-editor").is_some());
+}
+
 /// Отказ и пробелы не сохраняют сообщение. Ошибка SQLite оставляет текст; повтор даёт одну запись.
 #[gpui::test]
 fn accepts_only_valid_text_and_one_click_while_saving(cx: &mut TestAppContext) {

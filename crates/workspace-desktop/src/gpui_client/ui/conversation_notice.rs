@@ -20,6 +20,8 @@ impl ConversationNotice {
         div()
             .debug_selector(|| "conversation-send-notice".into())
             .flex()
+            // Переносим кнопку целиком, когда пояснение и кнопка не помещаются рядом.
+            .flex_wrap()
             .flex_none()
             .items_center()
             .justify_center()
@@ -33,14 +35,18 @@ impl ConversationNotice {
             .bg(palette.surface)
             .child(
                 label(palette, TextRole::Caption, self.text)
-                    .min_w_0()
-                    .text_center(),
+                    .flex_none()
+                    .max_w_full()
+                    .truncate()
+                    .text_center()
+                    .debug_selector(|| "conversation-send-notice-text".into()),
             )
             .children(self.action.map(|button| {
                 let id = button.id.clone();
                 button
                     .render(palette, None, on_action)
                     .flex_none()
+                    .max_w_full()
                     .debug_selector(move || id.to_string())
             }))
     }
