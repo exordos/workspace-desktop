@@ -8,6 +8,7 @@ mod fragment_forward;
 mod gallery;
 mod key_lifecycle;
 mod media;
+mod new_chats;
 mod position;
 mod reactions;
 
@@ -379,6 +380,7 @@ struct Received {
     details: Option<DetailsFixture>, // Ответы для правой панели UI-13.
     folders: Mutex<HashMap<(&'static str, Uuid), Value>>, // Папки, созданные в тестовых входах.
     folder_posts: AtomicUsize,    // Число запросов создания, дошедших через HTTPS.
+    new_chats: Option<new_chats::Fixture>, // Справочник, новые стримы и добавление участников.
 }
 
 impl Received {
@@ -531,7 +533,8 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         let two_accounts = state.delayed.is_some()
             || state.recovery.is_some()
             || state.topic.is_some()
-            || state.protected_wire.is_some();
+            || state.protected_wire.is_some()
+            || state.new_chats.is_some();
         let user = match protocol {
             "workspace.events.v1, bearer.local-user" => USER,
             "workspace.events.v1, bearer.local-peer" if two_accounts => PEER,
@@ -626,7 +629,8 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
             if state.delayed.is_some()
                 || state.recovery.is_some()
                 || state.topic.is_some()
-                || state.protected_wire.is_some() =>
+                || state.protected_wire.is_some()
+                || state.new_chats.is_some() =>
         {
             (PEER, USER)
         }
@@ -672,6 +676,11 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
             || query_value(&request, "starred") == Some("true"))
     {
         return json_response(StatusCode::OK, json!([]));
+    }
+    if let Some(fixture) = &state.new_chats
+        && fixture.handles(&request)
+    {
+        return fixture.response(request, user, peer).await;
     }
     if path == FOLDERS && request.method() == Method::POST {
         let bytes = request.into_body().collect().await.unwrap().to_bytes();
@@ -1876,7 +1885,7 @@ fn direct_destination_change_requires_manual_recheck_before_enqueue(cx: &mut Tes
 }
 
 /// Находит реальную кнопку по текущему снимку аккаунтов, без предположения об их порядке.
-fn click_account(client: &Entity<Client>, ui: &mut VisualTestContext, account: &AccountId) {
+fn click_account_button(client: &Entity<Client>, ui: &mut VisualTestContext, account: &AccountId) {
     let index = ui.read(|app| {
         client
             .read(app)
@@ -1891,6 +1900,11 @@ fn click_account(client: &Entity<Client>, ui: &mut VisualTestContext, account: &
         .debug_bounds(selector)
         .unwrap_or_else(|| panic!("Нет кнопки аккаунта с индексом {index}"));
     ui.simulate_click(button.center(), Modifiers::none());
+}
+
+/// Переключает аккаунт и ждёт тестовую строку, когда сценарий уже загрузил общий каталог.
+fn click_account(client: &Entity<Client>, ui: &mut VisualTestContext, account: &AccountId) {
+    click_account_button(client, ui, account);
     until(
         ui,
         "клик переключает аккаунт и подставляет его каталог",

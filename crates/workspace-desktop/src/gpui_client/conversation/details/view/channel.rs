@@ -15,7 +15,7 @@ use super::{
 use crate::gpui_client::{
     preferences::Language,
     ui::{
-        BadgeTone, Icon, Palette, TextRole, activate, ellipsized_label, label, mention_badge,
+        BadgeTone, Icon, Palette, PersonRow, TextRole, activate, ellipsized_label, label, mention_badge,
         popup::tooltip, text_role, unread_badge,
     },
 };
@@ -657,72 +657,38 @@ fn render_member(
     palette: Palette,
     dispatch: &Dispatch,
 ) -> Div {
-    let name = div()
-        .flex()
-        .items_center()
-        .gap(px(6.))
-        .child(div().min_w_0().flex_1().child(ellipsized_label(
-            palette,
-            TextRole::Body,
-            member.name.clone(),
-        )))
-        .children(member.role.iter().map(|role| {
-            label(palette, TextRole::Caption, role.clone())
-                .text_size(px(10.))
-                .line_height(px(14.))
-                .flex_none()
-        }));
-    div()
-        .flex()
-        .items_center()
-        .gap(px(12.))
-        .px(px(12.))
-        .py(px(8.))
-        .rounded(px(8.))
-        .bg(palette.card)
-        .group("details-member")
-        .hover(|style| style.bg(palette.card_hover))
-        .child(
-            member
-                .avatar
-                .avatar()
-                .render_at(palette, px(32.), palette.surface),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .child(name)
-                .children(member.secondary.iter().map(|text| {
-                    label(palette, TextRole::Caption, text.clone())
-                        .text_size(px(11.))
-                        .line_height(px(16.))
-                        .truncate()
-                })),
-        )
-        .when(member.remove != Availability::Hidden, |row| {
-            row.child(
-                icon_button(
-                    IconAction {
-                        id: format!("details-remove-member-{}", member.id).into(),
-                        icon: Icon::Close,
-                        description: language.tr("desktop.conversation.channel.removeMember"),
-                        edge: 24.,
-                        glyph: 14.,
-                        availability: member.remove,
-                        action: PanelAction::RemoveMember(member.id),
-                    },
-                    None,
-                    palette,
-                    dispatch,
-                )
-                .opacity(0.)
-                .group_hover("details-member", |style| style.opacity(1.))
-                .when(palette.keyboard_focus_visible(), |button| {
-                    button.focus(|style| style.border_color(palette.focus).opacity(1.))
-                }),
+    PersonRow {
+        avatar: member.avatar.avatar(),
+        name: member.name.clone(),
+        secondary: member.secondary.clone(),
+        role: member.role.clone(),
+        selected: false,
+    }
+    .render(palette)
+    .group("details-member")
+    .when(member.remove != Availability::Hidden, |row| {
+        row.child(
+            icon_button(
+                IconAction {
+                    id: format!("details-remove-member-{}", member.id).into(),
+                    icon: Icon::Close,
+                    description: language.tr("desktop.conversation.channel.removeMember"),
+                    edge: 24.,
+                    glyph: 14.,
+                    availability: member.remove,
+                    action: PanelAction::RemoveMember(member.id),
+                },
+                None,
+                palette,
+                dispatch,
             )
-        })
+            .opacity(0.)
+            .group_hover("details-member", |style| style.opacity(1.))
+            .when(palette.keyboard_focus_visible(), |button| {
+                button.focus(|style| style.border_color(palette.focus).opacity(1.))
+            }),
+        )
+    })
 }
 
 /// Размер и действие компактной кнопки в строке правой панели.

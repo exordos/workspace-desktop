@@ -33,7 +33,7 @@ use super::{
     preferences::{ChatClick, Language, Preferences as AppPreferences, appearance::ChatDensity},
     runtime::RuntimeClient,
     ui::{
-        BadgeTone, Button, ButtonAppearance, ChatRowPreview, Icon, PANEL_RADIUS, Palette, TextInput,
+        BadgeTone, Button, ButtonAppearance, ChatRowPreview, PANEL_RADIUS, Palette, TextInput,
         TextInputChanged, TextRole, label,
         popup::{MenuInput, menu_layer, menu_navigation, menu_surface, tooltip},
     },
@@ -45,6 +45,7 @@ mod folder_dialog;
 mod folder_menu;
 mod folder_rail;
 mod folders;
+pub(super) mod new_chats;
 pub(in crate::gpui_client) mod order;
 mod projection;
 mod protected_previews;
@@ -57,6 +58,9 @@ use folder_menu::{RowAction, RowActions};
 use folder_rail::FolderRail;
 pub(super) use folders::FolderIntent;
 use folders::FolderPane;
+use new_chats::NewChats;
+#[cfg(debug_assertions)]
+pub use new_chats::preview::{NewChatPreview, new_chat_preview};
 use projection::{ChatGroup, Presentation, TopicToggleFocus, TopicToggleKind};
 use protected_previews::ProtectedPreviews;
 use rows::{ChatActions, ChatHeader, ChatRowDetails as RowDetails, PreviewAction, TopicRow};
@@ -76,6 +80,7 @@ pub struct Sidebar {
     menu_scroll: ScrollHandle, // Не даёт подсветке уйти за края длинного списка папок.
     #[cfg(all(test, feature = "gpui-test"))]
     renders: usize, // Вызовы настоящего Render в проверках изоляции GPUI.
+    new_chats: Entity<NewChats>, // Временный режим создания и архив той же панели.
     folders: FolderPane,    // Подписки, панель и форма управления папками.
     activity: Option<ActivityNavigation>, // Видимый маршрут и счётчики блока активности.
 }
@@ -334,13 +339,26 @@ impl Sidebar {
 
     /// Создаёт каталог без выбранного входа.
     pub fn new(cx: &mut Context<Self>) -> Self {
+        Self::make(None, cx)
+    }
+
+    /// Создаёт рабочий каталог с доступом к серверным действиям и аватарам.
+    pub(super) fn with_runtime(runtime: RuntimeClient, cx: &mut Context<Self>) -> Self {
+        Self::make(Some(runtime), cx)
+    }
+
+    /// Подключает отдельный режим создания к перерисовке того же сайдбара.
+    fn make(runtime: Option<RuntimeClient>, cx: &mut Context<Self>) -> Self {
+        let new_chats = cx.new(|cx| NewChats::new(runtime.clone(), cx));
+        cx.observe(&new_chats, |_, _, cx| cx.notify()).detach();
         Self {
             active: None,
-            runtime: None,
+            runtime,
             action_panel: None,
             saved: HashMap::new(),
             menu_focus: cx.focus_handle(),
             menu_scroll: ScrollHandle::new(),
+            new_chats,
             folders: FolderPane::new(cx),
             #[cfg(all(test, feature = "gpui-test"))]
             renders: 0,
@@ -348,17 +366,15 @@ impl Sidebar {
         }
     }
 
-    /// Создаёт рабочий каталог с доступом к аватарам текущего входа.
-    pub(super) fn with_runtime(runtime: RuntimeClient, cx: &mut Context<Self>) -> Self {
-        Self {
-            runtime: Some(runtime),
-            ..Self::new(cx)
-        }
+    /// Передаёт окну вложенный режим для открытия модалки и маршрутов.
+    pub(super) fn new_chats(&self) -> Entity<NewChats> {
+        self.new_chats.clone()
     }
 
     /// Регистрирует команды редактирования поиска один раз при запуске GPUI.
     pub fn bind_keys(app: &mut App) {
         search::bind_keys(app);
+        NewChats::bind_keys(app);
         FolderRail::bind_keys(app);
         FolderDialog::bind_keys(app);
         app.bind_keys([
@@ -370,7 +386,10 @@ impl Sidebar {
 
     /// Направляет ввод клавиатуры в поле поиска текущего каталога.
     pub(super) fn focus_search(&self, window: &mut Window, app: &App) {
-        if let Some(active) = &self.active {
+        let creation = self.new_chats.read(app);
+        if creation.is_open() {
+            creation.active_input().read(app).focus(window);
+        } else if let Some(active) = &self.active {
             active.search.read(app).focus(window);
         }
     }
@@ -381,6 +400,10 @@ impl Sidebar {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<bool> {
+        let creation = self.new_chats.read(cx);
+        if creation.is_open() {
+            return None;
+        }
         let active = self.active.as_ref()?;
         let input = active.search.read(cx);
         let focused = input.is_focused(window);
@@ -393,9 +416,14 @@ impl Sidebar {
 
     /// Возвращает фокус поиска, с которого начинается область каталога.
     pub(super) fn search_focus(&self, app: &App) -> Option<FocusHandle> {
-        self.active
-            .as_ref()
-            .map(|active| active.search.read(app).keyboard_focus())
+        let creation = self.new_chats.read(app);
+        if creation.is_open() {
+            Some(creation.active_input().read(app).keyboard_focus())
+        } else {
+            self.active
+                .as_ref()
+                .map(|active| active.search.read(app).keyboard_focus())
+        }
     }
 
     /// Передаёт снимок оболочки. Запрос и раскрытие сохраняются только в пределах того же входа.
@@ -409,6 +437,8 @@ impl Sidebar {
         let current = self.active.as_ref().map(|active| &active.session);
         let switched = current != session;
         if switched {
+            self.new_chats
+                .update(cx, |view, cx| view.select(session, cx));
             if let Some(previous) = self.active.take() {
                 self.saved.insert(
                     previous.session,
@@ -481,6 +511,16 @@ impl Sidebar {
 
         if switched {
             self.update_folder_view(cx);
+        }
+        if self.new_chats.read(cx).is_open()
+            && !same_catalog(
+                self.active
+                    .as_ref()
+                    .and_then(|active| active.catalog.as_ref()),
+                catalog,
+            )
+        {
+            self.new_chats.update(cx, NewChats::load_catalog);
         }
         if let Some(active) = &mut self.active {
             let catalog = catalog.filter(|list| list.generation == active.session.generation);
@@ -1235,15 +1275,7 @@ impl Sidebar {
     }
 }
 
-/// Открытие формы защищённого канала из каталога выбранного входа.
-#[derive(Clone)]
-pub(super) struct OpenEncryptedChannel {
-    pub session: AccountSession, // Выбранный вход, которому принадлежит действие.
-    pub opener: FocusHandle,     // Точка возврата после закрытия диалога.
-}
-
 impl EventEmitter<SidebarAction> for Sidebar {}
-impl EventEmitter<OpenEncryptedChannel> for Sidebar {}
 
 impl Render for Sidebar {
     /// Показывает поиск и состояние загрузки, прокручивая отдельно строки каталога.
@@ -1276,6 +1308,9 @@ impl Render for Sidebar {
             .flex_col()
             .bg(palette.surface);
 
+        if self.new_chats.read(cx).is_open() {
+            return self.with_folder_rail(panel.child(self.new_chats.clone()));
+        }
         let Some(active) = &mut self.active else {
             if self.menu_focus.is_focused(window) {
                 window.blur();
@@ -1292,34 +1327,28 @@ impl Render for Sidebar {
         active.search.update(cx, |search, cx| {
             search.set_placeholder(t("search.find"), cx)
         });
-        let channel = self
-            .runtime
-            .as_ref()
-            .and_then(|runtime| runtime.message_encryption(&active.session))
-            .map(|_| {
-                let mut add = Button::new("e2ee-create-channel", "");
-                add.icon = Some(Icon::Add);
-                let intent = OpenEncryptedChannel {
-                    session: active.session.clone(),
-                    opener: active.search.read(cx).keyboard_focus(),
-                };
-                let sidebar = cx.entity().downgrade();
-                let title = t("desktop.sidebar.createEncryptedChannel");
-                add.render(palette, None, move |_, app| {
-                    let _ = sidebar.update(app, |_, cx| cx.emit(intent.clone()));
-                })
-                .tooltip(move |_, app| tooltip(palette, title.into(), app))
-                .debug_selector(|| "e2ee-create-channel".into())
-            });
         panel = panel.child(
             div()
                 .px(px(12.))
                 .pt(px(16.))
                 .pb(px(12.))
                 .flex_none()
-                .child(div().flex().gap_1().items_center()
-                    .child(div().flex_1().min_w_0().child(search::render(&active.search, palette, window, cx)))
-                    .children(channel)),
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(div().flex_1().min_w_0().child(search::render(
+                    &active.search,
+                    palette,
+                    window,
+                    cx,
+                )))
+                .child(NewChats::opener(
+                    &self.new_chats,
+                    palette,
+                    locale,
+                    active.presentation.searching(),
+                    cx,
+                )),
         );
         let catalog = active.catalog.clone();
         let snapshot = active.folder_view.clone();

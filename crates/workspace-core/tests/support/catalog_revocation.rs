@@ -2,7 +2,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -88,12 +88,14 @@ impl IamClient for TestIam {
 /// Барьеры задерживают старый ответ B до фиксации отзыва.
 #[derive(Default)]
 struct Api {
-    delayed: Notify,           // Сервер получил старый запрос B.
-    release: Notify,           // Тест разрешает вернуть его после отзыва.
-    first_b: AtomicBool,       // Задерживаем только первый запрос списка каналов B.
-    revoked: AtomicBool,       // Новые ответы B уже учитывают отзыв.
-    preview_requested: Notify, // Сервер получил запрос превью для уже готового списка.
-    preview_release: Notify,   // Разрешает вернуть превью после проверки готового списка.
+    delayed: Notify,            // Сервер получил старый запрос B.
+    release: Notify,            // Тест разрешает вернуть его после отзыва.
+    first_b: AtomicBool,        // Задерживаем только первый запрос списка каналов B.
+    revoked: AtomicBool,        // Новые ответы B уже учитывают отзыв.
+    preview_requested: Notify,  // Сервер получил запрос превью для уже готового списка.
+    preview_release: Notify,    // Разрешает вернуть превью после проверки готового списка.
+    archived: AtomicBool,       // Канал находится в архиве в списке и прямом GET.
+    restore_posts: AtomicUsize, // Число принятых команд восстановления.
 }
 
 /// Запускает локальный HTTPS для списка каналов и тем.
@@ -119,7 +121,9 @@ async fn server(api: Arc<Api>) -> (String, tokio::task::JoinHandle<()>) {
                 let mut socket = BufReader::new(tls.accept(socket).await.unwrap());
                 let mut line = String::new();
                 socket.read_line(&mut line).await.unwrap();
-                let path = line.split_whitespace().nth(1).unwrap().to_owned();
+                let mut request = line.split_whitespace();
+                let method = request.next().unwrap().to_owned();
+                let path = request.next().unwrap().to_owned();
                 let mut headers = String::new();
                 loop {
                     line.clear();
@@ -171,6 +175,19 @@ async fn server(api: Arc<Api>) -> (String, tokio::task::JoinHandle<()>) {
                             "stream_uuid": STREAM, "name": "topic", "is_done": true,
                             "last_message_uuid": MESSAGE, "unread_count": 0, "color": 0xAA_BBCCu32
                         }])
+                    } else if path.contains("/actions/unarchive/invoke") {
+                        assert_eq!(method, "POST");
+                        assert!(path.contains(STREAM));
+                        api.restore_posts.fetch_add(1, Ordering::SeqCst);
+                        api.archived.store(false, Ordering::SeqCst);
+                        // Запись дошла до сервера, но клиент не получил снимок.
+                        json!(null)
+                    } else if path.ends_with(&format!("/streams/{STREAM}")) {
+                        assert_eq!(method, "GET");
+                        json!({
+                            "uuid": STREAM, "project_id": PROJECT, "user_uuid": user,
+                            "is_archived": api.archived.load(Ordering::SeqCst)
+                        })
                     } else {
                         let streams =
                             if user == B && !old_request && api.revoked.load(Ordering::SeqCst) {
@@ -180,7 +197,8 @@ async fn server(api: Arc<Api>) -> (String, tokio::task::JoinHandle<()>) {
                             };
                         json!(streams.into_iter().map(|id| json!({
                         "uuid": id, "project_id": PROJECT, "user_uuid": user, "name": id,
-                        "private": false, "is_archived": false, "default_topic_uuid": TOPIC,
+                        "private": false, "is_archived": id == STREAM && api.archived.load(Ordering::SeqCst),
+                        "default_topic_uuid": TOPIC,
                         "color": 0xBB_CCDDu32, "active_unread_count": 2
                     })).collect::<Vec<_>>())
                     }
@@ -199,6 +217,49 @@ async fn server(api: Arc<Api>) -> (String, tokio::task::JoinHandle<()>) {
         }
     });
     (address, task)
+}
+
+/// Разводит активный список и архив, затем перепроверяет результат одного POST.
+#[tokio::test]
+async fn archived_stream_is_listed_separately_and_restored_once() {
+    let api = Arc::new(Api::default());
+    api.archived.store(true, Ordering::SeqCst);
+    let (server_url, server_task) = server(api.clone()).await;
+    let stores = Arc::new(MemoryStores::default());
+    let auth = Auth::new(Arc::new(TestIam), stores.clone(), stores);
+    let login = auth.begin_login(&server_url, A, "password", None).unwrap();
+    let owner = auth.complete_login(login.id, PROJECT).unwrap();
+    let generation = auth.snapshot()[0].generation;
+    let storage = Arc::new(Storage::in_memory().unwrap());
+    let sync = Sync::new(auth, storage);
+    let ca = CertificateDer::from_pem_slice(CA).unwrap();
+    let messenger = MessengerSource::with_private_ca(ca.as_ref()).unwrap();
+
+    let before = messenger
+        .new_chat_catalog(&sync, &owner, generation)
+        .await
+        .unwrap();
+    assert_eq!(before.active.len(), 1);
+    assert_eq!(before.active[0].id.to_string(), OTHER);
+    assert_eq!(before.archived.len(), 1);
+    let archived = &before.archived[0];
+    assert_eq!(archived.id.to_string(), STREAM);
+    assert_eq!(archived.metadata.default_topic_id, TOPIC.parse().ok());
+
+    for _ in 0..2 {
+        messenger
+            .restore_archived_chat(&sync, &owner, generation, archived.id)
+            .await
+            .unwrap();
+    }
+    let after = messenger
+        .new_chat_catalog(&sync, &owner, generation)
+        .await
+        .unwrap();
+    assert!(after.archived.is_empty());
+    assert_eq!(after.active.len(), 2);
+    assert_eq!(api.restore_posts.load(Ordering::SeqCst), 1);
+    server_task.abort();
 }
 
 /// Создаёт событие отзыва с заданной позицией журнала.
@@ -343,7 +404,9 @@ async fn revoke_stream_updates_catalog_and_rejects_old_response() {
                 if let Some(preview) = preview {
                     assert_eq!(
                         preview.body(),
-                        &workspace_core::messenger::catalog::SidebarPreviewBody::from("hello world"),
+                        &workspace_core::messenger::catalog::SidebarPreviewBody::from(
+                            "hello world"
+                        ),
                     );
                     assert_eq!(preview.author_name.as_deref(), Some("Вы"));
                     break;

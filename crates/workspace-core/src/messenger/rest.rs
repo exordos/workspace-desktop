@@ -2,6 +2,8 @@
 //! Также разбирает общий формат событий, который используют HTTP и WebSocket.
 
 mod activity_messages;
+mod archive;
+mod creation;
 mod drafts;
 mod folders;
 mod fragments;

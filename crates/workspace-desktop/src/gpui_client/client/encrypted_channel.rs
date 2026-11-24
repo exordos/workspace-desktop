@@ -3,8 +3,8 @@
 use std::collections::HashSet;
 
 use gpui::{
-    Context, Entity, IntoElement, Render, Subscription, Task, WeakEntity, Window, div, prelude::*,
-    px,
+    Context, Entity, FocusHandle, IntoElement, Render, Subscription, Task, WeakEntity, Window, div,
+    prelude::*, px,
 };
 use uuid::Uuid;
 use workspace_core::{
@@ -23,9 +23,17 @@ use crate::gpui_client::{
     preferences::Preferences,
     right_panel::RightPanel,
     runtime::RuntimeClient,
-    sidebar::OpenEncryptedChannel,
+    sidebar::new_chats::{ChannelDialog, EncryptedChannelFields},
+    ui::TopBarSection,
     ui::{Button, ButtonAppearance, Palette, TextInput, TextInputChanged, TextRole, label},
 };
+
+/// Переход к защищённой форме из диалога создания канала.
+pub(super) struct OpenEncryptedChannel {
+    pub session: AccountSession,       // Выбранный вход, которому принадлежит действие.
+    pub opener: FocusHandle,           // Кнопка в сайдбаре для возврата после закрытия.
+    pub fields: EncryptedChannelFields, // Введённые поля обычной формы.
+}
 
 impl Client {
     /// Открывает форму в штатной рамке только для выбранного действующего входа.
@@ -37,7 +45,11 @@ impl Client {
         let Some(intent) = self.encrypted_channel.take() else {
             return;
         };
-        if self.shell.selected() != Some(&intent.session) || self.sign_in.is_some() {
+        if self.shell.selected() != Some(&intent.session)
+            || self.section != TopBarSection::Chats
+            || self.status().is_some()
+            || !self.right_panel.read(cx).modal_is::<ChannelDialog>()
+        {
             return;
         }
         let Some((_, activation)) = self.runtime.message_encryption(&intent.session) else {
@@ -48,10 +60,13 @@ impl Client {
         let session = intent.session.clone();
         let runtime = self.runtime.clone();
         self.right_panel.update(cx, |panel, cx| {
+            panel.close_modal(window, cx);
             let mut active = None;
             panel.open_modal(&intent.session, intent.opener, window, cx, |_, cx| {
                 let view = cx.new(|cx| {
-                    CreateEncryptedChannel::new(root, host, session, activation, runtime, cx)
+                    CreateEncryptedChannel::new(
+                        root, host, session, activation, runtime, intent.fields, cx,
+                    )
                 });
                 active = Some(view.downgrade());
                 view
@@ -68,11 +83,11 @@ impl Client {
     /// Откладывает открытие до кадра, когда доступна общая рамка и системное окно.
     pub(super) fn request_encrypted_channel(
         &mut self,
-        intent: &OpenEncryptedChannel,
+        intent: OpenEncryptedChannel,
         cx: &mut Context<Self>,
     ) {
         if self.shell.selected() == Some(&intent.session) {
-            self.encrypted_channel = Some(intent.clone());
+            self.encrypted_channel = Some(intent);
             cx.notify();
         }
     }
@@ -82,12 +97,18 @@ impl Client {
         &mut self,
         session: &AccountSession,
         created: CreatedEncryptedChannel,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let effect =
             self.shell
                 .open_created_topic(session, created.stream_id, created.topic_id);
-        if effect.is_some() {
+        let opened = effect.is_some();
+        if opened {
+            self.sidebar
+                .read(cx)
+                .new_chats()
+                .update(cx, |view, cx| view.return_to_catalog(cx));
             let runtime = self.runtime.clone();
             let session = session.clone();
             cx.spawn(async move |_, _| {
@@ -95,6 +116,13 @@ impl Client {
             })
             .detach();
             self.apply(effect, cx);
+        }
+        if self.right_panel.read(cx).modal_is::<CreateEncryptedChannel>() {
+            self.right_panel
+                .update(cx, |panel, cx| panel.close_modal(window, cx));
+        }
+        if opened {
+            self.sidebar.read(cx).focus_search(window, cx);
         }
     }
 }
@@ -127,6 +155,7 @@ impl CreateEncryptedChannel {
         session: AccountSession,
         activation: EncryptionActivation,
         runtime: RuntimeClient,
+        fields: EncryptedChannelFields,
         cx: &mut Context<Self>,
     ) -> Self {
         let locale = Preferences::read_for(cx, &session.owner).language;
@@ -138,6 +167,7 @@ impl CreateEncryptedChannel {
                 cx,
             )
         });
+        name.update(cx, |input, cx| input.set_text(&fields.name, cx));
         let description = cx.new(|cx| {
             TextInput::new(
                 "e2ee-channel-description",
@@ -146,6 +176,7 @@ impl CreateEncryptedChannel {
                 cx,
             )
         });
+        description.update(cx, |input, cx| input.set_text(&fields.description, cx));
         let search = cx.new(|cx| {
             TextInput::new(
                 "e2ee-channel-members-search",
@@ -290,11 +321,8 @@ impl CreateEncryptedChannel {
                     match result {
                         Ok((_, Ok(created))) => {
                             let _ = view.root.update(cx, |client, cx| {
-                                client.created_encrypted_channel(&view.session, created, cx)
+                                client.created_encrypted_channel(&view.session, created, window, cx)
                             });
-                            let _ = view
-                                .host
-                                .update(cx, |panel, cx| panel.close_modal(window, cx));
                         }
                         Ok((_, Err(KeyLifecycleError::CreateRejected(_)))) => {
                             view.resume = None;

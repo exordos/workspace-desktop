@@ -2,7 +2,7 @@
 //! Сначала описаны данные для окна, затем загрузка и разбор ответов сервера.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex, Weak},
 };
 
@@ -12,11 +12,13 @@ use uuid::Uuid;
 
 use crate::{
     auth::{Auth, AuthError, Service, SessionSnapshot},
-    context::OwnerContext,
+    context::{OwnerContext, SessionGeneration},
     runtime::SourceError,
     storage::{Storage, StorageError},
+    sync::Sync,
 };
 
+use super::MessengerSource;
 use super::rest::{RestClient, STREAMS_PATH, TOPICS_PATH};
 
 #[cfg(test)]
@@ -97,15 +99,26 @@ pub struct CatalogCounts {
     pub passive: u32,           // Остальные непрочитанные сообщения.
 }
 
+/// Две части каталога для режима «Новые чаты и каналы».
+#[derive(Debug, Eq, PartialEq)]
+pub struct NewChatCatalog {
+    pub active: Vec<Chat>, // Активные лички и каналы, где сервер подтвердил членство.
+    pub archived: Vec<Chat>, // Архивные лички и каналы с доступными темами.
+}
+
 /// Причина, по которой список чатов не удалось обновить.
 #[derive(Debug, Error)]
-pub(crate) enum CatalogError {
+pub enum CatalogError {
     #[error(transparent)]
     Auth(#[from] AuthError), // Сессия не смогла выдать токен или завершилась.
     #[error(transparent)]
     Source(#[from] SourceError), // Сервер не вернул полный список.
     #[error(transparent)]
     Storage(#[from] StorageError), // Ошибка записи полного снимка.
+    #[error("the archive restore was rejected with HTTP {0}")]
+    RestoreRejected(u16), // Сервер отклонил восстановление.
+    #[error("the archive restore is not confirmed")]
+    RestoreUnconfirmed, // Сервер мог принять команду, но не вернул пригодный снимок.
 }
 
 /// Загружает чаты и темы через REST и сохраняет их в SQLite.
@@ -117,6 +130,71 @@ pub struct Catalog {
 
 /// Слабые ссылки на блокировки загрузки для каждого владельца.
 pub(super) type RefreshGates = Mutex<HashMap<OwnerContext, Weak<tokio::sync::Mutex<()>>>>;
+
+impl MessengerSource {
+    /// Читает доступные входу разговоры, отдельно выделяя архив.
+    pub async fn new_chat_catalog(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+    ) -> Result<NewChatCatalog, CatalogError> {
+        let catalog = self.catalog(sync.storage().clone());
+        let gate = catalog.refresh_gate(owner);
+        let _loading = gate.lock().await;
+        let auth = sync.auth();
+        let token = auth
+            .access_token_for_generation(owner, Service::Messenger, generation)
+            .await?;
+        let revision = catalog.storage.catalog_revision(owner)?;
+        let result = catalog.fetch(owner, &token, true).await;
+        // Если журнал отозвал доступ во время GET, поздний каталог нельзя передать окну.
+        auth.with_active_generation(owner, generation, || {
+            if catalog.storage.catalog_revision(owner)? != revision {
+                return Err(StorageError::StaleCatalog);
+            }
+            Ok(())
+        })??;
+        Ok(result?)
+    }
+
+    /// Восстанавливает доступный архивный разговор и запрашивает сверку каталога и папок.
+    pub async fn restore_archived_chat(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        stream_id: Uuid,
+    ) -> Result<(), CatalogError> {
+        if stream_id.is_nil() {
+            return Err(SourceError::InvalidResponse.into());
+        }
+        let auth = sync.auth();
+        let token = auth
+            .access_token_for_generation(owner, Service::Messenger, generation)
+            .await?;
+        let archived = self.rest.chat_is_archived(owner, &token, stream_id).await?;
+        auth.with_active_generation(owner, generation, || ())?;
+        if archived {
+            match self.rest.restore_chat(owner, &token, stream_id).await {
+                Err(CatalogError::RestoreUnconfirmed) => {
+                    auth.with_active_generation(owner, generation, || ())?;
+                    if !matches!(
+                        self.rest.chat_is_archived(owner, &token, stream_id).await,
+                        Ok(false)
+                    ) {
+                        return Err(CatalogError::RestoreUnconfirmed);
+                    }
+                }
+                result => result?,
+            }
+        }
+        auth.with_active_generation(owner, generation, || {
+            sync.storage().request_catalog_and_folder_refresh(owner)
+        })??;
+        Ok(())
+    }
+}
 
 impl Catalog {
     /// Использует HTTP-клиент мессенджера и общую базу приложения.
@@ -243,7 +321,7 @@ impl Catalog {
             .await?;
         // Позиция журнала до запроса — нижняя граница событий, которые учёл REST.
         let fence = self.storage.cursor(owner, super::SOURCE_ID)?;
-        let chats = self.fetch(owner, &token).await?;
+        let chats = self.fetch(owner, &token, false).await?.active;
         let snapshot = serde_json::to_string(&chats).map_err(StorageError::from)?;
         auth.with_active_generation(owner, session.generation, || {
             self.storage
@@ -252,8 +330,13 @@ impl Catalog {
         Ok(chats)
     }
 
-    /// Загружает разговоры и темы, проверяет их владельца и связывает темы с разговорами.
-    async fn fetch(&self, owner: &OwnerContext, token: &str) -> Result<Vec<Chat>, SourceError> {
+    /// Загружает разговоры и темы, проверяет их владельца и отделяет архив от активных чатов.
+    async fn fetch(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        include_archive: bool,
+    ) -> Result<NewChatCatalog, SourceError> {
         let streams_path = format!("{STREAMS_PATH}/");
         let topics_path = format!("{TOPICS_PATH}/");
         let (streams, topics): (Vec<WireChat>, Vec<WireTopic>) = tokio::try_join!(
@@ -279,10 +362,18 @@ impl Catalog {
         }
         let streams: Vec<_> = streams
             .into_iter()
-            .filter(|chat| !chat.is_archived)
+            .filter(|chat| include_archive || !chat.is_archived)
             .collect();
         let users = self.direct_users(owner, token, &streams).await;
-        Ok(Self::assemble(streams, topics, &users))
+        let archived_ids: HashSet<_> = streams
+            .iter()
+            .filter(|chat| chat.is_archived)
+            .map(|chat| chat.uuid)
+            .collect();
+        let (archived, active) = Self::assemble(streams, topics, &users)
+            .into_iter()
+            .partition(|chat| archived_ids.contains(&chat.id));
+        Ok(NewChatCatalog { active, archived })
     }
 
     /// Собирает чат из уже проверенных данных сервера и справочника.
@@ -392,24 +483,24 @@ impl Catalog {
 /// Поля разговора из REST, нужные для списка и проверки владельца.
 #[derive(Deserialize)]
 struct WireChat {
-    uuid: Uuid,                       // Идентификатор разговора.
-    project_id: Uuid,                 // Проект, которому принадлежит разговор.
-    user_uuid: Uuid,                  // Пользователь, от имени которого получен разговор.
-    name: String,                     // Название, сохранённое на сервере.
-    private: bool,                    // Признак личного разговора.
-    direct_user_uuid: Option<Uuid>,   // Собеседник. У канала его нет.
-    is_archived: bool,                // Архивный разговор скрыт из основного списка.
-    source_name: Option<String>,      // Источник разговора, если сервер его указал.
+    uuid: Uuid,                            // Идентификатор разговора.
+    project_id: Uuid,                      // Проект, которому принадлежит разговор.
+    user_uuid: Uuid,                       // Пользователь, от имени которого получен разговор.
+    name: String,                          // Название, сохранённое на сервере.
+    private: bool,                         // Признак личного разговора.
+    direct_user_uuid: Option<Uuid>,        // Собеседник. У канала его нет.
+    is_archived: bool,                     // Архивный разговор скрыт из основного списка.
+    source_name: Option<String>,           // Источник разговора, если сервер его указал.
     encryption: Option<serde_json::Value>, // Явное состояние шифрования от сервера.
-    default_topic_uuid: Option<Uuid>, // Тема по умолчанию, указанная сервером.
-    last_message_uuid: Option<Uuid>,  // Последнее сообщение в разговоре.
-    color: Option<u32>,               // Цвет разговора в формате RGB.
+    default_topic_uuid: Option<Uuid>,      // Тема по умолчанию, указанная сервером.
+    last_message_uuid: Option<Uuid>,       // Последнее сообщение в разговоре.
+    color: Option<u32>,                    // Цвет разговора в формате RGB.
     #[serde(default)]
     invite_only: bool, // Вступление по приглашению.
-    notification_mode: Option<String>, // Режим уведомлений канала.
-    unread_count: Option<u64>,        // Все непрочитанные сообщения.
-    active_unread_count: Option<u64>, // Активные непрочитанные сообщения.
-    passive_unread_count: Option<u64>, // Пассивные непрочитанные сообщения.
+    notification_mode: Option<String>,     // Режим уведомлений канала.
+    unread_count: Option<u64>,             // Все непрочитанные сообщения.
+    active_unread_count: Option<u64>,      // Активные непрочитанные сообщения.
+    passive_unread_count: Option<u64>,     // Пассивные непрочитанные сообщения.
 }
 
 /// Поля темы из REST, нужные для вложенной строки и проверки владельца.

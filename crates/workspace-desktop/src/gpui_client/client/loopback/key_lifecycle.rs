@@ -149,6 +149,21 @@ impl Fixture {
     }
 }
 
+/// Входит в защищённый сценарий из общего действия создания канала.
+fn open_channel_forms(ui: &mut VisualTestContext) {
+    until(ui, "доступен плюс в каталоге", |ui| {
+        ui.debug_bounds("new-chats-open").is_some()
+    });
+    click(ui, "new-chats-open");
+    until(ui, "доступно создание канала", |ui| {
+        ui.debug_bounds("new-chats-create-channel").is_some()
+    });
+    click(ui, "new-chats-create-channel");
+    until(ui, "форма предлагает защищённый канал", |ui| {
+        ui.debug_bounds("e2ee-create-channel").is_some()
+    });
+}
+
 /// Терминальный отказ возвращает форму к новой операции с другим серверным UUID.
 #[gpui::test]
 fn rejected_channel_creation_allows_a_new_attempt(cx: &mut TestAppContext) {
@@ -165,12 +180,12 @@ fn rejected_channel_creation_allows_a_new_attempt(cx: &mut TestAppContext) {
         let subscription = events.attach(&client, app, Client::handle_runtime);
         client.update(app, |view, cx| view.attach(subscription, cx));
     });
-    until(ui, "доступно создание из каталога", |ui| ui.debug_bounds("e2ee-create-channel").is_some());
+    open_channel_forms(ui);
+    click(ui, "new-channel-name");
+    ui.simulate_input("GPUI encrypted channel");
     click(ui, "e2ee-create-channel");
     let member = format!("e2ee-invite-member-{PEER}").leak();
     until(ui, "форма готова", |ui| ui.debug_bounds(member).is_some());
-    click(ui, "e2ee-channel-name");
-    ui.simulate_input("GPUI encrypted channel");
     click(ui, "e2ee-channel-submit");
     until(ui, "форма показывает известный отказ без продолжения", |ui| {
         fixture.creates.load(Ordering::SeqCst) == 1
@@ -220,11 +235,7 @@ fn encrypted_channel_creation_rotation_and_removal_use_normal_routes(cx: &mut Te
         client.update(app, |client, cx| client.attach(subscription, cx));
     });
     ui.simulate_resize(size(px(1250.), px(900.)));
-    until(
-        ui,
-        "доступно создание из обычного каталога",
-        |ui| ui.debug_bounds("e2ee-create-channel").is_some(),
-    );
+    open_channel_forms(ui);
     click(ui, "e2ee-create-channel");
     until(ui, "форма готова", |ui| {
         ui.debug_bounds("e2ee-channel-name").is_some()
@@ -250,10 +261,19 @@ fn encrypted_channel_creation_rotation_and_removal_use_normal_routes(cx: &mut Te
     click(ui, "e2ee-channel-resume");
     until(
         ui,
-        "открыта точная тема и показан защищённый редактор",
+        "открыта точная тема, показан защищённый редактор и возвращён каталог",
         |ui| {
             wire.invites.load(Ordering::SeqCst) == 1
                 && ui.debug_bounds("workspace-composer-editor").is_some()
+                && ui.read(|app| {
+                    !client
+                        .read(app)
+                        .sidebar
+                        .read(app)
+                        .new_chats()
+                        .read(app)
+                        .is_open()
+                })
         },
     );
     assert_eq!(wire.creates.load(Ordering::SeqCst), 1);

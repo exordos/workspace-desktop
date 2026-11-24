@@ -429,7 +429,33 @@ impl Shell {
         Some(effect)
     }
 
-    /// Повторяет сохранённый переход, только если разговор ещё в каталоге текущего входа.
+    /// Использует подтверждённую Core цель создания или чтения архива для текущего входа.
+    pub(super) fn open_confirmed_chat(
+        &mut self,
+        session: &AccountSession,
+        scope: HistoryScope,
+        entry: ChatEntry,
+    ) -> Option<ShellEffect> {
+        if self.selected() != Some(session)
+            || !self.is_active(session)
+            || scope.stream_id.is_nil()
+            || scope.topic_id.is_some_and(|id| id.is_nil())
+            || !matches!(entry, ChatEntry::Latest | ChatEntry::Archived)
+        {
+            return None;
+        }
+        let route = ChatRoute {
+            owner: session.owner.clone(),
+            scope,
+            entry,
+        };
+        self.begin_navigation();
+        self.activity = None;
+        self.conversation_draft = None;
+        Some(self.open_conversation(route, session.generation))
+    }
+
+    /// Повторяет обычный переход из каталога или перепроверяет архивную историю.
     pub(super) fn restore_navigation(
         &mut self,
         route: Option<&ChatRoute>,
@@ -454,14 +480,19 @@ impl Shell {
         }
         let generation = selected.generation;
         if let Some(route) = route {
-            let chats = selected
-                .catalog_chats(
-                    self.selected_catalog(),
-                    self.folders.get(&route.owner).map(Arc::as_ref),
-                )
-                .ok_or(())?;
-            if selected.owner != route.owner || !catalog_contains(chats, route.scope) {
+            if selected.owner != route.owner {
                 return Err(());
+            }
+            if route.entry != ChatEntry::Archived {
+                let chats = selected
+                    .catalog_chats(
+                        self.selected_catalog(),
+                        self.folders.get(&route.owner).map(Arc::as_ref),
+                    )
+                    .ok_or(())?;
+                if !catalog_contains(chats, route.scope) {
+                    return Err(());
+                }
             }
         }
         self.begin_navigation();
@@ -483,17 +514,14 @@ impl Shell {
     pub(super) fn open_created_topic(
         &mut self, session: &AccountSession, stream_id: Uuid, topic_id: Uuid,
     ) -> Option<ShellEffect> {
-        if self.selected() != Some(session) || !self.is_active(session) || stream_id.is_nil() || topic_id.is_nil() {
-            return None;
-        }
-        self.begin_navigation();
-        self.activity = None;
-        self.conversation_draft = None;
-        Some(self.open_conversation(ChatRoute {
-            owner: session.owner.clone(),
-            scope: HistoryScope { stream_id, topic_id: Some(topic_id) },
-            entry: ChatEntry::Latest,
-        }, session.generation))
+        self.open_confirmed_chat(
+            session,
+            HistoryScope {
+                stream_id,
+                topic_id: Some(topic_id),
+            },
+            ChatEntry::Latest,
+        )
     }
 
     /// Открывает оригинал пересылки из того же экрана и активного входа.

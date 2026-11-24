@@ -127,6 +127,7 @@ impl ReactionRow {
 /// Данные и маршрут действий, общие для кнопок у пузыря и будущей полосы в меню.
 #[derive(Clone)]
 pub(super) struct ReactionControls {
+    pub read_only: bool, // В архиве разрешено видеть счётчики реакций.
     choices: Rc<[Choice]>, // Популярные и базовые эмодзи в порядке Core.
     rows: Rc<HashMap<Uuid, ReactionRow>>, // Только подтверждённые доступные сообщения окна.
     conversation: WeakEntity<Conversation>, // Действие пропадает вместе с экраном.
@@ -135,6 +136,9 @@ pub(super) struct ReactionControls {
 impl ReactionControls {
     /// Возвращает быстрые реакции, учитывая общие настройки и собственные отметки строки.
     pub(super) fn quick(&self, id: Uuid) -> Vec<QuickReaction> {
+        if self.read_only {
+            return Vec::new();
+        }
         let row = self.rows.get(&id);
         self.choices
             .iter()
@@ -171,7 +175,9 @@ impl ReactionControls {
 
     /// Сравнивает входы кэшируемой строки без проверки остальных сообщений.
     pub(super) fn same_row(&self, other: &Self, id: Uuid) -> bool {
-        self.rows.get(&id) == other.rows.get(&id) && self.choices == other.choices
+        self.read_only == other.read_only
+            && self.rows.get(&id) == other.rows.get(&id)
+            && self.choices == other.choices
     }
 
     /// Передаёт намерение экрану, который проверит адрес и доступ повторно.
@@ -253,6 +259,7 @@ impl Conversation {
         };
         self.avatar_runtime.as_ref()?;
         Some(ReactionControls {
+            read_only: self.is_archived(),
             choices: self
                 .reactions
                 .usage
@@ -275,7 +282,8 @@ impl Conversation {
 
     /// Разрешает реакцию у серверного сообщения, тело которого сейчас открыто.
     fn can_react(&self, message: &HistoryMessage) -> bool {
-        !message.id.is_nil()
+        !self.is_archived()
+            && !message.id.is_nil()
             && match &message.body {
                 MessageBody::Markdown(_) => true,
                 MessageBody::Encrypted { .. } => self.encryption.as_ref()

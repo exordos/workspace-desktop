@@ -303,7 +303,7 @@ impl Conversation {
             return entries;
         }
 
-        entries.reactions = true;
+        entries.reactions = !self.is_archived();
         let reply_available = composer.is_some_and(|composer| composer.reply_action_enabled(cx));
         let protected_reply = composer.is_some_and(|composer| composer.can_edit_protected());
         let can_add = composer.is_some_and(|composer| composer.has_reply_tabs());
@@ -353,7 +353,7 @@ impl Conversation {
                 .chain((!protected).then_some((Action::Select, false))),
         );
 
-        if own {
+        if own && !self.is_archived() {
             let edit = if protected {
                 protected_actions.then_some((Action::Edit, protected_reply))
             } else {

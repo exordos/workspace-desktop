@@ -8,6 +8,8 @@ pub(super) use key_exchange::{IncomingKey, key_exchange_is_permanent};
 mod local_drafts;
 mod login;
 mod self_chat;
+mod new_chat_catalog;
+mod new_chat_creation;
 
 pub(super) use local_drafts::LocalDraftError;
 pub use login::{LoginAttempt, LoginError};

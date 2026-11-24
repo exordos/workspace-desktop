@@ -118,7 +118,8 @@ impl Conversation {
             return None;
         };
         let scope = self.address.route.scope;
-        if !self.heading.native_markdown
+        if self.is_archived()
+            || !self.heading.native_markdown
             || (scope.topic_id.is_none() && !self.heading.direct)
             || self.message_delete.awaiting_history.contains(&id)
         {

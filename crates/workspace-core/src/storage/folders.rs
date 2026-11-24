@@ -167,6 +167,21 @@ impl Storage {
         Ok(())
     }
 
+    /// Запрашивает согласованную сверку каталога и папок после восстановления чата.
+    pub(crate) fn request_catalog_and_folder_refresh(
+        &self,
+        owner: &OwnerContext,
+    ) -> Result<(), StorageError> {
+        let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        mark_catalog_refresh(&transaction, owner)?;
+        mark_refresh(&transaction, owner, None)?;
+        transaction.commit()?;
+        drop(connection);
+        self.notify_catalog_change();
+        Ok(())
+    }
+
     /// Выбирает следующую область для запроса. Незагруженный профиль начинает со всего списка.
     pub(crate) fn folder_refresh_plan(
         &self,

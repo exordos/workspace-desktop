@@ -5,6 +5,7 @@ mod activity;
 mod encrypted_channel;
 mod history_positions;
 mod key_inbox;
+mod new_chats;
 mod notification_banner;
 mod preference_runtime;
 
@@ -101,7 +102,7 @@ pub(super) struct Client {
     shell: Shell,           // Выбор, адрес разговора и фильтр событий по входам.
     runtime: RuntimeClient, // Очередь команд рабочего потока этого профиля.
     sidebar: Entity<Sidebar>, // Единственный каталог; хранит поиск каждого входа.
-    encrypted_channel: Option<super::sidebar::OpenEncryptedChannel>, // Запрошенная форма для текущего входа.
+    encrypted_channel: Option<encrypted_channel::OpenEncryptedChannel>, // Запрошенная форма для текущего входа.
     key_response_scan: Option<Task<()>>, // Чтение сохранённых ответов для текущего выбора входа.
     sidebar_visible: bool,  // Показывается ли каталог в рабочем разделе.
     search_return: Option<FocusHandle>, // Куда вернуться после завершения поиска сочетанием.
@@ -144,9 +145,7 @@ impl Client {
     pub(super) fn new(options: Options, runtime: RuntimeClient, cx: &mut Context<Self>) -> Self {
         let sidebar = cx.new(|cx| Sidebar::with_runtime(runtime.clone(), cx));
         cx.observe(&sidebar, |_, _, cx| cx.notify()).detach();
-        cx.subscribe(&sidebar, |client, _, intent: &super::sidebar::OpenEncryptedChannel, cx| {
-            client.request_encrypted_channel(intent, cx);
-        }).detach();
+        new_chats::subscribe(&sidebar, cx);
         cx.subscribe(&sidebar, |client, _, intent: &FolderIntent, cx| {
             client.handle_folder_intent(intent.clone(), cx);
         })
@@ -364,6 +363,14 @@ impl Client {
                 use workspace_core::sync::{HistoryRevocation, SyncChange};
                 if let Some((activation, incoming)) = self.runtime.incoming_key(update) {
                     self.queue_key_response(activation, incoming, cx);
+                }
+                if matches!(
+                    update.change,
+                    SyncChange::HistoryAccessRevoked(_) | SyncChange::MessengerReset
+                ) {
+                    self.sidebar.read(cx).new_chats().update(cx, |view, cx| {
+                        view.reload_after_access_change(update, cx);
+                    });
                 }
                 match update.change {
                     SyncChange::HistoryAccessRevoked(HistoryRevocation::Stream(stream)) => {
@@ -1042,6 +1049,7 @@ impl Render for Client {
         self.sync_profile_avatar(cx);
         self.sync_profile_details(cx);
         RightPanel::restore_focus(&self.right_panel, window, cx);
+        self.open_requested_new_channel(window, cx);
         self.open_requested_profile(window, cx);
         self.open_requested_details_profile(window, cx);
         self.open_requested_encrypted_channel(window, cx);

@@ -575,7 +575,7 @@ pub(super) fn reaction_chips(
                 let caption =
                     SharedString::from(locale.tr_with("a11y.quickReaction", &[("emoji", &glyph)]));
                 let mut button = Button::new((ElementId::Uuid(id), emoji.clone()), "");
-                button.disabled = controls.is_pending(id, &emoji);
+                button.disabled = controls.read_only || controls.is_pending(id, &emoji);
                 let controls = controls.clone();
                 let selected = emoji.clone();
                 button
