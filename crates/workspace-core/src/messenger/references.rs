@@ -1,13 +1,66 @@
-//! Находит файлы Workspace и веб-ссылки в открытом Markdown сообщений.
+//! Строит постоянные ссылки на сообщения и разбирает вложения и веб-ссылки в Markdown.
 //! Карточки вложений и индекс доступа используют общий разбор файловых ссылок.
 
-use std::ops::Range;
+use std::{fmt::Write as _, ops::Range};
 
 use markdown::{ParseOptions, mdast::Node, to_mdast};
 use reqwest::Url;
 use uuid::Uuid;
 
-use crate::storage::media::{ExternalLink, MediaKind, MediaLink};
+use crate::{
+    context::OwnerContext,
+    storage::media::{ExternalLink, MediaKind, MediaLink},
+};
+
+/// Строит ссылку для браузера по адресу Workspace и UUID подтверждённого сообщения.
+pub fn message_permalink(owner: &OwnerContext, message_id: Uuid) -> Option<String> {
+    if message_id.is_nil() {
+        return None;
+    }
+    let url = super::rest::workspace_origin(owner).ok()?;
+    let project = web_route_segment(&owner.project_id)?;
+
+    // Веб-клиент определяет организацию в маршруте по хосту и порту сервера.
+    let mut authority = url.host_str()?.to_ascii_lowercase();
+    if let Some(port) = url.port() {
+        write!(authority, "-{port}").unwrap();
+    }
+    let organization = authority
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let organization = match organization.as_str() {
+        "" => "org",
+        "." | ".." => return None,
+        organization => organization,
+    };
+
+    let origin = url.origin().ascii_serialization();
+    Some(format!(
+        "{origin}/org/{organization}/project/{project}/message/{message_id}"
+    ))
+}
+
+/// Проверяет и кодирует сегмент по правилам маршрутов веб-клиента.
+fn web_route_segment(value: &str) -> Option<String> {
+    if matches!(value, "" | "." | "..")
+        || value.contains(|ch: char| {
+            ch.is_whitespace() || ch.is_control() || matches!(ch, '/' | '\\' | '%' | '?' | '#')
+        })
+    {
+        return None;
+    }
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&byte) {
+            encoded.push(byte.into());
+        } else {
+            write!(encoded, "%{byte:02X}").unwrap();
+        }
+    }
+    Some(encoded)
+}
 
 /// Вложение и сведения, которые можно взять из самого сообщения для показа карточки.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,6 +142,25 @@ pub(crate) fn media_links(text: &str) -> Vec<MediaLink> {
 
 /// Берёт ссылки HTTP и HTTPS из открытого Markdown без запросов к сайтам и разбора цитат.
 pub(crate) fn external_links(text: &str) -> Vec<ExternalLink> {
+    external_link_references(text)
+        .into_iter()
+        .map(|link| ExternalLink {
+            url: link.url,
+            label: link.label,
+        })
+        .collect()
+}
+
+/// Видимая веб-ссылка и её местоположение в исходном теле сообщения.
+pub struct ExternalLinkReference {
+    pub range: Range<usize>, // Байты всего элемента ссылки в исходном Markdown.
+    pub url: String,         // Проверенный нормализованный адрес HTTP или HTTPS.
+    pub href: String,        // Исходный адрес для копирования без изменения представления.
+    pub label: String,       // Имя ссылки, пригодное для показа.
+}
+
+/// Находит доступные для копирования ссылки и диапазоны для попадания указателем.
+pub fn external_link_references(text: &str) -> Vec<ExternalLinkReference> {
     if !text.contains("://") && !text.contains("www.") {
         return Vec::new();
     }
@@ -101,9 +173,16 @@ pub(crate) fn external_links(text: &str) -> Vec<ExternalLink> {
         match node {
             Node::Blockquote(_) => {}
             Node::Link(link) => {
-                if let Some(url) = external_url(&link.url) {
+                if let Some(url) = external_url(&link.url)
+                    && let Some(position) = &link.position
+                {
                     let label = clean_label(&display_label(node)).unwrap_or_else(|| url.clone());
-                    links.push(ExternalLink { url, label });
+                    links.push(ExternalLinkReference {
+                        range: position.start.offset..position.end.offset,
+                        url,
+                        href: link.url.clone(),
+                        label,
+                    });
                 }
             }
             _ => pending.extend(node.children().into_iter().flatten().rev()),
@@ -223,6 +302,52 @@ fn decode_query_value(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::AccountId;
+
+    /// Использует хост и порт аккаунта, кодирует сегмент проекта по правилам Electron.
+    #[test]
+    fn message_permalink_uses_the_web_route_for_the_active_owner() {
+        let owner = OwnerContext {
+            account_id: AccountId("account".into()),
+            server: "https://Workspace.Example:8443".into(),
+            organization_id: "iam-organization-id".into(),
+            project_id: "проект:2026".into(),
+            user_id: "user".into(),
+        };
+        let message = Uuid::from_u128(10);
+        assert_eq!(
+            message_permalink(&owner, message),
+            Some(format!(
+                "https://workspace.example:8443/org/workspace.example-8443/project/%D0%BF%D1%80%D0%BE%D0%B5%D0%BA%D1%82%3A2026/message/{message}"
+            ))
+        );
+    }
+
+    /// Не создаёт ссылку без подтверждённого UUID, серверного адреса или корректного проекта.
+    #[test]
+    fn message_permalink_rejects_an_invalid_target() {
+        let mut owner = OwnerContext {
+            account_id: AccountId("account".into()),
+            server: "https://workspace.example".into(),
+            organization_id: "organization".into(),
+            project_id: "project".into(),
+            user_id: "user".into(),
+        };
+        let message = Uuid::from_u128(10);
+        assert_eq!(message_permalink(&owner, Uuid::nil()), None);
+        for project in ["", "..", "a/b", "a%2fb", "a?b", "a b"] {
+            owner.project_id = project.into();
+            assert_eq!(message_permalink(&owner, message), None);
+        }
+        owner.project_id = "project".into();
+        for server in [
+            "https://workspace.example/api",
+            "https://user@workspace.example",
+        ] {
+            owner.server = server.into();
+            assert_eq!(message_permalink(&owner, message), None);
+        }
+    }
 
     /// Включает прямые веб-ссылки, пропускает цитаты, вставленные картинки и опасные схемы.
     #[test]

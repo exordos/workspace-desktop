@@ -19,7 +19,7 @@ use super::{
     encryption::fragments::{fragment_links, has_protected_draft},
     history::OpenHistoryError,
     quote::{QuoteSourceFence, SourceCheckError},
-    references::display_label,
+    references::{display_label, media_references},
     send::DirectSendError,
 };
 
@@ -231,14 +231,17 @@ pub(super) fn has_forwarded_fragment(markdown: &str) -> bool {
 
 /// Публичный оригинал из текущей истории и отображаемые подписи для снимка.
 #[derive(Clone)]
-pub struct ProtectedForwardOrigin {
-    pub scope: HistoryScope, // Исходный чат и тема, если это канал.
+pub struct ForwardOrigin {
+    pub scope: HistoryScope, // Исходный разговор и его тема, если она известна.
     pub message_id: Uuid,    // Публичный UUID подтверждённого сообщения.
     pub author: String,      // Имя автора для подписи пересылки.
     pub chat: String,        // Название исходного разговора для подписи.
 }
 
-/// Причина, по которой защищённая пересылка не поставлена в очередь.
+/// Адрес оригинала для существующей команды пересылки защищённых фрагментов.
+pub type ProtectedForwardOrigin = ForwardOrigin;
+
+/// Причина, по которой пересылка не поставлена в очередь.
 #[derive(Debug, Error)]
 pub enum ProtectedForwardError {
     #[error(transparent)]
@@ -249,10 +252,47 @@ pub enum ProtectedForwardError {
     Queue(#[from] PrepareSendError), // Запись не поставлена в очередь.
     #[error(transparent)]
     Session(#[from] SyncError), // Сессия закрылась во время запроса.
-    #[error("the original has no forwardable protected fragments")]
-    InvalidSource, // Источник не содержит подходящий нативный защищённый Markdown.
+    #[error("the original has no forwardable content")]
+    InvalidSource, // Источник или выделение не подходят для снимка.
     #[error("the forwarded snapshot exceeds the message limit")]
     TooLong, // Строка со снимком и заголовком больше лимита отправки.
+}
+
+/// Выбирает допустимое тело снимка для старого маршрута фрагментов или меню сообщения.
+enum ForwardContent<'a> {
+    Protected,
+    Message(Option<&'a str>),
+}
+
+/// Проверяет, поддерживает ли очередь пересылку такого тела в обычную тему.
+pub fn can_forward_markdown(text: &str) -> bool {
+    !text.trim().is_empty()
+        && !has_protected_draft(text)
+        && (contains_protected_snapshot(text, MAX_FORWARD_DEPTH - 1)
+            || media_references(text).is_empty())
+}
+
+/// Для защищённых фрагментов сохраняет полный снимок, для обычных допускает выделение.
+fn forward_snapshot<'a>(
+    stored: &'a str,
+    content: ForwardContent<'a>,
+) -> Result<(&'a str, bool), ProtectedForwardError> {
+    if !can_forward_markdown(stored) {
+        return Err(ProtectedForwardError::InvalidSource);
+    }
+    if contains_protected_snapshot(stored, MAX_FORWARD_DEPTH - 1) {
+        return Ok((stored, false));
+    }
+    match content {
+        ForwardContent::Protected => Err(ProtectedForwardError::InvalidSource),
+        ForwardContent::Message(None) => Ok((stored, false)),
+        ForwardContent::Message(Some(fragment))
+            if !fragment.is_empty() && stored.contains(fragment) =>
+        {
+            Ok((fragment, true))
+        }
+        ForwardContent::Message(Some(_)) => Err(ProtectedForwardError::InvalidSource),
+    }
 }
 
 impl MessengerSource {
@@ -297,6 +337,48 @@ impl MessengerSource {
         origin: &ProtectedForwardOrigin,
         target: HistoryScope,
     ) -> Result<PreparedSend, ProtectedForwardError> {
+        self.prepare_forward_content(
+            sync,
+            owner,
+            generation,
+            origin,
+            target,
+            ForwardContent::Protected,
+        )
+        .await
+    }
+
+    /// Ставит один подтверждённый снимок или его открытый фрагмент в обычную очередь.
+    pub async fn prepare_message_forward(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        origin: &ForwardOrigin,
+        target: HistoryScope,
+        fragment: Option<&str>,
+    ) -> Result<PreparedSend, ProtectedForwardError> {
+        self.prepare_forward_content(
+            sync,
+            owner,
+            generation,
+            origin,
+            target,
+            ForwardContent::Message(fragment),
+        )
+        .await
+    }
+
+    /// Проверяет источник и цель в той же сессии, затем сохраняет готовую пересылку.
+    async fn prepare_forward_content(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        origin: &ForwardOrigin,
+        target: HistoryScope,
+        content: ForwardContent<'_>,
+    ) -> Result<PreparedSend, ProtectedForwardError> {
         let access = sync
             .prepare_fragment_origins(
                 owner,
@@ -309,8 +391,9 @@ impl MessengerSource {
             .access_token_for_generation(owner, Service::Messenger, generation)
             .await
             .map_err(SyncError::from)?;
-        self.rest
-            .fragment_source_topic(owner, &token, origin.scope.stream_id)
+        let source_is_direct = self
+            .rest
+            .forward_source_is_direct(owner, &token, origin.scope.stream_id)
             .await
             .map_err(SourceCheckError::from)?;
         let topic_id = self.rest.fragment_send_topic(owner, &token, target).await?;
@@ -328,22 +411,18 @@ impl MessengerSource {
             .body
             .markdown()
             .ok_or(ProtectedForwardError::InvalidSource)?;
-        if has_protected_draft(stored)
-            || !contains_protected_snapshot(stored, MAX_FORWARD_DEPTH - 1)
-        {
-            return Err(ProtectedForwardError::InvalidSource);
-        }
+        let (snapshot, plain) = forward_snapshot(stored, content)?;
         let markdown = ForwardReference {
             id: original.id,
             author: display_or_id(
                 &origin.author,
                 original.metadata.author_id.unwrap_or(original.id),
             ),
-            snapshot: stored.to_owned(),
-            plain: false,
+            snapshot: snapshot.to_owned(),
+            plain,
             source: Some(ForwardSource {
                 label: display_or_id(&origin.chat, original.stream_id),
-                direct: origin.scope.topic_id.is_none(),
+                direct: source_is_direct,
                 created_at: original.metadata.created_at.clone(),
             }),
         }

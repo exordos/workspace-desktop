@@ -24,6 +24,17 @@ impl RestClient {
         Ok(default_topic(&row))
     }
 
+    /// Подтверждает нативный источник пересылки и определяет, является ли он личным.
+    pub(in crate::messenger) async fn forward_source_is_direct(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        stream_id: Uuid,
+    ) -> Result<bool, OpenHistoryError> {
+        let row = self.fragment_stream(owner, token, stream_id).await?;
+        Ok(row.is_direct())
+    }
+
     /// Проверяет, что в эту нативную тему всё ещё можно отправлять обычный Markdown.
     pub(in crate::messenger) async fn fragment_send_topic(
         &self,
@@ -37,18 +48,11 @@ impl RestClient {
         if row.direct_user_uuid.is_some() && !direct {
             return Err(SourceError::InvalidResponse.into());
         }
-        let topic = if direct {
-            let default = default_topic(&row).ok_or(DirectSendError::TopicUnavailable)?;
-            if scope.topic_id.is_some_and(|id| id != default) {
-                return Err(DirectSendError::TopicUnavailable);
-            }
-            default
-        } else {
-            scope
-                .topic_id
-                .filter(|id| !id.is_nil())
-                .ok_or(DirectSendError::TopicUnavailable)?
-        };
+        let topic = scope
+            .topic_id
+            .or(default_topic(&row).filter(|_| direct))
+            .filter(|id| !id.is_nil())
+            .ok_or(DirectSendError::TopicUnavailable)?;
         let target = self
             .topic_access(owner, token, scope.stream_id, topic)
             .await?;

@@ -527,6 +527,62 @@ async fn own_plain_markdown_edit_can_add_first_fragment_and_observes_origin_revo
     }
 }
 
+/// Пересылает выделение из обычного сообщения в точную цель и проверяет формат снимка.
+#[tokio::test]
+async fn message_forward_queues_only_the_selected_text() {
+    use workspace_core::messenger::forward::{ForwardOrigin, ProtectedForwardError, forward_spans};
+
+    let test = Test::new().await;
+    *test.api.access.lock().unwrap() = Access::NativeMarkdown;
+    *test.api.default_topic.lock().unwrap() = OTHER_TOPIC;
+    let (_, sync) = test.open();
+    let session = test.session();
+    let id = Uuid::from_u128(762);
+    test.api.lookups.lock().unwrap().insert(
+        id,
+        json!({
+            "uuid": id, "stream_uuid": CHAT, "topic_uuid": TOPIC,
+            "project_id": "project", "user_uuid": B, "author_uuid": B, "source_name": "native",
+            "created_at": "2026-01-01T12:00:00Z",
+            "payload": {"kind": "markdown", "content": "До [выделения](https://example.test/) после"}
+        }),
+    );
+    let target = HistoryScope {
+        topic_id: Some(TOPIC),
+        ..SCOPE
+    };
+    let origin = ForwardOrigin {
+        scope: target,
+        message_id: id,
+        author: "Автор".into(),
+        chat: "Исходный чат".into(),
+    };
+    let prepare = |fragment| {
+        test.source.prepare_message_forward(
+            &sync,
+            &session.context,
+            session.generation,
+            &origin,
+            target,
+            Some(fragment),
+        )
+    };
+    assert!(matches!(
+        prepare("устаревшее выделение").await,
+        Err(ProtectedForwardError::InvalidSource)
+    ));
+    let record = prepare("выделения").await.unwrap();
+    assert_eq!((record.stream_id, record.topic_id), (CHAT, TOPIC));
+    let PreparedSendBody::Markdown(body) = record.body else {
+        panic!("снимок должен быть обычным Markdown");
+    };
+    let forwarded = forward_spans(&body).pop().unwrap().reference.unwrap();
+    assert_eq!(forwarded.id, id);
+    assert_eq!(forwarded.snapshot, "выделения");
+    assert!(forwarded.plain);
+    assert!(forwarded.source.unwrap().direct);
+}
+
 /// Пересылает исходный конверт в другую тему и отзывает чтение по исходному чату.
 #[tokio::test]
 async fn protected_forward_posts_canonical_snapshot_and_tracks_the_origin() {
