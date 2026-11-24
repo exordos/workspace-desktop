@@ -1,0 +1,23 @@
+{
+  "poll_bubble": {
+    "anonymous": "Anonymous poll",
+    "public": "Public poll",
+    "questions": "Questions: %{count}",
+    "multiple": "Choose multiple options",
+    "single": "Choose one option",
+    "participants": "Participants: %{count}",
+    "results_after_vote": "Results after voting",
+    "closed": "Poll closed",
+    "deadline": "Until %{date}",
+    "read_only": "Read only",
+    "add_option_placeholder": "Add an answer option…",
+    "add_error": "Could not add the option. Try again.",
+    "participant_count_one": "%{count} participant",
+    "participant_count_other": "%{count} participants",
+    "correct_answer": "Correct answer: %{options}",
+    "you_voted": "You voted",
+    "view_votes": "View votes",
+    "completed_at": "Closed %{date}",
+    "unavailable": "Could not load the poll"
+  }
+}

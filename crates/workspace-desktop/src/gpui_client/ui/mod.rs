@@ -10,6 +10,7 @@ mod filter_group;
 mod focus;
 mod icons;
 mod person_row;
+pub mod poll;
 pub(super) mod popup;
 mod quote;
 mod text_input;

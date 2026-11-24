@@ -1,0 +1,25 @@
+{
+  "poll_bubble": {
+    "anonymous": "Анонимное голосование",
+    "public": "Публичное голосование",
+    "questions": "Вопросов: %{count}",
+    "multiple": "несколько вариантов",
+    "single": "один вариант",
+    "participants": "Участников: %{count}",
+    "results_after_vote": "Результаты после голосования",
+    "closed": "Опрос завершён",
+    "deadline": "До %{date}",
+    "read_only": "Только для чтения",
+    "add_option_placeholder": "Добавить вариант ответа…",
+    "add_error": "Не удалось добавить вариант. Попробуйте ещё раз.",
+    "participant_count_one": "%{count} участник",
+    "participant_count_few": "%{count} участника",
+    "participant_count_many": "%{count} участников",
+    "participant_count_other": "%{count} участника",
+    "correct_answer": "Правильный ответ: %{options}",
+    "you_voted": "Вы проголосовали",
+    "view_votes": "Посмотреть голоса",
+    "completed_at": "Завершён %{date}",
+    "unavailable": "Не удалось загрузить опрос"
+  }
+}

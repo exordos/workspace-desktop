@@ -4,6 +4,7 @@ mod conversation_notices;
 #[path = "../parity/new_chat_components.rs"]
 mod new_chat_components;
 mod pickers;
+mod polls;
 mod quotes;
 
 use std::time::Duration;
@@ -20,7 +21,7 @@ use workspace_desktop::gpui_client::{
         Avatar, AvatarPresence, AvatarSize, BadgeTone, Button, ButtonAppearance, ChatRow,
         ChatRowPreview, DeliveryMark, FieldAppearance, FilterGroup, Icon, MessageBubble, Palette,
         SEARCH_ICON_SIZE, TextRole, ThemeMode, TopBar, TopBarAccount, TopBarSelection,
-        WorkspaceAssets, field, label, track_focus_input,
+        WorkspaceAssets, field, label, poll::PollBubble, track_focus_input,
     },
 };
 
@@ -37,7 +38,8 @@ struct Panel {
     selected: u8,                 // Номер выбранной строки каталога.
     draft: Entity<Editor>,        // Общий редактор с локальным черновиком.
     retrying_notice: bool,        // Пример плашки временно показывает повторную проверку.
-    pickers: pickers::Pickers,    // Календарь и часы со своим выбором в этой теме.
+    polls: polls::Examples,       // Выбор в демонстрационном опросе и видимость большого примера.
+    pickers: pickers::Pickers,     // Календарь и часы со своим выбором в этой теме.
     pickers_only: bool,           // Показывает только примеры календаря и часов.
 }
 
@@ -59,6 +61,7 @@ impl Panel {
             selected: 0,
             draft: cx.new(Editor::for_conversation),
             retrying_notice: false,
+            polls: polls::Examples::default(),
             pickers: pickers::Pickers::new(Palette::for_mode(mode), window, cx),
             pickers_only,
         }
@@ -189,6 +192,7 @@ impl Panel {
                 label(palette, TextRole::Body, "Редактирование недоступно")
                     .text_color(palette.text_muted),
             ))
+            .child(self.polls.render(palette, cx))
             .child(self.pickers.render(palette, cx))
     }
 
@@ -404,6 +408,7 @@ pub fn run() {
         .with_assets(WorkspaceAssets)
         .run(move |app: &mut App| {
             Editor::bind_keys(app);
+            PollBubble::load_font(app);
             app.bind_keys([
                 KeyBinding::new("tab", NextControl, None),
                 KeyBinding::new("shift-tab", PreviousControl, None),
