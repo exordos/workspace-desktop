@@ -9,7 +9,7 @@ use rustls::{
 };
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
     sync::oneshot,
     task::JoinHandle,
@@ -22,12 +22,15 @@ use workspace_core::{
     context::{OwnerContext, SessionGeneration},
     messenger::{
         MessengerSource,
+        details::{DetailsError, SidebarTopicAction},
         message_actions::{
             DeleteError, MessageTarget, MutationReceipt, MutationStatus, MutationStatusError,
         },
+        sidebar_actions::{SidebarStreamAction, SidebarStreamResult},
     },
     runtime::SourceError,
-    storage::HistoryScope,
+    storage::{HistoryScope, Storage},
+    sync::Sync,
 };
 
 use super::Fixture;
@@ -46,11 +49,12 @@ const SIBLING: Uuid = Uuid::from_u128(45);
 
 /// Один ожидаемый запрос и управляемый ответ локального сервера.
 struct Step {
-    request: String,     // Метод HTTP и путь запроса.
-    user: &'static str,  // Владелец тестового токена.
-    status: Option<u16>, // Код ответа. None означает обрыв соединения.
-    body: Option<Value>, // JSON успешного ответа.
-    headers: String,     // Дополнительные заголовки ответа.
+    request: String,              // Метод HTTP и путь запроса.
+    user: &'static str,           // Владелец тестового токена.
+    status: Option<u16>,          // Код ответа. None означает обрыв соединения.
+    body: Option<Value>,          // JSON успешного ответа.
+    expected_body: Option<Value>, // JSON запроса, если его требуется проверить.
+    headers: String,              // Дополнительные заголовки ответа.
     paused: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>, // Остановить ответ до смены входа.
 }
 
@@ -62,6 +66,7 @@ impl Step {
             user,
             status: Some(200),
             body: Some(body),
+            expected_body: None,
             headers: String::new(),
             paused: None,
         }
@@ -74,6 +79,7 @@ impl Step {
             user: USER,
             status,
             body: None,
+            expected_body: None,
             headers,
             paused: None,
         }
@@ -150,20 +156,29 @@ impl Step {
         socket.read_line(&mut line).await.unwrap();
         assert_eq!(line, format!("{} HTTP/1.1\r\n", self.request));
         let mut authorized = false;
+        let mut length = 0;
         loop {
             line.clear();
             assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
             if line == "\r\n" {
                 break;
             }
-            if let Some((name, value)) = line.trim().split_once(':')
-                && name.eq_ignore_ascii_case("authorization")
-            {
-                assert_eq!(value.trim(), format!("Bearer {}", self.user));
-                authorized = true;
+            if let Some((name, value)) = line.trim().split_once(':') {
+                if name.eq_ignore_ascii_case("authorization") {
+                    assert_eq!(value.trim(), format!("Bearer {}", self.user));
+                    authorized = true;
+                }
+                if name.eq_ignore_ascii_case("content-length") {
+                    length = value.trim().parse().unwrap();
+                }
             }
         }
         assert!(authorized, "нет токена для {}", self.request);
+        if let Some(expected) = self.expected_body {
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).await.unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), expected);
+        }
         if let Some((received, resume)) = self.paused {
             received.send(()).unwrap();
             resume.await.unwrap();
@@ -285,6 +300,10 @@ async fn message_delete_uses_exact_placement_and_reads_mutation_status() {
         topic(USER),
         message(USER, USER),
         Step::delete(Some(204), String::new()),
+        stream(USER, true),
+        topic(USER),
+        message(USER, USER),
+        Step::delete(Some(204), String::new()),
         stream(USER, false),
         topic(USER),
         message(USER, USER),
@@ -303,6 +322,13 @@ async fn message_delete_uses_exact_placement_and_reads_mutation_status() {
     assert_eq!(
         source
             .delete_message(&fixture.auth, &owner, generation, target(true))
+            .await
+            .unwrap(),
+        MutationReceipt::Applied,
+    );
+    assert_eq!(
+        source
+            .delete_message(&fixture.auth, &owner, generation, target(false))
             .await
             .unwrap(),
         MutationReceipt::Applied,
@@ -347,6 +373,115 @@ async fn message_delete_uses_exact_placement_and_reads_mutation_status() {
         source.mutation_status(&fixture.auth, &ticket).await,
         Err(MutationStatusError::Auth(AuthError::SessionUnavailable))
     ));
+    server.verify().await;
+}
+
+/// Прочитывает точную тему личного чата без запроса карточки собеседника.
+#[tokio::test]
+async fn personal_topic_read_checks_placement_without_peer_profile() {
+    let mut wrong_topic = topic(USER);
+    wrong_topic.body.as_mut().unwrap()["stream_uuid"] = json!(SIBLING);
+    let server = Server::start(vec![
+        topic(USER),
+        Step {
+            request: format!("POST {API}/stream_topics/{TOPIC}/actions/read/invoke"),
+            user: USER,
+            status: Some(204),
+            body: None,
+            expected_body: None,
+            headers: String::new(),
+            paused: None,
+        },
+        wrong_topic,
+    ])
+    .await;
+    let (fixture, owner, generation, source) = open(&server, USER);
+    let sync = Sync::new(
+        fixture.auth.clone(),
+        Arc::new(Storage::in_memory().unwrap()),
+    );
+    let read = || {
+        source.update_sidebar_topic(
+            &sync,
+            &owner,
+            generation,
+            STREAM,
+            TOPIC,
+            SidebarTopicAction::MarkRead,
+        )
+    };
+    read().await.unwrap();
+    assert!(matches!(
+        read().await,
+        Err(DetailsError::Source(SourceError::InvalidResponse))
+    ));
+    server.verify().await;
+}
+
+/// Сверяет команды личного чата с REST и повторяет создание по тому же UUID.
+#[tokio::test]
+async fn personal_sidebar_stream_actions_use_verified_routes_and_recover_creation() {
+    let mut read = stream(USER, true);
+    read.request = format!("POST {API}/streams/{STREAM}/actions/read/invoke");
+    let mut before_create = topic(USER);
+    before_create.status = Some(404);
+    before_create.body = None;
+    let mut created = topic(USER);
+    created.body.as_mut().unwrap()["name"] = json!("Планы");
+    let mut create = topic(USER);
+    create.request = format!("POST {API}/stream_topics/");
+    create.status = Some(201);
+    create.body = created.body.clone();
+    create.expected_body = Some(json!({
+        "uuid": TOPIC,
+        "stream_uuid": STREAM,
+        "name": "Планы",
+    }));
+    let mut archived = stream(USER, true);
+    archived.body.as_mut().unwrap()["is_archived"] = json!(true);
+    let mut archive = stream(USER, true);
+    archive.request = format!("POST {API}/streams/{STREAM}/actions/archive/invoke");
+    archive.body = archived.body.clone();
+    let server = Server::start(vec![
+        stream(USER, true),
+        read,
+        stream(USER, true),
+        before_create,
+        create,
+        stream(USER, true),
+        created,
+        stream(USER, true),
+        stream(USER, true),
+        archive,
+        archived,
+    ])
+    .await;
+    let (fixture, owner, generation, source) = open(&server, USER);
+    let sync = Sync::new(
+        fixture.auth.clone(),
+        Arc::new(Storage::in_memory().unwrap()),
+    );
+    let run = |action| source.update_sidebar_stream(&sync, &owner, generation, STREAM, action);
+    assert!(matches!(
+        run(SidebarStreamAction::MarkRead).await,
+        Ok(SidebarStreamResult::Updated)
+    ));
+    for _ in 0..2 {
+        assert!(matches!(
+            run(SidebarStreamAction::CreateTopic { id: TOPIC, name: "  Планы  ".into() }).await,
+            Ok(SidebarStreamResult::TopicCreated(id)) if id == TOPIC
+        ));
+    }
+    assert!(matches!(
+        run(SidebarStreamAction::Rename("Другое имя".into())).await,
+        Err(DetailsError::ActionDenied)
+    ));
+    for _ in 0..2 {
+        assert!(matches!(
+            run(SidebarStreamAction::Archive).await,
+            Ok(SidebarStreamResult::Updated)
+        ));
+    }
     server.verify().await;
 }
 

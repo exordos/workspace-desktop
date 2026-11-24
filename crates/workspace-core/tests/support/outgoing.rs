@@ -94,6 +94,7 @@ pub(super) struct Api {
     default_topic: Mutex<Uuid>, // Значение, которое может измениться между сохранением и POST.
     temporary_topic_failure: AtomicBool, // Следующий GET темы вернёт временный сбой.
     persistent_topic_failure: AtomicBool, // Каждый GET первой темы вернёт временный сбой.
+    topic_done: AtomicBool,     // Первая тема закрыта для отправки.
     ready: watch::Sender<bool>, // Пока false, WebSocket не сообщает о готовности к работе.
     events: broadcast::Sender<Value>, // События, отправляемые только B.
     page_events: Mutex<Vec<Value>>, // Сохранённые события B для REST-догрузки после обрыва.
@@ -207,7 +208,7 @@ impl Api {
                     "200 OK",
                     json!({
                         "uuid":TOPIC, "stream_uuid":CHAT, "project_id":"project", "user_uuid":token,
-                        "notification_mode":"default"
+                        "notification_mode":"default", "is_done":self.topic_done.load(Relaxed)
                     }),
                 )
             }
@@ -863,6 +864,7 @@ impl Test {
             default_topic: Mutex::new(TOPIC),
             temporary_topic_failure: AtomicBool::new(false),
             persistent_topic_failure: AtomicBool::new(false),
+            topic_done: AtomicBool::new(false),
             ready: watch::channel(false).0,
             events: broadcast::channel(8).0,
             page_events: Mutex::default(),
@@ -1815,6 +1817,37 @@ async fn direct_send_requires_explicit_unencrypted_destination() {
     assert!(opening.refresh().await.unwrap().messages.is_empty());
     test.fixture.auth.logout(&test.b.account_id).unwrap();
     assert!(matches!(resolve().await, Err(DirectSendError::Auth(_))));
+}
+
+/// Открывает указанную тему лички и сохраняет её адрес, даже если общая тема другая.
+#[tokio::test]
+async fn personal_topic_history_and_send_use_explicit_topic() {
+    let test = Test::new().await;
+    let (_, sync) = test.open();
+    let generation = test.session().generation;
+    *test.api.default_topic.lock().unwrap() = OTHER_TOPIC;
+    *test.api.access.lock().unwrap() = Access::NativeMarkdown;
+    let scope = HistoryScope {
+        topic_id: Some(TOPIC),
+        ..SCOPE
+    };
+
+    let opening = test
+        .source
+        .open_latest_history(&sync, &test.b, generation, scope)
+        .await
+        .unwrap();
+    assert!(opening.refresh().await.unwrap().messages.is_empty());
+
+    let resolve = || {
+        test.source
+            .resolve_plain_send(&sync, &test.b, generation, scope)
+    };
+    let target = resolve().await.unwrap();
+    assert_eq!(target.topic_id(), TOPIC);
+    assert!(target.fragments_allowed());
+    test.api.topic_done.store(true, Relaxed);
+    assert!(matches!(resolve().await, Err(DirectSendError::TopicClosed)));
 }
 
 /// Проверяет живой источник и точный фрагмент по HTTPS до любых записей очереди.

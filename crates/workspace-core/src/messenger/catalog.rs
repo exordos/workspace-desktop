@@ -35,12 +35,12 @@ pub struct Chat {
     pub id: Uuid,           // Идентификатор разговора.
     pub name: String,       // Название канала или имя собеседника.
     pub direct: bool,       // У разговора один собеседник или это чат с собой.
-    pub topics: Vec<Topic>, // Доступные темы канала.
+    pub topics: Vec<Topic>, // Доступные темы разговора.
     #[serde(default)]
     pub metadata: ChatMetadata, // Сведения для строки разговора и переходов.
 }
 
-/// Тема канала в списке чатов.
+/// Тема разговора в списке чатов.
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Topic {
     pub id: Uuid,     // Идентификатор темы.
@@ -53,18 +53,19 @@ pub struct Topic {
 #[derive(Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct ChatMetadata {
-    pub native_markdown: bool, // Сервер подтвердил обычный нативный разговор.
     pub default_topic_id: Option<Uuid>, // Доступная тема по умолчанию, если сервер её указал.
-    pub direct_peer_id: Option<Uuid>, // Собеседник в личном чате.
+    pub native_markdown: bool,          // Сервер подтвердил обычный нативный разговор.
+    pub direct_peer_id: Option<Uuid>,   // Собеседник в личном чате.
     pub direct_peer_username: Option<String>, // Имя учётной записи собеседника для поиска.
     pub direct_peer_email: Option<String>, // Доступный адрес собеседника для поиска.
-    pub last_message_id: Option<Uuid>, // UUID последнего известного сообщения разговора.
+    pub last_message_id: Option<Uuid>,  // UUID последнего известного сообщения разговора.
     #[serde(skip)]
     pub preview: Option<SidebarPreview>, // Превью того же сообщения для текущего входа.
-    pub color: Option<u32>,    // Цвет в формате RGB, заданный сервером.
-    pub invite_only: bool,     // Вступление в канал требует приглашения.
+    pub color: Option<u32>,             // Цвет в формате RGB, заданный сервером.
+    pub invite_only: bool,              // Вступление в канал требует приглашения.
+    pub encrypted: Option<bool>,        // Подтверждённое сервером шифрование канала.
     pub notification_mode: Option<String>, // Режим уведомлений из ответа сервера.
-    pub unread_count: Option<u64>, // Все непрочитанные сообщения, если известны.
+    pub unread_count: Option<u64>,      // Все непрочитанные сообщения, если известны.
     pub active_unread_count: Option<u64>, // Непрочитанные, влияющие на уведомления.
     pub passive_unread_count: Option<u64>, // Остальные непрочитанные сообщения.
 }
@@ -250,7 +251,7 @@ impl Catalog {
         Ok(chats)
     }
 
-    /// Загружает разговоры и темы, проверяет их владельца и связывает темы с каналами.
+    /// Загружает разговоры и темы, проверяет их владельца и связывает темы с разговорами.
     async fn fetch(&self, owner: &OwnerContext, token: &str) -> Result<Vec<Chat>, SourceError> {
         let streams_path = format!("{STREAMS_PATH}/");
         let topics_path = format!("{TOPICS_PATH}/");
@@ -280,7 +281,7 @@ impl Catalog {
             .filter(|chat| !chat.is_archived)
             .collect();
         let users = self.direct_users(owner, token, &streams).await;
-        Ok(Self::assemble(streams, topics, &users, user))
+        Ok(Self::assemble(streams, topics, &users))
     }
 
     /// Собирает чат из уже проверенных данных сервера и справочника.
@@ -288,7 +289,6 @@ impl Catalog {
         streams: Vec<WireChat>,
         topics: Vec<WireTopic>,
         users: &HashMap<Uuid, WireUser>,
-        user: Uuid,
     ) -> Vec<Chat> {
         let mut topics_by_chat: HashMap<Uuid, Vec<Topic>> = HashMap::new();
         for topic in topics {
@@ -317,16 +317,8 @@ impl Catalog {
                 let direct = chat.private && chat.direct_user_uuid.is_some();
                 let peer_id = chat.direct_user_uuid.filter(|_| direct);
                 let peer = peer_id.and_then(|id| users.get(&id));
-                let name = match peer_id {
-                    Some(peer) if peer == user => "Избранное".to_owned(),
-                    Some(_) => peer.map(WireUser::display_name).unwrap_or(chat.name),
-                    None => chat.name,
-                };
-                let mut topics = if direct {
-                    Vec::new()
-                } else {
-                    topics_by_chat.remove(&chat.uuid).unwrap_or_default()
-                };
+                let name = peer.map(WireUser::display_name).unwrap_or(chat.name);
+                let mut topics = topics_by_chat.remove(&chat.uuid).unwrap_or_default();
                 topics.sort_by_cached_key(|topic| (topic.name.to_lowercase(), topic.id));
                 let default_topic_id = match chat.default_topic_uuid {
                     Some(id) => topics.iter().find(|topic| topic.id == id),
@@ -342,9 +334,9 @@ impl Catalog {
                     direct,
                     topics,
                     metadata: ChatMetadata {
+                        default_topic_id,
                         native_markdown: chat.source_name.as_deref() == Some("native")
                             && chat.encryption == Some(serde_json::Value::Bool(false)),
-                        default_topic_id,
                         direct_peer_id: peer_id,
                         direct_peer_username: peer.map(|profile| profile.username.clone()),
                         direct_peer_email: peer
@@ -356,6 +348,7 @@ impl Catalog {
                         preview: None,
                         color: chat.color,
                         invite_only: chat.invite_only,
+                        encrypted: chat.encryption.and_then(|value| value.as_bool()),
                         notification_mode: chat.notification_mode,
                         unread_count: chat.unread_count,
                         active_unread_count: chat.active_unread_count,
@@ -398,24 +391,24 @@ impl Catalog {
 /// Поля разговора из REST, нужные для списка и проверки владельца.
 #[derive(Deserialize)]
 struct WireChat {
-    uuid: Uuid,                            // Идентификатор разговора.
-    project_id: Uuid,                      // Проект, которому принадлежит разговор.
-    user_uuid: Uuid,                       // Пользователь, от имени которого получен разговор.
-    name: String,                          // Название, сохранённое на сервере.
-    private: bool,                         // Признак личного разговора.
-    direct_user_uuid: Option<Uuid>,        // Собеседник. У канала его нет.
-    is_archived: bool,                     // Архивный разговор скрыт из основного списка.
-    source_name: Option<String>,           // Источник разговора, если сервер его указал.
+    uuid: Uuid,                       // Идентификатор разговора.
+    project_id: Uuid,                 // Проект, которому принадлежит разговор.
+    user_uuid: Uuid,                  // Пользователь, от имени которого получен разговор.
+    name: String,                     // Название, сохранённое на сервере.
+    private: bool,                    // Признак личного разговора.
+    direct_user_uuid: Option<Uuid>,   // Собеседник. У канала его нет.
+    is_archived: bool,                // Архивный разговор скрыт из основного списка.
+    source_name: Option<String>,      // Источник разговора, если сервер его указал.
     encryption: Option<serde_json::Value>, // Явное состояние шифрования от сервера.
-    default_topic_uuid: Option<Uuid>,      // Тема по умолчанию, указанная сервером.
-    last_message_uuid: Option<Uuid>,       // Последнее сообщение в разговоре.
-    color: Option<u32>,                    // Цвет разговора в формате RGB.
+    default_topic_uuid: Option<Uuid>, // Тема по умолчанию, указанная сервером.
+    last_message_uuid: Option<Uuid>,  // Последнее сообщение в разговоре.
+    color: Option<u32>,               // Цвет разговора в формате RGB.
     #[serde(default)]
     invite_only: bool, // Вступление по приглашению.
-    notification_mode: Option<String>,     // Режим уведомлений канала.
-    unread_count: Option<u64>,             // Все непрочитанные сообщения.
-    active_unread_count: Option<u64>,      // Активные непрочитанные сообщения.
-    passive_unread_count: Option<u64>,     // Пассивные непрочитанные сообщения.
+    notification_mode: Option<String>, // Режим уведомлений канала.
+    unread_count: Option<u64>,        // Все непрочитанные сообщения.
+    active_unread_count: Option<u64>, // Активные непрочитанные сообщения.
+    passive_unread_count: Option<u64>, // Пассивные непрочитанные сообщения.
 }
 
 /// Поля темы из REST, нужные для вложенной строки и проверки владельца.
@@ -424,7 +417,7 @@ struct WireTopic {
     uuid: Uuid,         // Идентификатор темы.
     project_id: Uuid,   // Проект, которому принадлежит тема.
     user_uuid: Uuid,    // Пользователь, от имени которого получена тема.
-    stream_uuid: Uuid,  // Канал, которому принадлежит тема.
+    stream_uuid: Uuid,  // Разговор, которому принадлежит тема.
     name: String,       // Название темы.
     color: Option<u32>, // Цвет темы в формате RGB.
     #[serde(default)]
@@ -468,12 +461,56 @@ impl WireUser {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
     use crate::{
         bootstrap::{ChatList, ChatListStatus, ChatLists},
         context::{AccountId, SessionGeneration},
         storage::{Cursor, EventWrite, HistoryChange},
     };
+
+    /// Сохраняет обычную и завершённую темы личного чата с отметкой темы по умолчанию.
+    #[test]
+    fn catalog_retains_personal_topics_and_default() {
+        let project = Uuid::from_u128(1);
+        let user = Uuid::from_u128(2);
+        let peer = Uuid::from_u128(3);
+        let stream = Uuid::from_u128(4);
+        let general = Uuid::from_u128(5);
+        let completed = Uuid::from_u128(6);
+        let chat = serde_json::from_value(json!({
+            "uuid": stream, "project_id": project, "user_uuid": user,
+            "name": "Личный чат", "private": true, "direct_user_uuid": peer,
+            "is_archived": false, "default_topic_uuid": general,
+        }))
+        .unwrap();
+        let topics = serde_json::from_value(json!([
+            {
+                "uuid": completed, "project_id": project, "user_uuid": user,
+                "stream_uuid": stream, "name": "Завершённая", "is_done": true,
+                "is_default": true, "active_unread_count": 2,
+            },
+            {
+                "uuid": general, "project_id": project, "user_uuid": user,
+                "stream_uuid": stream, "name": "Общая",
+            },
+        ]))
+        .unwrap();
+
+        let chats = Catalog::assemble(vec![chat], topics, &HashMap::new());
+        let chat = &chats[0];
+        assert!(chat.direct);
+        assert_eq!(chat.metadata.direct_peer_id, Some(peer));
+        assert_eq!(chat.metadata.default_topic_id, Some(general));
+        assert_eq!(chat.topics.len(), 2);
+        assert_eq!(chat.topics[0].id, completed);
+        assert!(chat.topics[0].metadata.is_done);
+        assert!(!chat.topics[0].metadata.is_default);
+        assert_eq!(chat.topics[0].metadata.active_unread_count, Some(2));
+        assert_eq!(chat.topics[1].id, general);
+        assert!(chat.topics[1].metadata.is_default);
+    }
 
     /// Снимок, уже ожидающий публикации, перечитывается после отзыва из базы.
     #[test]

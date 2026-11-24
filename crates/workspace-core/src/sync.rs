@@ -1482,6 +1482,22 @@ impl Sync {
         })
     }
 
+    /// Перечитывает сведения и ставит обновление каталога в очередь после команды.
+    pub(crate) fn refresh_sidebar_catalog(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        stream_id: Uuid,
+    ) -> Result<(), AuthError> {
+        self.refresh_sidebar(owner, generation, stream_id)?;
+        self.auth.with_active_generation(owner, generation, || {
+            if let Err(error) = self.storage.request_catalog_refresh(owner) {
+                // Сервер уже применил действие. Сбой сверки не меняет его результат.
+                log::warn!("Не удалось запросить обновление каталога разговоров: {error}");
+            }
+        })
+    }
+
     /// Скрывает историю сразу после выхода. Запись в базу обновит событие `stream.deleted`.
     pub(crate) fn complete_sidebar_leave(
         &self,

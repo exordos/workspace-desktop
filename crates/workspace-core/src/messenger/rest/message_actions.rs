@@ -176,10 +176,10 @@ impl RestClient {
             stream.project_id.as_deref(),
             stream.user_uuid.as_deref(),
         )?;
-        let valid_kind = match target.scope.topic_id {
-            Some(_) => !stream.private && stream.direct_user_uuid.is_none(),
-            None => stream.is_direct(),
-        };
+        let valid_kind = stream.is_direct()
+            || (target.scope.topic_id.is_some()
+                && !stream.private
+                && stream.direct_user_uuid.is_none());
         if !valid_kind
             || stream.is_archived
             || stream.source_name.as_deref() != Some("native")

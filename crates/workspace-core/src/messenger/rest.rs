@@ -11,6 +11,8 @@ mod own_profile;
 mod protected_drafts;
 mod reactions;
 pub(super) mod sidebar;
+mod sidebar_actions;
+mod summary_settings;
 
 use std::{collections::HashSet, time::Duration};
 
@@ -34,7 +36,7 @@ use crate::{
 };
 
 use super::catalog::CatalogCounts;
-use super::details::{DetailsError, StreamNotificationMode, TopicNotificationMode};
+use super::details::{DetailsError, SidebarChange, StreamNotificationMode, TopicNotificationMode};
 use super::history::OpenHistoryError;
 use super::read::ReadError;
 use super::send::{DirectSendError, MarkdownOrigin, SendError};
@@ -468,7 +470,7 @@ impl RestClient {
             .ok_or(DirectSendError::TopicUnavailable)
     }
 
-    /// Проверяет явную тему канала или сохранённую цель отправки.
+    /// Проверяет явную тему разговора или сохранённую цель отправки.
     pub(super) async fn check_send_topic(
         &self,
         owner: &OwnerContext,
@@ -497,26 +499,24 @@ impl RestClient {
         let topic = self.topic_access(owner, token, stream, topic).await?;
         // Проверяем шифрование после чтения темы, прямо перед записью или отправкой.
         let row = self.stream_access(owner, token, stream).await?;
-        if row.is_direct() {
-            // Сохранённую тему лички перепроверяем без пересчёта темы по умолчанию.
-            return if queued {
-                row.check_plain_send().map(|()| row.markdown_origin(owner))
-            } else {
-                Err(DirectSendError::AccessLost)
-            };
-        }
-        if row.direct_user_uuid.is_some()
-            || row.project_id.as_deref() != Some(owner.project_id.as_str())
-            || row.user_uuid.as_deref() != Some(owner.user_id.as_str())
-            || topic.project_id.as_deref() != Some(owner.project_id.as_str())
-            || topic.user_uuid.as_deref() != Some(owner.user_id.as_str())
-        {
+        let direct = row.is_direct();
+        if row.direct_user_uuid.is_some() && !direct {
             return Err(SourceError::InvalidResponse.into());
+        }
+        // Старые ответы для уже сохранённой личной отправки могли не повторять владельца.
+        if !queued || !direct {
+            check_explicit_owner(owner, row.project_id.as_deref(), row.user_uuid.as_deref())?;
+            check_explicit_owner(
+                owner,
+                topic.project_id.as_deref(),
+                topic.user_uuid.as_deref(),
+            )?;
         }
         row.check_plain_send()?;
         match topic.is_done {
             Some(false) => Ok(row.markdown_origin(owner)),
             Some(true) => Err(DirectSendError::TopicClosed),
+            None if direct => Ok(row.markdown_origin(owner)),
             None => Err(SourceError::InvalidResponse.into()),
         }
     }
@@ -692,7 +692,7 @@ impl RestClient {
         Ok(())
     }
 
-    /// Определяет вид подтверждённого разговора для открытия точного сообщения.
+    /// Подтверждает разговор и сохраняет точную тему для открытия сообщения.
     pub(super) async fn presentation_scope(
         &self,
         owner: &OwnerContext,
@@ -710,7 +710,7 @@ impl RestClient {
         }
         Ok(HistoryScope {
             stream_id: message.stream_id,
-            topic_id: (!stream.is_direct()).then_some(message.topic_id),
+            topic_id: Some(message.topic_id),
         })
     }
 
@@ -1467,6 +1467,8 @@ struct WireTopic {
     active_unread_count: Option<u32>, // Счётчик сообщений с уведомлениями.
     passive_unread_count: Option<u32>, // Счётчик остальных непрочитанных.
     summary: Option<String>,    // Текст последней серверной сводки.
+    summary_enabled: Option<bool>, // Отсутствие поля означает, что сводка включена.
+    summary_has_new_messages: Option<bool>, // Признак новых сообщений после сводки.
 }
 
 impl WireTopic {
@@ -1676,9 +1678,16 @@ pub(super) fn wire_event(
             None,
         ));
     }
-    // Стрим и тема могут одним снимком обновить папки, счётчики и правый сайдбар.
+    // Стрим и тема могут одним снимком обновить каталог, счётчики и правый сайдбар.
     let sidebar_change = sidebar::wire_sidebar_change(&wire, &value["payload"], owner);
     let mut folder_event = folder_event(&wire, owner, &cursor)?;
+    if wire.action == "created" && matches!(&sidebar_change, Some(SidebarChange::Topic { .. })) {
+        folder_event = Some(Event::FolderChanged {
+            cursor: cursor.clone(),
+            change: FolderChange::TopicCreated,
+            sidebar: None,
+        });
+    }
     if let Some(Event::FolderChanged { sidebar, .. }) = &mut folder_event {
         *sidebar = sidebar_change.clone().map(Box::new);
     }
@@ -1696,9 +1705,10 @@ pub(super) fn wire_event(
     let folder = match &folder_event {
         Some(Event::FolderChanged {
             change:
-                change @ FolderChange::StreamChanged {
+                change @ (FolderChange::StreamChanged {
                     archived: false, ..
-                },
+                }
+                | FolderChange::TopicCreated),
             ..
         }) => Some(*change),
         Some(event) => return Ok((event.clone(), None)),

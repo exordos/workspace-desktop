@@ -23,7 +23,7 @@ use super::{super::rest::RestClient, DetailsError, MessengerSource};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SidebarDetails {
     Peer(DirectSidebar),     // Собеседник обычного личного чата.
-    Channel(ChannelSidebar), // Стрим с темами и списком участников.
+    Channel(ChannelSidebar), // Канал или защищённая личка со списком участников.
 }
 
 /// Сведения о личном чате, включая особый случай чата с собой.
@@ -38,14 +38,19 @@ pub struct DirectSidebar {
 /// Сведения о стриме, видимые его участнику.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChannelSidebar {
-    pub name: String,                              // Название стрима.
-    pub description: Option<String>,               // Публичное описание, если заполнено.
-    pub color: Option<u32>,                        // Цвет значка RGB, если указан.
-    pub invite_only: bool,                         // Стрим доступен по приглашению.
+    pub name: String,                               // Название стрима.
+    pub description: Option<String>,                // Публичное описание, если заполнено.
+    pub color: Option<u32>,                         // Цвет значка RGB, если указан.
+    pub invite_only: bool,                          // Стрим доступен по приглашению.
+    pub is_private: bool,                           // Сервер считает стрим закрытым.
+    pub encrypted: bool, // Сообщения канала защищены сквозным шифрованием.
+    pub direct_peer: Option<Uuid>, // Собеседник для защищённой лички.
+    pub allow_key_sharing_by_holders: Option<bool>, // Текущее значение политики, если сервер его поддерживает.
+    pub can_edit_key_sharing: bool, // Владелец защищённого чата с поддержкой настройки.
     pub notification_mode: StreamNotificationMode, // Настройка текущего пользователя.
-    pub can_add_members: bool,                     // Текущий пользователь может приглашать.
-    pub topics: Vec<SidebarTopic>,                 // Темы стрима, в том числе завершённые.
-    pub members: Vec<SidebarMember>,               // Все подтверждённые привязки участников.
+    pub can_add_members: bool,      // Текущий пользователь может приглашать.
+    pub topics: Vec<SidebarTopic>,  // Темы стрима, в том числе завершённые.
+    pub members: Vec<SidebarMember>, // Все подтверждённые привязки участников.
 }
 
 /// Строка темы, открываемой по её UUID.
@@ -53,12 +58,14 @@ pub struct ChannelSidebar {
 pub struct SidebarTopic {
     pub id: Uuid,     // UUID темы, сохраняемый при переименовании.
     pub name: String, // Название темы.
-    pub done: bool,   // Тема отмечена завершённой для текущего пользователя.
+    pub done: bool,   // Тема отмечена завершённой для всех участников.
     pub notification_mode: TopicNotificationMode, // Настройка уведомлений темы.
     pub unread_count: u32, // Все непрочитанные сообщения текущего пользователя.
     pub active_unread_count: u32, // Непрочитанные, которые учитываются с настройками уведомлений.
     pub passive_unread_count: u32, // Остальные непрочитанные сообщения.
     pub summary: Option<String>, // Последняя серверная сводка, если она появилась.
+    pub summary_enabled: bool, // Workspace продолжает обновлять сводку.
+    pub summary_has_new_messages: bool, // После сводки в теме появились сообщения.
 }
 
 /// Участник, его привязка и действия, видимые в рамках текущей сессии.
@@ -95,13 +102,21 @@ pub enum StreamNotificationMode {
 }
 
 /// Настройка уведомлений темы на сервере.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TopicNotificationMode {
     Default, // Использовать настройку стрима.
     Mute,    // Выключить уведомления темы.
     Unmute,  // Включить уведомления темы.
     Follow,  // Следить за темой.
+}
+
+/// Действие над темой разговора, доступное участнику через её контекстное меню.
+pub enum SidebarTopicAction {
+    SetNotifications(TopicNotificationMode), // Задаёт личную настройку уведомлений темы.
+    MarkRead,                                // Прочитывает тему от имени текущего пользователя.
+    Rename(String),                          // Сохраняет новое название темы.
+    ToggleDone,                              // Меняет общий признак завершённости.
 }
 
 /// Изменение журнала, которое может обновить сохранённую панель.
@@ -136,16 +151,21 @@ pub struct SidebarStreamMetadata {
     pub(in crate::messenger) description: Option<String>, // Заполненное описание стрима.
     pub(in crate::messenger) color: Option<u32>,      // Цвет значка RGB.
     pub(in crate::messenger) invite_only: bool,       // Признак доступа по приглашению.
+    pub(in crate::messenger) is_private: bool,        // Признак закрытого стрима.
+    pub(in crate::messenger) encrypted: bool,         // Подтверждённый режим шифрования канала.
+    pub(in crate::messenger) allow_key_sharing_by_holders: Option<bool>, // Политика в ответе сервера, если известна.
+    pub(in crate::messenger) can_edit_key_sharing: bool, // Владелец защищённого чата может поменять политику.
     pub(in crate::messenger) notification_mode: StreamNotificationMode, // Настройка подписчика.
-    pub(in crate::messenger) can_add_members: bool,   // Текущий пользователь владеет стримом.
+    pub(in crate::messenger) can_add_members: bool,      // Текущий пользователь владеет стримом.
 }
 
 /// Тип карточки, выведенный из подтверждённых полей стрима.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::messenger) enum SidebarStreamKind {
-    Peer(Uuid),  // Личка с подтверждённым UUID собеседника.
-    Channel,     // Стрим с темами и участниками.
-    Unsupported, // Неизвестный тип стрима или неподтверждённый режим шифрования.
+    Peer(Uuid),          // Обычная личка с подтверждённым UUID собеседника.
+    ProtectedPeer(Uuid), // Защищённая личка с общей карточкой стрима и участниками.
+    Channel,             // Стрим с темами и участниками.
+    Unsupported,         // Неизвестный тип стрима или неподтверждённый режим шифрования.
 }
 
 type SidebarKey = (OwnerContext, SessionGeneration, Uuid);
@@ -365,7 +385,9 @@ impl SidebarDetails {
     fn kind(&self) -> SidebarStreamKind {
         match self {
             Self::Peer(peer) => SidebarStreamKind::Peer(peer.user_id),
-            Self::Channel(_) => SidebarStreamKind::Channel,
+            Self::Channel(channel) => channel
+                .direct_peer
+                .map_or(SidebarStreamKind::Channel, SidebarStreamKind::ProtectedPeer),
         }
     }
 
@@ -395,6 +417,10 @@ impl SidebarDetails {
                 channel.description.clone_from(&metadata.description);
                 channel.color = metadata.color;
                 channel.invite_only = metadata.invite_only;
+                channel.is_private = metadata.is_private;
+                channel.encrypted = metadata.encrypted;
+                channel.allow_key_sharing_by_holders = metadata.allow_key_sharing_by_holders;
+                channel.can_edit_key_sharing = metadata.can_edit_key_sharing;
                 channel.notification_mode = metadata.notification_mode;
                 if channel.can_add_members != metadata.can_add_members {
                     // Права удаления вычисляются с учётом собственного UUID, который передаёт привязка.
@@ -404,7 +430,9 @@ impl SidebarDetails {
                 }
                 channel.can_add_members = metadata.can_add_members;
             }
-            (Self::Channel(channel), SidebarChange::Topic { topic, .. }) => {
+            (Self::Channel(channel), SidebarChange::Topic { topic, .. })
+                if channel.direct_peer.is_none() =>
+            {
                 if let Some(current) = channel
                     .topics
                     .iter_mut()
@@ -415,7 +443,9 @@ impl SidebarDetails {
                     channel.topics.push(topic.clone());
                 }
             }
-            (Self::Channel(channel), SidebarChange::RemoveTopic { topic_id, .. }) => {
+            (Self::Channel(channel), SidebarChange::RemoveTopic { topic_id, .. })
+                if channel.direct_peer.is_none() =>
+            {
                 channel.topics.retain(|topic| topic.id != *topic_id);
             }
             (Self::Channel(channel), SidebarChange::Profile { user_id, profile }) => {
@@ -574,8 +604,7 @@ impl MessengerSource {
         stream_id: Uuid,
         mode: StreamNotificationMode,
     ) -> Result<(), DetailsError> {
-        self.sidebar_details(sync, owner, generation, stream_id)
-            .await?;
+        self.check_sidebar_mutation_access(sync, owner, generation, stream_id)?;
         let token = sync
             .auth()
             .access_token_for_generation(owner, Service::Messenger, generation)
@@ -587,7 +616,85 @@ impl MessengerSource {
         sync.auth()
             .with_active_generation(owner, generation, || ())?;
         result?;
+        Ok(sync.refresh_sidebar_catalog(owner, generation, stream_id)?)
+    }
+
+    /// Меняет политику передачи ключей подтверждённого защищённого чата по праву владельца.
+    pub async fn update_sidebar_key_sharing(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        stream_id: Uuid,
+        allow: bool,
+    ) -> Result<(), DetailsError> {
+        let details = self
+            .sidebar_details(sync, owner, generation, stream_id)
+            .await?;
+        let SidebarDetails::Channel(channel) = details.as_ref() else {
+            return Err(DetailsError::ActionDenied);
+        };
+        if !channel.can_edit_key_sharing {
+            return Err(DetailsError::ActionDenied);
+        }
+        if channel.allow_key_sharing_by_holders == Some(allow) {
+            return Ok(());
+        }
+        let token = sync
+            .auth()
+            .access_token_for_generation(owner, Service::Messenger, generation)
+            .await?;
+        let result = self
+            .rest
+            .update_sidebar_key_sharing(owner, &token, stream_id, allow)
+            .await;
+        sync.auth()
+            .with_active_generation(owner, generation, || ())?;
+        result?;
         Ok(sync.refresh_sidebar(owner, generation, stream_id)?)
+    }
+
+    /// Выполняет действие для подтверждённой темы разговора текущей сессии.
+    pub async fn update_sidebar_topic(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        stream_id: Uuid,
+        topic_id: Uuid,
+        action: SidebarTopicAction,
+    ) -> Result<(), DetailsError> {
+        self.check_sidebar_mutation_access(sync, owner, generation, stream_id)?;
+        let token = sync
+            .auth()
+            .access_token_for_generation(owner, Service::Messenger, generation)
+            .await?;
+        let result = self
+            .rest
+            .update_sidebar_topic(owner, &token, stream_id, topic_id, action)
+            .await;
+        sync.auth()
+            .with_active_generation(owner, generation, || ())?;
+        result?;
+        Ok(sync.refresh_sidebar_catalog(owner, generation, stream_id)?)
+    }
+
+    /// Проверяет локальный отзыв стрима перед серверной проверкой действия.
+    pub(in crate::messenger) fn check_sidebar_mutation_access(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        stream_id: Uuid,
+    ) -> Result<(), DetailsError> {
+        sync.auth().with_active_generation(owner, generation, || {
+            let entry = sync.sidebar_cache.entry(owner, generation, stream_id);
+            if entry.state.lock().expect("sidebar entry").revoked {
+                Err(DetailsError::AccessLost)
+            } else {
+                Ok(())
+            }
+        })?
     }
 
     /// Добавляет новых участников, если текущему пользователю доступно приглашение в стрим.
@@ -710,6 +817,10 @@ mod tests {
                 description: None,
                 color: None,
                 invite_only: false,
+                is_private: false,
+                encrypted: false,
+                allow_key_sharing_by_holders: None,
+                can_edit_key_sharing: false,
                 notification_mode: StreamNotificationMode::AllMessages,
                 can_add_members: false,
             },
@@ -724,6 +835,11 @@ mod tests {
                 description: None,
                 color: None,
                 invite_only: false,
+                is_private: false,
+                encrypted: false,
+                direct_peer: None,
+                allow_key_sharing_by_holders: None,
+                can_edit_key_sharing: false,
                 notification_mode: StreamNotificationMode::AllMessages,
                 can_add_members: false,
                 topics: Vec::new(),

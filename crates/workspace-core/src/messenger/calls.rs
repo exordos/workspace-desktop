@@ -1,5 +1,7 @@
-//! Читает настройки Jitsi, распознаёт ссылки и отправляет приглашения защищённым маршрутом.
+//! Читает настройки Jitsi, распознаёт ссылки и отправляет приглашения в чаты.
 //! Ссылку нового звонка можно открыть только после подтверждения того же сообщения.
+
+mod ordinary;
 
 use std::{
     pin::pin,
@@ -22,7 +24,7 @@ use crate::{
         DeliveryStatus, HistoryMessage, HistoryScope, MessageBody, PreparedSend, PreparedSendBody,
         Storage, StorageError,
     },
-    sync::Sync,
+    sync::{PrepareSendError, Sync},
 };
 
 use super::{
@@ -32,10 +34,13 @@ use super::{
     history::OpenHistoryError,
     quote::QuoteSourceFence,
     references::external_links,
+    send::DirectSendError,
 };
 
 const INVITATION_TIMEOUT: Duration = Duration::from_secs(30);
 const PUBLIC_JITSI_HOST: &str = "meet.jit.si";
+
+pub use ordinary::DeliveredPlainJitsiCall;
 
 /// Разрешённый адрес конференций этой организации.
 pub struct JitsiSettings(Url); // HTTPS-источник из настроек Workspace.
@@ -225,6 +230,10 @@ pub enum CallError {
     #[error(transparent)]
     Send(#[from] EncryptedMessageError), // Не удалось подготовить защищённую отправку.
     #[error(transparent)]
+    Destination(#[from] DirectSendError), // Сервер больше не разрешает запись в выбранную тему.
+    #[error(transparent)]
+    Queue(#[from] PrepareSendError), // Не удалось поставить приглашение в очередь.
+    #[error(transparent)]
     Key(#[from] DecryptionError), // Исходный конверт нельзя подтвердить локальным ключом.
     #[error(transparent)]
     History(#[from] OpenHistoryError), // Исходное сообщение или его тема больше недоступны.
@@ -284,7 +293,7 @@ impl MessengerSource {
                 expected.id,
             )
             .await?;
-        if original != *expected {
+        if !original.same_content(expected) {
             return Err(CallError::Unavailable);
         }
         let accepted = profile.keys.accept(
@@ -421,11 +430,25 @@ impl MessengerSource {
 /// Сверяет доставленное размещение с неизменным снимком этой очереди.
 fn call_delivered(storage: &Storage, call: &PendingJitsiCall) -> Result<bool, CallError> {
     call.verify(storage)?;
-    let owner = &call.activation.session().owner;
+    invitation_delivered(
+        storage,
+        &call.activation.session().owner,
+        call.scope,
+        &call.snapshot,
+    )
+}
+
+/// Ждёт исходящую попытку и сверяет точный результат по канонической истории.
+fn invitation_delivered(
+    storage: &Storage,
+    owner: &OwnerContext,
+    scope: HistoryScope,
+    snapshot: &PreparedSend,
+) -> Result<bool, CallError> {
     let pending = storage
-        .outbox(owner, Some(call.scope))?
+        .outbox(owner, Some(scope))?
         .into_iter()
-        .find(|entry| entry.snapshot.canonical_id == call.snapshot.canonical_id);
+        .find(|entry| entry.snapshot.canonical_id == snapshot.canonical_id);
     match pending {
         Some(entry)
             if matches!(
@@ -436,7 +459,7 @@ fn call_delivered(storage: &Storage, call: &PendingJitsiCall) -> Result<bool, Ca
             Ok(false)
         }
         Some(_) => Err(CallError::Unconfirmed),
-        None if storage.matches_delivered_body(owner, &call.snapshot)? => Ok(true),
+        None if storage.matches_delivered_body(owner, snapshot)? => Ok(true),
         None => Err(CallError::Unconfirmed),
     }
 }

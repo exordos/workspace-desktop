@@ -26,6 +26,7 @@ pub enum FolderChange {
     Refresh(Option<Uuid>), // Папка для сверки. None означает весь список.
     DeleteFolder(Uuid),    // UUID удалённой папки вместе с её составом.
     DeleteItem(Uuid),      // UUID удалённой связи с разговором.
+    TopicCreated,          // Новая тема, для которой нужно перечитать каталог.
     StreamChanged {
         stream_id: Uuid, // UUID созданного или обновлённого разговора.
         archived: bool,  // Архивный разговор исключается из активного списка.
@@ -149,6 +150,17 @@ impl Storage {
         let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         mark_refresh(&transaction, owner, folder_id)?;
+        transaction.commit()?;
+        drop(connection);
+        self.notify_folder_change();
+        Ok(())
+    }
+
+    /// Ставит сверку каталога в очередь после подтверждённого изменения разговора или темы.
+    pub(crate) fn request_catalog_refresh(&self, owner: &OwnerContext) -> Result<(), StorageError> {
+        let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        mark_catalog_refresh(&transaction, owner)?;
         transaction.commit()?;
         drop(connection);
         self.notify_folder_change();
@@ -302,6 +314,10 @@ pub(super) fn apply_change(
             let folder_id = folder_id.as_deref().map(parse_folder_id).transpose()?;
             bump_revision(connection, owner)?;
             mark_refresh(connection, owner, folder_id)?;
+        }
+        FolderChange::TopicCreated => {
+            mark_catalog_refresh(connection, owner)?;
+            catalog = true;
         }
         FolderChange::StreamChanged {
             stream_id,

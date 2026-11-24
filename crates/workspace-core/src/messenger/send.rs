@@ -62,7 +62,7 @@ pub enum DirectSendError {
     #[error("the server did not provide a valid send topic")]
     TopicUnavailable, // Личный стрим не объявил пригодную тему для записи.
     #[error("the topic is closed for sending")]
-    TopicClosed, // Тема канала завершена.
+    TopicClosed, // Тема разговора завершена.
     #[error(transparent)]
     Auth(#[from] AuthError), // Поколение сессии изменилось или не удалось получить токен.
     #[error(transparent)]
@@ -147,7 +147,7 @@ impl MessengerSource {
         topic
     }
 
-    /// Подтверждает явную тему канала для открытия редактора или записи сообщения в очередь.
+    /// Подтверждает явную тему разговора для редактора или очереди отправки.
     pub async fn check_topic_send(
         &self,
         sync: &Sync,

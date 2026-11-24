@@ -21,7 +21,9 @@ pub mod read;
 pub mod references;
 mod rest;
 pub mod send;
+pub mod sidebar_actions;
 mod socket;
+pub mod summary_settings;
 
 use std::{sync::Arc, time::Duration, vec::IntoIter};
 

@@ -11,7 +11,7 @@ use crate::directory::{ProfileRow, normalize_avatar_reference};
 use crate::messenger::details::{
     ChannelSidebar, DirectSidebar, SidebarAvatar, SidebarAvatarFormat, SidebarChange,
     SidebarDetails, SidebarMember, SidebarStreamKind, SidebarStreamMetadata, SidebarTopic,
-    StreamRole,
+    SidebarTopicAction, StreamRole,
 };
 
 pub(super) const BINDINGS_PATH: &str = "/api/workspace/v1/messenger/stream_bindings/";
@@ -41,6 +41,15 @@ struct UpdateNotifications {
     notification_mode: StreamNotificationMode, // Новое значение для текущего пользователя.
 }
 
+/// Подтверждение записи политики для конкретного стрима и пользователя.
+#[derive(Deserialize)]
+struct KeySharingResponse {
+    uuid: Uuid,                        // UUID изменённого стрима.
+    project_id: String,               // Проект текущего входа.
+    user_uuid: String,                // Пользователь текущего входа.
+    allow_key_sharing_by_holders: bool, // Значение политики после записи.
+}
+
 /// Тело запроса приглашения обычных участников.
 #[derive(Serialize)]
 struct AddMembers<'a> {
@@ -65,7 +74,7 @@ impl RestClient {
             stream.user_uuid.as_deref(),
         )?;
         let current_user = parse_uuid(&owner.user_id).ok_or(SourceError::InvalidResponse)?;
-        match stream.sidebar_kind() {
+        let direct_peer = match stream.sidebar_kind() {
             SidebarStreamKind::Peer(user_id) => {
                 let profile = self
                     .sidebar_profile(owner, token, user_id)
@@ -78,16 +87,23 @@ impl RestClient {
                     notification_mode: stream.notification_mode,
                 }));
             }
-            SidebarStreamKind::Channel => {}
+            SidebarStreamKind::ProtectedPeer(user_id) => Some(user_id),
+            SidebarStreamKind::Channel => None,
             SidebarStreamKind::Unsupported => return Err(DetailsError::Unsupported),
-        }
+        };
 
         let metadata = stream.sidebar_metadata(owner)?;
         let stream_uuid = stream_id.to_string();
         let filters = [("stream_uuid", stream_uuid.as_str())];
         let topic_path = format!("{TOPICS_PATH}/");
         let (topics, bindings) = tokio::try_join!(
-            self.filtered_collection::<WireTopic>(owner, token, &topic_path, &filters),
+            async {
+                if direct_peer.is_some() {
+                    return Ok(Vec::new());
+                }
+                self.filtered_collection::<WireTopic>(owner, token, &topic_path, &filters)
+                    .await
+            },
             self.filtered_collection::<WireBinding>(owner, token, BINDINGS_PATH, &filters),
         )
         .map_err(|error| match error {
@@ -130,7 +146,7 @@ impl RestClient {
                 profile,
                 role: binding.role,
                 is_self,
-                can_remove: metadata.can_add_members || is_self,
+                can_remove: direct_peer.is_none() && (metadata.can_add_members || is_self),
             })
         }))
         .buffered(MAX_PROFILE_REQUESTS)
@@ -142,6 +158,11 @@ impl RestClient {
             description: metadata.description,
             color: metadata.color,
             invite_only: metadata.invite_only,
+            is_private: metadata.is_private,
+            encrypted: metadata.encrypted,
+            direct_peer,
+            allow_key_sharing_by_holders: metadata.allow_key_sharing_by_holders,
+            can_edit_key_sharing: metadata.can_edit_key_sharing,
             notification_mode: metadata.notification_mode,
             can_add_members: metadata.can_add_members,
             topics,
@@ -233,6 +254,18 @@ impl RestClient {
         stream_id: Uuid,
         mode: StreamNotificationMode,
     ) -> Result<(), DetailsError> {
+        let current = self
+            .stream_access(owner, token, stream_id)
+            .await
+            .map_err(details_access_error)?;
+        check_explicit_owner(
+            owner,
+            current.project_id.as_deref(),
+            current.user_uuid.as_deref(),
+        )?;
+        if current.is_archived || current.sidebar_kind() == SidebarStreamKind::Unsupported {
+            return Err(DetailsError::ActionDenied);
+        }
         self.sidebar_mutation(
             owner,
             token,
@@ -243,6 +276,95 @@ impl RestClient {
             }),
         )
         .await
+    }
+
+    /// Записывает политику передачи ключей и сверяет подтверждение с запросом.
+    pub(in crate::messenger) async fn update_sidebar_key_sharing(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        stream_id: Uuid,
+        allow: bool,
+    ) -> Result<(), DetailsError> {
+        let mut url = workspace_origin(owner)?;
+        url.set_path(&format!("{STREAMS_PATH}/{stream_id}"));
+        let response = self
+            .send
+            .put(url)
+            .header(ACCEPT, "application/json")
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "allow_key_sharing_by_holders": allow }))
+            .send()
+            .await
+            .map_err(request_error)?;
+        match response.status() {
+            StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND | StatusCode::FORBIDDEN => {
+                return Err(DetailsError::ActionDenied);
+            }
+            status => check_status(status)?,
+        }
+        let saved: KeySharingResponse = response.json().await.map_err(request_error)?;
+        check_explicit_owner(owner, Some(&saved.project_id), Some(&saved.user_uuid))?;
+        if saved.uuid != stream_id || saved.allow_key_sharing_by_holders != allow {
+            return Err(SourceError::InvalidResponse.into());
+        }
+        Ok(())
+    }
+
+    /// Сверяет владельца темы и её разговор перед действием.
+    pub(in crate::messenger) async fn update_sidebar_topic(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        stream_id: Uuid,
+        topic_id: Uuid,
+        action: SidebarTopicAction,
+    ) -> Result<(), DetailsError> {
+        let current = self
+            .topic_access(owner, token, stream_id, topic_id)
+            .await
+            .map_err(|error| match error {
+                OpenHistoryError::AccessLost => DetailsError::ActionDenied,
+                error => details_access_error(error),
+            })?;
+        check_explicit_owner(
+            owner,
+            current.project_id.as_deref(),
+            current.user_uuid.as_deref(),
+        )?;
+        let path = format!("{TOPICS_PATH}/{topic_id}");
+        let (method, path, body) = match action {
+            SidebarTopicAction::SetNotifications(mode) => {
+                if current.notification_mode == mode {
+                    return Ok(());
+                }
+                (
+                    Method::POST,
+                    format!("{path}/actions/notifications/invoke"),
+                    Some(serde_json::json!({ "notification_mode": mode })),
+                )
+            }
+            SidebarTopicAction::MarkRead => {
+                (Method::POST, format!("{path}/actions/read/invoke"), None)
+            }
+            SidebarTopicAction::Rename(name) => {
+                let name = name.trim();
+                if name.is_empty() {
+                    return Err(DetailsError::ActionDenied);
+                }
+                if current.name.as_deref() == Some(name) {
+                    return Ok(());
+                }
+                (Method::PUT, path, Some(serde_json::json!({ "name": name })))
+            }
+            SidebarTopicAction::ToggleDone => (
+                Method::POST,
+                format!("{path}/actions/toggle_done/invoke"),
+                None,
+            ),
+        };
+        self.sidebar_mutation(owner, token, method, &path, body.as_ref())
+            .await
     }
 
     /// Добавляет переданных пользователей в стрим.
@@ -313,16 +435,22 @@ impl RestClient {
 impl WireStream {
     /// Проверяет тип стрима для сведений, включая явно защищённый нативный разговор.
     fn sidebar_kind(&self) -> SidebarStreamKind {
-        if !matches!(self.encryption, Some(Value::Bool(false)))
-            && !(self.encryption == Some(Value::Bool(true))
-                && self.source_name.as_deref() == Some("native"))
-        {
-            return SidebarStreamKind::Unsupported;
-        }
+        let encrypted = match (self.encryption.as_ref(), self.source_name.as_deref()) {
+            (Some(Value::Bool(false)), _) => false,
+            (Some(Value::Bool(true)), Some("native")) => true,
+            _ => return SidebarStreamKind::Unsupported,
+        };
         match (self.private, self.direct_user_uuid.as_deref()) {
-            (true, Some(peer)) => parse_uuid(peer)
-                .filter(|id| !id.is_nil())
-                .map_or(SidebarStreamKind::Unsupported, SidebarStreamKind::Peer),
+            (true, Some(peer)) => parse_uuid(peer).filter(|id| !id.is_nil()).map_or(
+                SidebarStreamKind::Unsupported,
+                |id| {
+                    if encrypted {
+                        SidebarStreamKind::ProtectedPeer(id)
+                    } else {
+                        SidebarStreamKind::Peer(id)
+                    }
+                },
+            ),
             (_, None) => SidebarStreamKind::Channel,
             _ => SidebarStreamKind::Unsupported,
         }
@@ -330,8 +458,11 @@ impl WireStream {
 
     /// Оставляет только поля, важные для панели, без счётчиков и UUID последнего сообщения.
     fn sidebar_metadata(&self, owner: &OwnerContext) -> Result<SidebarStreamMetadata, SourceError> {
+        let kind = self.sidebar_kind();
+        let encrypted = self.encryption == Some(Value::Bool(true));
+        let is_owner = self.owner.as_deref() == Some(owner.user_id.as_str());
         Ok(SidebarStreamMetadata {
-            kind: self.sidebar_kind(),
+            kind,
             name: required_title(self.name.clone())?,
             description: self
                 .description
@@ -339,8 +470,14 @@ impl WireStream {
                 .filter(|value| !value.trim().is_empty()),
             color: self.color.filter(|color| *color <= 0x00ff_ffff),
             invite_only: self.invite_only.unwrap_or_default(),
+            is_private: self.private,
+            encrypted,
+            allow_key_sharing_by_holders: self.allow_key_sharing_by_holders,
+            can_edit_key_sharing: encrypted
+                && is_owner
+                && self.allow_key_sharing_by_holders.is_some(),
             notification_mode: self.notification_mode,
-            can_add_members: self.owner.as_deref() == Some(owner.user_id.as_str()),
+            can_add_members: kind == SidebarStreamKind::Channel && is_owner,
         })
     }
 }
@@ -378,6 +515,8 @@ impl WireTopic {
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .map(str::to_owned),
+                summary_enabled: self.summary_enabled.unwrap_or(true),
+                summary_has_new_messages: self.summary_has_new_messages.unwrap_or_default(),
             },
         ))
     }
@@ -537,6 +676,55 @@ fn avatar_signature_matches(format: SidebarAvatarFormat, bytes: &[u8]) -> bool {
 }
 
 #[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    /// Защищённая личка получает общие сведения, а политику меняет только её владелец.
+    #[test]
+    fn protected_direct_sidebar_projects_key_sharing_only_for_its_owner() {
+        let peer = Uuid::new_v4();
+        let mut owner = OwnerContext {
+            account_id: crate::context::AccountId("account".into()),
+            server: "https://workspace.test".into(),
+            organization_id: "organization".into(),
+            project_id: "project".into(),
+            user_id: Uuid::new_v4().to_string(),
+        };
+        let mut stream: WireStream = serde_json::from_value(serde_json::json!({
+            "uuid": Uuid::new_v4(),
+            "name": "Защищённый чат",
+            "owner": owner.user_id,
+            "source_name": "native",
+            "private": true,
+            "is_archived": false,
+            "direct_user_uuid": peer,
+            "encryption": true,
+            "allow_key_sharing_by_holders": false,
+            "notification_mode": "all_messages",
+        }))
+        .unwrap();
+        let settings = stream.sidebar_metadata(&owner).unwrap();
+        assert_eq!(settings.kind, SidebarStreamKind::ProtectedPeer(peer));
+        assert_eq!(settings.allow_key_sharing_by_holders, Some(false));
+        assert!(settings.can_edit_key_sharing);
+        assert!(!settings.can_add_members);
+
+        let owner_id = std::mem::replace(&mut owner.user_id, peer.to_string());
+        assert!(!stream.sidebar_metadata(&owner).unwrap().can_edit_key_sharing);
+        owner.user_id = owner_id;
+
+        stream.allow_key_sharing_by_holders = None;
+        assert!(!stream.sidebar_metadata(&owner).unwrap().can_edit_key_sharing);
+
+        stream.allow_key_sharing_by_holders = Some(true);
+        stream.encryption = Some(Value::Bool(false));
+        let settings = stream.sidebar_metadata(&owner).unwrap();
+        assert_eq!(settings.kind, SidebarStreamKind::Peer(peer));
+        assert!(!settings.can_edit_key_sharing);
+    }
+}
+
+#[cfg(test)]
 mod topic_tests {
     use super::*;
 
@@ -552,10 +740,10 @@ mod topic_tests {
         };
         let stream_id = Uuid::new_v4();
         let topic_id = Uuid::new_v4();
-        for (action, raw, active, passive, summary) in [
-            ("updated", 4, 1, 3, Some("  Серверная сводка  ")),
-            ("read", 0, 0, 0, Some("  Серверная сводка  ")),
-            ("updated", 0, 0, 0, None),
+        for (action, raw, active, passive, summary, enabled, new_messages) in [
+            ("updated", 4, 1, 3, Some("  Серверная сводка  "), Some(false), Some(true)),
+            ("read", 0, 0, 0, Some("  Серверная сводка  "), Some(true), Some(false)),
+            ("updated", 0, 0, 0, None, None, None),
         ] {
             let event = serde_json::json!({
                 "schema_version": 1,
@@ -577,6 +765,8 @@ mod topic_tests {
                     "active_unread_count": active,
                     "passive_unread_count": passive,
                     "summary": summary,
+                    "summary_enabled": enabled,
+                    "summary_has_new_messages": new_messages,
                 },
             });
             let (event, _) = wire_event(event, &owner, "generation").unwrap();
@@ -607,6 +797,8 @@ mod topic_tests {
             assert_eq!(topic.active_unread_count, active);
             assert_eq!(topic.passive_unread_count, passive);
             assert_eq!(topic.summary.as_deref(), summary.map(str::trim));
+            assert_eq!(topic.summary_enabled, enabled.unwrap_or(true));
+            assert_eq!(topic.summary_has_new_messages, new_messages.unwrap_or_default());
         }
     }
 }

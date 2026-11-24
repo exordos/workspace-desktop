@@ -25,5 +25,7 @@ pub enum DetailsError {
 
 mod avatars;
 mod sidebar;
+mod topic_summary;
 pub use avatars::*;
 pub use sidebar::*;
+pub use topic_summary::*;
