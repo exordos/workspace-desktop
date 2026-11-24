@@ -9,9 +9,8 @@ use serde::Serialize;
 use super::*;
 use crate::directory::{ProfileRow, normalize_avatar_reference};
 use crate::messenger::details::{
-    ChannelSidebar, DirectSidebar, SidebarAvatar, SidebarAvatarFormat, SidebarChange,
-    SidebarDetails, SidebarMember, SidebarStreamKind, SidebarStreamMetadata, SidebarTopic,
-    SidebarTopicAction, StreamRole,
+    ChannelSidebar, DirectSidebar, SidebarAvatar, SidebarChange, SidebarDetails, SidebarMember,
+    SidebarStreamKind, SidebarStreamMetadata, SidebarTopic, SidebarTopicAction, StreamRole,
 };
 
 pub(super) const BINDINGS_PATH: &str = "/api/workspace/v1/messenger/stream_bindings/";
@@ -588,8 +587,6 @@ pub(super) fn wire_sidebar_change(
     }
 }
 
-const AVATAR_BYTE_LIMIT: usize = 25 * 1024 * 1024;
-
 impl RestClient {
     /// Читает изображение только с текущего HTTPS-сервера, ограничивает тело и проверяет формат.
     pub(in crate::messenger) async fn sidebar_avatar(
@@ -605,7 +602,7 @@ impl RestClient {
         url.set_path(&format!(
             "/api/workspace/v1/messenger/files/{file_id}/actions/download"
         ));
-        let mut response = self
+        let response = self
             .read
             .get(url)
             .bearer_auth(token)
@@ -620,58 +617,7 @@ impl RestClient {
             return Err(DetailsError::ProfileUnavailable);
         }
         check_status(response.status())?;
-        let format = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|header| header.to_str().ok())
-            .and_then(avatar_format)
-            .ok_or(SourceError::InvalidResponse)?;
-        if response
-            .content_length()
-            .is_some_and(|size| size > AVATAR_BYTE_LIMIT as u64)
-        {
-            return Err(SourceError::InvalidResponse.into());
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(request_error)? {
-            if chunk.len() > AVATAR_BYTE_LIMIT - bytes.len() {
-                return Err(SourceError::InvalidResponse.into());
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        if !avatar_signature_matches(format, &bytes) {
-            return Err(SourceError::InvalidResponse.into());
-        }
-        Ok(SidebarAvatar { format, bytes })
-    }
-}
-
-/// Принимает MIME только из набора, разрешённого для аватаров сервером.
-fn avatar_format(content_type: &str) -> Option<SidebarAvatarFormat> {
-    match content_type
-        .split(';')
-        .next()?
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "image/png" => Some(SidebarAvatarFormat::Png),
-        "image/jpeg" | "image/jpg" => Some(SidebarAvatarFormat::Jpeg),
-        "image/gif" => Some(SidebarAvatarFormat::Gif),
-        "image/webp" => Some(SidebarAvatarFormat::Webp),
-        _ => None,
-    }
-}
-
-/// Сверяет начальные байты файла с MIME, прежде чем передать их графическому декодеру.
-fn avatar_signature_matches(format: SidebarAvatarFormat, bytes: &[u8]) -> bool {
-    match format {
-        SidebarAvatarFormat::Png => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-        SidebarAvatarFormat::Jpeg => bytes.starts_with(&[0xff, 0xd8, 0xff]),
-        SidebarAvatarFormat::Gif => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
-        SidebarAvatarFormat::Webp => {
-            bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP")
-        }
+        Ok(SidebarAvatar::read_response(response).await?)
     }
 }
 
@@ -805,18 +751,16 @@ mod topic_tests {
 
 #[cfg(test)]
 mod avatar_tests {
-    use super::*;
+    use crate::directory::AvatarFormat;
 
     /// Пропускает только согласованный MIME и подпись форматов, разрешённых Workspace.
     #[test]
     fn validates_avatar_formats() {
-        let png = avatar_format("image/png; charset=binary").unwrap();
-        assert!(avatar_signature_matches(png, b"\x89PNG\r\n\x1a\n"));
-        assert!(!avatar_signature_matches(png, b"GIF89a"));
-        assert_eq!(avatar_format("image/svg+xml"), None);
-        assert!(!avatar_signature_matches(
-            SidebarAvatarFormat::Webp,
-            b"RIFF"
-        ));
+        let png = AvatarFormat::from_content_type("image/png; charset=binary");
+        assert_eq!(png, Some(AvatarFormat::Png));
+        assert_eq!(AvatarFormat::sniff(b"\x89PNG\r\n\x1a\n"), png);
+        assert_ne!(AvatarFormat::sniff(b"GIF89a"), png);
+        assert_eq!(AvatarFormat::from_content_type("image/svg+xml"), None);
+        assert_ne!(AvatarFormat::sniff(b"RIFF"), Some(AvatarFormat::Webp));
     }
 }

@@ -4,6 +4,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 mod avatars;
+mod external_avatar;
 pub(crate) use avatars::AvatarLoads;
 pub use avatars::{AvatarFormat, AvatarImage, AvatarState, AvatarStore};
 
@@ -52,20 +53,8 @@ pub(crate) fn normalize_avatar_reference(reference: &str) -> Option<String> {
         return avatar_file_id(reference).map(|id| format!("urn:image:{id}"));
     }
 
-    // Внешняя ссылка тоже подтверждает замену файла Workspace. Core её не скачивает.
-    let external = match reference
-        .strip_prefix("urn:")
-        .and_then(|urn| urn.split_once(':'))
-    {
-        Some(("gravatar", hash)) => {
-            matches!(hash.len(), 32 | 64) && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-        }
-        Some(("url", url)) => reqwest::Url::parse(url)
-            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some()),
-        Some(("gavatar", id)) => Uuid::parse_str(id).is_ok_and(|id| !id.is_nil()),
-        _ => false,
-    };
-    external.then(|| reference.to_owned())
+    external_avatar::profile_url(reference)?;
+    Some(reference.to_owned())
 }
 
 /// Известные значения присутствия из Workspace.

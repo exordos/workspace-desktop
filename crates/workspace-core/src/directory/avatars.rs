@@ -8,6 +8,7 @@ use std::{
 };
 
 use futures::{Stream, StreamExt};
+use reqwest::{Response, Url, header::CONTENT_TYPE};
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore, broadcast, watch};
 use uuid::Uuid;
@@ -16,14 +17,16 @@ use crate::{
     auth::{AuthError, Service, SessionSnapshot, SessionStatus},
     context::{OwnerContext, SessionGeneration},
     messenger::{MessengerSource, details::DetailsError},
+    runtime::SourceError,
     storage::{AvatarFence, AvatarSnapshot, StorageError},
     sync::{Sync, SyncChange, SyncUpdate},
 };
 
-use super::avatar_file_id;
+use super::{avatar_file_id, external_avatar};
 
 const PROFILE_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 const PARALLEL_REQUEST_LIMIT: usize = 4;
+const AVATAR_BYTE_LIMIT: usize = 25 * 1024 * 1024;
 
 /// Форматы изображений, которые принимает Workspace.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,6 +73,15 @@ impl AvatarFormat {
             _ => None,
         }
     }
+
+    /// Принимает заголовок HTTP с параметрами и известными именами MIME.
+    pub(crate) fn from_content_type(value: &str) -> Option<Self> {
+        let mime = value.split(';').next()?.trim().to_ascii_lowercase();
+        if mime == "image/jpg" {
+            return Some(Self::Jpeg);
+        }
+        Self::from_mime(&mime)
+    }
 }
 
 /// Файл аватара с проверенным форматом и размером.
@@ -77,6 +89,41 @@ impl AvatarFormat {
 pub struct AvatarImage {
     pub format: AvatarFormat, // Формат для выбора декодера.
     pub bytes: Vec<u8>,       // Содержимое файла в пределах серверного лимита.
+}
+
+impl AvatarImage {
+    /// Читает изображение с лимитом байтов и сравнивает заголовок с сигнатурой файла.
+    pub(crate) async fn read_response(mut response: Response) -> Result<Self, SourceError> {
+        let format = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|header| header.to_str().ok())
+            .and_then(AvatarFormat::from_content_type)
+            .ok_or(SourceError::InvalidResponse)?;
+        if response
+            .content_length()
+            .is_some_and(|size| size > AVATAR_BYTE_LIMIT as u64)
+        {
+            return Err(SourceError::InvalidResponse);
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            if error.is_decode() || error.is_builder() {
+                SourceError::InvalidResponse
+            } else {
+                SourceError::Temporary
+            }
+        })? {
+            if chunk.len() > AVATAR_BYTE_LIMIT - bytes.len() {
+                return Err(SourceError::InvalidResponse);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if AvatarFormat::sniff(&bytes) != Some(format) {
+            return Err(SourceError::InvalidResponse);
+        }
+        Ok(Self { format, bytes })
+    }
 }
 
 /// Текущее состояние аватара для подписчиков одной сессии.
@@ -143,7 +190,23 @@ impl Default for AvatarLoads {
 struct AvatarWork {
     fence: AvatarFence,  // Версия профиля и граница сброса на момент принятия решения.
     check_profile: bool, // Нужно узнать актуальную ссылку на изображение.
-    file_id: Option<Uuid>, // UUID исходного файла, если его байтов нет в базе.
+    source: Option<AvatarSource>, // Подтверждённое фото, которого ещё нет в базе.
+}
+
+/// Адрес изображения. Только собственный файл получает авторизацию Workspace.
+enum AvatarSource {
+    Workspace(Uuid), // UUID файла для API Workspace.
+    External(Url),   // Независимый HTTP-адрес фото из профиля.
+}
+
+impl AvatarSource {
+    /// Выбирает загрузчик по формату ссылки профиля.
+    fn from_reference(reference: &str) -> Option<Self> {
+        if let Some(id) = avatar_file_id(reference) {
+            return Some(Self::Workspace(id));
+        }
+        external_avatar::profile_url(reference).map(Self::External)
+    }
 }
 
 /// Различает ошибки проверки сессии, локальной базы и запроса Workspace.
@@ -279,9 +342,6 @@ impl AvatarStore {
             .acquire()
             .await
             .expect("avatar semaphore");
-        let token = auth
-            .access_token_for_generation(&request.owner, Service::Messenger, request.generation)
-            .await?;
         // Ответ устаревает уже в очереди, если в это время пришло событие или сбросился журнал.
         let current = auth.with_active_generation(&request.owner, request.generation, || {
             self.sync
@@ -291,23 +351,49 @@ impl AvatarStore {
         if !current {
             return Ok(());
         }
+        let token = if work.check_profile || matches!(work.source, Some(AvatarSource::Workspace(_)))
+        {
+            Some(
+                auth.access_token_for_generation(
+                    &request.owner,
+                    Service::Messenger,
+                    request.generation,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         if work.check_profile {
             let reference = self
                 .source
-                .avatar_reference(&request.owner, &token, request.user_id)
+                .avatar_reference(
+                    &request.owner,
+                    token.as_deref().expect("profile token"),
+                    request.user_id,
+                )
                 .await?;
             let next = self.save_reference(request, work.fence, reference.as_deref(), observers)?;
             let Some(next) = next else { return Ok(()) };
             work = next;
         }
-        let Some(file_id) = work.file_id else {
+        let Some(source) = work.source else {
             return Ok(());
         };
-        match self
-            .source
-            .avatar_image(&request.owner, &token, file_id)
-            .await
-        {
+        let workspace_file = matches!(source, AvatarSource::Workspace(_));
+        let result = match source {
+            AvatarSource::Workspace(file_id) => {
+                self.source
+                    .avatar_image(
+                        &request.owner,
+                        token.as_deref().expect("avatar token"),
+                        file_id,
+                    )
+                    .await
+            }
+            AvatarSource::External(url) => external_avatar::download(url).await,
+        };
+        match result {
             Ok(image) => {
                 auth.with_active_generation(&request.owner, request.generation, || {
                     if self.sync.storage().save_avatar_bytes(
@@ -323,9 +409,22 @@ impl AvatarStore {
                     Ok::<_, StorageError>(())
                 })??;
             }
-            Err(DetailsError::ProfileUnavailable) => {
+            Err(DetailsError::ProfileUnavailable) if workspace_file => {
                 // 403 и 404 подтверждают, что этот файл больше нельзя показывать.
                 self.save_reference(request, work.fence, None, observers)?;
+            }
+            Err(DetailsError::ProfileUnavailable) => {
+                // Внешний сервер не меняет профиль Workspace. Следующее обращение может повторить запрос.
+                auth.with_active_generation(&request.owner, request.generation, || {
+                    if self.sync.storage().avatar_fence_is_current(
+                        &request.owner,
+                        request.user_id,
+                        work.fence,
+                    )? {
+                        observers.publish(AvatarState::Missing);
+                    }
+                    Ok::<_, StorageError>(())
+                })??;
             }
             Err(error) => return Err(error.into()),
         }
@@ -391,12 +490,15 @@ fn publish_snapshot(
     let check_profile = snapshot
         .checked_at
         .is_none_or(|checked| unix_seconds().saturating_sub(checked) >= PROFILE_TTL_SECONDS);
-    let file_id = if image.is_none() {
-        snapshot.reference.as_deref().and_then(avatar_file_id)
+    let source = if image.is_none() {
+        snapshot
+            .reference
+            .as_deref()
+            .and_then(AvatarSource::from_reference)
     } else {
         None
     };
-    let needs_network = check_profile || file_id.is_some();
+    let needs_network = check_profile || source.is_some();
     observers.publish(match image {
         Some(image) => AvatarState::Ready(Arc::new(image)),
         None if needs_network => pending,
@@ -405,7 +507,7 @@ fn publish_snapshot(
     needs_network.then_some(AvatarWork {
         fence: snapshot.fence,
         check_profile,
-        file_id,
+        source,
     })
 }
 
