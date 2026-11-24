@@ -27,7 +27,7 @@ use super::{
 
 pub use recovery::KeyRecovery;
 pub use responses::{
-    KeyReplyCapabilities, KeyRequestCompletion, KeyRequestOutcome, StoredKeyReply,
+    KeyReplyCapabilities, KeyRequestCompletion, KeyRequestOutcome, KeyRequestStatus, StoredKeyReply,
 };
 
 /// Размещение и поколение, для которых устройство просит доступ.

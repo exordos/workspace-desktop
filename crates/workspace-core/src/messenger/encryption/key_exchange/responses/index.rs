@@ -3,16 +3,16 @@
 use crate::{messenger::encryption::grant::decode_grant_envelope, storage::KeyRequestHint};
 
 use super::{
-    EncryptionActivation, KeyExchange, KeyExchangeError, KeyRequestTarget, KeyServiceMessage,
-    KeyServicePayload, response_details,
+    EncryptionActivation, KeyExchange, KeyExchangeError, KeyRequestOutcome, KeyRequestTarget,
+    KeyServiceMessage, KeyServicePayload, response_details,
 };
 
 /// Что подтверждено о сохранённых возможных ответах на точный запрос.
 #[derive(PartialEq, Eq)]
 pub(super) enum ReplyResolution {
-    Pending,    // Ни один известный адрес не содержит разрешённого ответа.
-    Resolved,   // Сервер вернул подходящий ответ с проверенным правом автора.
-    Unverified, // Ответ по одному из адресов временно не удалось прочитать.
+    Pending,                     // Ни один известный адрес не содержит разрешённого ответа.
+    Resolved(KeyRequestOutcome), // Сервер вернул подходящий ответ с проверенным правом автора.
+    Unverified,                  // Ответ по одному из адресов временно не удалось прочитать.
 }
 
 impl KeyExchange {
@@ -87,7 +87,7 @@ impl KeyExchange {
                 // Наблюдатель проверяет формат и автора. HPKE может открыть только получатель.
                 let policy = self.reply_policy(activation, token, target).await?;
                 if policy.permits_reply(response.author_id, request.author_id, outcome, false) {
-                    return Ok(ReplyResolution::Resolved);
+                    return Ok(ReplyResolution::Resolved(outcome));
                 }
             }
         }

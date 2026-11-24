@@ -1,7 +1,7 @@
 //! Ведёт создание защищённого чата и смену поколения ключа от намерения до подтверждения.
 //! Хранит этапы и идентификаторы в базе, а скрытый ключ открывает в защищённом адаптере после сервера.
 
-use std::{future::poll_fn, pin::pin, task::Poll};
+use std::{collections::HashMap, future::poll_fn, pin::pin, task::Poll};
 
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -88,6 +88,7 @@ pub struct LocalStreamKeys {
     pub current_key_id: Uuid, // UUID поколения, которое объявлено сервером.
     pub can_rotate: bool, // Владелец стрима может начать ротацию.
     pub keys: Vec<HeldChatKey>, // Открытые локальные поколения того же устройства.
+    pub announced_at: HashMap<Uuid, u64>, // Даты объявлений в мс с Unix epoch, если есть в истории.
 }
 
 /// Причина остановки создания или ротации.
@@ -418,6 +419,9 @@ impl MessengerSource {
         let mut keys = active.with_keys(|store| {
             Ok(store.list(&session.owner, session.device_id, scope.stream_id)?)
         })?;
+        let announced_at = active.in_storage(|storage| {
+            storage.key_announcement_dates(&session.owner, scope.stream_id)
+        })?;
         if version()? != opened {
             return Err(OpenHistoryError::AccessLost.into());
         }
@@ -427,6 +431,7 @@ impl MessengerSource {
             current_key_id,
             can_rotate,
             keys,
+            announced_at,
         })
     }
 
@@ -577,6 +582,30 @@ impl MessengerSource {
         activation: &EncryptionActivation,
         scope: HistoryScope,
     ) -> Result<Uuid, KeyLifecycleError> {
+        self.stage_key_rotation_at(sync, activation, scope, None)
+            .await
+    }
+
+    /// Начинает или продолжает ротацию поколения, которое пользователь видел перед подтверждением.
+    pub async fn stage_confirmed_key_rotation(
+        &self,
+        sync: &Sync,
+        activation: &EncryptionActivation,
+        scope: HistoryScope,
+        expected_key_id: Uuid,
+    ) -> Result<Uuid, KeyLifecycleError> {
+        self.stage_key_rotation_at(sync, activation, scope, Some(expected_key_id))
+            .await
+    }
+
+    /// Проверяет серверное поколение перед сохранением или продолжением операции.
+    async fn stage_key_rotation_at(
+        &self,
+        sync: &Sync,
+        activation: &EncryptionActivation,
+        scope: HistoryScope,
+        expected: Option<Uuid>,
+    ) -> Result<Uuid, KeyLifecycleError> {
         let profile = self.encryption_profile(activation)?;
         let _operation = profile.lifecycle_gate.lock().await;
         let active = ActiveLifecycle {
@@ -593,10 +622,17 @@ impl MessengerSource {
         active.current()?;
         let (topic_id, previous_key_id) = destination?;
         if let Some(pending) = active.pending()?.into_iter().find(|pending| {
-            pending.stream_id == scope.stream_id && matches!(pending.intent, KeyLifecycleIntent::Rotate { previous_key_id: previous, .. }
-                if previous == previous_key_id || pending.key_id == previous_key_id)
+            pending.stream_id == scope.stream_id && matches!(pending.intent, KeyLifecycleIntent::Rotate { previous_key_id: previous, topic_id: pending_topic }
+                if (previous == previous_key_id || pending.key_id == previous_key_id)
+                    && expected.is_none_or(|key| {
+                        (key == previous || key == pending.key_id)
+                            && scope.topic_id.is_none_or(|topic| topic == pending_topic)
+                    }))
         }) {
             return Ok(pending.operation_id);
+        }
+        if expected.is_some_and(|key| key != previous_key_id) {
+            return Err(KeyLifecycleError::Changed);
         }
         active.stage(&PendingKeyLifecycle::new(
             scope.stream_id,

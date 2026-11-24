@@ -59,6 +59,18 @@ pub struct KeyReplyCapabilities {
     pub can_reject: bool, // Можно отказать с учётом правил отказа и наличия ключа.
 }
 
+/// Подтверждённое состояние запроса другого устройства в загруженной истории.
+pub enum KeyRequestStatus {
+    Pending {
+        author_id: Uuid,                    // Проверенный автор запроса.
+        capabilities: KeyReplyCapabilities, // Действия до подтверждённого ответа.
+    },
+    Completed {
+        author_id: Uuid,            // Проверенный автор запроса.
+        outcome: KeyRequestOutcome, // Проверенная выдача или отказ.
+    },
+}
+
 impl KeyResponseHint {
     /// Возвращает исходный адрес, который проверит авторитетное чтение ответа.
     pub fn target(&self) -> KeyRequestTarget {
@@ -108,20 +120,49 @@ impl KeyExchange {
         target: KeyRequestTarget,
         request_id: Uuid,
     ) -> Result<KeyReplyCapabilities, KeyExchangeError> {
+        Ok(
+            match self
+                .read_key_request_status(activation, target, request_id, false)
+                .await?
+            {
+                Some(KeyRequestStatus::Pending { capabilities, .. }) => capabilities,
+                _ => KeyReplyCapabilities::default(),
+            },
+        )
+    }
+
+    /// Показывает историю только для запросов, на которые у текущего входа есть право отвечать.
+    pub async fn key_request_status(
+        &self,
+        activation: &EncryptionActivation,
+        target: KeyRequestTarget,
+        request_id: Uuid,
+    ) -> Result<Option<KeyRequestStatus>, KeyExchangeError> {
+        self.read_key_request_status(activation, target, request_id, true)
+            .await
+    }
+
+    /// Проверяет получателя, доступность ответа и исход уже рассмотренного запроса.
+    async fn read_key_request_status(
+        &self,
+        activation: &EncryptionActivation,
+        target: KeyRequestTarget,
+        request_id: Uuid,
+        include_history: bool,
+    ) -> Result<Option<KeyRequestStatus>, KeyExchangeError> {
         let token = self.exchange_token(activation).await?;
         let request = self
             .key_message(activation, &token, target, request_id)
             .await?;
         let local = activation.session().device_id.to_string();
         if reply_recipient(&request, &local)?.recipient_device_id == local {
-            return Ok(KeyReplyCapabilities::default());
+            return Ok(None);
         }
-        if self
+        let resolution = self
             .confirm_reply_resolution(activation, &token, target, &request)
-            .await?
-            == ReplyResolution::Resolved
-        {
-            return Ok(KeyReplyCapabilities::default());
+            .await?;
+        if !include_history && matches!(resolution, ReplyResolution::Resolved(_)) {
+            return Ok(None);
         }
         let key = self.reply_key(activation, target).await?;
         let policy = self.reply_policy(activation, &token, target).await?;
@@ -132,7 +173,7 @@ impl KeyExchange {
                 .is_current(self.encryption.selection.lock().unwrap().as_ref())
         });
         self.require_current(activation)?;
-        Ok(KeyReplyCapabilities {
+        let capabilities = KeyReplyCapabilities {
             can_grant: policy.permits_outbound_reply(
                 issuer,
                 request.author_id,
@@ -145,7 +186,20 @@ impl KeyExchange {
                 KeyRequestOutcome::Rejected,
                 has_key,
             ),
-        })
+        };
+        if !capabilities.can_grant && !capabilities.can_reject {
+            return Ok(None);
+        }
+        Ok(Some(match resolution {
+            ReplyResolution::Resolved(outcome) => KeyRequestStatus::Completed {
+                author_id: request.author_id,
+                outcome,
+            },
+            ReplyResolution::Pending | ReplyResolution::Unverified => KeyRequestStatus::Pending {
+                author_id: request.author_id,
+                capabilities,
+            },
+        }))
     }
 
     /// Выдаёт точный локальный ключ либо отказывает в той же теме, где опубликован запрос.
@@ -211,7 +265,7 @@ impl KeyExchange {
                     .confirm_reply_resolution(activation, &token, target, &request)
                     .await?
                 {
-                    ReplyResolution::Resolved => return Err(KeyExchangeError::Forbidden),
+                    ReplyResolution::Resolved(_) => return Err(KeyExchangeError::Forbidden),
                     ReplyResolution::Unverified => return Err(SendError::Unknown.into()),
                     ReplyResolution::Pending => {}
                 }

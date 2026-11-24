@@ -2,6 +2,8 @@
 
 mod requests;
 
+use std::collections::HashMap;
+
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -93,6 +95,46 @@ pub(super) fn initialize(connection: &Connection) -> Result<(), StorageError> {
 }
 
 impl Storage {
+    /// Читает даты первых объявлений из загруженной истории подтверждённого стрима.
+    pub(crate) fn key_announcement_dates(
+        &self,
+        owner: &OwnerContext,
+        stream_id: Uuid,
+    ) -> Result<HashMap<Uuid, u64>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut query = connection.prepare(
+            "SELECT json_extract(m.key_service_payload, '$.key_uuid') AS key_id,
+                    CAST(ROUND(unixepoch(MIN(m.created_at), 'subsec') * 1000) AS INTEGER)
+             FROM sync_messages AS m LEFT JOIN history_changes AS changed
+               USING (account_id, server, organization_id, project_id, user_id, message_id)
+             WHERE m.account_id = ?1 AND m.server = ?2 AND m.organization_id = ?3
+               AND m.project_id = ?4 AND m.user_id = ?5 AND m.stream_id = ?6
+               AND json_extract(m.key_service_payload, '$.kind') = 'key_announced'
+               AND m.created_at IS NOT NULL AND COALESCE(changed.deleted, 0) = 0
+             GROUP BY key_id",
+        )?;
+        let mut rows = query.query(params![
+            owner.account_id.0,
+            owner.server,
+            owner.organization_id,
+            owner.project_id,
+            owner.user_id,
+            stream_id.to_string(),
+        ])?;
+        let mut dates = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let id: Option<String> = row.get(0)?;
+            let milliseconds: Option<i64> = row.get(1)?;
+            if let (Some(id), Some(milliseconds)) = (
+                id.as_deref().and_then(response_uuid),
+                milliseconds.and_then(|time| u64::try_from(time).ok()),
+            ) {
+                dates.insert(id, milliseconds);
+            }
+        }
+        Ok(dates)
+    }
+
     /// Читает ответы нужного устройства во всех сохранённых темах этого владельца.
     pub(crate) fn key_service_responses(
         &self,
@@ -198,6 +240,74 @@ mod tests {
             HistoryTime, MessageBody,
         },
     };
+
+    /// Использует первое сохранённое объявление, ограниченное входом и стримом.
+    #[test]
+    fn key_announcement_dates_use_first_loaded_announcement_in_the_stream() {
+        let storage = Storage::in_memory().unwrap();
+        let owner = OwnerContext {
+            account_id: AccountId("keys".into()),
+            server: "https://workspace.test".into(),
+            organization_id: "org".into(),
+            project_id: "project".into(),
+            user_id: "user".into(),
+        };
+        let [stream, topic, key, author] = [(); 4].map(|()| Uuid::new_v4());
+        let rows =
+            ["1970-01-01T00:00:02.321Z", "1970-01-01T00:00:04Z"].map(|time| HistoryMessage {
+                id: Uuid::new_v4(),
+                stream_id: stream,
+                topic_id: topic,
+                body: MessageBody::KeyService {
+                    canonical_id: None,
+                    payload: KeyServicePayload::Announced { key_uuid: key },
+                },
+                metadata: HistoryMetadata {
+                    author_id: Some(author),
+                    created_at: HistoryTime::parse(time).unwrap(),
+                    updated_at: None,
+                },
+            });
+        let scope = HistoryScope {
+            stream_id: stream,
+            topic_id: Some(topic),
+        };
+        let guard = storage
+            .prepare_history_page(&owner, scope, HistoryPageTarget::New)
+            .unwrap()
+            .unwrap();
+        storage
+            .save_history_page(
+                &owner,
+                guard,
+                &rows,
+                HistoryPageEdges::New {
+                    older: HistoryEdge::End,
+                    newer: HistoryEdge::End,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            storage.key_announcement_dates(&owner, stream).unwrap(),
+            HashMap::from([(key, 2321)]),
+        );
+        assert!(
+            storage
+                .key_announcement_dates(&owner, Uuid::new_v4())
+                .unwrap()
+                .is_empty()
+        );
+        let other_owner = OwnerContext {
+            account_id: AccountId("other".into()),
+            ..owner
+        };
+        assert!(
+            storage
+                .key_announcement_dates(&other_owner, stream)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     /// Продолжает после совпадающего времени, даже если на первой странице есть неверный ответ.
     #[test]
