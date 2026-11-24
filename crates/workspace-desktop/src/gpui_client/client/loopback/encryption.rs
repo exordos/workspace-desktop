@@ -1122,6 +1122,7 @@ fn protected_preview_after_commit(cx: &mut TestAppContext, change: PreviewInvali
                         stream_id: STREAM.into(),
                         topic_id: TOPIC.into(),
                     }),
+                    reactions: None,
                 },
             },
             if saving {

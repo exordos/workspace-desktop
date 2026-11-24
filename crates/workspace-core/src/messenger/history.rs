@@ -602,7 +602,7 @@ impl MessengerSource {
         }
         .await;
         auth.with_active_generation(owner, generation, || ())?;
-        let anchor = verified?;
+        let mut anchor = verified?;
 
         if let Some(window) = sync
             .history_windows(owner, generation, scope)?
@@ -623,6 +623,10 @@ impl MessengerSource {
             });
         }
 
+        self.rest
+            .hydrate_own_reactions(owner, &token, std::slice::from_mut(&mut anchor))
+            .await;
+        auth.with_active_generation(owner, generation, || ())?;
         let fetched = self
             .rest
             .anchor_pages(owner, &token, scope, anchor_id)
@@ -700,7 +704,7 @@ impl MessengerSource {
             sync.auth()
                 .with_active_generation(owner, generation, || ())?;
             match checked {
-                Ok(confirmed) if confirmed == *message => {
+                Ok(confirmed) if confirmed.same_content(message) => {
                     request.verify_legacy_encrypted_message(message.id);
                 }
                 Ok(_) | Err(OpenHistoryError::MessageMissing) => {

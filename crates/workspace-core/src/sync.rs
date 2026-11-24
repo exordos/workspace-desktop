@@ -22,6 +22,7 @@ use crate::{
         details::{AvatarCache, SidebarCache, SidebarChange},
         encryption::fragments::has_protected_draft,
         files::{MediaLoads, OpenMediaError},
+        quick_reactions::{self, QuickReactionUsage},
         quote::QuoteSourceFence,
         send::PlainSendTarget,
     },
@@ -88,6 +89,10 @@ pub enum SyncChange {
     HistoryMessageChanged {
         message_id: Uuid, // UUID исправленной или удалённой строки.
     },
+    HistoryMessageReactionsChanged {
+        message_id: Uuid, // UUID строки с изменившимися реакциями.
+    },
+    QuickReactionUsageChanged, // Подтверждённое добавление обновило общий список быстрых реакций.
     QuoteOriginChanged {
         message_id: Uuid, // UUID оригинала, чья проверенная версия перестала действовать.
     },
@@ -153,6 +158,12 @@ pub enum Event {
         cursor: Cursor,        // Позиция изменения в журнале.
         change: HistoryChange, // Правка, удаление или отзыв доступа.
     },
+    OwnMessageReactionChanged {
+        cursor: Cursor,   // Позиция события реакции в журнале.
+        message_id: Uuid, // Публичный UUID размещения.
+        emoji: String,    // Ключ эмодзи из ответа сервера.
+        selected: bool,   // Есть ли реакция после события.
+    },
     SidebarChanged {
         cursor: Cursor,        // Позиция в общем журнале Workspace.
         change: SidebarChange, // Изменение профиля, стрима, темы или состава.
@@ -201,6 +212,7 @@ impl Event {
             Self::MessageCreated { cursor, .. }
             | Self::IncomingDirectMessage { cursor, .. }
             | Self::HistoryChanged { cursor, .. }
+            | Self::OwnMessageReactionChanged { cursor, .. }
             | Self::SidebarChanged { cursor, .. }
             | Self::UserUpdated { cursor, .. }
             | Self::FileDeleted { cursor, .. }
@@ -430,6 +442,38 @@ impl Sync {
         Ok(self.storage.unread(owner)?)
     }
 
+    /// Загружает историю популярности для действующего входа.
+    pub fn quick_reaction_usage(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+    ) -> Result<QuickReactionUsage, SyncError> {
+        self.auth.with_active_generation(owner, generation, || {
+            let first_day = quick_reactions::first_day(quick_reactions::utc_day());
+            Ok(self.storage.quick_reaction_usage(owner, first_day)?)
+        })?
+    }
+
+    /// Учитывает подтверждённое добавление и обновляет общий список у открытых разговоров.
+    pub(crate) fn record_quick_reaction(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        emoji: &str,
+    ) -> Result<(), SyncError> {
+        let today = quick_reactions::utc_day();
+        self.auth.with_active_generation(owner, generation, || {
+            self.storage.record_quick_reaction(
+                owner,
+                quick_reactions::first_day(today),
+                today,
+                &quick_reactions::canonical_reaction_name(emoji),
+            )?;
+            self.publish(owner, generation, SyncChange::QuickReactionUsageChanged);
+            Ok(())
+        })?
+    }
+
     /// Сбрасывает данные источника, пока поколение сессии имеет право на запись.
     pub(crate) fn reset_source(
         &self,
@@ -605,6 +649,36 @@ impl Sync {
                 .storage
                 .history_window(owner, scope, id)?
                 .filter(|window| !window.needs_refresh))
+        })?
+    }
+
+    /// Применяет подтверждение реакции для того же размещения и поколения сессии.
+    pub(crate) fn confirm_message_reaction(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        target: crate::messenger::message_actions::MessageTarget,
+        emoji: &str,
+        selected: bool,
+    ) -> Result<(), SyncError> {
+        self.auth.with_active_generation(owner, generation, || {
+            if self.storage.confirm_message_reaction(
+                owner,
+                target.message_id,
+                target.scope,
+                target.topic_id,
+                emoji,
+                selected,
+            )? {
+                self.publish(
+                    owner,
+                    generation,
+                    SyncChange::HistoryMessageReactionsChanged {
+                        message_id: target.message_id,
+                    },
+                );
+            }
+            Ok(())
         })?
     }
 
@@ -1142,6 +1216,15 @@ impl Sync {
                 Event::HistoryChanged { change, .. } => Some(change),
                 _ => None,
             };
+            let own_reaction = match &event {
+                Event::OwnMessageReactionChanged {
+                    message_id,
+                    emoji,
+                    selected,
+                    ..
+                } => Some((*message_id, emoji.as_str(), *selected)),
+                _ => None,
+            };
             let folder = match &event {
                 Event::FolderChanged { change, .. } => Some(*change),
                 Event::CatalogCountsChanged { folder, .. } => *folder,
@@ -1189,6 +1272,7 @@ impl Sync {
                         placement,
                         metadata,
                         history,
+                        own_reaction,
                         folder,
                         catalog_counts,
                         avatar,
@@ -1272,6 +1356,13 @@ impl Sync {
                 }
             }
             if saved.outcome == ApplyOutcome::Applied && source == crate::messenger::SOURCE_ID {
+                if let Some(message_id) = saved.reaction_message {
+                    self.publish(
+                        owner,
+                        generation,
+                        SyncChange::HistoryMessageReactionsChanged { message_id },
+                    );
+                }
                 for &user_id in &saved.avatar_changed {
                     self.publish_avatar_change(owner, generation, user_id);
                 }

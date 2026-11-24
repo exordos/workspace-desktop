@@ -114,7 +114,7 @@ impl MessengerSource {
             let current = self
                 .load_quote_original(sync, &session.owner, session.generation, scope, expected.id)
                 .await?;
-            if &current != expected {
+            if !current.same_content(expected) {
                 return Err(SourceCheckError::Changed);
             }
             let MessageBody::Encrypted { key_id, ciphertext } = current.body else {

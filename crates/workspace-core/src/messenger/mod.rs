@@ -14,7 +14,9 @@ pub mod history;
 pub mod message_actions;
 mod outbox;
 pub mod own_profile;
+pub mod quick_reactions;
 pub mod quote;
+pub mod reactions;
 pub mod read;
 pub mod references;
 mod rest;
@@ -47,8 +49,9 @@ const NOTIFICATION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct MessengerSource {
     rest: Arc<RestClient>,        // Общий HTTP-клиент для чтения страниц журнала.
     connector: Option<Connector>, // Настройки TLS для сервера с частным центром сертификации.
-    chat_encryption: Option<encrypted_send::ChatEncryption>, // Локальные ключи этого профиля.
     catalog_refresh: Arc<catalog::RefreshGates>, // Общие запросы каталога одного владельца.
+    chat_encryption: Option<encrypted_send::ChatEncryption>, // Локальные ключи этого профиля.
+    reaction_requests: reactions::ReactionRequests, // Активные команды переключения реакций.
 }
 
 impl MessengerSource {
@@ -72,8 +75,9 @@ impl MessengerSource {
         Ok(Self {
             rest: Arc::new(RestClient::new(None)?),
             connector: None,
-            chat_encryption: None,
             catalog_refresh: Arc::default(),
+            chat_encryption: None,
+            reaction_requests: reactions::ReactionRequests::default(),
         })
     }
 
@@ -91,8 +95,9 @@ impl MessengerSource {
         Ok(Self {
             rest: Arc::new(RestClient::new(Some(certificate_der))?),
             connector: Some(Connector::Rustls(Arc::new(tls))),
-            chat_encryption: None,
             catalog_refresh: Arc::default(),
+            chat_encryption: None,
+            reaction_requests: reactions::ReactionRequests::default(),
         })
     }
 }

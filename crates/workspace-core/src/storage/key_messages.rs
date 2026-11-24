@@ -255,6 +255,7 @@ mod tests {
         let [stream, topic, key, author] = [(); 4].map(|()| Uuid::new_v4());
         let rows =
             ["1970-01-01T00:00:02.321Z", "1970-01-01T00:00:04Z"].map(|time| HistoryMessage {
+                reactions: Vec::new(),
                 id: Uuid::new_v4(),
                 stream_id: stream,
                 topic_id: topic,
@@ -328,6 +329,7 @@ mod tests {
         };
         let rows = (1..=68)
             .map(|id| HistoryMessage {
+                reactions: Vec::new(),
                 id: Uuid::from_u128(id),
                 stream_id: stream,
                 topic_id: topic,

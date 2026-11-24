@@ -19,6 +19,7 @@ fn server_message(id: Uuid, body: &str, own: bool, seconds: &str) -> HistoryMess
         stream_id: STREAM,
         topic_id: TOPIC,
         body: MessageBody::Markdown(body.into()),
+        reactions: Vec::new(),
         metadata: HistoryMetadata {
             author_id: Some(Uuid::from_u128(if own { 900 } else { 901 })),
             created_at: HistoryTime::parse(&format!("2026-11-18T10:00:{seconds}Z")).unwrap(),

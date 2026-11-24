@@ -500,6 +500,7 @@ async fn protected_original_and_attachment_use_exact_key_and_cancel_without_inde
                     epoch_version: 1,
                 },
                 change: HistoryChange::Edit {
+                    reactions: None,
                     message: Message {
                         id: ANCHOR.to_string(),
                         body: MessageBody::Encrypted {
@@ -672,6 +673,7 @@ async fn protected_preview_tracks_committed_file_and_message_after_reader_is_dro
                     epoch_version: 3,
                 },
                 change: HistoryChange::Edit {
+                    reactions: None,
                     message: Message {
                         id: NEWER.to_string(),
                         body: MessageBody::Encrypted {
@@ -727,6 +729,7 @@ async fn protected_quote_rejects_realtime_edit_before_and_during_old_rest_respon
                         epoch_version: 1,
                     },
                     change: HistoryChange::Edit {
+                        reactions: None,
                         message: Message {
                             id: NEWER.to_string(),
                             body: MessageBody::Encrypted {
@@ -990,6 +993,7 @@ async fn media_cache_rejects_stale_snapshot_link_after_message_edit() {
                     epoch_version: 1,
                 },
                 change: HistoryChange::Edit {
+                    reactions: None,
                     message: Message {
                         id: NEWER.to_string(),
                         body: MessageBody::Markdown("вложение убрано".into()),

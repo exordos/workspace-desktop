@@ -141,6 +141,7 @@ fn key_service_sync_emits_scoped_durable_placement_without_notification() {
         updated_at: None,
     };
     let row = HistoryMessage {
+        reactions: Vec::new(),
         id: next_public,
         stream_id: stream,
         topic_id: topic,

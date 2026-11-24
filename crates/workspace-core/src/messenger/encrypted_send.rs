@@ -188,7 +188,7 @@ impl MessengerSource {
             .await;
         auth.with_active_generation(&session.owner, session.generation, || ())?;
         let original = original?;
-        if original != *expected {
+        if !original.same_content(expected) {
             return Err(EncryptedMessageError::StaleEdit);
         }
         let MessageBody::Encrypted { key_id, .. } = expected.body else {

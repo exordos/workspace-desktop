@@ -206,6 +206,7 @@ fn window(
                 id: Uuid::from_u128(id),
                 stream_id: scope.stream_id,
                 topic_id: Uuid::from_u128(1001),
+                reactions: Vec::new(),
                 body: MessageBody::Markdown(format!(
                     "Сообщение {id}{}",
                     "\nСинтетическая строка".repeat((id % 3) as usize)

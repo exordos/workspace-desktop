@@ -9,6 +9,7 @@ mod message_actions;
 pub(super) mod mutations;
 mod own_profile;
 mod protected_drafts;
+mod reactions;
 pub(super) mod sidebar;
 
 use std::{collections::HashSet, time::Duration};
@@ -783,7 +784,9 @@ impl RestClient {
             }
             status => check_status(status)?,
         }
-        Ok(Self::decode_history_page(response, owner, scope).await?)
+        Ok(self
+            .decode_history_page(response, owner, token, scope)
+            .await?)
     }
 
     /// Запрашивает страницу от конца истории или от маркера старого края.
@@ -807,7 +810,9 @@ impl RestClient {
             return Err(OpenHistoryError::AccessLost);
         }
         check_status(response.status())?;
-        Ok(Self::decode_history_page(response, owner, scope).await?)
+        Ok(self
+            .decode_history_page(response, owner, token, scope)
+            .await?)
     }
 
     /// Запрашивает следующую страницу от маркера нового края.
@@ -831,7 +836,9 @@ impl RestClient {
             return Err(OpenHistoryError::AccessLost);
         }
         check_status(response.status())?;
-        Ok(Self::decode_history_page(response, owner, scope).await?)
+        Ok(self
+            .decode_history_page(response, owner, token, scope)
+            .await?)
     }
 
     /// Собирает запрос страницы для стрима или отдельной темы.
@@ -856,8 +863,10 @@ impl RestClient {
 
     /// Читает маркер и проверяет область каждой строки перед сохранением.
     async fn decode_history_page(
+        &self,
         response: reqwest::Response,
         owner: &OwnerContext,
+        token: &str,
         scope: HistoryScope,
     ) -> Result<HistoryPage, SourceError> {
         let edge = match response.headers().get("X-Pagination-Marker") {
@@ -872,7 +881,7 @@ impl RestClient {
             ),
         };
         let rows: Vec<WireHistoryMessage> = response.json().await.map_err(request_error)?;
-        let messages = rows
+        let mut messages: Vec<_> = rows
             .into_iter()
             .filter_map(|row| {
                 if scope.topic_id.is_some_and(|topic| row.topic_uuid != topic) {
@@ -881,6 +890,8 @@ impl RestClient {
                 row.into_history(owner, scope.stream_id).transpose()
             })
             .collect::<Result<_, _>>()?;
+        self.hydrate_own_reactions(owner, token, &mut messages)
+            .await;
         Ok(HistoryPage { messages, edge })
     }
 
@@ -1151,6 +1162,8 @@ pub(super) struct WireHistoryMessage {
     updated_at: Option<String>,             // Серверное время последней правки.
     source_name: Option<String>,            // Серверный носитель сообщения, если он известен.
     payload: WireMessageBody,               // Формат и содержимое сообщения.
+    reactions: Option<Value>,               // Число участников по ключу эмодзи.
+    reaction_users: Option<Value>,          // Полные списки участников небольших групп.
 }
 
 impl WireHistoryMessage {
@@ -1219,6 +1232,13 @@ impl WireHistoryMessage {
                 created_at,
                 updated_at,
             },
+            reactions: self
+                .reactions
+                .as_ref()
+                .and_then(|counts| {
+                    reactions::aggregate(counts, self.reaction_users.as_ref(), owner)
+                })
+                .unwrap_or_default(),
         }))
     }
 }
@@ -1590,6 +1610,12 @@ pub(super) fn wire_event(
     if message_created != (wire.payload.kind == "message.created") {
         return Err(SourceError::InvalidResponse);
     }
+    if wire.object_type == "message_reaction" {
+        return Ok((
+            reactions::own_reaction_event(&value["payload"], owner, cursor, &wire.action)?,
+            None,
+        ));
+    }
     if wire.object_type == "file"
         && matches!(
             (wire.action.as_str(), wire.payload.kind.as_str()),
@@ -1835,7 +1861,13 @@ pub(super) fn wire_event(
         return Ok((
             Event::HistoryChanged {
                 cursor,
-                change: HistoryChange::Edit { message, placement },
+                change: HistoryChange::Edit {
+                    message,
+                    placement,
+                    reactions: value["payload"].get("reactions").and_then(|counts| {
+                        reactions::aggregate(counts, value["payload"].get("reaction_users"), owner)
+                    }),
+                },
             },
             None,
         ));
@@ -2126,6 +2158,7 @@ mod tests {
                 Event::HistoryChanged {
                     cursor: cursor(100),
                     change: HistoryChange::Edit {
+                        reactions: None,
                         message: Message {
                             id: "message-uuid".to_owned(),
                             body: MessageBody::Markdown("hello".to_owned())
@@ -2186,6 +2219,7 @@ mod tests {
                 Event::HistoryChanged {
                     cursor: cursor(2),
                     change: HistoryChange::Edit {
+                        reactions: None,
                         message,
                         placement: None
                     },

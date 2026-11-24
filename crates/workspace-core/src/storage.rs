@@ -11,6 +11,7 @@ mod key_lifecycle;
 mod key_messages;
 pub mod media;
 mod outbox;
+mod quick_reactions;
 
 pub(crate) use avatars::{AvatarEvent, AvatarFence, AvatarSnapshot};
 pub(crate) use catalog_messages::{CatalogMessage, CatalogSnapshot};
@@ -23,13 +24,13 @@ pub(crate) use history::{ConfirmedEdit, EncryptedEditVersion, HistoryPageGuard};
 pub use history::{
     HistoryDirection, HistoryEdge, HistoryMessage, HistoryMetadata, HistoryPageEdges,
     HistoryPageOutcome, HistoryPageTarget, HistoryScope, HistoryTime, HistoryWindow,
+    MessageReaction,
 };
+pub(crate) use key_lifecycle::{LifecyclePhase, StoredKeyLifecycle};
 pub use key_messages::{
     KeyRequestCursor, KeyRequestHint, KeyRequestPage, KeyResponseCursor, KeyResponseHint,
     KeyResponsePage, KeyResponseTarget, KeyServicePayload,
 };
-
-pub(crate) use key_lifecycle::{LifecyclePhase, StoredKeyLifecycle};
 
 pub use outbox::{DeliveryStatus, OutboxEntry, PreparedSend, PreparedSendBody, SendBlock};
 
@@ -166,8 +167,9 @@ pub struct MessagePlacement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HistoryChange {
     Edit {
-        message: Message,                    // Новое содержимое существующего сообщения.
-        placement: Option<MessagePlacement>, // Адрес из снимка, если сервер его передал.
+        message: Message,                        // Новое содержимое существующего сообщения.
+        placement: Option<MessagePlacement>,     // Адрес из снимка, если сервер его передал.
+        reactions: Option<Vec<MessageReaction>>, // Полный снимок реакций, если присутствует.
     },
     RemoveMessage(String), // UUID удалённого или больше не поддерживаемого сообщения.
     RemoveStream(String),  // UUID стрима, доступ к которому потерян.
@@ -177,16 +179,17 @@ pub enum HistoryChange {
 /// Данные одной записи журнала. Пустые поля не меняют соответствующие таблицы.
 #[derive(Default)]
 pub(crate) struct EventWrite<'a> {
-    pub message: Option<&'a Message>,               // Новое сообщение.
-    pub metadata: Option<&'a HistoryMetadata>,      // Автор и серверное время нового сообщения.
-    pub placement: Option<&'a MessagePlacement>,    // Стрим и тема нового сообщения.
-    pub unread: Option<u32>,                        // Подтверждённый счётчик.
-    pub notification_conversation: Option<&'a str>, // Разговор для цели баннера.
-    pub history: Option<&'a HistoryChange>,         // Правка или удаление.
-    pub folder: Option<FolderChange>,               // Сверка состава папок или удаление связей.
-    pub catalog_counts: Option<&'a CatalogCounts>,  // Абсолютные счётчики строки каталога.
-    pub avatar: Option<AvatarEvent<'a>>,            // Изменение ссылки, сверка или удаление файла.
-    pub media_invalidated: Option<Uuid>,            // UUID изменённого или удалённого вложения.
+    pub message: Option<&'a Message>,                // Новое сообщение.
+    pub metadata: Option<&'a HistoryMetadata>,       // Автор и серверное время нового сообщения.
+    pub placement: Option<&'a MessagePlacement>,     // Стрим и тема нового сообщения.
+    pub unread: Option<u32>,                         // Подтверждённый счётчик.
+    pub notification_conversation: Option<&'a str>,  // Разговор для цели баннера.
+    pub history: Option<&'a HistoryChange>,          // Правка или удаление.
+    pub own_reaction: Option<(Uuid, &'a str, bool)>, // Сообщение, эмодзи и выбор текущего пользователя.
+    pub folder: Option<FolderChange>,                // Сверка состава папок или удаление связей.
+    pub catalog_counts: Option<&'a CatalogCounts>,   // Абсолютные счётчики строки каталога.
+    pub avatar: Option<AvatarEvent<'a>>,             // Изменение ссылки, сверка или удаление файла.
+    pub media_invalidated: Option<Uuid>,             // UUID изменённого или удалённого вложения.
     pub checkpoint: bool, // Событие может задать начальную позицию журнала.
 }
 
@@ -206,12 +209,13 @@ pub enum ApplyOutcome {
 
 /// Результаты одной транзакции. Помогают опубликовать только записанные изменения.
 pub(crate) struct AppliedEvent {
-    pub outcome: ApplyOutcome,     // Была ли сохранена позиция источника.
-    pub message_inserted: bool,    // Появилась ли новая строка с сообщением.
-    pub unread_changed: bool,      // Изменилось ли число непрочитанных.
-    pub send_confirmed: bool,      // Закрыта ли строка очереди отправки.
-    pub avatar_changed: Vec<Uuid>, // Пользователи, чьи фото или состояния сверки изменились.
-    pub history_changed: bool,     // Лента должна применить событие или сверить спорное тело.
+    pub outcome: ApplyOutcome,          // Была ли сохранена позиция источника.
+    pub message_inserted: bool,         // Появилась ли новая строка с сообщением.
+    pub unread_changed: bool,           // Изменилось ли число непрочитанных.
+    pub send_confirmed: bool,           // Закрыта ли строка очереди отправки.
+    pub avatar_changed: Vec<Uuid>,      // Пользователи, чьи фото или состояния сверки изменились.
+    pub history_changed: bool,          // Лента должна применить событие или сверить спорное тело.
+    pub reaction_message: Option<Uuid>, // Строка с обновлёнными группами реакций.
 }
 
 /// Причины, по которым локальная база не смогла прочитать или записать данные.
@@ -225,6 +229,8 @@ pub enum StorageError {
     Poisoned, // Доступ к соединению потерян после паники под блокировкой.
     #[error("invalid messenger history page")]
     InvalidHistoryPage, // Страница не подходит по области, направлению или формату.
+    #[error("invalid stored reaction projection")]
+    ReactionProjection(#[source] serde_json::Error), // Не удалось записать группы реакций.
     #[error("invalid prepared message in the outbox")]
     InvalidPreparedSend, // Исходный снимок или его черновик не подходят для очереди.
     #[error("invalid durable chat key operation")]
@@ -446,6 +452,7 @@ impl Storage {
         key_messages::initialize(&transaction)?;
         key_lifecycle::initialize(&transaction)?;
         outbox::initialize(&transaction)?;
+        quick_reactions::initialize(&transaction)?;
         drafts::initialize(&transaction)?;
         folders::initialize(&transaction)?;
         avatars::initialize(&transaction)?;
@@ -679,6 +686,7 @@ impl Storage {
                     send_confirmed: false,
                     avatar_changed: Vec::new(),
                     history_changed: false,
+                    reaction_message: None,
                 });
             }
         }
@@ -704,6 +712,30 @@ impl Storage {
         } else {
             false
         };
+        let mut reaction_message = None;
+        if source == crate::messenger::SOURCE_ID {
+            if let Some(HistoryChange::Edit {
+                message,
+                reactions: Some(reactions),
+                ..
+            }) = change.history
+                && let Ok(id) = Uuid::parse_str(&message.id)
+                && history::apply_reaction_aggregate(&transaction, owner, &message.id, reactions)?
+            {
+                reaction_message = Some(id);
+            }
+            if let Some((id, emoji, selected)) = change.own_reaction
+                && history::apply_own_reaction(
+                    &transaction,
+                    owner,
+                    &id.to_string(),
+                    emoji,
+                    selected,
+                )?
+            {
+                reaction_message = Some(id);
+            }
+        }
         if source == crate::messenger::SOURCE_ID
             && let Some(file_id) = change.media_invalidated
         {
@@ -904,6 +936,7 @@ impl Storage {
             send_confirmed,
             avatar_changed,
             history_changed,
+            reaction_message,
         })
     }
 }
@@ -1132,7 +1165,9 @@ fn apply_history(
     history: &HistoryChange,
 ) -> Result<(), StorageError> {
     match history {
-        HistoryChange::Edit { message, placement } => {
+        HistoryChange::Edit {
+            message, placement, ..
+        } => {
             let (body, key_id) = message.body.storage_parts();
             let (service, canonical) = message.body.key_service_parts()?;
             connection.execute(
@@ -1602,6 +1637,7 @@ mod tests {
             body: PreparedSendBody::Markdown("sent".into()),
         };
         let response = HistoryMessage {
+            reactions: Vec::new(),
             id: entry.public_id,
             stream_id: entry.stream_id,
             topic_id: entry.topic_id,
@@ -1708,6 +1744,7 @@ mod tests {
         create(2).unwrap();
         assert!(storage.claimed_sends(&owner).unwrap().is_empty());
         let edited = HistoryChange::Edit {
+            reactions: None,
             message: message(&sent.id, "edited"),
             placement: Some(address.clone()),
         };
@@ -1764,6 +1801,7 @@ mod tests {
             body: PreparedSendBody::Markdown("sent".into()),
         };
         let response = HistoryMessage {
+            reactions: Vec::new(),
             id: entry.public_id,
             stream_id: entry.stream_id,
             topic_id: entry.topic_id,
@@ -1838,6 +1876,7 @@ mod tests {
         );
 
         let edit = HistoryChange::Edit {
+            reactions: None,
             message: message(&sent.id, "edited"),
             placement: Some(address),
         };

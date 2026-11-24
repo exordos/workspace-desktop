@@ -109,7 +109,7 @@ impl MessengerSource {
             .rest
             .markdown_edit_source(&session.owner, &token, target)
             .await?;
-        if &source != expected {
+        if !source.same_content(expected) {
             return Err(FragmentMessageError::StaleEdit);
         }
         auth.with_active_generation(&session.owner, session.generation, || ())?;
@@ -162,7 +162,7 @@ impl MessengerSource {
             .rest
             .markdown_edit_source(&session.owner, &token, edit.target)
             .await?;
-        if current != edit.source {
+        if !current.same_content(&edit.source) {
             return Err(FragmentMessageError::StaleEdit);
         }
         let (sealed, outgoing_key) = if has_protected_draft(&markdown) {

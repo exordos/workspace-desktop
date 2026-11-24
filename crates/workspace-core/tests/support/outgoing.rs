@@ -104,6 +104,7 @@ pub(super) struct Api {
     lookup_gate: Mutex<Option<LookupGate>>, // Пауза после получения одного точного снимка.
     history: Mutex<Vec<Value>>, // Строки, которые сервер возвращает в актуальной истории B.
     meet_url: Mutex<Option<String>>, // Публичная настройка Jitsi локального сервера.
+    own_reaction: Mutex<Option<Value>>, // Единственная реакция в тесте переключения.
 }
 
 impl Api {
@@ -209,6 +210,49 @@ impl Api {
                         "notification_mode":"default"
                     }),
                 )
+            }
+        } else if let Some((_, suffix)) = path.split_once("/message_reactions/") {
+            assert_eq!(token, B.to_string());
+            match method {
+                "GET" => {
+                    let filters: HashMap<_, _> = uri.query_pairs().collect();
+                    assert_eq!(filters["project_id"], "project");
+                    assert_eq!(filters["user_uuid"], token);
+                    let active = self.own_reaction.lock().unwrap();
+                    if let Some(row) = active.as_ref() {
+                        assert_eq!(
+                            filters["message_uuid"].as_ref(),
+                            row["message_uuid"].as_str().unwrap()
+                        );
+                    }
+                    ("200 OK", json!(active.iter().collect::<Vec<_>>()))
+                }
+                "POST" => {
+                    assert!(suffix.is_empty());
+                    let mut bytes = vec![0; header("content-length").unwrap().parse().unwrap()];
+                    socket.read_exact(&mut bytes).await.unwrap();
+                    let payload: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(payload["emoji_name"], "👍");
+                    let row = json!({
+                        "uuid": Uuid::from_u128(902), "project_id": "project",
+                        "message_uuid": payload["message_uuid"], "user_uuid": token,
+                        "emoji_name": "thumbs_up"
+                    });
+                    assert!(
+                        self.own_reaction
+                            .lock()
+                            .unwrap()
+                            .replace(row.clone())
+                            .is_none()
+                    );
+                    ("201 Created", row)
+                }
+                "DELETE" => {
+                    let row = self.own_reaction.lock().unwrap().take().unwrap();
+                    assert_eq!(row["uuid"], suffix);
+                    ("204 No Content", Value::Null)
+                }
+                _ => panic!("неожиданный метод реакции {method}"),
             }
         } else if (path.ends_with("/messages/") && method == "POST")
             || (method == "PUT"
@@ -432,6 +476,7 @@ async fn own_plain_markdown_edit_can_add_first_fragment_and_observes_origin_revo
     let session = test.session();
     let id = Uuid::new_v4();
     let expected = HistoryMessage {
+        reactions: Vec::new(),
         id,
         stream_id: CHAT,
         topic_id: TOPIC,
@@ -723,6 +768,80 @@ fn message_created(version: u64, mut payload: Value) -> Value {
     })
 }
 
+/// Загружает собственную реакцию для большой группы и проверяет переключение через HTTPS.
+#[tokio::test]
+async fn message_reaction_uses_owner_resource_and_updates_history() {
+    use workspace_core::messenger::reactions::ReactionToggle;
+
+    let test = Test::new().await;
+    let (_, sync) = test.open();
+    let session = test.session();
+    let owner = &session.context;
+    let generation = session.generation;
+    let id = Uuid::from_u128(900);
+    let target = MessageTarget {
+        scope: SCOPE,
+        topic_id: TOPIC,
+        message_id: id,
+    };
+    let message = json!({
+        "uuid": id, "stream_uuid": CHAT, "topic_uuid": TOPIC,
+        "project_id": "project", "user_uuid": B, "author_uuid": A,
+        "created_at": "2026-01-01T10:00:00Z", "payload": {"kind": "markdown", "content": "текст"},
+        "reactions": {"heart": 8}, "reaction_users": {}
+    });
+    test.api.lookups.lock().unwrap().insert(id, message.clone());
+    test.api.history.lock().unwrap().push(message);
+    *test.api.own_reaction.lock().unwrap() = Some(json!({
+        "uuid": Uuid::from_u128(901), "project_id": "project", "message_uuid": id,
+        "user_uuid": B, "emoji_name": "❤️"
+    }));
+    let window = test
+        .source
+        .load_latest_history(&sync, owner, generation, SCOPE)
+        .await
+        .unwrap();
+    assert_eq!(window.messages[0].reactions[0].count, 8);
+    assert!(window.messages[0].reactions[0].is_own);
+    let current = || {
+        sync.refresh_history_window(owner, generation, SCOPE, window.id)
+            .unwrap()
+            .unwrap()
+            .messages
+            .remove(0)
+    };
+    assert_eq!(
+        test.source
+            .toggle_message_reaction(&test.fixture.auth, &sync, owner, generation, target, "❤️")
+            .await
+            .unwrap(),
+        ReactionToggle::Removed,
+    );
+    assert_eq!(current().reactions[0].count, 7);
+    assert!(!current().reactions[0].is_own);
+    assert_eq!(
+        sync.quick_reaction_usage(owner, generation)
+            .unwrap()
+            .ranked()[0],
+        "❤️"
+    );
+    assert_eq!(
+        test.source
+            .toggle_message_reaction(&test.fixture.auth, &sync, owner, generation, target, "👍")
+            .await
+            .unwrap(),
+        ReactionToggle::Added,
+    );
+    assert_eq!(current().reactions[1].emoji, "thumbs_up");
+    assert!(current().reactions[1].is_own);
+    assert_eq!(
+        sync.quick_reaction_usage(owner, generation)
+            .unwrap()
+            .ranked()[0],
+        "👍"
+    );
+}
+
 /// Тестовый стенд с двумя входами и SQLite на диске для перезапуска.
 struct Test {
     api: Arc<Api>,                           // Управление ответами локального Workspace.
@@ -754,6 +873,7 @@ impl Test {
             lookup_gate: Mutex::default(),
             history: Mutex::new(Vec::new()),
             meet_url: Mutex::new(None),
+            own_reaction: Mutex::new(None),
         });
         let (address, server) = serve(Arc::new(HistoryApi {
             outgoing: Some(api.clone()),
@@ -1188,6 +1308,7 @@ async fn encrypted_send_preserves_envelope_and_fails_closed_when_key_changes() {
     };
     let original = delivered(&snapshot);
     let expected = HistoryMessage {
+        reactions: Vec::new(),
         id: snapshot.public_id,
         stream_id: snapshot.stream_id,
         topic_id: snapshot.topic_id,
@@ -1307,6 +1428,7 @@ async fn encrypted_send_preserves_envelope_and_fails_closed_when_key_changes() {
                 epoch_version: 2,
             },
             change: HistoryChange::Edit {
+                reactions: None,
                 message: Message {
                     id: snapshot.public_id.to_string(),
                     body: expected.body.clone(),
@@ -1359,6 +1481,7 @@ async fn encrypted_send_preserves_envelope_and_fails_closed_when_key_changes() {
                     epoch_version: 3,
                 },
                 change: HistoryChange::Edit {
+                    reactions: None,
                     message: Message {
                         id: snapshot.public_id.to_string(),
                         body: MessageBody::Encrypted {
@@ -2131,6 +2254,7 @@ async fn protected_quote_permit_tracks_committed_original_without_ui_refresh() {
         unreachable!();
     };
     let citing = HistoryMessage {
+        reactions: Vec::new(),
         id: parent.public_id,
         stream_id: parent.stream_id,
         topic_id: parent.topic_id,

@@ -78,6 +78,7 @@ fn pending_key_requests_span_known_topics_and_require_exact_response() {
         author,
     ] = [(); 7].map(|()| Uuid::new_v4());
     let row = |stream_id, topic_id, id, payload| HistoryMessage {
+        reactions: Vec::new(),
         id: Uuid::from_u128(id),
         stream_id,
         topic_id,

@@ -12,6 +12,7 @@ pub(super) fn fixture_rows(scope: HistoryScope, start: u128, end: u128) -> Vec<H
             id: Uuid::from_u128(number),
             stream_id: scope.stream_id,
             topic_id: Uuid::from_u128(2002),
+            reactions: Vec::new(),
             body: MessageBody::Markdown(
                 "Синтетическая строка для переноса. ".repeat(1 + (number % 5) as usize),
             ),

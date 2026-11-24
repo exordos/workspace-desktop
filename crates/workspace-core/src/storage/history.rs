@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{CatalogMessage, Cursor, Message, MessageBody, Storage, StorageError, read_cursor};
@@ -11,6 +12,7 @@ use crate::{
     context::OwnerContext,
     messenger::{
         SOURCE_ID,
+        quick_reactions::canonical_reaction_name,
         references::{external_links, media_links},
     },
 };
@@ -88,14 +90,35 @@ pub struct HistoryMetadata {
     pub updated_at: Option<HistoryTime>, // Время правки, если оно известно.
 }
 
+/// Один серверный счётчик реакций и известные участники группы.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+pub struct MessageReaction {
+    pub emoji: String,            // Ключ эмодзи из ответа сервера.
+    pub count: u32,               // Число пользователей с этой реакцией.
+    pub users: Option<Vec<Uuid>>, // Полный список, если сервер его раскрыл.
+    pub is_own: bool,             // Реакция есть у владельца снимка.
+}
+
 /// Одна запись подтверждённой страницы или сохранённого окна.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HistoryMessage {
-    pub id: Uuid,                  // Публичный UUID сообщения.
-    pub stream_id: Uuid,           // Стрим сообщения из ответа сервера.
-    pub topic_id: Uuid,            // Тема сообщения внутри стрима.
-    pub body: MessageBody,         // Открытый Markdown или зашифрованный конверт.
-    pub metadata: HistoryMetadata, // Автор и серверное время.
+    pub id: Uuid,                        // Публичный UUID сообщения.
+    pub stream_id: Uuid,                 // Стрим сообщения из ответа сервера.
+    pub topic_id: Uuid,                  // Тема сообщения внутри стрима.
+    pub body: MessageBody,               // Открытый Markdown или зашифрованный конверт.
+    pub metadata: HistoryMetadata,       // Автор и серверное время.
+    pub reactions: Vec<MessageReaction>, // Счётчики и выбранные реакции владельца.
+}
+
+impl HistoryMessage {
+    /// Сверяет адрес, автора, время и тело сообщения для цитирования или правки.
+    pub fn same_content(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.stream_id == other.stream_id
+            && self.topic_id == other.topic_id
+            && self.body == other.body
+            && self.metadata == other.metadata
+    }
 }
 
 /// Локальные версии канонической строки, полученные перед подтверждённой серверной правкой.
@@ -266,6 +289,26 @@ pub(super) fn initialize(connection: &Connection) -> Result<(), StorageError> {
         connection.execute_batch(
             "ALTER TABLE sync_messages ADD COLUMN key_service_payload TEXT;
              ALTER TABLE sync_messages ADD COLUMN key_service_canonical_id TEXT;",
+        )?;
+    }
+    let has_reactions: bool = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('sync_messages') WHERE name = 'reactions_json')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_reactions {
+        connection.execute_batch(
+            "ALTER TABLE sync_messages ADD COLUMN reactions_json TEXT NOT NULL DEFAULT '[]';",
+        )?;
+    }
+    let has_reaction_revision: bool = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('sync_messages') WHERE name = 'reactions_revision')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_reaction_revision {
+        connection.execute_batch(
+            "ALTER TABLE sync_messages ADD COLUMN reactions_revision INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
     connection.execute_batch(
@@ -606,6 +649,7 @@ impl Storage {
             confirmed,
             revision,
             cursor.as_ref(),
+            None,
         )?;
         project_media_message(&transaction, owner, &confirmed.id.to_string())?;
         transaction.commit()?;
@@ -1018,6 +1062,7 @@ impl Storage {
                 message,
                 revision,
                 guard.cursor.as_ref(),
+                Some(guard.revision),
             )?;
             project_message_refs(
                 &transaction,
@@ -1225,6 +1270,7 @@ fn save_snapshot(
     message: &HistoryMessage,
     revision: i64,
     cursor: Option<&Cursor>,
+    reaction_guard: Option<i64>,
 ) -> Result<(), StorageError> {
     let id = message.id.to_string();
     let (body, key_id) = message.body.storage_parts();
@@ -1246,6 +1292,9 @@ fn save_snapshot(
             message.metadata.created_at.0, message.metadata.updated_at.as_ref().map(|time| &time.0), key_id,
             service, canonical],
     )?;
+    if let Some(guard) = reaction_guard {
+        write_reactions(connection, owner, &id, &message.reactions, revision, guard)?;
+    }
     record_revision(connection, owner, &id, revision, false, Some(cursor))?;
     mark_media_indexed(connection, owner, &id)
 }
@@ -1258,7 +1307,7 @@ fn read_members(
 ) -> Result<Vec<HistoryMessage>, StorageError> {
     let mut query = connection.prepare(
         "SELECT message_id, stream_id, topic_id, text, author_id, created_at, updated_at, encryption_key_id,
-                key_service_payload, key_service_canonical_id
+                key_service_payload, key_service_canonical_id, reactions_json
          FROM history_members JOIN sync_messages USING (account_id, server, organization_id, project_id, user_id, message_id)
          WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3 AND project_id = ?4 AND user_id = ?5
            AND window_id = ?6 ORDER BY created_at, message_id",
@@ -1279,13 +1328,14 @@ fn read_members(
 
 /// Поля размещённого сообщения со строковыми идентификаторами SQLite.
 struct HistoryRecord {
-    id: String,              // Публичный UUID.
-    stream: String,          // UUID стрима.
-    topic: String,           // UUID темы.
-    body: MessageBody,       // Типизированное сохранённое тело.
-    author: Option<String>,  // UUID автора, если известен.
-    created: String,         // Нормализованное время создания.
-    updated: Option<String>, // Нормализованное время последней правки.
+    id: String,                      // Публичный UUID.
+    stream: String,                  // UUID стрима.
+    topic: String,                   // UUID темы.
+    body: MessageBody,               // Типизированное сохранённое тело.
+    author: Option<String>,          // UUID автора, если известен.
+    created: String,                 // Нормализованное время создания.
+    updated: Option<String>,         // Нормализованное время последней правки.
+    reactions: Vec<MessageReaction>, // Сохранённые группы реакций.
 }
 
 impl TryFrom<HistoryRecord> for HistoryMessage {
@@ -1305,6 +1355,7 @@ impl TryFrom<HistoryRecord> for HistoryMessage {
                 created_at: HistoryTime(record.created),
                 updated_at: record.updated.map(HistoryTime),
             },
+            reactions: record.reactions,
         })
     }
 }
@@ -1319,7 +1370,200 @@ fn history_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryRecord> {
         author: row.get(4)?,
         created: row.get(5)?,
         updated: row.get(6)?,
+        reactions: read_reactions_column(row, 10)?,
     })
+}
+
+/// Читает сохранённые реакции из одного столбца SQLite.
+fn read_reactions_column(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+) -> rusqlite::Result<Vec<MessageReaction>> {
+    let json: String = row.get(column)?;
+    serde_json::from_str(&json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+/// Возвращает текущие группы точной строки владельца, если строка сохранена.
+fn read_reactions(
+    connection: &Connection,
+    owner: &OwnerContext,
+    id: &str,
+) -> Result<Option<Vec<MessageReaction>>, StorageError> {
+    Ok(connection
+        .query_row(
+            "SELECT reactions_json FROM sync_messages WHERE account_id = ?1 AND server = ?2
+         AND organization_id = ?3 AND project_id = ?4 AND user_id = ?5 AND message_id = ?6",
+            params![
+                owner.account_id.0,
+                owner.server,
+                owner.organization_id,
+                owner.project_id,
+                owner.user_id,
+                id
+            ],
+            |row| read_reactions_column(row, 0),
+        )
+        .optional()?)
+}
+
+/// Записывает счётчики, если с начала чтения не пришла их более свежая версия.
+fn write_reactions(
+    connection: &Connection,
+    owner: &OwnerContext,
+    id: &str,
+    reactions: &[MessageReaction],
+    revision: i64,
+    guard: i64,
+) -> Result<(), StorageError> {
+    let json = serde_json::to_string(reactions).map_err(StorageError::ReactionProjection)?;
+    connection.execute(
+        "UPDATE sync_messages SET reactions_json = ?7, reactions_revision = ?8
+         WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3 AND project_id = ?4
+           AND user_id = ?5 AND message_id = ?6 AND reactions_revision <= ?9",
+        params![
+            owner.account_id.0,
+            owner.server,
+            owner.organization_id,
+            owner.project_id,
+            owner.user_id,
+            id,
+            json,
+            revision,
+            guard,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Применяет полный серверный снимок и сохраняет известный выбор для групп без списка.
+pub(super) fn apply_reaction_aggregate(
+    connection: &Connection,
+    owner: &OwnerContext,
+    id: &str,
+    aggregate: &[MessageReaction],
+) -> Result<bool, StorageError> {
+    let Some(previous) = read_reactions(connection, owner, id)? else {
+        return Ok(false);
+    };
+    let mut next = aggregate.to_vec();
+    for reaction in &mut next {
+        if reaction.users.is_none() {
+            let emoji = canonical_reaction_name(&reaction.emoji);
+            reaction.is_own |= previous
+                .iter()
+                .any(|old| old.is_own && canonical_reaction_name(&old.emoji) == emoji);
+        }
+    }
+    commit_reaction_change(connection, owner, id, &previous, &next)
+}
+
+/// Применяет подтверждение роли пользователя до прихода абсолютного снимка счётчиков.
+pub(super) fn apply_own_reaction(
+    connection: &Connection,
+    owner: &OwnerContext,
+    id: &str,
+    emoji: &str,
+    selected: bool,
+) -> Result<bool, StorageError> {
+    let Some(previous) = read_reactions(connection, owner, id)? else {
+        return Ok(false);
+    };
+    let user_id = Uuid::parse_str(&owner.user_id).ok();
+    let mut next = previous.clone();
+    let position = next
+        .binary_search_by(|group| group.emoji.as_str().cmp(emoji))
+        .or_else(|insertion| {
+            let emoji = canonical_reaction_name(emoji);
+            next.iter()
+                .position(|group| canonical_reaction_name(&group.emoji) == emoji)
+                .ok_or(insertion)
+        });
+    match position {
+        Ok(index) => {
+            let group = &mut next[index];
+            if group.is_own == selected {
+                return Ok(false);
+            }
+            group.is_own = selected;
+            if selected {
+                group.count = group.count.saturating_add(1);
+                if let (Some(users), Some(user)) = (&mut group.users, user_id) {
+                    users.push(user);
+                }
+            } else {
+                group.count = group.count.saturating_sub(1);
+                if let Some(users) = &mut group.users {
+                    users.retain(|user| Some(*user) != user_id);
+                }
+                if group.count == 0 {
+                    next.remove(index);
+                }
+            }
+        }
+        Err(index) if selected => next.insert(
+            index,
+            MessageReaction {
+                emoji: emoji.to_owned(),
+                count: 1,
+                users: user_id.map(|user| vec![user]),
+                is_own: true,
+            },
+        ),
+        Err(_) => return Ok(false),
+    }
+    commit_reaction_change(connection, owner, id, &previous, &next)
+}
+
+/// Повышает только версию реакций, чтобы ранняя страница не вернула прежние счётчики.
+fn commit_reaction_change(
+    connection: &Connection,
+    owner: &OwnerContext,
+    id: &str,
+    previous: &[MessageReaction],
+    next: &[MessageReaction],
+) -> Result<bool, StorageError> {
+    if previous == next {
+        return Ok(false);
+    }
+    let revision = advance(connection, owner, false)?;
+    write_reactions(connection, owner, id, next, revision, revision)?;
+    Ok(true)
+}
+
+impl Storage {
+    /// Применяет ответ команды только к исходному размещению, пока оно есть в базе.
+    pub(crate) fn confirm_message_reaction(
+        &self,
+        owner: &OwnerContext,
+        message_id: Uuid,
+        scope: HistoryScope,
+        topic_id: Uuid,
+        emoji: &str,
+        selected: bool,
+    ) -> Result<bool, StorageError> {
+        let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let matches = history_message(&transaction, owner, message_id)?
+            .is_some_and(|row| row.stream_id == scope.stream_id && row.topic_id == topic_id);
+        if !matches {
+            return Ok(false);
+        }
+        let changed = apply_own_reaction(
+            &transaction,
+            owner,
+            &message_id.to_string(),
+            emoji,
+            selected,
+        )?;
+        transaction.commit()?;
+        Ok(changed)
+    }
 }
 
 /// Читает точное размещённое сообщение из локальной истории того же владельца.
@@ -1330,7 +1574,7 @@ fn history_message(
 ) -> Result<Option<HistoryMessage>, StorageError> {
     let current = connection.query_row(
         "SELECT message_id, stream_id, topic_id, text, author_id, created_at, updated_at, encryption_key_id,
-                key_service_payload, key_service_canonical_id
+                key_service_payload, key_service_canonical_id, reactions_json
          FROM sync_messages WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
            AND project_id = ?4 AND user_id = ?5 AND message_id = ?6
            AND stream_id IS NOT NULL AND topic_id IS NOT NULL AND created_at IS NOT NULL",
@@ -1353,7 +1597,7 @@ pub(super) fn latest_catalog_message(
     };
     let mut query = connection.prepare_cached(&format!(
         "SELECT message_id, stream_id, topic_id, text, author_id, created_at, updated_at, encryption_key_id,
-                key_service_payload, key_service_canonical_id
+                key_service_payload, key_service_canonical_id, reactions_json
          FROM sync_messages
          WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3 AND project_id = ?4
            AND user_id = ?5 AND stream_id = ?6 AND created_at IS NOT NULL AND {topic_filter}
@@ -1425,7 +1669,8 @@ fn encrypted_edit_version(
     let revision = message_revision(connection, owner, &expected.id.to_string())?;
     if revision.deleted
         || revision.media_projection == MEDIA_PROJECTION_CONFLICT
-        || history_message(connection, owner, expected.id)?.as_ref() != Some(expected)
+        || history_message(connection, owner, expected.id)?
+            .is_none_or(|current| !current.same_content(expected))
     {
         return Ok(None);
     }
@@ -1515,7 +1760,11 @@ pub(super) fn before_change(
             record_revision(connection, owner, id, revision, true, None)?;
             invalidate_message_edges(connection, owner, id, revision)?;
         }
-        HistoryChange::Edit { message, placement } => {
+        HistoryChange::Edit {
+            message,
+            placement,
+            reactions,
+        } => {
             let stored = message_revision(connection, owner, &message.id)?;
             if stored.deleted {
                 if stored.legacy_encryption_check {
@@ -1524,7 +1773,7 @@ pub(super) fn before_change(
                 }
                 return Ok(HistoryEventEffect::Reconcile);
             }
-            if stored.snapshot {
+            let same_body = if stored.snapshot || reactions.is_some() {
                 let (body, key_id) = message.body.storage_parts();
                 let (service, canonical) = message.body.key_service_parts()?;
                 let same_body: bool = connection.query_row(
@@ -1538,10 +1787,17 @@ pub(super) fn before_change(
                         placement.as_ref().map(|address| &address.topic_id), key_id, service, canonical],
                     |row| row.get(0),
                 )?;
-                if same_body && matches!(message.body, MessageBody::Encrypted { .. }) {
-                    // Журнал подтвердил уже сохранённое тело. Действующие чтения остаются пригодны.
-                    return Ok(HistoryEventEffect::Known);
-                }
+                same_body
+            } else {
+                false
+            };
+            if same_body
+                && (reactions.is_some() || matches!(message.body, MessageBody::Encrypted { .. }))
+            {
+                // Событие со счётчиками может повторить прежнее тело. Цитаты и вложения остаются доступны.
+                return Ok(HistoryEventEffect::Known);
+            }
+            if stored.snapshot {
                 // REST-снимок мог уже учесть более позднюю правку. Сохраняем его до сверки,
                 // но новая локальная версия блокирует страницы, которые начали читать раньше.
                 let revision = advance(connection, owner, false)?;
@@ -1764,6 +2020,7 @@ mod tests {
     /// Создаёт сообщение с заданным серверным временем.
     fn message(scope: HistoryScope, id: u128, timestamp: &str) -> HistoryMessage {
         HistoryMessage {
+            reactions: Vec::new(),
             id: Uuid::from_u128(id),
             stream_id: scope.stream_id,
             topic_id: scope.topic_id.unwrap(),
@@ -1804,6 +2061,140 @@ mod tests {
         id
     }
 
+    /// Проверяет добавление, дубль журнала и абсолютный счётчик без инвалидации тела.
+    #[test]
+    fn message_reactions_keep_history_and_respect_owner() {
+        let storage = Storage::in_memory().unwrap();
+        let mut owner = owner("first");
+        let user = Uuid::from_u128(31);
+        owner.user_id = user.to_string();
+        let mut other = owner.clone();
+        other.account_id = AccountId("second".into());
+        let (_, scope) = scopes();
+        let original = message(scope, 58, "2026-01-01T10:00:00Z");
+        let id = new_window(&storage, &owner, scope, std::slice::from_ref(&original));
+        let other_id = new_window(&storage, &other, scope, std::slice::from_ref(&original));
+        let current = || {
+            storage
+                .history_window(&owner, scope, id)
+                .unwrap()
+                .unwrap()
+                .messages
+                .remove(0)
+        };
+        let topic = original.topic_id;
+        let earlier = storage
+            .prepare_history_page(&owner, scope, HistoryPageTarget::New)
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            storage
+                .confirm_message_reaction(&owner, original.id, scope, topic, "heart", true)
+                .unwrap()
+        );
+        assert!(matches!(
+            storage
+                .save_history_page(
+                    &owner,
+                    earlier,
+                    std::slice::from_ref(&original),
+                    HistoryPageEdges::New {
+                        older: HistoryEdge::End,
+                        newer: HistoryEdge::End
+                    },
+                )
+                .unwrap(),
+            HistoryPageOutcome::Saved(_),
+        ));
+        assert_eq!(
+            current().reactions,
+            vec![MessageReaction {
+                emoji: "heart".into(),
+                count: 1,
+                users: Some(vec![user]),
+                is_own: true,
+            }]
+        );
+        let reaction_event = EventWrite {
+            own_reaction: Some((original.id, "heart", true)),
+            ..Default::default()
+        };
+        event(&storage, &owner, 1, reaction_event);
+        assert_eq!(current().reactions[0].count, 1);
+        let edit = HistoryChange::Edit {
+            message: Message {
+                id: original.id.to_string(),
+                body: original.body.clone(),
+            },
+            placement: Some(MessagePlacement {
+                stream_id: original.stream_id.to_string(),
+                topic_id: topic.to_string(),
+            }),
+            reactions: Some(vec![MessageReaction {
+                emoji: "heart".into(),
+                count: 10,
+                users: None,
+                is_own: false,
+            }]),
+        };
+        let saved = storage
+            .apply(
+                &owner,
+                SOURCE_ID,
+                &Cursor {
+                    epoch_generation: "test".into(),
+                    epoch_version: 2,
+                },
+                EventWrite {
+                    history: Some(&edit),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!saved.history_changed);
+        assert_eq!(saved.reaction_message, Some(original.id));
+        assert_eq!(current().reactions[0].count, 10);
+        assert!(current().reactions[0].is_own);
+        assert!(
+            !storage
+                .confirm_message_reaction(&owner, original.id, scope, Uuid::nil(), "heart", false)
+                .unwrap()
+        );
+        assert!(
+            storage
+                .confirm_message_reaction(&owner, original.id, scope, topic, "heart", false)
+                .unwrap()
+        );
+        assert_eq!(current().reactions[0].count, 9);
+        assert!(!current().reactions[0].is_own);
+        event(
+            &storage,
+            &owner,
+            3,
+            EventWrite {
+                own_reaction: Some((original.id, "heart", true)),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !storage
+                .confirm_message_reaction(&owner, original.id, scope, topic, "heart", true)
+                .unwrap()
+        );
+        assert_eq!(current().reactions[0].count, 10);
+        assert!(current().reactions[0].is_own);
+        assert_eq!(current().body, original.body);
+        assert_eq!(
+            storage
+                .history_window(&other, scope, other_id)
+                .unwrap()
+                .unwrap()
+                .messages,
+            vec![original]
+        );
+    }
+
     /// Сохраняет событие мессенджера вместе с позицией.
     fn event(storage: &Storage, owner: &OwnerContext, position: u64, change: EventWrite<'_>) {
         storage
@@ -1832,6 +2223,7 @@ mod tests {
         assert!(storage.matches_markdown_edit(&a, &original).unwrap());
         assert!(!storage.matches_markdown_edit(&b, &original).unwrap());
         let change = HistoryChange::Edit {
+            reactions: None,
             message: Message {
                 id: original.id.to_string(),
                 body: MessageBody::Markdown("[secret](urn:secret:v1:changed)".into()),
@@ -1851,6 +2243,62 @@ mod tests {
             },
         );
         assert!(!storage.matches_markdown_edit(&a, &original).unwrap());
+    }
+
+    /// Реакция во время редактирования сохраняется вместе с подтверждённым текстом.
+    #[test]
+    fn encrypted_edit_and_quote_fence_ignore_reaction_changes() {
+        let storage = Storage::in_memory().unwrap();
+        let owner = owner("A");
+        let (_, topic) = scopes();
+        let mut original = message(topic, 18, "2026-01-02T03:04:05Z");
+        let key_id = Uuid::from_u128(42);
+        original.body = MessageBody::Encrypted {
+            key_id,
+            ciphertext: "first".into(),
+        };
+        let id = new_window(&storage, &owner, topic, std::slice::from_ref(&original));
+        let start = storage
+            .prepare_encrypted_edit(&owner, &original)
+            .unwrap()
+            .unwrap();
+        let quote = storage.quote_source_revision(&owner, original.id).unwrap();
+        assert!(
+            storage
+                .confirm_message_reaction(
+                    &owner,
+                    original.id,
+                    topic,
+                    original.topic_id,
+                    "heart",
+                    true
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            storage.quote_source_revision(&owner, original.id).unwrap(),
+            quote
+        );
+        let mut confirmed = original.clone();
+        confirmed.body = MessageBody::Encrypted {
+            key_id,
+            ciphertext: "confirmed".into(),
+        };
+        confirmed.metadata.updated_at = HistoryTime::parse("2026-01-02T03:04:06Z");
+        assert!(matches!(
+            storage
+                .confirm_encrypted_edit(&owner, &original, start, &confirmed)
+                .unwrap(),
+            ConfirmedEdit::Applied
+        ));
+        let saved = storage
+            .history_window(&owner, topic, id)
+            .unwrap()
+            .unwrap()
+            .messages
+            .remove(0);
+        assert!(saved.same_content(&confirmed));
+        assert!(saved.reactions[0].is_own);
     }
 
     /// Подтверждение PUT не заменяет более свежую строку или отозванный доступ.
@@ -1883,6 +2331,7 @@ mod tests {
         };
         newer.metadata.updated_at = HistoryTime::parse("2026-01-02T03:04:07Z");
         let change = HistoryChange::Edit {
+            reactions: None,
             message: Message {
                 id: original.id.to_string(),
                 body: newer.body.clone(),
@@ -1984,6 +2433,7 @@ mod tests {
             2,
             EventWrite {
                 history: Some(&HistoryChange::Edit {
+                    reactions: None,
                     message: created.clone(),
                     placement: Some(address),
                 }),
@@ -2271,6 +2721,7 @@ mod tests {
             4,
             EventWrite {
                 history: Some(&HistoryChange::Edit {
+                    reactions: None,
                     message: creation.clone(),
                     placement: None,
                 }),
@@ -2445,6 +2896,7 @@ mod tests {
         };
 
         let stale_edit = HistoryChange::Edit {
+            reactions: None,
             message: Message {
                 id: base.id.to_string(),
                 body: MessageBody::Markdown("более старый текст из журнала".into()),

@@ -95,6 +95,7 @@ dtor-proc-macro	0.0.5	Apache-2.0 OR MIT	Matt Mastracci
 dunce	1.0.5	CC0-1.0 OR MIT-0 OR Apache-2.0	Kornel
 dyn-clone	1.0.20	MIT OR Apache-2.0	David Tolnay
 either	1.19.0	MIT OR Apache-2.0	—
+emojibase-data	17.0.0	MIT	Miles Johnson
 encoding_rs	0.8.44	(Apache-2.0 OR MIT) AND BSD-3-Clause	Henri Sivonen
 encoding_rs_io	0.1.8	MIT OR Apache-2.0	Andrew Gallant
 equator	0.4.2	MIT	sarah

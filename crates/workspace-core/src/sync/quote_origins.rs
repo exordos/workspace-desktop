@@ -292,6 +292,7 @@ mod tests {
     /// Создаёт обычный снимок с известным либо отсутствующим временем правки.
     fn snapshot(id: Uuid, body: &str, updated: Option<&str>) -> QuoteOrigin {
         QuoteOrigin::from_message(&HistoryMessage {
+            reactions: Vec::new(),
             id,
             stream_id: Uuid::from_u128(1),
             topic_id: Uuid::from_u128(2),

@@ -637,6 +637,7 @@ fn editor_growth_preserves_reading_anchor_and_tail(cx: &mut TestAppContext) {
             stream_id,
             topic_id: TOPIC,
             body: MessageBody::Markdown("Синтетическая строка".into()),
+            reactions: Vec::new(),
             metadata: HistoryMetadata {
                 author_id: Some(Uuid::from_u128(900)),
                 created_at: HistoryTime::parse("2026-11-17T07:10:30Z").unwrap(),
@@ -842,6 +843,7 @@ fn keeps_unknown_delivery_and_deduplicates_after_confirmation(cx: &mut TestAppCo
         stream_id: scope.stream_id,
         topic_id: TOPIC,
         body: MessageBody::Markdown("Проверка отправки".into()),
+        reactions: Vec::new(),
         metadata: HistoryMetadata {
             author_id: Some(Uuid::from_u128(900)),
             created_at: HistoryTime::parse("2026-11-17T07:10:30Z").unwrap(),
