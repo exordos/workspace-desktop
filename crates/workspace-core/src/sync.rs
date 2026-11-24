@@ -82,6 +82,7 @@ pub enum SyncChange {
     DraftPurgePending, // Локальный черновик закрыт, осталось удалить прежнюю серверную версию.
     Unread(u32),       // Готовое число непрочитанных в папке «Все чаты».
     MessengerReset,    // Кэш очищен. Счётчик неизвестен до снимка с сервера.
+    ActivityChanged, // Полученная отметка чтения или сверка соединения требует обновить активность.
     HistoryMessageCreated {
         scope: HistoryScope,    // Стрим и тема сохранённого сообщения.
         message_id: uuid::Uuid, // UUID новой строки в базе.
@@ -141,6 +142,7 @@ pub enum AvatarUpdate {
 /// Изменение, которое источник передаёт для сохранения.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
+    ActivityRead(Cursor), // Сервер подтвердил чтение сообщения или набора сообщений.
     MessageCreated {
         cursor: Cursor,                      // Позиция, которую сохраняем вместе с сообщением.
         message: Message,                    // Новое сообщение для локальной базы.
@@ -221,6 +223,7 @@ impl Event {
             | Self::FolderChanged { cursor, .. }
             | Self::CatalogCountsChanged { cursor, .. }
             | Self::UnreadBaseline { cursor, .. }
+            | Self::ActivityRead(cursor)
             | Self::SourceReady(cursor)
             | Self::Checkpoint(cursor) => cursor,
         }
@@ -885,9 +888,21 @@ impl Sync {
         opening: DraftOpening,
         scope: DraftScope,
     ) -> Result<(DraftAccess, Option<PlaintextDraft>), SyncError> {
+        self.open_draft_with_id(owner, generation, opening, scope, None)
+    }
+
+    /// Читает черновик по UUID после сетевой проверки его точной темы.
+    pub fn open_draft_with_id(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        opening: DraftOpening,
+        scope: DraftScope,
+        draft_id: Option<uuid::Uuid>,
+    ) -> Result<(DraftAccess, Option<PlaintextDraft>), SyncError> {
         self.auth.with_active_generation(owner, generation, || {
             let access = self.storage.finish_draft_opening(owner, opening, scope)?;
-            let draft = self.storage.read_plaintext_draft(&access, None)?;
+            let draft = self.storage.read_plaintext_draft(&access, draft_id)?;
             Ok((access, draft))
         })?
     }
@@ -1181,11 +1196,16 @@ impl Sync {
     ) -> Result<ApplyOutcome, SyncError> {
         self.auth.with_active_generation(owner, generation, || {
             if matches!(event, Event::SourceReady(_)) {
+                if source == crate::messenger::SOURCE_ID {
+                    self.publish(owner, generation, SyncChange::ActivityChanged);
+                }
                 return Ok(ApplyOutcome::Applied);
             }
             if let Event::UnreadBaseline { cursor, count } = &event {
                 if self.storage.apply_unread_baseline(owner, cursor, *count)? {
                     self.publish(owner, generation, SyncChange::Unread(*count));
+                } else if source == crate::messenger::SOURCE_ID {
+                    self.publish(owner, generation, SyncChange::ActivityChanged);
                 }
                 return Ok(ApplyOutcome::Applied);
             }
@@ -1362,6 +1382,12 @@ impl Sync {
                         generation,
                         SyncChange::HistoryMessageReactionsChanged { message_id },
                     );
+                }
+                if matches!(
+                    event,
+                    Event::ActivityRead(_) | Event::CatalogCountsChanged { .. }
+                ) {
+                    self.publish(owner, generation, SyncChange::ActivityChanged);
                 }
                 for &user_id in &saved.avatar_changed {
                     self.publish_avatar_change(owner, generation, user_id);

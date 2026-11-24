@@ -16,7 +16,7 @@ mod quick_reactions;
 pub(crate) use avatars::{AvatarEvent, AvatarFence, AvatarSnapshot};
 pub(crate) use catalog_messages::{CatalogMessage, CatalogSnapshot};
 pub use drafts::{
-    DraftAccess, DraftOpening, DraftReplies, DraftReply, DraftScope, DraftVersion,
+    DraftAccess, DraftListEntry, DraftOpening, DraftReplies, DraftReply, DraftScope, DraftVersion,
     DraftWriteOutcome, PlaintextDraft,
 };
 pub use folders::FolderChange;

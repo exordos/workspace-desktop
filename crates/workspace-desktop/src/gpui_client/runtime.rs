@@ -1,12 +1,17 @@
 //! Запускает Bootstrap вне потока GPUI и связывает его с окном.
 //! Сначала описаны команды и подписка окна, затем настройка профиля и фоновый цикл.
 
+mod activity_messages;
 mod folders;
 mod key_exchange;
 pub(super) use key_exchange::{IncomingKey, key_exchange_is_permanent};
+mod local_drafts;
 mod login;
+mod self_chat;
 
+pub(super) use local_drafts::LocalDraftError;
 pub use login::{LoginAttempt, LoginError};
+pub(super) use self_chat::SelfChatRequestError;
 
 use std::{
     fmt,

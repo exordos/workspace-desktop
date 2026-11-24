@@ -1,6 +1,8 @@
 //! Работает с HTTPS API мессенджера: читает настройки, журнал и историю, отправляет сообщения.
 //! Также разбирает общий формат событий, который используют HTTP и WebSocket.
 
+mod activity_messages;
+mod drafts;
 mod folders;
 mod fragments;
 mod key_lifecycle;
@@ -10,6 +12,7 @@ pub(super) mod mutations;
 mod own_profile;
 mod protected_drafts;
 mod reactions;
+mod self_chat;
 pub(super) mod sidebar;
 mod sidebar_actions;
 mod summary_settings;
@@ -1611,6 +1614,19 @@ pub(super) fn wire_event(
     let message_created = wire.object_type == "message" && wire.action == "created";
     if message_created != (wire.payload.kind == "message.created") {
         return Err(SourceError::InvalidResponse);
+    }
+    if wire.object_type == "message"
+        && wire.action == "read"
+        && matches!(wire.payload.kind.as_str(), "message.read" | "messages.read")
+    {
+        if !matches_owner(
+            owner,
+            wire.payload.project_id.as_deref(),
+            wire.payload.user_uuid.as_deref(),
+        ) {
+            return Err(SourceError::InvalidResponse);
+        }
+        return Ok((Event::ActivityRead(cursor), None));
     }
     if wire.object_type == "message_reaction" {
         return Ok((

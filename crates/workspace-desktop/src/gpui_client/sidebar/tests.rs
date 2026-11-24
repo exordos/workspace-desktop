@@ -102,7 +102,7 @@ fn initialize(cx: &mut TestAppContext) -> Harness<'_> {
                     Recorded::Open(route.clone(), *generation)
                 }
                 SidebarAction::RetryCatalog(session) => Recorded::Retry(session.clone()),
-                SidebarAction::OpenCreatedTopic { .. } => {
+                SidebarAction::OpenActivity { .. } | SidebarAction::OpenCreatedTopic { .. } => {
                     return;
                 }
             };

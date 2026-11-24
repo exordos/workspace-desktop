@@ -7,11 +7,13 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod list;
+mod protected;
+pub use list::DraftListEntry;
+
 use crate::context::OwnerContext;
 
 use super::{Storage, StorageError};
-
-mod protected;
 
 #[cfg(test)]
 mod tests;
@@ -84,7 +86,7 @@ pub(super) fn initialize(connection: &Connection) -> Result<(), StorageError> {
             project_id TEXT NOT NULL, user_id TEXT NOT NULL, draft_id TEXT NOT NULL,
             stream_id TEXT NOT NULL, topic_id TEXT NOT NULL,
             local_version INTEGER NOT NULL CHECK (typeof(local_version) = 'integer' AND local_version > 0),
-            markdown TEXT, reply_context TEXT,
+            markdown TEXT, reply_context TEXT, updated_at TEXT,
             UNIQUE (account_id, server, organization_id, project_id, user_id, draft_id)
          );
          CREATE INDEX IF NOT EXISTS messenger_drafts_by_scope
@@ -104,6 +106,14 @@ pub(super) fn initialize(connection: &Connection) -> Result<(), StorageError> {
     )?;
     if !has_replies {
         connection.execute_batch("ALTER TABLE messenger_drafts ADD COLUMN reply_context TEXT;")?;
+    }
+    let has_updated_at: bool = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('messenger_drafts') WHERE name = 'updated_at')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_updated_at {
+        connection.execute_batch("ALTER TABLE messenger_drafts ADD COLUMN updated_at TEXT;")?;
     }
     protected::initialize(connection)
 }
@@ -279,11 +289,12 @@ impl Storage {
         }
         transaction.execute(
             "INSERT INTO messenger_drafts (account_id, server, organization_id, project_id,
-             user_id, draft_id, stream_id, topic_id, local_version, markdown, reply_context)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             user_id, draft_id, stream_id, topic_id, local_version, markdown, reply_context, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
              ON CONFLICT (account_id, server, organization_id, project_id, user_id, draft_id)
              DO UPDATE SET local_version = excluded.local_version, markdown = excluded.markdown,
-                           reply_context = excluded.reply_context",
+                           reply_context = excluded.reply_context, updated_at = excluded.updated_at",
             params![
                 owner.account_id.0,
                 owner.server,

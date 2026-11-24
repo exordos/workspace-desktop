@@ -1,5 +1,6 @@
 //! Проверяет путь от окна через каталог и очередь до локального HTTPS/WSS-сервера.
 
+mod activity_drafts;
 mod calls;
 mod drafts;
 mod encryption;
@@ -352,6 +353,7 @@ impl DetailsFixture {
 struct Received {
     media: Option<media::Fixture>, // Карточка фото из обычного сообщения и наблюдения HTTPS.
     drafting: Option<drafts::Fixture>, // Сообщения и задержка проверки цитаты для черновиков.
+    server_drafts: Option<activity_drafts::Fixture>, // Страницы, чтение и удаление серверных черновиков.
     encrypted_history: bool,                         // Штатный каталог и история защищённой лички.
     fragment_forward: Option<fragment_forward::Fixture>, // Снимок и отправка защищённого фрагмента.
     protected_wire: Option<encryption::ProtectedWire>, // Служебные сообщения и очередь E2EE.
@@ -657,6 +659,19 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         && reactions.handles(&request)
     {
         return reactions.response(request, user, peer).await;
+    }
+    if let Some(drafts) = &state.server_drafts
+        && let Some(response) = drafts.response(&request, user)
+    {
+        return response;
+    }
+    // У активности тот же URL, что у истории, но отдельные фильтры и ответы фикстуры.
+    if path == MESSAGES
+        && request.method() == Method::GET
+        && (query_value(&request, "mentioned") == Some("true")
+            || query_value(&request, "starred") == Some("true"))
+    {
+        return json_response(StatusCode::OK, json!([]));
     }
     if path == FOLDERS && request.method() == Method::POST {
         let bytes = request.into_body().collect().await.unwrap().to_bytes();
@@ -1180,7 +1195,10 @@ fn click(ui: &mut VisualTestContext, selector: &'static str) {
 /// Открывает контекстное меню правым кликом по отрисованному сообщению.
 fn open_history_context_menu(ui: &mut VisualTestContext, selector: &'static str) {
     ui.update(|window, app| window.draw(app).clear());
-    let position = ui.debug_bounds(selector).expect("сообщение в истории").center();
+    let position = ui
+        .debug_bounds(selector)
+        .expect("сообщение в истории")
+        .center();
     ui.simulate_mouse_move(position, None, Modifiers::none());
     ui.simulate_mouse_down(position, gpui::MouseButton::Right, Modifiers::none());
     ui.simulate_mouse_up(position, gpui::MouseButton::Right, Modifiers::none());

@@ -13,7 +13,7 @@ use workspace_core::{
     directory::{ProfilePresence, UserProfile},
     messenger::{
         details::sidebar_profile_link,
-        own_profile::{PersonalEdit, PersonalIdentity, favorites_link},
+        own_profile::{PersonalEdit, PersonalIdentity},
     },
 };
 
@@ -494,7 +494,8 @@ impl Personal {
             .session
             .user_uuid()
             .and_then(|id| sidebar_profile_link(&self.session.owner, id).ok());
-        let favorites = favorites_link(&self.session.owner).ok();
+        let client = self.client.clone();
+        let session = self.session.clone();
         div()
             .flex()
             .gap_2()
@@ -503,10 +504,10 @@ impl Personal {
                 language.tr("common.favorites"),
                 (Icon::Home, 26.),
                 palette,
-                move |_, app| {
-                    if let Some(link) = favorites.as_deref() {
-                        app.open_url(link);
-                    }
+                move |window, app| {
+                    let _ = client.update(app, |client, cx| {
+                        client.open_favorites(session.clone(), window, cx);
+                    });
                 },
             ))
             .child(action_tile(

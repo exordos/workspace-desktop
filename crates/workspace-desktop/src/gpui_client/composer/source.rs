@@ -102,7 +102,11 @@ pub(in crate::gpui_client) struct SendSource {
 
 impl SendSource {
     /// Связывает отправку с тем же исполнителем, на котором работает мессенджер.
-    pub fn runtime(runtime: RuntimeClient, activation: Option<EncryptionActivation>) -> Self {
+    pub fn runtime(
+        runtime: RuntimeClient,
+        draft_id: Option<Uuid>,
+        activation: Option<EncryptionActivation>,
+    ) -> Self {
         let worker = runtime.clone();
         let resolve_activation = activation.clone();
         Self {
@@ -121,7 +125,7 @@ impl SendSource {
                                 Ok(target) => (target.topic_id(), Some(target), false),
                                 // Этот ответ появляется после проверки владельца, темы и encryption=false.
                                 Err(DirectSendError::TopicClosed) if let Some(topic) = address.route.scope.topic_id => (topic, None, true),
-                                Err(DirectSendError::EncryptionUnavailable) if let Some(activation) = activation.as_ref() => {
+                                Err(DirectSendError::EncryptionUnavailable) if draft_id.is_none() && let Some(activation) = activation.as_ref() => {
                                     let target = services.messenger.encrypted_send_key(&services.sync, activation, address.route.scope).await?;
                                     return Ok(ResolvedDestination { topic: target.topic_id, encrypted: true, closed: false, plain_target: None, restored_protected: false, draft: None });
                                 }
@@ -131,13 +135,28 @@ impl SendSource {
                             services.drafts.wait_for_send(&address, scope).await;
                             let pending = services.drafts.current(&address, scope);
                             let draft = opening.and_then(|opening| {
-                                services.sync.open_draft(owner, generation, opening, scope)
+                                services.sync.open_draft_with_id(owner, generation, opening, scope, draft_id)
                             });
                             let (draft, restored_protected) = match draft {
-                                Ok((access, saved)) => {
+                                Ok((access, mut saved)) => {
+                                    let pending = if let Some(id) = draft_id && saved.is_none()
+                                        && pending.as_ref().is_none_or(|(pending_access, pending, _)| *pending_access != access || pending.id != id)
+                                    {
+                                        // Сервер читаем только для точного UUID после проверки темы и обычного текста.
+                                        saved = services.messenger.open_server_draft(
+                                            &services.sync, owner, generation, &access, id,
+                                        ).await.map_err(|_| DestinationError::DraftUnavailable)?;
+                                        if saved.is_none() {
+                                            return Err(DestinationError::DraftUnavailable);
+                                        }
+                                        services.drafts.current(&address, scope).or(pending)
+                                    } else {
+                                        pending
+                                    };
                                     let pending = pending
-                                        .filter(|(pending_access, _, _)| {
+                                        .filter(|(pending_access, pending, _)| {
                                             *pending_access == access
+                                                && draft_id.is_none_or(|id| pending.id == id)
                                         })
                                         .map(|(_, pending, protected)| (pending, protected));
                                     let (latest, protected) = match (saved, pending) {

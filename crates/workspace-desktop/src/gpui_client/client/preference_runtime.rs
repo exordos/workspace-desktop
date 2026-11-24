@@ -3,11 +3,12 @@
 use std::time::SystemTime;
 
 use gpui::{App, Context, Entity, KeystrokeEvent, Window};
+use uuid::Uuid;
 use workspace_core::auth::SessionStatus;
 
 use super::Client;
 use crate::gpui_client::{
-    contracts::{AccountSession, ChatRoute},
+    contracts::{AccountSession, ActivityPage, ChatRoute},
     preferences::{IdleTimeout, Preferences, appearance::ThemeChoice, shortcuts::matching},
     ui::{ThemeMode, TopBarSection},
 };
@@ -17,6 +18,8 @@ use crate::gpui_client::{
 struct Place {
     section: TopBarSection, // Экран, на который пользователь может вернуться.
     conversation: Option<ChatRoute>, // Открытый или сохранённый каталогом разговор.
+    activity: Option<ActivityPage>, // Раздел активности, к которому можно вернуться.
+    draft: Option<Uuid>,    // Черновик, с которым был открыт разговор.
 }
 
 /// История переходов внутри одного действующего входа.
@@ -104,14 +107,24 @@ impl Client {
 
     /// Запоминает штатный маршрут после того, как оболочка разрешила переход.
     pub(super) fn record_place(&mut self) {
+        let draft = self.shell.conversation_draft();
+        let route = self.shell.conversation().map(|address| &address.route);
+        let activity = self
+            .shell
+            .activity()
+            .filter(|_| draft.is_none())
+            .filter(|address| {
+                address.page != ActivityPage::Favorites
+                    || route.is_none_or(|route| route.scope.topic_id.is_none())
+            })
+            .map(|address| address.page);
         self.places.record(
             self.shell.selected(),
             Place {
                 section: self.section,
-                conversation: self
-                    .shell
-                    .conversation()
-                    .map(|address| address.route.clone()),
+                conversation: route.filter(|_| activity.is_none()).cloned(),
+                activity,
+                draft,
             },
         );
     }
@@ -121,7 +134,7 @@ impl Client {
         let target = self.places.candidates(forward).find_map(|(index, place)| {
             let effect = self
                 .shell
-                .restore_navigation(place.conversation.as_ref())
+                .restore_navigation(place.conversation.as_ref(), place.activity, place.draft)
                 .ok()?;
             Some((index, place.section, effect))
         });
@@ -309,6 +322,11 @@ impl Client {
             "navigation.calendar" => self.open_section(TopBarSection::Calendar, cx),
             "navigation.mail" => self.open_section(TopBarSection::Mail, cx),
             "navigation.calls" => self.open_section(TopBarSection::Calls, cx),
+            "navigation.activity" => {
+                if let Some(session) = self.shell.selected().cloned() {
+                    self.open_favorites(session, window, cx);
+                }
+            }
             "navigation.chatSearch" if self.section == TopBarSection::Chats => {
                 if !self.sidebar_visible {
                     self.search_return = window.focused(cx);

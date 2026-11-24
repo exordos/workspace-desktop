@@ -230,6 +230,18 @@ impl Conversation {
         restore: Option<ReadingAnchor>,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::open_with_draft(address, runtime, right_panel, restore, None, cx)
+    }
+
+    /// Открывает тот же разговор и передаёт редактору выбранный UUID черновика.
+    pub(super) fn open_with_draft(
+        address: ConversationAddress,
+        runtime: RuntimeClient,
+        right_panel: Entity<RightPanel>,
+        restore: Option<ReadingAnchor>,
+        draft_id: Option<Uuid>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let account = AccountSession {
             owner: address.route.owner.clone(),
             generation: address.generation,
@@ -246,7 +258,10 @@ impl Conversation {
             encryption,
             cx,
         );
-        view.attach_composer(SendSource::runtime(runtime.clone(), activation), cx);
+        view.attach_composer(
+            SendSource::runtime(runtime.clone(), draft_id, activation),
+            cx,
+        );
         view.attachments.runtime = Some(runtime.clone());
         view.avatar_runtime = Some(runtime.clone());
         view.calls.set_runtime(runtime.clone());
@@ -445,6 +460,11 @@ impl Conversation {
     /// Возвращает адрес, по которому оболочка доставляет события истории.
     pub fn address(&self) -> &ConversationAddress {
         &self.address
+    }
+
+    /// Выбирает оформление чата с собой сразу после создания экрана.
+    pub(super) fn set_favorites_presentation(&mut self, favorites: bool) {
+        self.favorites_presentation = favorites;
     }
 
     /// Обновляет названия по адресу экрана, когда каталог того же входа меняется.

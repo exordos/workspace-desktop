@@ -1,6 +1,7 @@
 //! Направляет действия между оболочкой, рабочим потоком, экраном разговора и AppKit.
 //! Здесь также собирается основная разметка окна из готовых компонентов.
 
+mod activity;
 mod encrypted_channel;
 mod history_positions;
 mod key_inbox;
@@ -19,11 +20,16 @@ use workspace_core::{
     directory::UserProfile,
 };
 
+use activity::FavoritesLoad;
 use history_positions::HistoryPositions;
 use notification_banner::{NotificationBanner, NotificationBannerActions};
 
 use super::{
     Options,
+    activity::{
+        drafts::{ActivityDrafts, OpenDraft},
+        messages::{ActivityMessageEvent, ActivityMessages},
+    },
     avatars::AvatarImages,
     contracts::{
         AccountSession, AccountSnapshot, ConversationAddress, NotificationRouteError, RuntimeEvent,
@@ -102,6 +108,9 @@ pub(super) struct Client {
     idle: Option<preference_runtime::IdleSession>, // Таймер автовыхода для выбранного входа.
     places: preference_runtime::Places, // Маршруты навигации назад и вперёд выбранного входа.
     conversation: Option<Entity<Conversation>>, // Экран актуального адреса, если он открыт.
+    favorites_load: Option<FavoritesLoad>, // Запрос или ошибка ещё не открытого чата с собой.
+    activity_drafts: Entity<ActivityDrafts>, // Список черновиков и действия для одного видимого входа.
+    activity_messages: Entity<ActivityMessages>, // Отметки, упоминания и фоновый счётчик.
     history_positions: HistoryPositions,     // Опоры чтения недавних разговоров этого окна.
     details_profile_requested: Option<DetailsProfileIntent>, // Переход из карточки своего профиля.
     details_navigation: Option<Subscription>, // Подписка на переход из правой панели текущего экрана.
@@ -164,6 +173,34 @@ impl Client {
         let right_panel = cx.new(|cx| RightPanel::new(initial_focus.clone(), cx));
         cx.observe(&right_panel, |_, _, cx| cx.notify()).detach();
         sidebar.update(cx, |sidebar, _| sidebar.set_action_panel(&right_panel));
+        let activity_drafts = cx.new(|_| ActivityDrafts::new(runtime.clone()));
+        cx.subscribe(&activity_drafts, |client, _, draft: &OpenDraft, cx| {
+            if client.visible_activity() != Some(&draft.address) {
+                return;
+            }
+            let effect = client
+                .shell
+                .open_activity_draft(&draft.address, draft.scope, draft.id);
+            client.apply(effect, cx);
+        })
+        .detach();
+        let activity_messages = cx.new(|_| ActivityMessages::new(runtime.clone()));
+        cx.observe(&activity_messages, |client, _, cx| {
+            client.sync_activity_navigation(cx)
+        })
+        .detach();
+        cx.subscribe(
+            &activity_messages,
+            |client, _, event: &ActivityMessageEvent, cx| {
+                let ActivityMessageEvent::Open { address, message } = event;
+                if client.visible_activity() != Some(address) {
+                    return;
+                }
+                let effect = client.shell.open_activity_message(address, message);
+                client.apply(effect, cx);
+            },
+        )
+        .detach();
         let selection = cx.subscribe(&top_bar, |client, _, selection: &TopBarSelection, cx| {
             client.open_section(TopBarSection::Chats, cx);
             client.handle_action(ShellAction::SelectAccount(selection.0.clone()), cx);
@@ -181,6 +218,13 @@ impl Client {
                 },
             );
         let subscription = cx.subscribe(&sidebar, |client, _, action: &SidebarAction, cx| {
+            if matches!(action, SidebarAction::OpenActivity { .. })
+                && (client.section != TopBarSection::Chats
+                    || !client.sidebar_visible
+                    || client.sign_in.is_some())
+            {
+                return;
+            }
             client.handle_action(ShellAction::Sidebar(action.clone()), cx);
         });
 
@@ -196,6 +240,9 @@ impl Client {
             conversation: None,
             encrypted_channel: None,
             key_response_scan: None,
+            favorites_load: None,
+            activity_drafts,
+            activity_messages,
             history_positions: HistoryPositions::default(),
             right_panel,
             details_profile_requested: None,
@@ -269,6 +316,7 @@ impl Client {
 
     /// Доставляет обновления аккаунтов и истории из подписки рабочего потока.
     pub(super) fn handle_runtime(&mut self, event: RuntimeEvent, cx: &mut Context<Self>) {
+        self.sync_activity_event(&event, cx);
         let event = match event {
             RuntimeEvent::Folders(snapshots) => {
                 self.shell
@@ -418,7 +466,10 @@ impl Client {
         self.sync_right_panel_context(cx);
         match effect {
             Some(ShellEffect::OpenConversation(address)) => {
-                self.open_conversation_view(address, cx);
+                self.open_conversation_view(address, None, cx);
+            }
+            Some(ShellEffect::OpenDraft(address, id)) => {
+                self.open_conversation_view(address, Some(id), cx);
             }
             Some(ShellEffect::CloseConversation) => {
                 self.save_history_position(cx);
@@ -480,14 +531,16 @@ impl Client {
                 cx,
             );
         });
+        self.sync_activity(cx);
         self.record_place();
         cx.notify();
     }
 
-    /// Открывает экран истории подтверждённого разговора.
+    /// Меняет экран истории, передавая UUID, если переход начался из черновиков.
     fn open_conversation_view(
         &mut self,
         address: ConversationAddress,
+        draft: Option<uuid::Uuid>,
         cx: &mut Context<Self>,
     ) {
         self.save_history_position(cx);
@@ -496,7 +549,20 @@ impl Client {
         let runtime = self.runtime.clone();
         let panel = self.right_panel.clone();
         let restore = self.history_positions.take(&address);
-        let conversation = cx.new(|cx| Conversation::open(address, runtime, panel, restore, cx));
+        let favorites = self
+            .shell
+            .activity()
+            .is_some_and(|address| address.page == super::contracts::ActivityPage::Favorites);
+        let conversation = cx.new(|cx| {
+            let mut view = match draft {
+                Some(id) => {
+                    Conversation::open_with_draft(address, runtime, panel, restore, Some(id), cx)
+                }
+                None => Conversation::open(address, runtime, panel, restore, cx),
+            };
+            view.set_favorites_presentation(favorites);
+            view
+        });
         self.details_navigation = Some(
             cx.subscribe(&conversation, |client, _, target: &OpenDetailsTopic, cx| {
                 client.open_details_topic(target, cx)
@@ -566,6 +632,7 @@ impl Client {
             }
             self.sync_conversation_avatar_visibility(cx);
             self.sync_right_panel_context(cx);
+            self.sync_activity(cx);
             self.top_bar
                 .update(cx, |bar, cx| bar.set_section(section, cx));
             log::debug!("event=workspace_section_opened section={}", section.id());
@@ -584,6 +651,7 @@ impl Client {
         licenses.read(cx).focus_search(window, cx);
         self.sync_right_panel_context(cx);
         self.sync_conversation_avatar_visibility(cx);
+        self.sync_activity(cx);
         cx.notify();
     }
 
@@ -593,6 +661,7 @@ impl Client {
         window.focus(&self.top_bar.read(cx).profile_focus());
         self.sync_right_panel_context(cx);
         self.sync_conversation_avatar_visibility(cx);
+        self.sync_activity(cx);
         cx.notify();
         window.refresh();
     }
@@ -696,11 +765,7 @@ impl Client {
             return;
         }
         match intent.action {
-            DetailsProfileAction::Favorites => {
-                if let Ok(link) = workspace_core::messenger::own_profile::favorites_link(&session.owner) {
-                    cx.open_url(&link);
-                }
-            }
+            DetailsProfileAction::Favorites => self.open_favorites(session, window, cx),
             DetailsProfileAction::Edit => {
                 let services = ProfileServices {
                     runtime: self.runtime.clone(),
@@ -1120,7 +1185,12 @@ impl Render for Client {
                                     .h_full()
                                     .child(conversation.clone()),
                             ),
-                            None => view.child(empty),
+                            None => match self.shell.activity() {
+                                Some(address) => {
+                                    view.child(self.render_activity(address, palette, cx))
+                                }
+                                None => view.child(empty.flex_1().min_w_0()),
+                            },
                         })
                         .children(RightPanel::frame(&self.right_panel, palette, window, cx)),
                 )

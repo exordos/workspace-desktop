@@ -1,6 +1,7 @@
 //! Подключает журнал мессенджера к фоновой синхронизации.
 //! Сначала источник догоняет журнал по HTTP, затем читает новые события через WebSocket.
 
+pub mod activity;
 pub mod calls;
 pub mod catalog;
 pub mod details;
@@ -53,6 +54,7 @@ pub struct MessengerSource {
     connector: Option<Connector>, // Настройки TLS для сервера с частным центром сертификации.
     catalog_refresh: Arc<catalog::RefreshGates>, // Общие запросы каталога одного владельца.
     chat_encryption: Option<encrypted_send::ChatEncryption>, // Локальные ключи этого профиля.
+    self_chat_requests: activity::SelfChatRequests, // Общий запрос «Избранного» одного входа.
     reaction_requests: reactions::ReactionRequests, // Активные команды переключения реакций.
 }
 
@@ -79,6 +81,7 @@ impl MessengerSource {
             connector: None,
             catalog_refresh: Arc::default(),
             chat_encryption: None,
+            self_chat_requests: activity::SelfChatRequests::default(),
             reaction_requests: reactions::ReactionRequests::default(),
         })
     }
@@ -99,6 +102,7 @@ impl MessengerSource {
             connector: Some(Connector::Rustls(Arc::new(tls))),
             catalog_refresh: Arc::default(),
             chat_encryption: None,
+            self_chat_requests: activity::SelfChatRequests::default(),
             reaction_requests: reactions::ReactionRequests::default(),
         })
     }

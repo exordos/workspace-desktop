@@ -219,12 +219,63 @@ impl DraftBuffer {
 
     /// Завершает оставшиеся локальные записи перед остановкой рабочего потока.
     pub(in crate::gpui_client) fn flush(&self, sync: &Sync) {
-        let keys: Vec<_> = self.slots.lock().unwrap().keys().cloned().collect();
-        for key in keys {
-            if !self.write(&key, sync) {
-                log::warn!("event=workspace_composer_draft_flush result=unavailable");
-            }
+        if !self.flush_matching(sync, |_| true) {
+            log::warn!("event=workspace_composer_draft_flush result=unavailable");
         }
+    }
+
+    /// Сохраняет последние правки выбранного входа перед чтением общей страницы черновиков.
+    pub(in crate::gpui_client) fn flush_session(
+        &self,
+        sync: &Sync,
+        session: &crate::gpui_client::contracts::AccountSession,
+    ) -> bool {
+        self.flush_matching(sync, |key| {
+            key.owner == session.owner && key.generation == session.generation
+        })
+    }
+
+    /// Завершает выбранные записи и сообщает об ошибке даже при частичном успехе.
+    fn flush_matching(&self, sync: &Sync, matches: impl Fn(&Key) -> bool) -> bool {
+        let keys: Vec<_> = self
+            .slots
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|key| matches(key))
+            .cloned()
+            .collect();
+        let mut complete = true;
+        for key in keys {
+            complete &= self.write(&key, sync);
+        }
+        complete
+    }
+
+    /// Сверяет ожидающие записи и удерживает их неизменными во время удаления из SQLite.
+    pub(in crate::gpui_client) fn delete_visible_version(
+        &self,
+        sync: &Sync,
+        session: &crate::gpui_client::contracts::AccountSession,
+        scope: DraftScope,
+        version: DraftVersion,
+    ) -> Result<bool, SyncError> {
+        let key = Key {
+            owner: session.owner.clone(),
+            generation: session.generation,
+            stream: scope.stream_id,
+            topic: scope.topic_id,
+        };
+        let slots = self.slots.lock().unwrap();
+        if slots.get(&key).is_some_and(|slot| {
+            slot.send.is_some()
+                || slot.pending.as_ref().is_some_and(|pending| {
+                    pending.value.id == version.id && pending.value.version > version.version
+                })
+        }) {
+            return Ok(false);
+        }
+        sync.delete_local_draft(&session.owner, session.generation, scope, version)
     }
 
     /// Скрывает снимок от нового окна до результата записи очереди.
@@ -494,6 +545,12 @@ impl Composer {
         op_id: Uuid,
         cx: &mut Context<Self>,
     ) -> Option<Arc<DraftSend>> {
+        // У чистого серверного снимка ещё нет локальной версии для связи с очередью.
+        if let Some(session) = self.draft_session.as_mut()
+            && session.version == 0
+        {
+            session.stamp = None;
+        }
         self.persist_draft(cx);
         let session = self.draft_session.as_ref()?;
         let runtime = self.draft_runtime.as_ref()?;

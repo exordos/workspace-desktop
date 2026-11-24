@@ -93,6 +93,24 @@ pub struct ChatRoute {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NavigationRevision(pub u64); // Увеличивается при новом переходе и отмене ожидания.
 
+/// Раздел «Моя активность», который открывается в рабочей области мессенджера.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActivityPage {
+    Inbox,     // Разговоры и темы с активными непрочитанными.
+    Favorites, // Личный чат с собой.
+    Marked,    // Отмеченные сообщения.
+    Mentions,  // Упомянувшие текущего пользователя сообщения.
+    Drafts,    // Черновики владельца.
+}
+
+/// Текущий показ активности. Отложенное действие хранит этот адрес целиком.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivityAddress {
+    pub page: ActivityPage,           // Раздел, из которого началось действие.
+    pub session: AccountSession,      // Вход, которому принадлежат данные страницы.
+    pub revision: NavigationRevision, // Номер показа для проверки позднего результата.
+}
+
 /// Адрес открытого экрана, который фоновая команда сохраняет при запуске.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConversationAddress {
@@ -125,6 +143,10 @@ pub enum SidebarAction {
         session: AccountSession, // Вход, который получил подтверждение создания.
         stream_id: Uuid,          // UUID разговора, из меню которого создали тему.
         topic: Uuid,              // UUID новой темы, подтверждённый Core.
+    },
+    OpenActivity {
+        page: ActivityPage,      // Раздел, выбранный в блоке «Моя активность».
+        session: AccountSession, // Вход, чей блок был виден в момент выбора.
     },
     RetryCatalog(AccountSession), // Повторить загрузку того входа, чей каталог показан.
 }

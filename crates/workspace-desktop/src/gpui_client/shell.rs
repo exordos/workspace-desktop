@@ -7,22 +7,23 @@ use workspace_core::{
     auth::SessionStatus,
     bootstrap::{ChatList, ChatLists},
     context::{AccountId, OwnerContext, SessionGeneration},
-    messenger::{FolderSnapshot, catalog::Chat},
+    messenger::{FolderSnapshot, activity::ActivityMessage, catalog::Chat},
     notification_target::NotificationTarget,
     storage::HistoryScope,
     sync::{SyncChange, SyncUpdate},
 };
 
 use super::contracts::{
-    AccountSession, AccountSnapshot, ChatEntry, ChatRoute, ConversationAddress, NavigationRevision,
-    NotificationReply, NotificationRequest, NotificationRouteError, RuntimeEvent, ShellAction,
-    SidebarAction,
+    AccountSession, AccountSnapshot, ActivityAddress, ActivityPage, ChatEntry, ChatRoute,
+    ConversationAddress, NavigationRevision, NotificationReply, NotificationRequest,
+    NotificationRouteError, RuntimeEvent, ShellAction, SidebarAction,
 };
 use crate::platform::notifications::NotificationClick;
 
 /// Команда, которую клиент выполняет после изменения состояния оболочки.
 pub enum ShellEffect {
     OpenConversation(ConversationAddress), // Открыть историю по адресу нового перехода.
+    OpenDraft(ConversationAddress, Uuid),  // Открыть разговор с конкретным черновиком редактора.
     CloseConversation,                     // Снять экран истории при смене видимого входа.
     RetryCatalog(AccountSession),          // Повторить загрузку каталога указанного входа.
     ResolveNotification(NotificationRequest), // Проверить цель на рабочем потоке.
@@ -40,6 +41,8 @@ pub struct Shell {
     preferred: Option<AccountId>, // Аккаунт, который по возможности нужно выбрать при запуске.
     selected: Option<AccountSession>, // Вход, чей каталог и экран сейчас показаны.
     conversation: Option<ConversationAddress>, // Открытая история, если выбран разговор.
+    conversation_draft: Option<Uuid>, // Точный черновик, если разговор открыт с его карточки.
+    activity: Option<ActivityAddress>, // Выбранный раздел активности вместо истории.
     revision: NavigationRevision, // Последнее принятое намерение о переходе.
     pending_notification: Option<NotificationRequest>, // Клик, ответ на который окно ещё ждёт.
     route_error: Option<NotificationRouteError>, // Ошибка текущей цели уведомления для показа в окне.
@@ -75,9 +78,28 @@ impl Shell {
             .filter(|catalog| catalog.generation == session.generation)
     }
 
+    /// Использует тот же резервный снимок папок, который доступен каталогу чатов.
+    pub(super) fn selected_activity_chats(&self) -> Option<&[Chat]> {
+        let session = self.selected().filter(|session| self.is_active(session))?;
+        session.catalog_chats(
+            self.selected_catalog(),
+            self.folders.get(&session.owner).map(Arc::as_ref),
+        )
+    }
+
     /// Возвращает адрес открытой истории для проверки поздних ответов.
     pub fn conversation(&self) -> Option<&ConversationAddress> {
         self.conversation.as_ref()
+    }
+
+    /// Возвращает точный черновик открытого разговора для истории переходов.
+    pub(super) fn conversation_draft(&self) -> Option<Uuid> {
+        self.conversation_draft
+    }
+
+    /// Возвращает адрес страницы «Моей активности» в рабочей области.
+    pub(super) fn activity(&self) -> Option<&ActivityAddress> {
+        self.activity.as_ref()
     }
 
     /// Возвращает безопасную категорию ошибки цели уведомления для перевода в окне.
@@ -94,6 +116,9 @@ impl Shell {
             }
             ShellAction::Sidebar(SidebarAction::OpenCreatedTopic { session, stream_id, topic }) => {
                 self.open_created_topic(&session, stream_id, topic)
+            }
+            ShellAction::Sidebar(SidebarAction::OpenActivity { page, session }) => {
+                self.open_activity(page, session)
             }
             ShellAction::Sidebar(SidebarAction::RetryCatalog(session)) => {
                 (self.selected() == Some(&session) && self.is_active(&session))
@@ -189,12 +214,14 @@ impl Shell {
             // Ответ завершённого входа не должен показывать ошибку поверх нового входа.
             self.pending_notification = None;
         }
-        let invalid_conversation = self.conversation.is_some()
+        let invalid_page = (self.conversation.is_some() || self.activity.is_some())
             && self
                 .selected()
                 .is_none_or(|session| !self.is_active(session));
-        if (previous.is_some() && previous != self.selected) || invalid_conversation {
+        if (previous.is_some() && previous != self.selected) || invalid_page {
             self.begin_navigation();
+            self.activity = None;
+            self.conversation_draft = None;
             return self
                 .conversation
                 .take()
@@ -218,6 +245,8 @@ impl Shell {
             return None;
         }
         self.selected = Some(session);
+        self.activity = None;
+        self.conversation_draft = None;
         log::debug!(
             "gpui_shell op_id={} event=account_selected",
             self.revision.0
@@ -252,16 +281,175 @@ impl Shell {
         Some(self.open_conversation(route, generation))
     }
 
+    /// Открывает раздел активности только для выбранного действующего входа.
+    fn open_activity(
+        &mut self,
+        page: ActivityPage,
+        session: AccountSession,
+    ) -> Option<ShellEffect> {
+        if self.selected() != Some(&session) || !self.is_active(&session) {
+            return None;
+        }
+        if self
+            .activity()
+            .is_some_and(|address| address.page == page && address.revision == self.revision)
+            && self.pending_notification.is_none()
+        {
+            return None;
+        }
+        self.begin_navigation();
+        self.activity = Some(ActivityAddress {
+            page,
+            session,
+            revision: self.revision,
+        });
+        self.conversation_draft = None;
+        log::debug!(
+            "gpui_shell op_id={} event=activity_opened page={page:?}",
+            self.revision.0
+        );
+        self.conversation
+            .take()
+            .map(|_| ShellEffect::CloseConversation)
+    }
+
+    /// Открывает строку страницы, если её показ и цель в каталоге всё ещё актуальны.
+    pub(super) fn open_activity_target(
+        &mut self,
+        source: &ActivityAddress,
+        scope: HistoryScope,
+        entry: ChatEntry,
+    ) -> Option<ShellEffect> {
+        if self.activity() != Some(source) || !self.is_active(&source.session) {
+            return None;
+        }
+        let chats = source.session.catalog_chats(
+            self.selected_catalog(),
+            self.folders.get(&source.session.owner).map(Arc::as_ref),
+        )?;
+        if !catalog_contains(chats, scope) {
+            return None;
+        }
+        let route = ChatRoute {
+            owner: source.session.owner.clone(),
+            scope,
+            entry,
+        };
+        self.begin_navigation();
+        Some(self.open_conversation(route, source.session.generation))
+    }
+
+    /// Использует тот же переход из списка, сохраняя точный UUID черновика для редактора.
+    pub(super) fn open_activity_draft(
+        &mut self,
+        source: &ActivityAddress,
+        scope: HistoryScope,
+        draft_id: Uuid,
+    ) -> Option<ShellEffect> {
+        if source.page != ActivityPage::Drafts || draft_id.is_nil() {
+            return None;
+        }
+        let effect = self.open_activity_target(source, scope, ChatEntry::Latest)?;
+        Some(self.effect_with_draft(effect, Some(draft_id)))
+    }
+
+    /// Передаёт UUID редактору при открытии или восстановлении перехода из списка черновиков.
+    fn effect_with_draft(&mut self, effect: ShellEffect, draft: Option<Uuid>) -> ShellEffect {
+        match (effect, draft) {
+            (ShellEffect::OpenConversation(address), Some(id)) => {
+                self.conversation_draft = Some(id);
+                ShellEffect::OpenDraft(address, id)
+            }
+            (effect, _) => effect,
+        }
+    }
+
+    /// Использует проверенный сервером адрес карточки, даже пока каталог не загружен.
+    pub(super) fn open_activity_message(
+        &mut self,
+        source: &ActivityAddress,
+        message: &ActivityMessage,
+    ) -> Option<ShellEffect> {
+        if self.activity() != Some(source)
+            || self.selected() != Some(&source.session)
+            || !self.is_active(&source.session)
+            || !matches!(source.page, ActivityPage::Marked | ActivityPage::Mentions)
+            || message.id.is_nil()
+            || message.stream_id.is_nil()
+            || message.topic_id.is_nil()
+        {
+            return None;
+        }
+        let route = ChatRoute {
+            owner: source.session.owner.clone(),
+            scope: HistoryScope {
+                stream_id: message.stream_id,
+                topic_id: Some(message.topic_id),
+            },
+            entry: ChatEntry::Around(message.id),
+        };
+        self.begin_navigation();
+        Some(self.open_conversation(route, source.session.generation))
+    }
+
+    /// Проверяет поколение и намерение перед применением отложенного перехода.
+    pub(super) fn can_finish_activity(&self, source: &ActivityAddress) -> bool {
+        self.activity() == Some(source)
+            && self.selected() == Some(&source.session)
+            && self.is_active(&source.session)
+            && self.revision == source.revision
+    }
+
+    /// Открывает проверенный Core личный чат, в том числе до обновления каталога.
+    pub(super) fn open_favorites_target(
+        &mut self,
+        source: &ActivityAddress,
+        scope: HistoryScope,
+    ) -> Option<ShellEffect> {
+        if source.page != ActivityPage::Favorites
+            || !self.can_finish_activity(source)
+            || scope.stream_id.is_nil()
+            || scope.topic_id.is_some()
+        {
+            return None;
+        }
+        self.begin_navigation();
+        let effect = self.open_conversation(
+            ChatRoute {
+                owner: source.session.owner.clone(),
+                scope,
+                entry: ChatEntry::Latest,
+            },
+            source.session.generation,
+        );
+        self.activity = Some(ActivityAddress {
+            revision: self.revision,
+            ..source.clone()
+        });
+        Some(effect)
+    }
+
     /// Повторяет сохранённый переход, только если разговор ещё в каталоге текущего входа.
     pub(super) fn restore_navigation(
         &mut self,
         route: Option<&ChatRoute>,
+        activity: Option<ActivityPage>,
+        draft: Option<Uuid>,
     ) -> Result<Option<ShellEffect>, ()> {
         let selected = self
             .selected()
             .filter(|session| self.is_active(session))
             .ok_or(())?;
-        if self.conversation.as_ref().map(|address| &address.route) == route {
+        if let Some(page) = activity {
+            return Ok(self.open_activity(page, selected.clone()));
+        }
+        if (draft.is_some()
+            || self.activity.as_ref().is_none_or(|address| {
+                address.page == ActivityPage::Favorites && route.is_some()
+            }))
+            && self.conversation.as_ref().map(|address| &address.route) == route
+            && self.conversation_draft == draft
+        {
             return Ok(None);
         }
         let generation = selected.generation;
@@ -277,8 +465,13 @@ impl Shell {
             }
         }
         self.begin_navigation();
+        self.activity = None;
+        self.conversation_draft = None;
         Ok(match route {
-            Some(route) => Some(self.open_conversation(route.clone(), generation)),
+            Some(route) => {
+                let effect = self.open_conversation(route.clone(), generation);
+                Some(self.effect_with_draft(effect, draft))
+            }
             None => self
                 .conversation
                 .take()
@@ -294,6 +487,8 @@ impl Shell {
             return None;
         }
         self.begin_navigation();
+        self.activity = None;
+        self.conversation_draft = None;
         Some(self.open_conversation(ChatRoute {
             owner: session.owner.clone(),
             scope: HistoryScope { stream_id, topic_id: Some(topic_id) },
@@ -386,12 +581,41 @@ impl Shell {
             generation,
             revision: self.revision,
         };
+        self.activity = self
+            .favorites_session(&address)
+            .map(|session| ActivityAddress {
+                page: ActivityPage::Favorites,
+                session: session.clone(),
+                revision: address.revision,
+            });
+        self.conversation_draft = None;
         self.conversation = Some(address.clone());
         log::debug!(
             "gpui_shell op_id={} event=conversation_opened",
             self.revision.0
         );
         ShellEffect::OpenConversation(address)
+    }
+
+    /// Узнаёт чат с собой при открытии обычного маршрута из каталога или уведомления.
+    fn favorites_session(&self, address: &ConversationAddress) -> Option<&AccountSession> {
+        let session = self.selected()?;
+        if address.generation != session.generation || address.route.owner != session.owner {
+            return None;
+        }
+        let user = session.user_uuid()?;
+        let chats = session.catalog_chats(
+            self.selected_catalog(),
+            self.folders.get(&session.owner).map(Arc::as_ref),
+        )?;
+        chats
+            .iter()
+            .any(|chat| {
+                chat.id == address.route.scope.stream_id
+                    && chat.direct
+                    && chat.metadata.direct_peer_id == Some(user)
+            })
+            .then_some(session)
     }
 
     /// Меняет номер перехода, отменяя ожидаемый ответ на прежний клик.

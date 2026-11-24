@@ -5,7 +5,11 @@ use std::sync::Arc;
 use workspace_core::{
     bootstrap::ChatListStatus,
     context::OwnerContext,
-    messenger::catalog::{Chat, Topic},
+    messenger::{
+        activity::ActivityMessagePreview,
+        catalog::{Chat, Topic},
+    },
+    storage::HistoryTime,
     sync::HistoryRevocation,
 };
 
@@ -131,11 +135,180 @@ fn opens_and_restores_a_direct_topic_from_the_catalog() {
         Some(ShellEffect::OpenConversation(address)) if address.route == selected
     ));
     assert!(shell.handle_action(open(missing)).is_none());
-    shell.restore_navigation(None).unwrap();
+    shell.restore_navigation(None, None, None).unwrap();
     assert!(matches!(
-        shell.restore_navigation(Some(&selected)),
+        shell.restore_navigation(Some(&selected), None, None),
         Ok(Some(ShellEffect::OpenConversation(address))) if address.route == selected
     ));
+}
+
+/// Сохраняет оформление «Избранного» и точный адрес после возврата в тему чата с собой.
+#[test]
+fn self_chat_topic_keeps_favorites_presentation_and_route() {
+    let (mut shell, mut a, _) = setup();
+    let user = Uuid::from_u128(25);
+    a.session.owner.user_id = user.to_string();
+    let catalog = direct_catalog(&a.session, Some(user));
+    shell.handle_runtime(RuntimeEvent::Accounts(vec![a.clone()]));
+    shell.handle_runtime(RuntimeEvent::Catalog(HashMap::from([(
+        a.session.owner.clone(),
+        catalog,
+    )])));
+    let mut selected = route(&a.session, ChatEntry::Latest);
+    selected.scope.topic_id = Some(DIRECT_TOPIC);
+    shell.handle_action(ShellAction::Sidebar(SidebarAction::OpenChat {
+        route: selected.clone(),
+        generation: a.session.generation,
+    }));
+    assert!(matches!(shell.activity(), Some(address) if address.page == ActivityPage::Favorites));
+    assert!(matches!(
+        shell.restore_navigation(Some(&selected), None, None),
+        Ok(None)
+    ));
+    shell.restore_navigation(None, None, None).unwrap();
+    assert!(matches!(
+        shell.restore_navigation(Some(&selected), None, None),
+        Ok(Some(ShellEffect::OpenConversation(address))) if address.route == selected
+    ));
+    assert!(matches!(shell.activity(), Some(address) if address.page == ActivityPage::Favorites));
+}
+
+/// Открывает отмеченное сообщение в той теме личного чата, где оно находится.
+#[test]
+fn activity_message_opens_its_exact_direct_topic() {
+    let (mut shell, a, _) = setup();
+    shell.handle_action(ShellAction::Sidebar(SidebarAction::OpenActivity {
+        page: ActivityPage::Marked,
+        session: a.session.clone(),
+    }));
+    let page = shell.activity().unwrap().clone();
+    let message = ActivityMessage {
+        id: MESSAGE,
+        stream_id: STREAM,
+        topic_id: DIRECT_TOPIC,
+        author_id: Uuid::from_u128(24),
+        author_name: None,
+        created_at: HistoryTime::parse("2026-07-16T12:30:00Z").unwrap(),
+        preview: ActivityMessagePreview::Text("Сообщение".into()),
+        read: true,
+    };
+    let mut expected = route(&a.session, ChatEntry::Around(MESSAGE));
+    expected.scope.topic_id = Some(DIRECT_TOPIC);
+    assert!(matches!(
+        shell.open_activity_message(&page, &message),
+        Some(ShellEffect::OpenConversation(address)) if address.route == expected
+    ));
+}
+
+/// Закрывает историю при переходе во входящие и отклоняет строку из старого показа.
+#[test]
+fn activity_targets_follow_the_visible_account_and_navigation() {
+    let (mut shell, a, b) = setup();
+    let open = |page, session: &AccountSession| {
+        ShellAction::Sidebar(SidebarAction::OpenActivity {
+            page,
+            session: session.clone(),
+        })
+    };
+    let first = open_sidebar(&mut shell, &a.session);
+    assert!(matches!(
+        shell.handle_action(open(ActivityPage::Inbox, &a.session)),
+        Some(ShellEffect::CloseConversation)
+    ));
+    let inbox = shell.activity().unwrap().clone();
+    assert!(shell.conversation().is_none());
+    assert!(
+        shell
+            .handle_action(open(ActivityPage::Drafts, &b.session))
+            .is_none()
+    );
+    assert_eq!(shell.activity(), Some(&inbox));
+
+    shell.handle_action(ShellAction::SelectAccount(b.session.clone()));
+    shell.handle_action(open(ActivityPage::Inbox, &b.session));
+    assert!(
+        shell
+            .open_activity_target(&inbox, first.route.scope, ChatEntry::Latest)
+            .is_none()
+    );
+    let active = shell.activity().unwrap().clone();
+    let Some(ShellEffect::OpenConversation(new)) =
+        shell.open_activity_target(&active, first.route.scope, ChatEntry::Latest)
+    else {
+        panic!("Входящие текущего входа не открыли разговор");
+    };
+    assert_eq!(new.route.owner, b.session.owner);
+    assert_eq!(new.generation, b.session.generation);
+    assert!(shell.activity().is_none());
+    assert!(matches!(
+        shell.restore_navigation(None, Some(ActivityPage::Inbox), None),
+        Ok(Some(ShellEffect::CloseConversation))
+    ));
+    assert!(
+        shell
+            .activity()
+            .is_some_and(|route| route.page == ActivityPage::Inbox)
+    );
+}
+
+/// Позднее избранное не перехватывает новое намерение открыть уведомление.
+#[test]
+fn favorites_reply_cannot_override_new_navigation() {
+    let (mut shell, a, _) = setup();
+    shell.handle_action(ShellAction::Sidebar(SidebarAction::OpenActivity {
+        page: ActivityPage::Favorites,
+        session: a.session.clone(),
+    }));
+    let old = shell.activity().unwrap().clone();
+    shell.handle_action(ShellAction::NotificationClicked(click(&a.session)));
+    assert!(
+        shell
+            .open_favorites_target(&old, route(&a.session, ChatEntry::Latest).scope)
+            .is_none()
+    );
+
+    shell.handle_action(ShellAction::Sidebar(SidebarAction::OpenActivity {
+        page: ActivityPage::Favorites,
+        session: a.session.clone(),
+    }));
+    let new = shell.activity().unwrap().clone();
+    let scope = HistoryScope {
+        stream_id: Uuid::from_u128(22),
+        topic_id: None,
+    };
+    assert!(
+        matches!(shell.open_favorites_target(&new, scope), Some(ShellEffect::OpenConversation(address)) if address.route.scope == scope)
+    );
+    assert!(
+        shell
+            .activity()
+            .is_some_and(|address| address.page == ActivityPage::Favorites)
+    );
+}
+
+/// Возвращает именно выбранный черновик, когда пользователь идёт назад и затем вперёд.
+#[test]
+fn draft_route_preserves_exact_uuid_in_navigation_history() {
+    let (mut shell, a, _) = setup();
+    shell.handle_action(ShellAction::Sidebar(SidebarAction::OpenActivity {
+        page: ActivityPage::Drafts,
+        session: a.session.clone(),
+    }));
+    let page = shell.activity().unwrap().clone();
+    let draft = Uuid::from_u128(77);
+    let mut selected = route(&a.session, ChatEntry::Latest);
+    selected.scope.topic_id = Some(DIRECT_TOPIC);
+    assert!(
+        matches!(shell.open_activity_draft(&page, selected.scope, draft), Some(ShellEffect::OpenDraft(_, id)) if id == draft)
+    );
+    assert_eq!(shell.conversation_draft(), Some(draft));
+    shell
+        .restore_navigation(None, Some(ActivityPage::Drafts), None)
+        .unwrap();
+    assert_eq!(shell.conversation_draft(), None);
+    assert!(
+        matches!(shell.restore_navigation(Some(&selected), None, Some(draft)), Ok(Some(ShellEffect::OpenDraft(address, id))) if address.route == selected && id == draft)
+    );
 }
 
 /// При открытии темы оболочка использует тот же актуальный снимок, что и сайдбар.

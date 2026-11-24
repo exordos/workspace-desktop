@@ -39,6 +39,7 @@ use super::{
     },
 };
 
+mod activity;
 mod catalog_actions;
 mod folder_dialog;
 mod folder_menu;
@@ -50,6 +51,7 @@ mod protected_previews;
 mod rows;
 mod search;
 
+pub(super) use activity::ActivityNavigation;
 use folder_dialog::FolderDialog;
 use folder_menu::{RowAction, RowActions};
 use folder_rail::FolderRail;
@@ -75,6 +77,7 @@ pub struct Sidebar {
     #[cfg(all(test, feature = "gpui-test"))]
     renders: usize, // Вызовы настоящего Render в проверках изоляции GPUI.
     folders: FolderPane,    // Подписки, панель и форма управления папками.
+    activity: Option<ActivityNavigation>, // Видимый маршрут и счётчики блока активности.
 }
 
 /// Состояние, которое можно вернуть при повторном выборе того же входа.
@@ -341,6 +344,7 @@ impl Sidebar {
             folders: FolderPane::new(cx),
             #[cfg(all(test, feature = "gpui-test"))]
             renders: 0,
+            activity: None,
         }
     }
 
@@ -1329,6 +1333,13 @@ impl Render for Sidebar {
         let language = settings.language;
         let user = active.session.user_uuid();
         active.presentation.set_titles(language, user);
+        let activity = if searching {
+            None
+        } else {
+            self.activity.as_ref().map(|navigation| {
+                activity::render(navigation, &active.session, settings, palette, cx)
+            })
+        };
         if active.presentation.set_sort(sort) {
             active.revision = active.revision.wrapping_add(1);
             active.menu = None;
@@ -1375,8 +1386,18 @@ impl Render for Sidebar {
             .debug_selector(|| "catalog-scroll".into());
         let mut results = Vec::new();
         let mut peers = Vec::new();
+        let has_activity = activity.is_some();
+        if let Some(activity) = activity {
+            rows = rows.child(activity);
+            peers.push(None);
+        }
         for notice in [folder_notice, catalog_notice].into_iter().flatten() {
-            panel = panel.child(notice);
+            if has_activity {
+                rows = rows.child(notice);
+                peers.push(None);
+            } else {
+                panel = panel.child(notice);
+            }
         }
         let mut found = false;
         let mut heading = None;
@@ -1429,7 +1450,12 @@ impl Render for Sidebar {
             };
             let empty =
                 catalog_status(palette, message, None).debug_selector(|| "catalog-empty".into());
-            panel = panel.child(empty);
+            if has_activity {
+                rows = rows.child(empty);
+                peers.push(None);
+            } else {
+                panel = panel.child(empty);
+            }
         }
         Self::restore_focus(active, &results, window, cx);
         if searching {
