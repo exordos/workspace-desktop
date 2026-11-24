@@ -90,7 +90,7 @@ use super::{
     runtime::RuntimeClient,
     ui::{
         Button, ButtonAppearance, ConversationNotice, Icon, PANEL_RADIUS, Palette, SURFACE_RADIUS,
-        TextRole, label, popup::tooltip,
+        TextRole, animation::Motion, label, popup::tooltip,
     },
 };
 
@@ -1340,8 +1340,8 @@ impl Conversation {
     }
 
     /// Показывает фоновый запрос поверх списка, сохраняя прокрутку и действия над строками.
-    fn render_background_loading(palette: Palette, locale: Language) -> gpui::Div {
-        use gpui::{Animation, AnimationExt, bounce, ease_in_out};
+    fn render_background_loading(palette: Palette, locale: Language, motion: Motion) -> gpui::Div {
+        use gpui::{Animation, bounce, ease_in_out};
         use std::time::Duration;
 
         let marks = div()
@@ -1352,14 +1352,18 @@ impl Conversation {
                     .size(px(3.))
                     .rounded_full()
                     .bg(palette.accent.opacity(opacity))
-            }))
-            .with_animation(
-                "history-background-loading-marks",
+            }));
+        let marks = motion.animate(
+            marks,
+            "history-background-loading-marks",
+            1.,
+            || {
                 Animation::new(Duration::from_secs(1))
                     .repeat()
-                    .with_easing(bounce(ease_in_out)),
-                |marks, progress| marks.opacity(0.55 + progress * 0.45),
-            );
+                    .with_easing(bounce(ease_in_out))
+            },
+            |marks, progress| marks.opacity(0.55 + progress * 0.45),
+        );
 
         // У плашки нет фокуса и обработчиков ввода. Прокрутка проходит в список под ней.
         div()
@@ -1747,7 +1751,9 @@ impl Conversation {
                         }))
                         .child(self.history_frame(palette, viewport, cx))
                         .when(background_loading, |history| {
-                            history.child(Self::render_background_loading(palette, locale))
+                            let motion =
+                                Motion::from_preference(Preferences::animations_enabled(cx));
+                            history.child(Self::render_background_loading(palette, locale, motion))
                         })
                         .children(problem.map(|problem| {
                             div()

@@ -1074,6 +1074,18 @@ fn cached_tail_refreshes_and_deduplicates_outbox(cx: &mut TestAppContext) {
         .debug_bounds("history-background-loading")
         .expect("Кэш уже виден, сверка ещё идёт");
     let frame = ui.debug_bounds("conversation-history-focus").unwrap();
+    ui.update(|_, app| {
+        assert!(Preferences::animations_enabled(app));
+        Preferences::set_animations_enabled(app, false).unwrap();
+    });
+    ui.run_until_parked();
+    assert!(!ui.read(|app| Preferences::animations_enabled(app)));
+    assert_eq!(
+        ui.debug_bounds("history-background-loading"),
+        Some(loading),
+        "При выключении анимаций плашка сохраняет своё место до ответа"
+    );
+    assert_eq!(ui.debug_bounds("conversation-history-focus"), Some(frame));
     let at_tail = ui.read(|app| view.read(app).viewport.at_tail());
     assert!(at_tail);
     ui.simulate_event(ScrollWheelEvent {
@@ -1108,7 +1120,10 @@ fn cached_tail_refreshes_and_deduplicates_outbox(cx: &mut TestAppContext) {
     assert_eq!(ui.debug_bounds("conversation-history-focus"), Some(frame));
     ui.read(|cx| {
         let view = view.read(cx);
-        assert!(!view.has_background_history_load());
+        assert!(
+            !view.has_background_history_load(),
+            "После ответа больше нет фоновой загрузки, которая показывает плашку"
+        );
         assert_eq!(
             view.viewport.list().item_count(),
             61,

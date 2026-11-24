@@ -11,7 +11,9 @@ use gpui::{
 use crate::{
     gpui_client::{
         preferences::Preferences,
-        ui::{Button, ButtonAppearance, Palette, TextRole, label, popup::tooltip},
+        ui::{
+            Button, ButtonAppearance, Palette, TextRole, animation::Motion, label, popup::tooltip,
+        },
     },
     platform::notifications::NotificationPermission,
 };
@@ -19,6 +21,9 @@ use crate::{
 const STRIP_HEIGHT: f32 = 8.;
 const CONTENT_HEIGHT: f32 = 94.;
 const SLIDE_TIME: Duration = Duration::from_millis(150);
+
+#[cfg(all(test, feature = "gpui-test"))]
+mod tests;
 
 /// Источник системного состояния и действия, которые запрашивает планка.
 #[derive(Clone, Copy)]
@@ -42,8 +47,8 @@ pub(super) struct NotificationBanner {
     mode: BannerMode,                   // Как долго планка остаётся раскрытой.
     hovered: bool,                      // Указатель находится над текущей видимой частью.
     hover_blocked: bool,                // После сворачивания ждём выхода указателя.
-    slide_from: f32,                    // Доля раскрытия в начале текущего перехода.
-    slide_started: Option<Instant>,     // Момент начала анимации, если планка уже переключалась.
+    slide_from: f32,                    // Доля раскрытия в начале движения или в покое.
+    slide_started: Option<Instant>,     // Начало движения. None — перехода нет.
     settings_failed: bool,              // Вместо описания показать ручной путь в настройки.
     group: FocusHandle,                 // Родитель фокуса полоски и кнопок.
     strip: FocusHandle,                 // Сюда возвращаем фокус после сворачивания.
@@ -99,18 +104,52 @@ impl NotificationBanner {
         self.slide_from + (Self::target(self.mode) - self.slide_from) * eased
     }
 
+    /// Проверяет общую настройку перед запуском движения и запросом кадров.
+    fn motion_allowed(app: &App) -> bool {
+        Motion::from_preference(Preferences::animations_enabled(app)).allows()
+    }
+
+    /// Запоминает конечное положение и сбрасывает время перехода.
+    fn finish_slide(&mut self, target: f32) -> f32 {
+        self.slide_from = target;
+        self.slide_started = None;
+        target
+    }
+
     /// Меняет режим и запускает движение из текущего положения.
     fn set_mode(&mut self, mode: BannerMode, cx: &mut Context<Self>) {
         if self.mode == mode {
             return;
         }
-        if Self::target(self.mode) != Self::target(mode) {
-            let now = cx.background_executor().now();
-            self.slide_from = self.progress(now);
-            self.slide_started = Some(now);
+        let target = Self::target(mode);
+        if Self::target(self.mode) != target {
+            if Self::motion_allowed(cx) {
+                let now = cx.background_executor().now();
+                self.slide_from = self.progress(now);
+                self.slide_started = (self.slide_from != target).then_some(now);
+            } else {
+                self.finish_slide(target);
+            }
         }
         self.mode = mode;
         cx.notify();
+    }
+
+    /// Возвращает видимую долю раскрытия и запрашивает кадр только во время движения.
+    fn slide_progress(&mut self, window: &Window, app: &App) -> f32 {
+        let target = Self::target(self.mode);
+        if !Self::motion_allowed(app) || self.slide_from == target {
+            return self.finish_slide(target);
+        }
+
+        // Если планку показывают впервые, у перехода ещё нет времени начала.
+        let now = app.background_executor().now();
+        let started = *self.slide_started.get_or_insert(now);
+        if now.saturating_duration_since(started) >= SLIDE_TIME {
+            return self.finish_slide(target);
+        }
+        window.request_animation_frame();
+        self.progress(now)
     }
 
     /// Обрабатывает новое наведение и закрывает предпросмотр при выходе.
@@ -262,12 +301,7 @@ impl NotificationBanner {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let now = cx.background_executor().now();
-        self.slide_started.get_or_insert(now);
-        let progress = self.progress(now);
-        if now.saturating_duration_since(self.slide_started.unwrap()) < SLIDE_TIME {
-            window.request_animation_frame();
-        }
+        let progress = self.slide_progress(window, cx);
         if self.focus_out.is_none() {
             self.focus_out = Some(cx.on_focus_out(&self.group, window, |banner, _, _, cx| {
                 if banner.mode == BannerMode::Preview && !banner.hovered {
@@ -346,6 +380,9 @@ impl Render for NotificationBanner {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (permission, requesting) = (self.actions.status)(cx);
         let visible = permission.filter(|value| *value != NotificationPermission::Enabled);
+        if visible.is_none() && self.slide_started.is_some() {
+            self.finish_slide(Self::target(self.mode));
+        }
         if visible.is_none()
             && (self.group.contains_focused(window, cx) || self.primary.is_focused(window))
         {
