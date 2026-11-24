@@ -53,6 +53,8 @@ declare_class!(
 pub struct Tray {
     bar: Retained<NSObject>,       // Системная строка меню.
     item: Retained<NSObject>,      // Значок, который нужно убрать при выходе.
+    show: Retained<NSObject>,      // Строка возврата окна, её подпись меняется при выборе языка.
+    quit: Retained<NSObject>,      // Строка выхода с обновляемой подписью.
     _target: Retained<MenuTarget>, // AppKit хранит слабую ссылку на получателя.
 }
 
@@ -61,6 +63,8 @@ impl Tray {
     pub fn install(
         _main_thread: MainThreadMarker,
         commands: UnboundedSender<Command>,
+        show_label: &str,
+        quit_label: &str,
     ) -> Option<Self> {
         // Все обращения к AppKit выполняются на главном потоке.
         unsafe {
@@ -77,10 +81,10 @@ impl Tray {
             let target: Retained<MenuTarget> =
                 msg_send_id![super(MenuTarget::alloc().set_ivars(commands)), init];
             let menu: Retained<NSObject> = msg_send_id![class!(NSMenu), new];
-            for (title, action) in [
-                ("Показать окно", sel!(workspaceShow:)),
-                ("Выход", sel!(workspaceQuit:)),
-            ] {
+            let [show, quit] = [
+                (show_label, sel!(workspaceShow:)),
+                (quit_label, sel!(workspaceQuit:)),
+            ].map(|(title, action)| {
                 let menu_item: Allocated<NSObject> = msg_send_id![class!(NSMenuItem), alloc];
                 let menu_item: Retained<NSObject> = msg_send_id![menu_item,
                     initWithTitle: &*NSString::from_str(title),
@@ -89,13 +93,24 @@ impl Tray {
                 ];
                 let _: () = msg_send![&menu_item, setTarget: &*target];
                 let _: () = msg_send![&menu, addItem: &*menu_item];
-            }
+                menu_item
+            });
             let _: () = msg_send![&item, setMenu: &*menu];
             Some(Self {
                 bar,
                 item,
+                show,
+                quit,
                 _target: target,
             })
+        }
+    }
+
+    /// Меняет только подписи, оставляя системный значок и команды на месте.
+    pub fn set_labels(&self, _main_thread: MainThreadMarker, show: &str, quit: &str) {
+        unsafe {
+            let _: () = msg_send![&self.show, setTitle: &*NSString::from_str(show)];
+            let _: () = msg_send![&self.quit, setTitle: &*NSString::from_str(quit)];
         }
     }
 }

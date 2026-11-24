@@ -2,6 +2,8 @@
 
 #[cfg(feature = "gpui-test")]
 mod gpui_tests {
+    use std::{cell::RefCell, rc::Rc};
+
     use gpui::{AppContext, Context, Render, TestAppContext, Window, div};
     use uuid::Uuid;
     use workspace_core::{
@@ -11,12 +13,13 @@ mod gpui_tests {
         storage::HistoryScope,
     };
 
-    use super::super::{NotificationClick, apply_click};
+    use super::super::{NotificationClick, apply_click, bind_menu_labels, notification_text};
     use crate::gpui_client::{
         contracts::{
             AccountSession, AccountSnapshot, ChatEntry, ChatRoute, NotificationReply, RuntimeEvent,
             ShellAction,
         },
+        preferences::{Language, Preferences},
         shell::{Shell, ShellEffect},
     };
 
@@ -48,6 +51,56 @@ mod gpui_tests {
             status: SessionStatus::Active,
             unread: None,
         }
+    }
+
+    /// Язык заголовка и подписи берётся у фонового аккаунта, для которого пришло сообщение.
+    #[gpui::test]
+    fn notification_text_uses_its_owner_language(cx: &mut TestAppContext) {
+        let visible = account("visible", 1).session.owner;
+        let background = account("background", 2).session.owner;
+        cx.update(|app| {
+            Preferences::select(app, Some(&background));
+            Preferences::update(app, |settings| settings.language = Language::En).unwrap();
+            Preferences::select(app, Some(&visible));
+
+            assert_eq!(Preferences::read(app).language, Language::Ru);
+            assert_eq!(
+                notification_text(app, &background, "Workspace B"),
+                ("New message", "Account Workspace B".to_owned())
+            );
+            assert_eq!(
+                notification_text(app, &visible, "Workspace A"),
+                ("Новое сообщение", "Аккаунт Workspace A".to_owned())
+            );
+        });
+    }
+
+    /// Подписи меню меняются при выборе языка и при переходе между двумя входами.
+    #[gpui::test]
+    fn menu_labels_follow_preferences_and_account_switch(cx: &mut TestAppContext) {
+        let first = account("first", 1).session.owner;
+        let second = account("second", 2).session.owner;
+        let updates = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|app| {
+            Preferences::select(app, Some(&first));
+            let updates = updates.clone();
+            bind_menu_labels(app, move |_, show, quit| {
+                updates.borrow_mut().push((show, quit))
+            });
+        });
+        cx.update(|app| Preferences::select(app, Some(&second)));
+        cx.update(|app| Preferences::update(app, |value| value.language = Language::En).unwrap());
+        cx.update(|app| Preferences::select(app, Some(&first)));
+        cx.update(|app| Preferences::select(app, Some(&second)));
+        assert_eq!(
+            updates.borrow().as_slice(),
+            &[
+                ("Показать окно", "Выход"),
+                ("Show window", "Quit"),
+                ("Показать окно", "Выход"),
+                ("Show window", "Quit"),
+            ]
+        );
     }
 
     /// Клик по цели из системного адаптера открывает проверенное сообщение B при выбранном A.

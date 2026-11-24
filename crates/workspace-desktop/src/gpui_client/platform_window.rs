@@ -12,9 +12,13 @@ use gpui::{
     AnyWindowHandle, App, AppContext, Entity, Global, KeyBinding, Menu, MenuItem, Subscription,
     Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, px, size,
 };
-use workspace_core::context::AccountId;
+use workspace_core::context::{AccountId, OwnerContext};
 
-use super::{contracts::RuntimeExit, runtime::RuntimeClient};
+use super::{
+    contracts::RuntimeExit,
+    preferences::{Language, NotificationSound, Preferences},
+    runtime::RuntimeClient,
+};
 use crate::platform::{
     notifications::{NotificationClick, NotificationError, NotificationPermission, Notifications},
     tray::{Command, Tray},
@@ -36,7 +40,7 @@ pub struct WindowPlatform {
     permission_read: u64,    // Номер последнего чтения, чтобы отсеять поздние ответы.
     requesting_permission: bool, // Системный запрос занимает кнопку до чтения нового статуса.
     quitting: bool,          // Идёт завершение, повторные действия отбрасываются.
-    _tray: Option<Tray>,     // Меню Workspace живёт вместе с оконным циклом.
+    tray: Option<Tray>,      // Меню Workspace живёт вместе с оконным циклом.
     _wake: WakeObserver,     // Передаёт пробуждение macOS фоновой работе.
     _bounds: Entity<SizeObserver>, // Подписка на размеры главного окна.
     size_writer: Option<SizeWriter>, // Ждёт последнюю запись при выходе.
@@ -86,8 +90,10 @@ impl WindowPlatform {
             native.is_some()
         );
         let (commands, mut menu) = mpsc::unbounded();
+        let language = Preferences::read(app).language;
+        let (show, quit) = menu_labels(language);
         let tray = if std::env::var_os("WORKSPACE_DESKTOP_DISABLE_TRAY").is_none() {
-            Tray::install(main_thread, commands)
+            Tray::install(main_thread, commands, show, quit)
         } else {
             None
         };
@@ -155,7 +161,7 @@ impl WindowPlatform {
             permission_read: 0,
             requesting_permission: false,
             quitting: false,
-            _tray: tray,
+            tray,
             _wake: wake,
             _bounds: bounds,
             size_writer: Some(size_writer),
@@ -165,10 +171,14 @@ impl WindowPlatform {
         });
         app.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         app.on_action(|_: &Quit, app| Self::request_quit(app));
-        app.set_menus(vec![Menu {
-            name: "Workspace Desktop".into(),
-            items: vec![MenuItem::action("Выход", Quit)],
-        }]);
+        bind_menu_labels(app, |app, show, quit| {
+            set_app_menu(app, quit);
+            if let Some(tray) = app.try_global::<Self>().and_then(|platform| platform.tray.as_ref())
+                && let Some(main_thread) = macos::main_thread()
+            {
+                tray.set_labels(main_thread, show, quit);
+            }
+        });
 
         Self::refresh_notification_permission(app);
         Ok(())
@@ -285,10 +295,8 @@ impl WindowPlatform {
             return;
         };
         let target = &click.target;
-        let settings = super::preferences::Preferences::read_for(app, &target.context);
-        let title = settings.language.text("Новое сообщение", "New message");
-        let body_label = settings.language.text("Аккаунт", "Account");
-        if settings.notification_sound != super::preferences::NotificationSound::None {
+        let settings = Preferences::read_for(app, &target.context);
+        if settings.notification_sound != NotificationSound::None {
             super::notification_audio::preview(settings.notification_sound);
         }
         if settings.dock_bounce {
@@ -300,7 +308,7 @@ impl WindowPlatform {
             account, target.context.project_id, target.message_id
         );
         let label = label.unwrap_or_else(|| account.get(..8).unwrap_or(account));
-        let body = format!("{body_label} {label}");
+        let (title, body) = notification_text(app, &target.context, label);
         let delivery = platform
             .notifications
             .show(&id, title, &body, target, click.generation);
@@ -371,6 +379,44 @@ impl WindowPlatform {
             NotificationError::System(_) => "system_error",
         }
     }
+}
+
+/// Получает тексты системных команд по языку выбранного входа.
+fn menu_labels(language: Language) -> (&'static str, &'static str) {
+    (language.tr("desktop.menu.showWindow"), language.tr("desktop.menu.quit"))
+}
+
+/// Передаёт подписи при первом запуске и при смене языка выбранного входа.
+fn bind_menu_labels(app: &mut App, mut update: impl FnMut(&mut App, &'static str, &'static str) + 'static) {
+    let mut previous = Preferences::read(app).language;
+    let (show, quit) = menu_labels(previous);
+    update(app, show, quit);
+    app.observe_global::<Preferences>(move |app| {
+        let current = Preferences::read(app).language;
+        if current == previous {
+            return;
+        }
+        previous = current;
+        let (show, quit) = menu_labels(current);
+        update(app, show, quit);
+    }).detach();
+}
+
+/// Заменяет главное меню GPUI, сохраняя системное действие закрытия приложения.
+fn set_app_menu(app: &mut App, quit: &'static str) {
+    app.set_menus(vec![Menu {
+        name: "Workspace Desktop".into(),
+        items: vec![MenuItem::action(quit, Quit)],
+    }]);
+}
+
+/// Готовит подписи по языку владельца уведомления, даже если в окне открыт другой аккаунт.
+fn notification_text(app: &App, owner: &OwnerContext, label: &str) -> (&'static str, String) {
+    let language = Preferences::read_for(app, owner).language;
+    (
+        language.tr("notifications.newMessage"),
+        language.tr_with("desktop.notifications.accountLabel", &[("account", label)]),
+    )
 }
 
 /// Возвращает окно из Dock и активирует его текущий экран.
