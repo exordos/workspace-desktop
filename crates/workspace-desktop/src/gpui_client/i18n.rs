@@ -29,7 +29,7 @@ static MISSING_KEYS: LazyLock<Mutex<HashSet<(&'static str, &'static str)>>> =
 /// Код языка из встраиваемого каталога. В профиле сохраняется обычной строкой.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
-pub(super) struct Language(&'static str); // Код локали BCP 47, например ru или pt-BR.
+pub struct Language(&'static str); // Код локали BCP 47, например ru или pt-BR.
 
 impl Language {
     /// Язык по умолчанию и запасной каталог для неполных переводов.

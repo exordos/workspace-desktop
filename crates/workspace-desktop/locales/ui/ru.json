@@ -1,0 +1,37 @@
+{
+  "datePicker": {
+    "label": "Дата",
+    "previous": "Предыдущий месяц",
+    "next": "Следующий месяц",
+    "monthYear": "%{month} %{year}",
+    "selected": "%{day} · %{monthYear}",
+    "january": "Январь",
+    "february": "Февраль",
+    "march": "Март",
+    "april": "Апрель",
+    "may": "Май",
+    "june": "Июнь",
+    "july": "Июль",
+    "august": "Август",
+    "september": "Сентябрь",
+    "october": "Октябрь",
+    "november": "Ноябрь",
+    "december": "Декабрь",
+    "mon": "пн",
+    "tue": "вт",
+    "wed": "ср",
+    "thu": "чт",
+    "fri": "пт",
+    "sat": "сб",
+    "sun": "вс"
+  },
+  "timePicker": {
+    "label": "Время",
+    "hours": "Часы",
+    "minutes": "Минуты",
+    "seconds": "Секунды"
+  },
+  "dateTimePicker": {
+    "label": "Дата и время"
+  }
+}

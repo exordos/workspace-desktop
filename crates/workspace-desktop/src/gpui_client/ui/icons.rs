@@ -95,6 +95,7 @@ workspace_icons! {
     Check => ("check.svg", "Сервер принял сообщение."),
     BusinessCenter => ("business_center.svg", "Команда или должность."),
     Calendar => ("calendar.svg", "Календарь или дата в профиле."),
+    CalendarNext => ("calendar-next.svg", "Переход между месяцами календаря."),
     Celebration => ("celebration.svg", "День рождения."),
     Chat => ("chat_bubble_outline.svg", "Мессенджер или личный разговор."),
     ChatLock => ("chat_lock.svg", "Защищённый канал в шапке разговора."),

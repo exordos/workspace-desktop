@@ -20,6 +20,8 @@ mod sign_in;
 mod test_profile;
 pub mod ui;
 
+pub use i18n::Language;
+
 use std::{cell::Cell, collections::HashMap, io, path::PathBuf, rc::Rc};
 
 use gpui::{App, AppContext, Application, KeyBinding, Window, actions};

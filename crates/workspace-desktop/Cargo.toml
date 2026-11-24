@@ -18,6 +18,7 @@ workspace-core = { path = "../workspace-core" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 base64 = { version = "0.22", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["std"], optional = true }
 gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "runtime_shaders"], optional = true }
 icu_locale_core = { version = "2.4", optional = true }
 icu_plurals = { version = "2.4", optional = true }
@@ -34,7 +35,7 @@ zeroize = { version = "1", optional = true }
 [features]
 default = ["gpui"]
 macos-adapters = ["dep:block2", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:objc2-user-notifications"]
-gpui = ["dep:base64", "dep:gpui", "dep:icu_locale_core", "dep:icu_plurals", "dep:image", "dep:rust-i18n", "dep:unicode-segmentation", "dep:zeroize", "macos-adapters"]
+gpui = ["dep:base64", "dep:chrono", "dep:gpui", "dep:icu_locale_core", "dep:icu_plurals", "dep:image", "dep:rust-i18n", "dep:unicode-segmentation", "dep:zeroize", "macos-adapters"]
 gpui-test = ["gpui", "gpui/test-support"]
 
 [dev-dependencies]

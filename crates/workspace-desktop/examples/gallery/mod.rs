@@ -3,6 +3,7 @@
 mod conversation_notices;
 #[path = "../parity/new_chat_components.rs"]
 mod new_chat_components;
+mod pickers;
 mod quotes;
 
 use std::time::Duration;
@@ -36,11 +37,19 @@ struct Panel {
     selected: u8,                 // Номер выбранной строки каталога.
     draft: Entity<Editor>,        // Общий редактор с локальным черновиком.
     retrying_notice: bool,        // Пример плашки временно показывает повторную проверку.
+    pickers: pickers::Pickers,    // Календарь и часы со своим выбором в этой теме.
+    pickers_only: bool,           // Показывает только примеры календаря и часов.
 }
 
 impl Panel {
     /// Создаёт редактор и выбирает первую строку примера.
-    fn new(mode: ThemeMode, id: &'static str, cx: &mut Context<Self>) -> Self {
+    fn new(
+        mode: ThemeMode,
+        id: &'static str,
+        pickers_only: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             mode,
             id,
@@ -50,6 +59,8 @@ impl Panel {
             selected: 0,
             draft: cx.new(Editor::for_conversation),
             retrying_notice: false,
+            pickers: pickers::Pickers::new(Palette::for_mode(mode), window, cx),
+            pickers_only,
         }
     }
 
@@ -178,6 +189,7 @@ impl Panel {
                 label(palette, TextRole::Body, "Редактирование недоступно")
                     .text_color(palette.text_muted),
             ))
+            .child(self.pickers.render(palette, cx))
     }
 
     /// Рисует строки каталога с длинным кириллическим текстом, счётчиком и выбором.
@@ -227,20 +239,27 @@ impl Render for Panel {
     /// Оставляет редактор видимым при прокрутке примеров внутри панели.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::for_mode(self.mode).with_window_input(window, cx);
-        let appearance = if self.draft.focus_handle(cx).is_focused(window) {
-            FieldAppearance::Focused
-        } else {
-            FieldAppearance::Normal
-        };
-        let panel_id = self.id;
-        div()
+        let panel = div()
             .id(self.id)
             .flex()
             .flex_col()
             .flex_1()
             .min_w_0()
             .h_full()
-            .bg(palette.background)
+            .bg(palette.background);
+        if self.pickers_only {
+            return panel
+                .overflow_y_scroll()
+                .p_4()
+                .child(self.pickers.render(palette, cx));
+        }
+        let appearance = if self.draft.focus_handle(cx).is_focused(window) {
+            FieldAppearance::Focused
+        } else {
+            FieldAppearance::Normal
+        };
+        let panel_id = self.id;
+        panel
             .child(
                 div()
                     .id("examples")
@@ -278,10 +297,12 @@ struct Gallery {
 
 impl Gallery {
     /// Открывает обе палитры и ставит фокус в первый черновик.
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let light = cx.new(|cx| Panel::new(ThemeMode::Light, "light", cx));
-        let dark = cx.new(|cx| Panel::new(ThemeMode::Dark, "dark", cx));
-        window.focus(&light.read(cx).draft.focus_handle(cx));
+    fn new(pickers_only: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let light = cx.new(|cx| Panel::new(ThemeMode::Light, "light", pickers_only, window, cx));
+        let dark = cx.new(|cx| Panel::new(ThemeMode::Dark, "dark", pickers_only, window, cx));
+        if !pickers_only {
+            window.focus(&light.read(cx).draft.focus_handle(cx));
+        }
         let top_bar = cx.new(TopBar::new);
         top_bar.update(cx, |view, cx| view.set_accounts(demo_accounts("A"), cx));
         let selection = cx.subscribe(&top_bar, |_, bar, chosen: &TopBarSelection, cx| {
@@ -376,9 +397,12 @@ fn delivery(palette: Palette, body: &'static str, status: DeliveryMark) -> impl 
 
 /// Запускает галерею с общими ресурсами и системным вводом рабочего клиента.
 pub fn run() {
+    let pickers_only = std::env::args()
+        .skip(1)
+        .any(|argument| argument == "--pickers");
     Application::new()
         .with_assets(WorkspaceAssets)
-        .run(|app: &mut App| {
+        .run(move |app: &mut App| {
             Editor::bind_keys(app);
             app.bind_keys([
                 KeyBinding::new("tab", NextControl, None),
@@ -401,7 +425,7 @@ pub fn run() {
                     }),
                     ..Default::default()
                 },
-                |window, app| app.new(|cx| Gallery::new(window, cx)),
+                |window, app| app.new(|cx| Gallery::new(pickers_only, window, cx)),
             )
             .expect("Не удалось открыть галерею GPUI");
             app.activate(true);
@@ -417,7 +441,7 @@ mod tests {
     /// Выбирает строку мышью и проверяет изоляцию палитр и недоступную строку.
     #[gpui::test]
     fn catalog_selection_belongs_to_each_panel(cx: &mut TestAppContext) {
-        let (gallery, ui) = cx.add_window_view(Gallery::new);
+        let (gallery, ui) = cx.add_window_view(|window, cx| Gallery::new(false, window, cx));
         ui.simulate_resize(size(px(720.), px(680.)));
         ui.run_until_parked();
         let second = ui.debug_bounds("dark-chat-1").expect("строка тёмной темы");
@@ -438,7 +462,7 @@ mod tests {
     /// Проверяет отступы и ограничение длинного фрагмента над полем в узком окне.
     #[gpui::test]
     fn reply_preview_fits_above_editor_in_both_themes(cx: &mut TestAppContext) {
-        let (_, ui) = cx.add_window_view(Gallery::new);
+        let (_, ui) = cx.add_window_view(|window, cx| Gallery::new(false, window, cx));
         ui.simulate_resize(size(px(600.), px(680.)));
         ui.run_until_parked();
 
