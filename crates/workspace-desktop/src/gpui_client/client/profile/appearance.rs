@@ -1,8 +1,9 @@
-//! Вложенная панель «Внешний вид». Рисует пять раскрываемых секций и передаёт
-//! настройки локальному профилю или существующей панели папок.
+//! Панель «Внешний вид». Рисует раскрываемые секции и переключатель анимаций.
+//! Передаёт выбор локальному профилю или панели папок.
 
 use gpui::{
-    App, Context, Div, FontWeight, Render, Stateful, WeakEntity, Window, div, prelude::*, px, rgb,
+    App, Context, Div, FontWeight, Render, Stateful, Svg, WeakEntity, Window, div, prelude::*, px,
+    rgb,
 };
 
 use crate::gpui_client::{
@@ -13,7 +14,7 @@ use crate::gpui_client::{
     },
     right_panel::{PanelKey, RightPanel, Scope},
     sidebar::Sidebar,
-    ui::{Icon, Palette, TextRole, activate, label, popup::tooltip},
+    ui::{Icon, Palette, TextRole, activate, label, popup::tooltip, switch_indicator},
 };
 
 mod background;
@@ -67,7 +68,7 @@ impl Section {
     }
 }
 
-/// Конкретный выбор в открытой группе.
+/// Действие на странице внешнего вида.
 #[derive(Clone, Copy)]
 enum Change {
     Theme(ThemeChoice),    // Принудительный режим или следование ОС.
@@ -75,6 +76,7 @@ enum Change {
     Sort(SidebarSort),     // Правило порядка строк.
     Vertical(bool),        // Вертикальная панель папок, иначе горизонтальные вкладки.
     Density(ChatDensity),  // Плотность строк каталога.
+    Animations,            // Переключить анимации для локального профиля.
 }
 
 /// Живое содержимое страницы под общей шапкой стека.
@@ -137,24 +139,35 @@ impl Appearance {
         {
             return;
         }
-        if let Change::Vertical(vertical) = change {
-            let _ = self.sidebar.update(cx, |sidebar, cx| {
-                sidebar.set_folder_placement(&self.session, vertical, cx);
-            });
-            return;
-        }
-        let result = Preferences::update(cx, |settings| {
-            let appearance = &mut settings.appearance;
-            match change {
-                Change::Theme(value) => appearance.theme = value,
-                Change::Palette(value) => appearance.palette = value,
-                Change::Sort(value) => appearance.sort = value,
-                Change::Density(value) => appearance.density = value,
-                Change::Vertical(_) => unreachable!("расположение хранит панель папок"),
+        let result = match change {
+            Change::Vertical(vertical) => {
+                let _ = self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.set_folder_placement(&self.session, vertical, cx);
+                });
+                return;
             }
-        });
+            Change::Animations => {
+                let enabled = Preferences::animations_enabled(cx);
+                Preferences::set_animations_enabled(cx, !enabled)
+            }
+            change => {
+                let result = Preferences::update(cx, |settings| {
+                    let appearance = &mut settings.appearance;
+                    match change {
+                        Change::Theme(value) => appearance.theme = value,
+                        Change::Palette(value) => appearance.palette = value,
+                        Change::Sort(value) => appearance.sort = value,
+                        Change::Density(value) => appearance.density = value,
+                        Change::Vertical(_) | Change::Animations => {
+                            unreachable!("выбор сохраняется отдельно от настроек аккаунта")
+                        }
+                    }
+                });
+                window.refresh();
+                result
+            }
+        };
         self.error = result.is_err();
-        window.refresh();
         cx.notify();
     }
 
@@ -182,51 +195,46 @@ impl Appearance {
         } else {
             Icon::ChevronRight
         };
-        let trigger = format!("right-panel-appearance-{id}-trigger");
         let view = cx.weak_entity();
         let icon_color = match section {
             Section::Sorting => rgb(0x707070).into(),
             _ => palette.text_secondary,
         };
-        let row = div()
-            .id(gpui::SharedString::from(trigger.clone()))
-            .debug_selector(move || trigger.clone())
-            .relative()
-            .w_full()
-            .min_h(px(44.))
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_2()
-            .hover(|style| style.bg(palette.card_hover))
-            .child(
-                div()
-                    .size(px(32.))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(icon.element(px(22.), icon_color)),
-            )
-            .child(label(palette, TextRole::Body, name).flex_1().min_w_0())
-            .child(arrow.element(px(16.), palette.text))
-            .when(index != 0, |row| {
-                row.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_2()
-                        .right_2()
-                        .h(px(1.))
-                        .bg(palette.border),
-                )
-            });
-        activate(row, None, palette, move |_, app| {
-            let _ = view.update(app, |view, cx| view.toggle(section, cx));
-        })
-        .when(palette.keyboard_focus_visible(), |row| {
-            row.focus(|row| row.bg(palette.card_hover))
-        })
+        appearance_row(
+            format!("right-panel-appearance-{id}-trigger"),
+            name,
+            icon.element(px(22.), icon_color),
+            arrow.element(px(16.), palette.text),
+            index != 0,
+            palette,
+            move |_, app| {
+                let _ = view.update(app, |view, cx| view.toggle(section, cx));
+            },
+        )
+    }
+
+    /// Показывает общий выбор и передаёт нажатие в настройки локального профиля.
+    fn animations_switch(
+        palette: Palette,
+        language: Language,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let enabled = Preferences::animations_enabled(cx);
+        appearance_row(
+            "right-panel-appearance-animations".into(),
+            language.tr("desktop.appearance.interfaceAnimations"),
+            Icon::DesktopWindows.element(px(22.), palette.text_secondary),
+            switch_indicator(palette, enabled).debug_selector(move || {
+                if enabled {
+                    "right-panel-appearance-animations-on".into()
+                } else {
+                    "right-panel-appearance-animations-off".into()
+                }
+            }),
+            true,
+            palette,
+            Self::select(cx, Change::Animations),
+        )
     }
 
     /// Рисует рамку раскрытой секции и её вкладки или список выбранных значений.
@@ -350,6 +358,7 @@ impl Render for Appearance {
                 sections = sections.child(self.options(section, palette, language, cx));
             }
         }
+        let sections = sections.child(Self::animations_switch(palette, language, cx));
         div()
             .id("profile-appearance-page")
             .debug_selector(|| "profile-appearance-page".into())
@@ -380,6 +389,54 @@ impl Render for Appearance {
                     }),
             )
     }
+}
+
+/// Рисует строку внешнего вида с общим разделителем, наведением и фокусом.
+fn appearance_row(
+    id: String,
+    title: &'static str,
+    icon: Svg,
+    control: impl IntoElement,
+    separator: bool,
+    palette: Palette,
+    on_activate: impl Fn(&mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let row = div()
+        .id(gpui::SharedString::from(id.clone()))
+        .debug_selector(move || id.clone())
+        .relative()
+        .w_full()
+        .min_h(px(44.))
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .hover(|style| style.bg(palette.card_hover))
+        .child(
+            div()
+                .size(px(32.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon),
+        )
+        .child(label(palette, TextRole::Body, title).flex_1().min_w_0())
+        .child(control)
+        .when(separator, |row| {
+            row.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_2()
+                    .right_2()
+                    .h(px(1.))
+                    .bg(palette.border),
+            )
+        });
+    activate(row, None, palette, on_activate).when(palette.keyboard_focus_visible(), |row| {
+        row.focus(|row| row.bg(palette.card_hover))
+    })
 }
 
 /// Рисует вариант списка с тонким разделителем и галочкой у выбранного значения.

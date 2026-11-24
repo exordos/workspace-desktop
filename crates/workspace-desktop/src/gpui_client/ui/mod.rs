@@ -1,6 +1,7 @@
 //! Общие примитивы клиента GPUI. Здесь находятся тема, иконки, элементы управления
 //! и представление чатов. Компоненты получают данные и действия от экрана.
 
+pub mod animation;
 mod content;
 mod controls;
 mod conversation_notice;
@@ -26,7 +27,9 @@ pub use content::{
 };
 pub(in crate::gpui_client) use content::{calendar_date_label, profile_joined_date};
 pub use controls::{Button, ButtonAppearance, FieldAppearance, field};
-pub(in crate::gpui_client) use controls::{activate, rounded_surface_corners, sidebar_item};
+pub(in crate::gpui_client) use controls::{
+    activate, rounded_surface_corners, sidebar_item, switch_indicator,
+};
 pub use conversation_notice::ConversationNotice;
 pub use date_time::{
     DatePicker, DatePickerChanged, DateTimePicker, DateTimePickerChanged, PickerMode,

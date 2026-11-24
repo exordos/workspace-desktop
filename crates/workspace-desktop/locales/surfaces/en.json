@@ -50,6 +50,7 @@
       "updatesUnavailable": "Update checks are unavailable in this build"
     },
     "appearance": {
+      "interfaceAnimations": "Interface animations",
       "paletteBlueCold": "Blue Cold",
       "paletteBlueMist": "Blue Mist",
       "paletteEmerald": "Emerald Chat",

@@ -50,6 +50,7 @@
       "updatesUnavailable": "Проверка обновлений недоступна в этой сборке"
     },
     "appearance": {
+      "interfaceAnimations": "Анимации интерфейса",
       "paletteBlueCold": "Холодный синий",
       "paletteBlueMist": "Дымчатый синий",
       "paletteEmerald": "Изумрудный",

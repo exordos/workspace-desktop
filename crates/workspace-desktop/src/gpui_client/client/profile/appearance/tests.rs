@@ -1,4 +1,4 @@
-//! Проверяет настройку темы, папок и фона из штатного профиля рабочего окна.
+//! Проверяет настройку анимаций, темы, папок и фона из профиля рабочего окна.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -21,7 +21,7 @@ use crate::gpui_client::{
 
 use super::*;
 
-/// Открывает раскрытия и диалог из рабочего окна и восстанавливает сохранённый результат.
+/// Меняет внешний вид из рабочего окна и восстанавливает сохранённый результат.
 #[gpui::test]
 fn appearance_changes_live_window_and_persists_background(cx: &mut TestAppContext) {
     let directory = tempfile::tempdir().unwrap();
@@ -94,6 +94,22 @@ fn appearance_changes_live_window_and_persists_background(cx: &mut TestAppContex
     };
     click(ui, "workspace-profile-trigger");
     click(ui, "profile-appearance");
+    let animations = "right-panel-appearance-animations";
+    let animations_on = "right-panel-appearance-animations-on";
+    let animations_off = "right-panel-appearance-animations-off";
+    assert!(ui.debug_bounds(animations_on).is_some());
+    click(ui, animations);
+    assert!(ui.debug_bounds(animations_off).is_some());
+    assert!(!ui.read(Preferences::animations_enabled));
+    ui.simulate_keystrokes("enter");
+    ui.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("enter").unwrap(),
+    });
+    ui.run_until_parked();
+    assert!(ui.read(Preferences::animations_enabled));
+    click(ui, animations);
+    assert!(!ui.read(Preferences::animations_enabled));
+
     click(ui, "right-panel-appearance-theme-trigger");
     let theme = ui
         .debug_bounds("right-panel-appearance-theme-options")
@@ -157,6 +173,7 @@ fn appearance_changes_live_window_and_persists_background(cx: &mut TestAppContex
     ui.update(|_, app| {
         Preferences::install(directory.path(), app);
         Preferences::select(app, Some(&owner));
+        assert!(!Preferences::animations_enabled(app));
         let appearance = &Preferences::read(app).appearance;
         assert_eq!(appearance.theme, ThemeChoice::Dark);
         assert_eq!(appearance.palette, ThemePalette::EmeraldChat);

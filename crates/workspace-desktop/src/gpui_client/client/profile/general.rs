@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use gpui::{
     AnyElement, Context, Div, FocusHandle, ScrollHandle, SharedString, Stateful, WeakEntity,
-    Window, div, prelude::*, px, rgb,
+    Window, div, prelude::*, px,
 };
 
 use crate::gpui_client::{
@@ -16,7 +16,7 @@ use crate::gpui_client::{
     },
     right_panel::RightPanel,
     runtime::RuntimeClient,
-    ui::{Icon, Palette, activate},
+    ui::{Icon, Palette, activate, switch_indicator},
 };
 
 #[path = "hotkeys.rs"]
@@ -299,29 +299,13 @@ impl General {
         cx: &mut Context<Self>,
         toggle: fn(&mut PreferenceValues),
     ) -> Stateful<Div> {
-        let tail = div()
-            .w(px(36.))
-            .h(px(20.))
-            .p(px(2.))
-            .rounded_full()
-            .flex_none()
-            .flex()
-            .justify_between()
-            .bg(if checked {
-                palette.accent
-            } else {
-                palette.border
-            })
-            .when(checked, |element| element.child(div()))
-            .child(div().size(px(16.)).rounded_full().bg(rgb(0xffffff)))
-            .into_any_element();
         self.row(
             Row {
                 id,
                 label,
                 icon,
                 subtitle: None,
-                tail,
+                tail: switch_indicator(palette, checked).into_any_element(),
             },
             palette,
             cx,

@@ -70,7 +70,7 @@ impl IdleTimeout {
     }
 }
 
-/// Настройки одного аккаунта и проекта в локальном профиле.
+/// Запись настроек аккаунта и проекта или всего локального профиля.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(super) struct PreferenceValues {
@@ -85,6 +85,8 @@ pub(super) struct PreferenceValues {
     pub(super) appearance: appearance::AppearancePreferences, // Тема и вид мессенджера.
     pub(super) manual_away: Option<bool>, // Последний явный выбор отсутствия. None — пользователь ещё не выбирал.
     pub(super) activity_expanded: bool,   // Показывать подписи вместо компактного ряда значков.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    animations_enabled: Option<bool>, // Читается из общей записи профиля. None — включено.
 }
 
 impl Default for PreferenceValues {
@@ -102,6 +104,7 @@ impl Default for PreferenceValues {
             appearance: appearance::AppearancePreferences::default(),
             manual_away: None,
             activity_expanded: false,
+            animations_enabled: None,
         }
     }
 }
@@ -138,6 +141,26 @@ impl Preferences {
         app.try_global::<Self>()
             .and_then(|store| store.values.get(&Some(owner.clone())))
             .unwrap_or(&DEFAULTS)
+    }
+
+    /// Читает общий флаг профиля. Галерея и старые профили включают анимации по умолчанию.
+    pub(super) fn animations_enabled(app: &App) -> bool {
+        app.try_global::<Self>()
+            .and_then(|store| store.values.get(&None))
+            .and_then(|values| values.animations_enabled)
+            .unwrap_or(true)
+    }
+
+    /// Сохраняет выбор для всех аккаунтов и после записи перерисовывает окна.
+    pub(super) fn set_animations_enabled(app: &mut App, enabled: bool) -> io::Result<()> {
+        let mut values = app
+            .try_global::<Self>()
+            .map(|store| store.values.clone())
+            .unwrap_or_default();
+        values.entry(None).or_default().animations_enabled = Some(enabled);
+        Self::save(app, values)?;
+        app.refresh_windows();
+        Ok(())
     }
 
     /// Проверяет, что действие старой панели всё ещё относится к владельцу настроек.
@@ -268,5 +291,66 @@ mod tests {
         let restored = read_file(&path).remove(&None).unwrap();
         assert_eq!(restored.language, Language::Ru);
         assert!(!restored.dock_bounce);
+    }
+
+    /// Общий выбор переживает смену входа и повторное чтение старого профиля.
+    #[cfg(feature = "gpui-test")]
+    #[gpui::test]
+    fn animation_preference_is_shared_and_persisted(cx: &mut gpui::TestAppContext) {
+        let profile = tempfile::tempdir().unwrap();
+        let first = OwnerContext {
+            account_id: workspace_core::context::AccountId("first".into()),
+            server: "https://workspace.test".into(),
+            organization_id: "org".into(),
+            project_id: "project".into(),
+            user_id: "first".into(),
+        };
+        let second = OwnerContext {
+            account_id: workspace_core::context::AccountId("second".into()),
+            user_id: "second".into(),
+            ..first.clone()
+        };
+        let legacy = serde_json::json!([
+            [null, {"dockBounce": false}],
+            [first, {"language": "en"}],
+        ]);
+        fs::write(profile.path().join(FILE), legacy.to_string()).unwrap();
+
+        cx.update(|app| {
+            assert!(Preferences::animations_enabled(app));
+            Preferences::install(profile.path(), app);
+            Preferences::select(app, Some(&first));
+            assert!(Preferences::animations_enabled(app));
+            Preferences::set_animations_enabled(app, false).unwrap();
+            Preferences::select(app, Some(&second));
+            assert!(!Preferences::animations_enabled(app));
+            Preferences::select(app, None);
+            assert!(!Preferences::animations_enabled(app));
+
+            Preferences::install(profile.path(), app);
+            assert!(!Preferences::animations_enabled(app));
+            assert!(!Preferences::read(app).dock_bounce);
+            assert_eq!(Preferences::read_for(app, &first).language, Language::En);
+            assert_eq!(Preferences::read_for(app, &second).language, Language::Ru);
+            Preferences::reset(app).unwrap();
+            assert!(Preferences::animations_enabled(app));
+        });
+    }
+
+    /// Ошибка сохранения оставляет прежний флаг доступным работающему окну.
+    #[cfg(feature = "gpui-test")]
+    #[gpui::test]
+    fn animation_preference_keeps_last_value_on_write_error(cx: &mut gpui::TestAppContext) {
+        let profile = tempfile::tempdir().unwrap();
+        let path = profile.path().join(FILE);
+        cx.update(|app| {
+            Preferences::install(profile.path(), app);
+            Preferences::set_animations_enabled(app, false).unwrap();
+            fs::rename(&path, profile.path().join("backup.json")).unwrap();
+            fs::create_dir(&path).unwrap();
+
+            assert!(Preferences::set_animations_enabled(app, true).is_err());
+            assert!(!Preferences::animations_enabled(app));
+        });
     }
 }
