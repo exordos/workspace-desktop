@@ -5,6 +5,7 @@ use uuid::Uuid;
 use crate::{
     auth::Service,
     context::{OwnerContext, SessionGeneration},
+    directory::UserProfile,
     sync::Sync,
 };
 
@@ -51,6 +52,26 @@ pub enum SidebarStreamResult {
 }
 
 impl MessengerSource {
+    /// Читает публичный профиль по UUID из ссылки. Сервер проверяет право текущего входа.
+    pub async fn reference_user_profile(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        user_id: Uuid,
+    ) -> Result<Option<UserProfile>, DetailsError> {
+        if user_id.is_nil() {
+            return Ok(None);
+        }
+        let auth = sync.auth();
+        let token = auth
+            .access_token_for_generation(owner, Service::Messenger, generation)
+            .await?;
+        let profile = self.rest.sidebar_profile(owner, &token, user_id).await;
+        auth.with_active_generation(owner, generation, || ())?;
+        profile
+    }
+
     /// Читает публичный профиль подтверждённого собеседника указанной лички.
     pub async fn sidebar_contact(
         &self,

@@ -126,6 +126,12 @@ pub use keychain::MacKeychain;
 #[cfg(all(target_os = "macos", feature = "gpui"))]
 pub(crate) mod chat_keys;
 
+#[cfg(all(target_os = "macos", feature = "gpui"))]
+pub(crate) mod message_time;
+
+#[cfg(all(target_os = "macos", feature = "gpui"))]
+pub(crate) mod media;
+
 #[cfg(feature = "macos-adapters")]
 pub mod notifications;
 

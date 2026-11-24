@@ -183,7 +183,50 @@ struct Selected {
     shared: bool, // Копия нужна для другой области.
 }
 
+/// Количество позиций в разделах галереи по известной истории.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GalleryCounts {
+    pub photos: u64, // Ссылки на фото и изображения.
+    pub videos: u64, // Ссылки на видео.
+    pub files: u64,  // Ссылки на обычные вложения.
+    pub links: u64,  // Веб-ссылки из сообщений.
+}
+
 impl MediaCache {
+    /// Считает позиции в той же области, которую используют страницы галереи.
+    pub(crate) fn gallery_counts(
+        &self,
+        owner: &OwnerContext,
+        scope: HistoryScope,
+    ) -> Result<GalleryCounts, MediaCacheError> {
+        let connection = self.connection()?;
+        Ok(connection.query_row(
+            "SELECT COUNT(CASE WHEN kind = ?4 THEN 1 END),
+                    COUNT(CASE WHEN kind = ?5 THEN 1 END),
+                    COUNT(CASE WHEN kind = ?6 THEN 1 END),
+                    (SELECT COUNT(*) FROM messenger_web_links
+                     WHERE owner = ?1 AND stream = ?2 AND (?3 IS NULL OR topic = ?3))
+             FROM messenger_media_refs
+             WHERE owner = ?1 AND stream = ?2 AND (?3 IS NULL OR topic = ?3)",
+            params![
+                owner_key(owner),
+                scope.stream_id.to_string(),
+                scope.topic_id.map(|id| id.to_string()),
+                MediaKind::Image as i64,
+                MediaKind::Video as i64,
+                MediaKind::File as i64,
+            ],
+            |row| {
+                Ok(GalleryCounts {
+                    photos: unsigned_column(row, 0)?,
+                    videos: unsigned_column(row, 1)?,
+                    files: unsigned_column(row, 2)?,
+                    links: unsigned_column(row, 3)?,
+                })
+            },
+        )?)
+    }
+
     /// Возвращает для владельца страницу известных ссылок в уже подтверждённой области.
     pub(crate) fn list_history(
         &self,

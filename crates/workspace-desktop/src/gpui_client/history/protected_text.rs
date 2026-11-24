@@ -7,7 +7,12 @@ use std::{
     sync::Arc,
 };
 
-use super::super::protected_quotes::QuoteText;
+use super::super::{
+    inline_references::{MentionNames, reference_in_range},
+    protected_quotes::QuoteText,
+    references::time_zone_hint,
+};
+use crate::platform::message_time::format_local_time_zone;
 use gpui::{
     App, AvailableSpace, Bounds, Element, ElementId, GlobalElementId, InspectorElementId,
     IntoElement, LayoutId, Pixels, Size, Style, TextAlign, WhiteSpace, Window, WrappedLine,
@@ -15,6 +20,7 @@ use gpui::{
 use workspace_core::messenger::{
     catalog::ProtectedSidebarSummary,
     encryption::{AcceptedDecryption, ProtectedMessage},
+    references::WorkspaceReferenceTarget,
 };
 use zeroize::Zeroizing;
 
@@ -33,6 +39,13 @@ pub(in crate::gpui_client) struct GuardedText {
 enum TextSource {
     Body(Arc<ProtectedMessage>, Option<Range<usize>>), // Тело или проверяемый поддиапазон.
     Fragment(Arc<AcceptedDecryption>),                 // Отдельно принятый защищённый фрагмент.
+    Reference {
+        access: Arc<ProtectedMessage>, // Действующее разрешение на это тело.
+        range: Range<usize>,           // Границы заранее проверенной ссылки в теле.
+        language: Language, // Используется для времени и подписи неизвестного пользователя.
+        names: MentionNames, // Уже доступный справочник того же аккаунта.
+        zone: bool, // Показывает пояс выбранного момента в отдельной строке панели.
+    },
     Sidebar {
         access: Arc<ProtectedSidebarSummary>, // Ключ, который разрешает читать подпись.
         mounted: Rc<Cell<bool>>, // Текущее место подписи в каталоге.
@@ -53,6 +66,31 @@ impl TextSource {
                 .with_body(|text| text.get(range.clone()).map(read))
                 .flatten(),
             Self::Fragment(access) => access.with_text(read),
+            Self::Reference {
+                access,
+                range,
+                language,
+                names,
+                zone,
+            } => access
+                .with_body(|text| {
+                    reference_in_range(text, range.clone()).map(|reference| {
+                        let caption = if *zone {
+                            match &reference.target {
+                                Some(WorkspaceReferenceTarget::Time(time)) => time_zone_hint(
+                                    *language,
+                                    &format_local_time_zone(time, language.code()),
+                                ),
+                                _ => String::new(),
+                            }
+                        } else {
+                            reference.caption(*language, |id| names.get(id))
+                        };
+                        let caption = Zeroizing::new(caption);
+                        read(&caption)
+                    })
+                })
+                .flatten(),
             Self::Sidebar { access, mounted, locale } => mounted.get().then(|| {
                 access.with_preview(|preview| {
                     let text = Zeroizing::new(locale.preview_text(preview));
@@ -70,6 +108,7 @@ impl TextSource {
     fn with_current<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
         match self {
             Self::Quote { access, .. } => access.with_current(action),
+            Self::Reference { access, .. } => access.with_current(action),
             Self::Sidebar { access, mounted, .. } => mounted.get().then(|| access.with_preview(|_| action())).flatten(),
             _ => self.with_text(|_| action()),
         }
@@ -77,6 +116,41 @@ impl TextSource {
 }
 
 impl GuardedText {
+    /// Показывает подпись ссылки под разрешением исходного сообщения, оставляя URL в Core.
+    pub(in crate::gpui_client::conversation) fn reference(
+        access: Arc<ProtectedMessage>,
+        range: Range<usize>,
+        language: Language,
+        names: MentionNames,
+    ) -> Self {
+        Self {
+            source: TextSource::Reference {
+                access,
+                range,
+                language,
+                names,
+                zone: false,
+            },
+        }
+    }
+
+    /// Показывает часовой пояс защищённой ссылки, пока действует её ключ.
+    pub(in crate::gpui_client::conversation) fn reference_zone(
+        access: Arc<ProtectedMessage>,
+        range: Range<usize>,
+        language: Language,
+    ) -> Self {
+        Self {
+            source: TextSource::Reference {
+                access,
+                range,
+                language,
+                names: MentionNames::default(),
+                zone: true,
+            },
+        }
+    }
+
     /// Показывает отдельно раскрытый фрагмент в фазах кадра под его собственным ключом.
     pub(in crate::gpui_client) fn fragment(access: Arc<AcceptedDecryption>) -> Self {
         Self {

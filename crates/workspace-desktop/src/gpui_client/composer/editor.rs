@@ -11,15 +11,17 @@ use crate::gpui_client::{
 };
 
 mod formatting;
+mod references;
 mod text_menu;
 
 pub(super) use formatting::Format;
 
+use references::{ReferenceSpan, References};
 use text_menu::TextMenu;
 
 use gpui::{
-    App, AvailableSpace, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Element,
-    ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
+    App, AvailableSpace, Bounds, ClipboardEntry, ClipboardItem, ContentMask, Context, CursorStyle,
+    Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
     Focusable, GlobalElementId, InspectorElementId, KeyBinding, KeyDownEvent, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, Style, TextAlign, TextRun,
     TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine, div, fill, point, prelude::*,
@@ -47,6 +49,8 @@ mod keys {
             Cut,
             Paste,
             OpenTextMenu,
+            PickQuietReference,
+            PickReference,
         ]
     );
 }
@@ -67,6 +71,11 @@ pub(super) struct EditPreviousRequested;
 
 impl EventEmitter<EditPreviousRequested> for Editor {}
 
+/// Картинка из буфера, которую рабочий редактор может предложить как файл.
+pub(super) struct PasteImageRequested(pub(super) Arc<gpui::Image>); // Байты и вид изображения от macOS.
+
+impl EventEmitter<PasteImageRequested> for Editor {}
+
 /// Черновик разговора и локальное состояние выделения. Индексы считаются в байтах UTF-8.
 pub struct Editor {
     version: u64,        // Меняется при каждом изменении текста, даже если его восстановили.
@@ -82,6 +91,7 @@ pub struct Editor {
     layout_current: bool,                     // Геометрия относится к текущей версии текста.
     dragging: bool,                           // Зажата кнопка мыши при выделении текста.
     text_menu: TextMenu,                      // Доступность и фокус контекстных команд поля.
+    references: References,                   // UUID выбранных ссылок и источники подсказок.
 }
 
 impl Editor {
@@ -101,6 +111,7 @@ impl Editor {
             layout_current: false,
             dragging: false,
             text_menu: TextMenu::new(cx),
+            references: References::default(),
         }
     }
 
@@ -137,7 +148,7 @@ impl Editor {
 
     /// Показывает снимок выбранной вкладки ответа.
     pub(in crate::gpui_client) fn show_reply(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.replace(0..self.text.len(), text, cx);
+        self.replace_markup(0..self.text.len(), text, cx);
     }
 
     /// Показывает открытые фрагменты под разрешением всех исходных ключей.
@@ -156,6 +167,7 @@ impl Editor {
     pub(super) fn finish_fragment_edit(&mut self) {
         if self.fragment_edit.take().is_some() {
             self.text.zeroize();
+            self.references.clear_content();
             self.anchor = 0;
             self.caret = 0;
             self.layout = None;
@@ -209,14 +221,20 @@ impl Editor {
             KeyBinding::new("cmd-c", keys::Copy, Some("WorkspaceComposerEditor")),
             KeyBinding::new("cmd-x", keys::Cut, Some("WorkspaceComposerEditor")),
             KeyBinding::new("cmd-v", keys::Paste, Some("WorkspaceComposerEditor")),
+            KeyBinding::new("alt-enter", keys::PickQuietReference, Some("ComposerSends")),
+            KeyBinding::new(
+                "tab",
+                keys::PickReference,
+                Some("ComposerReferenceSuggestions"),
+            ),
             KeyBinding::new("shift-f10", keys::OpenTextMenu, Some("ComposerSends")),
             KeyBinding::new("menu", keys::OpenTextMenu, Some("ComposerSends")),
         ]);
     }
 
-    /// Возвращает текущее содержимое, в том числе незавершённую композицию IME.
+    /// Возвращает Markdown для черновика и отправки с точными UUID вставленных ссылок.
     pub fn text(&self) -> &str {
-        &self.text
+        self.references.markdown(&self.text)
     }
 
     /// Проверяет, доступно ли форматирование текущего выделения.
@@ -230,11 +248,16 @@ impl Editor {
             return;
         }
         let selection = self.selection();
-        let language = Preferences::read(cx).language;
-        let (text, relative_selection) = format.edit(&self.text[selection.clone()], language);
-        let inserted = self.replace(selection, &text, cx);
-        self.anchor = inserted.start + relative_selection.start;
-        self.caret = inserted.start + relative_selection.end;
+        let language = self.reference_language(cx);
+        let selected = self
+            .references
+            .markdown_range(&self.text, selection.clone());
+        let (text, relative_selection) = format.edit(&selected, language);
+        let (visible, spans) = References::display_markup(&text, language);
+        let inserted = self.replace_with_spans(selection, &visible, spans, cx);
+        // Команды выбирают курсор или адрес после содержимого, а подписи меняют только его длину.
+        self.anchor = inserted.end - (text.len() - relative_selection.start);
+        self.caret = inserted.end - (text.len() - relative_selection.end);
     }
 
     /// Применяет выбранную комбинацию только в рабочем поле без активной композиции IME.
@@ -313,6 +336,9 @@ impl Editor {
 
     /// Перемещает курсор на строку выше или ниже по геометрии текущего кадра.
     fn vertical(&mut self, down: bool, cx: &mut Context<Self>) {
+        if self.move_reference_selection(down, cx) {
+            return;
+        }
         let Some(layout) = self.current_layout() else {
             return;
         };
@@ -336,9 +362,25 @@ impl Editor {
 
     /// Меняет выделенную область и возвращает байты вставленного текста.
     fn replace(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) -> Range<usize> {
-        if self.text[range.clone()] != *text {
+        self.replace_with_spans(range, text, Vec::new(), cx)
+    }
+
+    /// Обновляет текст с его ссылками как одну версию черновика.
+    fn replace_with_spans(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        spans: Vec<ReferenceSpan>,
+        cx: &mut Context<Self>,
+    ) -> Range<usize> {
+        let changed = self.text[range.clone()] != *text;
+        if changed || !spans.is_empty() || self.references.touches_span(&range) {
             self.text.replace_range(range.clone(), text);
+            self.references
+                .replaced(range.clone(), text.len(), &self.text, spans);
             self.version = self.version.wrapping_add(1);
+        }
+        if changed {
             self.layout_current = false;
         }
         let end = range.start + text.len();
@@ -369,7 +411,8 @@ impl Editor {
         if !selection.is_empty() {
             let copied = self.with_current_text(|| {
                 cx.write_to_clipboard(ClipboardItem::new_string(
-                    self.text[selection.clone()].into(),
+                    self.references
+                        .markdown_range(&self.text, selection.clone()),
                 ))
             });
             if cut && copied.is_some() {
@@ -380,8 +423,19 @@ impl Editor {
 
     /// Вставляет обычный текст, приводя переводы строк из буфера к LF.
     fn paste(&mut self, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace(self.input_range(None), &normalize_lines(&text), cx);
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        if let Some(text) = item.text() {
+            self.paste_markup(&normalize_lines(&text), cx);
+        } else if self.send_on_enter
+            && !self.composing()
+            && let Some(image) = item.into_entries().find_map(|entry| match entry {
+                ClipboardEntry::Image(image) => Some(image),
+                ClipboardEntry::String(_) => None,
+            })
+        {
+            cx.emit(PasteImageRequested(Arc::new(image)));
         }
     }
 
@@ -405,11 +459,19 @@ impl Editor {
 
     /// Передаёт обычный Enter один раз. AppKit первым получает клавиши незавершённого IME.
     fn handle_enter(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key == "escape" && self.dismiss_references(cx) {
+            cx.stop_propagation();
+            return;
+        }
         if event.keystroke.key != "enter" || event.keystroke.modifiers.modified() {
             return;
         }
         cx.stop_propagation();
-        if !event.is_held && !self.composing() && !self.text_menu.is_open() {
+        if !event.is_held
+            && !self.composing()
+            && !self.text_menu.is_open()
+            && !self.accept_reference(false, cx)
+        {
             cx.emit(SubmitRequested);
         }
     }
@@ -613,6 +675,8 @@ impl Render for Editor {
             .text_size(FONT_SIZE)
             .key_context(if self.text_menu.is_open() {
                 ""
+            } else if self.send_on_enter && self.has_reference_suggestions() {
+                "WorkspaceComposerEditor ComposerSends ComposerReferenceSuggestions"
             } else if self.send_on_enter {
                 "WorkspaceComposerEditor ComposerSends"
             } else {
@@ -624,6 +688,16 @@ impl Render for Editor {
                 field
                     .on_key_down(cx.listener(Self::handle_enter))
                     .on_key_down(cx.listener(Self::format_shortcut))
+                    .on_action(cx.listener(|editor, _: &keys::PickQuietReference, _, cx| {
+                        if !editor.accept_reference(true, cx) {
+                            cx.propagate();
+                        }
+                    }))
+                    .on_action(cx.listener(|editor, _: &keys::PickReference, _, cx| {
+                        if !editor.accept_reference(false, cx) {
+                            cx.propagate();
+                        }
+                    }))
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(Self::open_text_menu_at_pointer),
@@ -672,6 +746,7 @@ impl Render for Editor {
             .on_action(cx.listener(|editor, _: &keys::Cut, _, cx| editor.copy(true, cx)))
             .on_action(cx.listener(|editor, _: &keys::Paste, _, cx| editor.paste(cx)))
             .child(EditorSurface(cx.entity()))
+            .children(self.render_reference_menu(window, cx))
             .children(self.render_text_menu(window, cx))
     }
 }

@@ -1,6 +1,10 @@
 //! Выбирает сообщение или фрагмент из истории и передаёт намерение в редактор разговора.
 
-use std::{cell::RefCell, ops::Range, rc::Rc};
+use std::{
+    cell::RefCell,
+    ops::{Range, RangeInclusive},
+    rc::Rc,
+};
 
 use gpui::{
     Context, Div, FocusHandle, HighlightStyle, KeyDownEvent, MouseButton, Pixels, Point,
@@ -12,10 +16,10 @@ use workspace_core::messenger::{
     encryption::fragments::{FragmentDisplayKind, fragment_display_spans},
     forward::forward_spans,
     quote::{self, Block},
-    references::external_link_references,
+    references::{WorkspaceReferenceTarget, external_link_references},
 };
 
-use super::{Conversation, State, message_menu::MenuHit};
+use super::{Conversation, State, inline_references::references, message_menu::MenuHit};
 use crate::gpui_client::{
     composer::{ReplyAction, ReplyQuote, ReplyText, short_reply_text},
     preferences::Language,
@@ -98,6 +102,66 @@ pub(super) struct ReplyControls {
 }
 
 impl ReplyControls {
+    /// Пересчитывает общую область выделения в байты одного видимого блока тела.
+    pub(super) fn source_range(
+        &self,
+        id: Uuid,
+        body: &SharedString,
+        span: Range<usize>,
+    ) -> Option<Range<usize>> {
+        let selection = self.selection.borrow();
+        let selected = selection
+            .fragment
+            .as_ref()
+            .filter(|selected| selected.id == id && selected.body == *body)?;
+        let range = selected.range();
+        let clipped = range.start.max(span.start)..range.end.min(span.end);
+        (!clipped.is_empty()).then(|| clipped.start - span.start..clipped.end - span.start)
+    }
+
+    /// Отличает щелчок по ссылке от жеста, выделившего текст той же строки.
+    pub(super) fn has_selection(&self, id: Uuid, body: &SharedString) -> bool {
+        self.source_range(id, body, 0..body.len()).is_some()
+    }
+
+    /// Запоминает исходный байт при нажатии и переводит фокус в историю.
+    pub(super) fn start_selection(
+        &self,
+        id: Uuid,
+        body: SharedString,
+        index: usize,
+        window: &mut Window,
+    ) {
+        let mut selection = self.selection.borrow_mut();
+        selection.focused = Some(id);
+        selection.fragment = Some(Fragment {
+            id,
+            body,
+            anchor: index,
+            caret: index,
+        });
+        window.focus(&self.focus);
+        window.refresh();
+    }
+
+    /// Продлевает жест только в блоке, где он начался.
+    pub(super) fn extend_selection(
+        &self,
+        id: Uuid,
+        span: RangeInclusive<usize>,
+        index: usize,
+        window: &mut Window,
+    ) {
+        if let Some(selection) = self.selection.borrow_mut().fragment.as_mut()
+            && selection.id == id
+            && span.contains(&selection.anchor)
+            && index != selection.caret
+        {
+            selection.caret = index;
+            window.refresh();
+        }
+    }
+
     /// Оборачивает простой текст с живым выделением, не меняя метрики пузыря.
     pub(super) fn selectable(
         &self,
@@ -132,17 +196,7 @@ impl ReplyControls {
         let body = body.clone();
         let start = span.start;
         let end = span.end;
-        let range = self
-            .selection
-            .borrow()
-            .fragment
-            .as_ref()
-            .filter(|selected| selected.id == id && selected.body == body)
-            .map(Fragment::range)
-            .and_then(|range| {
-                let clipped = range.start.max(start)..range.end.min(end);
-                (!clipped.is_empty()).then(|| clipped.start - start..clipped.end - start)
-            });
+        let range = self.source_range(id, &body, span);
         let styled = StyledText::new(visible.clone()).with_highlights(range.map(|range| {
             (
                 range,
@@ -159,7 +213,7 @@ impl ReplyControls {
         let link_layout = layout.clone();
         let link_body = body.clone();
         let controls = self.clone();
-        let drag = self.selection.clone();
+        let drag = self.clone();
         let drag_visible = visible.clone();
         let element = text_role(palette, TextRole::Body)
             .id(SharedString::from(format!(
@@ -169,16 +223,7 @@ impl ReplyControls {
             .cursor(gpui::CursorStyle::IBeam)
             .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                 let index = start + byte_at(&mouse_layout, &visible, event.position);
-                let mut selection = controls.selection.borrow_mut();
-                selection.focused = Some(id);
-                selection.fragment = Some(Fragment {
-                    id,
-                    body: body.clone(),
-                    anchor: index,
-                    caret: index,
-                });
-                window.focus(&controls.focus);
-                window.refresh();
+                controls.start_selection(id, body.clone(), index, window);
                 cx.stop_propagation();
             })
             .on_mouse_down(MouseButton::Right, move |event, window, cx| {
@@ -199,16 +244,9 @@ impl ReplyControls {
                 cx.stop_propagation();
             })
             .on_mouse_move(move |event, window, _| {
-                if event.dragging()
-                    && let Some(selection) = drag.borrow_mut().fragment.as_mut()
-                    && selection.id == id
-                    && (start..=end).contains(&selection.anchor)
-                {
+                if event.dragging() {
                     let index = start + byte_at(&drag_layout, &drag_visible, event.position);
-                    if index != selection.caret {
-                        selection.caret = index;
-                        window.refresh();
-                    }
+                    drag.extend_selection(id, start..=end, index, window);
                 }
             })
             .child(styled);
@@ -258,7 +296,7 @@ impl ReplyControls {
 }
 
 /// Приводит координату к целой границе UTF-8 внутри нужной строки.
-fn byte_at(layout: &TextLayout, text: &str, position: Point<Pixels>) -> usize {
+pub(super) fn byte_at(layout: &TextLayout, text: &str, position: Point<Pixels>) -> usize {
     let index = layout
         .index_for_position(position)
         .unwrap_or_else(|index| index);
@@ -482,14 +520,35 @@ fn reply_preview(markdown: &str, skip_quotes: bool) -> ReplyText {
         .map(|span| {
             (
                 span.range,
-                (span.kind != FragmentDisplayKind::Definition).then_some("e2ee.secretFragment"),
+                (span.kind != FragmentDisplayKind::Definition)
+                    .then_some(ReplyText::Label("e2ee.secretFragment")),
             )
         })
         .chain(
             forward_spans(markdown)
                 .into_iter()
-                .map(|span| (span.range, Some("message.forwarded"))),
+                .map(|span| (span.range, Some(ReplyText::Label("message.forwarded")))),
         )
+        .chain(references(markdown).into_iter().map(|reference| {
+            let caption = match &reference.target {
+                Some(WorkspaceReferenceTarget::Time(time)) => ReplyText::Time(time.clone()),
+                Some(WorkspaceReferenceTarget::User { silent: false, .. })
+                    if reference.legacy_mention() =>
+                {
+                    ReplyText::Mixed(vec![
+                        ReplyText::Source("@".into()),
+                        ReplyText::Label("message.unknownMention"),
+                    ])
+                }
+                Some(WorkspaceReferenceTarget::User { silent: false, .. })
+                    if !reference.label.starts_with('@') =>
+                {
+                    ReplyText::Source(format!("@{}", reference.label))
+                }
+                _ => ReplyText::Source(reference.label),
+            };
+            (reference.range, Some(caption))
+        }))
         .collect();
     spans.sort_by_key(|(range, _)| (range.start, std::cmp::Reverse(range.end)));
     let blocks = if skip_quotes {
@@ -514,12 +573,12 @@ fn reply_preview(markdown: &str, skip_quotes: bool) -> ReplyText {
 fn preview_block(
     text: &str,
     start: usize,
-    spans: &[(Range<usize>, Option<&'static str>)],
+    spans: &[(Range<usize>, Option<ReplyText>)],
 ) -> Option<ReplyText> {
     let end = start + text.len();
     let mut cursor = start;
     let mut parts = Vec::new();
-    for (range, key) in spans {
+    for (range, caption) in spans {
         let visible_start = range.start.max(start);
         let visible_end = range.end.min(end);
         if visible_start >= visible_end || visible_end <= cursor {
@@ -529,8 +588,8 @@ fn preview_block(
             parts.push(ReplyText::Source(
                 text[cursor - start..visible_start - start].to_owned(),
             ));
-            if let Some(key) = key {
-                parts.push(ReplyText::Label(key));
+            if let Some(caption) = caption {
+                parts.push(caption.clone());
             }
         }
         cursor = visible_end;

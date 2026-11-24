@@ -423,6 +423,85 @@ fn confirm_text_menu(ui: &mut VisualTestContext) {
     ui.run_until_parked();
 }
 
+/// Через штатную панель форматирования вставляет один общий момент в текущий ответ.
+#[gpui::test]
+fn composer_time_picker_inserts_a_canonical_time(cx: &mut TestAppContext) {
+    let (view, ui, requests) = start(cx);
+    publish(&requests, Load::Open(ChatEntry::Latest), vec![], vec![], ui);
+    allow(&requests, Ok(TOPIC), ui);
+    paste(ui, "Встреча");
+    click(ui, "composer-toolbar-toggle");
+    click(ui, "composer-insert-time");
+    assert!(ui.debug_bounds("composer-time-picker").is_some());
+    click(ui, "composer-time-confirm");
+
+    let markdown = draft(&view, ui);
+    assert!(markdown.starts_with("Встреча urn:time:"));
+    let references = workspace_core::messenger::references::workspace_references(&markdown);
+    assert!(matches!(references.as_slice(), [reference] if matches!(
+        reference.target,
+        workspace_core::messenger::references::WorkspaceReferenceTarget::Time(_)
+    )));
+}
+
+/// Удаляет одну карточку файла перед отправкой и передаёт в очередь только оставшуюся ссылку.
+#[gpui::test]
+fn composer_attachment_round_trip_queues_only_retained_file(cx: &mut TestAppContext) {
+    let (view, ui, requests) = start(cx);
+    publish(&requests, Load::Open(ChatEntry::Latest), vec![], vec![], ui);
+    allow(&requests, Ok(TOPIC), ui);
+    let photo = Uuid::from_u128(65);
+    let document = Uuid::from_u128(66);
+    let retained = format!("[Отчёт](urn:file:{document}?name=report.pdf)");
+    let draft_with_files =
+        format!("Подпись\n\n![Кадр](urn:image:{photo}?name=frame.png)\n\n{retained}");
+    paste(ui, &draft_with_files);
+    assert_eq!(draft(&view, ui), draft_with_files);
+    assert!(ui.debug_bounds("composer-attachment-remove-1").is_some());
+
+    click(ui, "composer-attachment-remove-0");
+    let expected = format!("Подпись\n\n{retained}");
+    assert_eq!(draft(&view, ui), expected);
+    click(ui, "conversation-send");
+    let sent = next(&requests.save, "запись с оставшимся файлом");
+    assert_eq!(sent.input.markdown, expected);
+    saved(sent, Some(MESSAGE), ui);
+    publish(&requests, Load::Read(7), vec![], vec![], ui);
+}
+
+/// Оставляет загруженные файлы вне незакрытого блока кода в фактическом снимке отправки.
+#[gpui::test]
+fn composer_attachment_queue_keeps_files_outside_unclosed_code(cx: &mut TestAppContext) {
+    let (view, ui, requests) = start(cx);
+    publish(&requests, Load::Open(ChatEntry::Latest), vec![], vec![], ui);
+    allow(&requests, Ok(TOPIC), ui);
+    let code = "```rust\nlet value = 42;";
+    paste(ui, code);
+    let ids = [Uuid::from_u128(65), Uuid::from_u128(66)];
+    let composer = ui.read(|app| view.read(app).tested_composer().unwrap().clone());
+    ui.update(|_, app| {
+        composer.update(app, |composer, cx| {
+            for id in ids {
+                composer.tested_complete_attachment(&format!("[Документ](urn:file:{id})"), cx);
+            }
+        });
+    });
+    ui.run_until_parked();
+    click(ui, "conversation-send");
+    let sent = next(&requests.save, "запись с файлами перед кодом");
+    let references = workspace_core::messenger::references::media_references(&sent.input.markdown);
+    assert_eq!(
+        references
+            .iter()
+            .map(|reference| reference.file_id)
+            .collect::<Vec<_>>(),
+        ids
+    );
+    assert!(sent.input.markdown.ends_with(code));
+    saved(sent, Some(MESSAGE), ui);
+    publish(&requests, Load::Read(7), vec![], vec![], ui);
+}
+
 /// Системное меню работает в нормальном разговоре, удерживает Enter и сохраняет выделение.
 #[gpui::test]
 fn composer_text_menu_edits_selection_without_sending(cx: &mut TestAppContext) {

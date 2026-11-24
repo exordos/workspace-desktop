@@ -704,18 +704,17 @@ impl KeyView<'_> {
     /// Форматирует дату сохранения или показывает, что запись не содержит даты.
     fn added_date(&self, key: &HeldChatKey) -> String {
         key.added_at_unix_ms
-            .map(crate::platform::chat_keys::key_date)
+            .map(|time| {
+                crate::platform::message_time::format_unix_millis(time, self.language.code())
+            })
             .unwrap_or_else(|| self.language.tr("e2ee.localKeyDateUnknown").into())
     }
 
     /// Форматирует дату объявления, если сообщение уже есть в истории.
     fn announced_date(&self, id: Uuid) -> Option<String> {
-        self.keys
-            .data
-            .announced_at
-            .get(&id)
-            .copied()
-            .map(crate::platform::chat_keys::key_date)
+        self.keys.data.announced_at.get(&id).copied().map(|time| {
+            crate::platform::message_time::format_unix_millis(time, self.language.code())
+        })
     }
 
     /// Рисует название даты над её значением.

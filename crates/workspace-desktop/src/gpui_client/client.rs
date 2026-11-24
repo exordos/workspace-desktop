@@ -36,7 +36,10 @@ use super::{
         AccountSession, AccountSnapshot, ConversationAddress, NotificationRouteError, RuntimeEvent,
         RuntimeExit, ShellAction, SidebarAction,
     },
-    conversation::{Conversation, DetailsProfileAction, DetailsProfileIntent, OpenDetailsTopic, OpenForwardOriginal},
+    conversation::{
+        Conversation, DetailsProfileAction, DetailsProfileIntent, OpenConversationReference,
+        OpenDetailsTopic, OpenForwardOriginal,
+    },
     next_control,
     platform_window::WindowPlatform,
     previous_control,
@@ -581,6 +584,18 @@ impl Client {
                 client.apply(effect, cx);
             }
         })
+        .detach();
+        cx.subscribe(
+            &conversation,
+            |client, _, reference: &OpenConversationReference, cx| {
+                if client.section == TopBarSection::Chats {
+                    let effect = client
+                        .shell
+                        .open_conversation_reference(&reference.address, reference.target);
+                    client.apply(effect, cx);
+                }
+            },
+        )
         .detach();
         cx.subscribe(&conversation, |client, _, intent: &DetailsProfileIntent, cx| {
             client.details_profile_requested = Some(intent.clone());

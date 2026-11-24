@@ -90,6 +90,24 @@ pub struct ChatRoute {
     pub entry: ChatEntry,    // Начальная позиция в истории.
 }
 
+/// Цель перехода к последним сообщениям без указания конкретного сообщения.
+#[derive(Clone, Copy)]
+pub(super) enum ConversationReference {
+    Stream(Uuid), // Канал или личная переписка.
+    Topic {
+        topic_id: Uuid,          // Точный UUID темы.
+        stream_id: Option<Uuid>, // Ожидаемый родитель для ссылок с двумя UUID.
+    },
+    Contact(Uuid), // Существующая личная переписка с указанным пользователем.
+}
+
+/// Возвращает общую тему, если она есть в доступном каталоге разговора.
+pub(super) fn default_topic(chat: &Chat) -> Option<Uuid> {
+    chat.metadata
+        .default_topic_id
+        .filter(|id| chat.topics.iter().any(|topic| topic.id == *id))
+}
+
 /// Номер намерения пользователя, которым владеет оболочка.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NavigationRevision(pub u64); // Увеличивается при новом переходе и отмене ожидания.

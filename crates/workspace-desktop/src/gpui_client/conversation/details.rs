@@ -18,9 +18,12 @@ use gpui::{
     Task, WeakEntity, Window, div, prelude::*,
 };
 use uuid::Uuid;
-use workspace_core::messenger::{
-    catalog::Chat,
-    details::{SidebarDetails, TopicSummaryBlock, parse_topic_summary, sidebar_profile_link},
+use workspace_core::{
+    messenger::{
+        catalog::Chat,
+        details::{SidebarDetails, TopicSummaryBlock, parse_topic_summary, sidebar_profile_link},
+    },
+    storage::media::GalleryCounts,
 };
 
 use super::{
@@ -35,13 +38,13 @@ use crate::gpui_client::{
     runtime::RuntimeClient,
     ui::{Button, Icon, Palette, TextRole, activate, label},
 };
+pub(in crate::gpui_client) use contact::{ContactOrigin, ContactPanel, ContactRequest, ContactTarget};
 use gallery::Gallery;
 use picker::{Picker, PickerDialog};
 use source::{Mutation, Problem};
 use topic_actions::TopicMenu;
 use view::PanelAction;
 pub(in crate::gpui_client) use view::member_counts;
-pub(in crate::gpui_client) use contact::{ContactPanel, ContactRequest};
 
 /// Сведения видны только между открытием панели и закрытием.
 enum State {
@@ -104,8 +107,10 @@ pub(super) struct Panel {
     mutation_error: Option<MutationKind>, // Последняя ошибка рядом с действием.
     picker: Option<Picker>,          // Выбор участников внутри панели владельца.
     add_members_focus: FocusHandle,  // Кнопка открытия окна выбора участников.
-    gallery: Option<Gallery>,        // Выбранный раздел вложений и его страницы.
-    gallery_triggers: [FocusHandle; 4], // Кнопки категорий для возврата после галереи.
+    gallery: Option<Gallery>,                        // Выбранный раздел вложений и его страницы.
+    gallery_triggers: [FocusHandle; 4],              // Кнопки категорий для возврата после галереи.
+    gallery_counts: Option<GalleryCounts>,           // Числа известной истории.
+    gallery_counts_request: Option<(Uuid, Task<()>)>, // Текущий запрос чисел для этой панели.
     refocus_details: Option<FocusHandle>, // Кнопка, открывшая предыдущий вложенный экран.
     title_trigger: FocusHandle,      // Заголовок может открыть ту же панель.
     trigger: FocusHandle,            // Кнопка сведений в шапке разговора.
@@ -121,6 +126,14 @@ impl Panel {
     /// Даёт диалогу доступные чаты из каталога того же входа.
     pub(super) fn catalog_chats(&self) -> &[Chat] {
         self.catalog.as_deref().unwrap_or_default()
+    }
+
+    /// Даёт истории имена из уже доступных снимков для старых упоминаний.
+    pub(super) fn mention_names(&self) -> super::inline_references::MentionNames {
+        super::inline_references::MentionNames {
+            chats: self.catalog.clone(),
+            details: self.snapshot.clone(),
+        }
     }
 
     /// Готовит закрытую панель без сетевого запроса.
@@ -188,6 +201,8 @@ impl Panel {
             add_members_focus: cx.focus_handle(),
             gallery: None,
             gallery_triggers: std::array::from_fn(|_| cx.focus_handle()),
+            gallery_counts: None,
+            gallery_counts_request: None,
             refocus_details: None,
             title_trigger: cx.focus_handle(),
             trigger: cx.focus_handle(),
@@ -248,6 +263,8 @@ impl Panel {
         self.mutation_error = None;
         self.picker = None;
         self.release_gallery(app);
+        self.gallery_counts = None;
+        self.gallery_counts_request = None;
         self.refocus_details = None;
     }
 
@@ -374,6 +391,13 @@ impl Panel {
                 screen.handle_panel_action(intent, window, cx)
             });
         };
+        let gallery_triggers = view
+            .gallery_access()
+            .is_some()
+            .then_some(view::GalleryTriggers {
+                focus: &self.gallery_triggers,
+                counts: self.gallery_counts,
+            });
         let content = if let Some(gallery) = &self.gallery {
             view::render_gallery(view, gallery, palette, language, dispatch)
         } else if let Some(SidebarDetails::Channel(channel)) = self.snapshot.as_deref()
@@ -397,9 +421,7 @@ impl Panel {
                     self.encrypted_actions(view, palette, language, cx),
                     self.keys.render_info(self, palette, language, cx),
                     palette,
-                    view.gallery_access()
-                        .is_some()
-                        .then_some(&self.gallery_triggers),
+                    gallery_triggers,
                     dispatch,
                 )
                 .debug_selector(|| "conversation-details-ready".into()),
@@ -412,15 +434,8 @@ impl Panel {
                 cx,
                 view.peer_call_availability(cx),
             );
-            view::render(
-                &data,
-                palette,
-                view.gallery_access()
-                    .is_some()
-                    .then_some(&self.gallery_triggers),
-                dispatch,
-            )
-            .debug_selector(|| "conversation-details-ready".into())
+            view::render(&data, palette, gallery_triggers, dispatch)
+                .debug_selector(|| "conversation-details-ready".into())
         } else {
             match state {
                 State::Loading { .. } | State::Ready => label(
@@ -787,6 +802,7 @@ impl Conversation {
         if let Some(id) = opened {
             panel.body = Some(id);
             self.heading_request.take();
+            self.refresh_gallery_counts(cx);
             self.request_details(cx);
         }
     }

@@ -129,6 +129,66 @@ impl Button {
     }
 }
 
+/// Собирает базовую строку сайдбара с иконкой, текстом и местом для дополнения справа.
+pub(in crate::gpui_client) fn sidebar_item(
+    palette: Palette,
+    icon: impl IntoElement,
+    text: Div,
+    icon_gap: gpui::Pixels,
+) -> Div {
+    div()
+        .relative()
+        .w_full()
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .hover(move |style| style.bg(palette.card_hover))
+        .child(
+            div()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(icon_gap)
+                .child(icon)
+                .child(text.min_w_0()),
+        )
+}
+
+/// Подключает одинаковые события мыши и клавиатуры у кнопок и строк.
+pub(in crate::gpui_client) fn activate(
+    element: Stateful<Div>,
+    focus: Option<&FocusHandle>,
+    palette: Palette,
+    on_activate: impl Fn(&mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    activate_click(element, focus, palette, move |_, window, app| {
+        on_activate(window, app)
+    })
+}
+
+/// Сохраняет тип клика у тех элементов, которые управляют переходом фокуса.
+fn activate_click(
+    element: Stateful<Div>,
+    focus: Option<&FocusHandle>,
+    palette: Palette,
+    on_activate: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    // GPUI преобразует Enter и пробел у сфокусированного элемента в событие клика.
+    element
+        .map(|element| match focus {
+            Some(focus) => element.track_focus(&focus.clone().tab_stop(true)),
+            None => element.focusable(),
+        })
+        .tab_stop(true)
+        .when(palette.keyboard_focus_visible(), |element| {
+            element.focus(|style| style.border_color(palette.focus))
+        })
+        .cursor_pointer()
+        .on_click(on_activate)
+}
+
 /// Подключает одинаковые события мыши и клавиатуры у кнопок и строк.
 pub(in crate::gpui_client) fn activate(
     element: Stateful<Div>,

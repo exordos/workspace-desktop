@@ -8,9 +8,9 @@ mod tests;
 
 pub use links::{LinkHistoryCursor, LinkHistoryItem, LinkHistoryPage};
 pub use queries::{
-    MediaClearReport, MediaCopy, MediaCopyCursor, MediaCopyPage, MediaCopyQuery, MediaCopySort,
-    MediaEstimate, MediaFilter, MediaHistoryCursor, MediaHistoryItem, MediaHistoryPage,
-    MediaReapReport,
+    GalleryCounts, MediaClearReport, MediaCopy, MediaCopyCursor, MediaCopyPage, MediaCopyQuery,
+    MediaCopySort, MediaEstimate, MediaFilter, MediaHistoryCursor, MediaHistoryItem,
+    MediaHistoryPage, MediaReapReport,
 };
 
 use std::{

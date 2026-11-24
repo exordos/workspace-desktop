@@ -15,8 +15,8 @@ use workspace_core::{
         history::MediaAccess,
     },
     storage::media::{
-        LinkHistoryCursor, LinkHistoryItem, MediaCacheError, MediaHistoryCursor, MediaHistoryItem,
-        MediaKind,
+        GalleryCounts, LinkHistoryCursor, LinkHistoryItem, MediaCacheError, MediaHistoryCursor,
+        MediaHistoryItem, MediaKind,
     },
 };
 
@@ -79,6 +79,31 @@ impl From<OpenMediaError> for GalleryProblem {
             OpenMediaError::Cache(MediaCacheError::Stale) => Self::StaleCursor,
             _ => Self::Unavailable,
         }
+    }
+}
+
+/// Читает числа для входа в галерею без загрузки страниц и оригиналов.
+pub(super) async fn load_counts(
+    runtime: RuntimeClient,
+    address: ConversationAddress,
+    access: MediaAccess,
+) -> ConversationReply<Option<GalleryCounts>> {
+    let reply = runtime
+        .conversation(address, move |services, _| async move {
+            tokio::task::spawn_blocking(move || {
+                services
+                    .messenger
+                    .gallery_counts(&services.sync, &access)
+                    .ok()
+            })
+            .await
+            .ok()
+            .flatten()
+        })
+        .await;
+    ConversationReply {
+        address: reply.address,
+        value: reply.value.ok().flatten(),
     }
 }
 

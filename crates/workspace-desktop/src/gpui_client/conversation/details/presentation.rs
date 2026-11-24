@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use gpui::{App, ImageSource, SharedString, rgb};
+use uuid::Uuid;
 use workspace_core::{
     directory::{ProfilePresence, UserProfile},
     messenger::details::{
@@ -121,15 +122,24 @@ fn peer_content(
             ..PeerActions::default()
         }
     };
-    let mut card = peer_card(peer, panel.avatars.image(peer.user_id, app), language);
+    let mut card = peer_card(
+        peer.user_id,
+        &peer.profile,
+        panel.avatars.image(peer.user_id, app),
+        language,
+    );
     card.copied_fields = panel.copy_feedback.keys().copied().collect();
     card.actions = actions;
     card
 }
 
 /// Готовит общие поля карточки собеседника до подключения действий экрана.
-pub(super) fn peer_card(peer: &DirectSidebar, image: Option<ImageSource>, language: Language) -> PeerView {
-    let profile = &peer.profile;
+pub(super) fn peer_card(
+    user_id: Uuid,
+    profile: &UserProfile,
+    image: Option<ImageSource>,
+    language: Language,
+) -> PeerView {
     let mut avatar = avatar(&profile.display_name, Some(profile), image);
     if profile.presence == Some(ProfilePresence::Offline) {
         avatar.presence = AvatarPresence::Offline;
@@ -145,7 +155,7 @@ pub(super) fn peer_card(peer: &DirectSidebar, image: Option<ImageSource>, langua
             field(
                 language.tr("info.userId"),
                 Icon::AlternateEmail,
-                Some(peer.user_id.to_string()),
+                Some(user_id.to_string()),
             ),
             field(
                 language.tr("common.email"),

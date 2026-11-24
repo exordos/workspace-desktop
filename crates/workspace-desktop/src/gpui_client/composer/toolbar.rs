@@ -3,7 +3,8 @@
 use std::{cell::Cell, rc::Rc};
 
 use gpui::{
-    Context, Div, FocusHandle, Pixels, ScrollHandle, Stateful, Window, div, prelude::*, px,
+    AnyElement, Context, Div, FocusHandle, Pixels, ScrollHandle, Stateful, Window, div, prelude::*,
+    px,
 };
 
 use super::{COMPOSER_INSET, Composer, ToolbarPreferences, editor::Format};
@@ -14,10 +15,10 @@ use crate::gpui_client::{
 
 /// Команда ряда с подписью и размерами иконки из референса.
 struct Command {
-    format: Format,      // Изменение Markdown в редакторе.
-    icon: Icon,          // Глиф для кнопки команды.
-    glyph: [f32; 2],     // Ширина и высота глифа в логических пикселях.
-    id: &'static str,    // Устойчивое имя кнопки для маршрута фокуса и тестов.
+    format: Format,          // Изменение Markdown в редакторе.
+    icon: Icon,              // Глиф для кнопки команды.
+    glyph: [f32; 2],         // Ширина и высота глифа в логических пикселях.
+    id: &'static str,        // Устойчивое имя кнопки для маршрута фокуса и тестов.
     title_key: &'static str, // Ключ названия действия в подсказке.
 }
 
@@ -115,13 +116,15 @@ const COMMANDS: [Command; 10] = [
 const STYLE_GROUP_END: usize = 4;
 const DIVIDERS: [usize; 3] = [0, STYLE_GROUP_END, 6];
 const TOOLBAR_GAP: Pixels = px(8.);
+const EXTRA_COMMANDS: usize = 3;
 
 /// Устойчивый фокус и позиция прокрутки команд одного редактора.
 pub(super) struct Toolbar {
-    toggle: FocusHandle,          // Кнопка раскрытия переезжает из поля в ряд.
-    commands: [FocusHandle; 10],  // Кнопки сохраняют фокус при перерисовке.
-    scroll: ScrollHandle,         // Показывает команды за правой границей узкого окна.
-    last_focused: Option<usize>,  // Дочерний элемент, который уже показан прокруткой.
+    toggle: FocusHandle,         // Кнопка раскрытия переезжает из поля в ряд.
+    commands: [FocusHandle; 10], // Кнопки сохраняют фокус при перерисовке.
+    extras: [FocusHandle; EXTRA_COMMANDS], // Фокус для времени, файла и защищённого фрагмента.
+    scroll: ScrollHandle,        // Показывает команды за правой границей узкого окна.
+    last_focused: Option<usize>, // Дочерний элемент, который уже показан прокруткой.
     last_width: Rc<Cell<Pixels>>, // Фактическая ширина ряда после расчёта размеров.
 }
 
@@ -131,10 +134,16 @@ impl Toolbar {
         Self {
             toggle: cx.focus_handle(),
             commands: std::array::from_fn(|_| cx.focus_handle()),
+            extras: std::array::from_fn(|_| cx.focus_handle()),
             scroll: ScrollHandle::new(),
             last_focused: None,
             last_width: Rc::default(),
         }
+    }
+
+    /// Передаёт устойчивый фокус кнопкам, для которых доступность определяет редактор.
+    pub(super) fn extra_focus(&self) -> [FocusHandle; EXTRA_COMMANDS] {
+        self.extras.clone()
     }
 
     /// Возвращает кнопку раскрытия в поле или в начале панели.
@@ -175,6 +184,7 @@ impl Toolbar {
         palette: Palette,
         can_format: bool,
         language: Language,
+        extras: [Option<AnyElement>; EXTRA_COMMANDS],
         window: &Window,
         cx: &Context<Composer>,
     ) -> Stateful<Div> {
@@ -183,6 +193,12 @@ impl Toolbar {
         } else {
             self.commands
                 .iter()
+                .chain(
+                    self.extras
+                        .iter()
+                        .zip(&extras)
+                        .filter_map(|(focus, element)| element.as_ref().map(|_| focus)),
+                )
                 .enumerate()
                 .find(|(_, focus)| focus.is_focused(window))
                 .map(|(index, focus)| {
@@ -259,7 +275,7 @@ impl Toolbar {
                 .ml(gap),
             );
         }
-        row
+        row.children(extras.into_iter().flatten())
     }
 }
 

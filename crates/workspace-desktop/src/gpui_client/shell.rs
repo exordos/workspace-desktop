@@ -15,8 +15,9 @@ use workspace_core::{
 
 use super::contracts::{
     AccountSession, AccountSnapshot, ActivityAddress, ActivityPage, ChatEntry, ChatRoute,
-    ConversationAddress, NavigationRevision, NotificationReply, NotificationRequest,
-    NotificationRouteError, RuntimeEvent, ShellAction, SidebarAction,
+    ConversationAddress, ConversationReference, NavigationRevision, NotificationReply,
+    NotificationRequest, NotificationRouteError, RuntimeEvent, ShellAction, SidebarAction,
+    default_topic,
 };
 use crate::platform::notifications::NotificationClick;
 
@@ -570,6 +571,25 @@ impl Shell {
         Some(self.open_conversation(route, source.generation))
     }
 
+    /// Использует каталог текущего входа для точных переходов из текста сообщения.
+    pub(super) fn open_conversation_reference(
+        &mut self,
+        source: &ConversationAddress,
+        target: ConversationReference,
+    ) -> Option<ShellEffect> {
+        if self.conversation() != Some(source) {
+            return None;
+        }
+        let scope = reference_scope(self.selected_activity_chats()?, target)?;
+        if source.route.scope == scope && source.route.entry == ChatEntry::Latest {
+            return None;
+        }
+        self.open_sidebar_route(
+            ChatRoute { owner: source.route.owner.clone(), scope, entry: ChatEntry::Latest },
+            source.generation,
+        )
+    }
+
     /// Начинает проверку баннера, сохраняя видимый разговор до получения ответа.
     fn request_notification(&mut self, click: NotificationClick) -> Option<ShellEffect> {
         self.begin_navigation();
@@ -726,6 +746,34 @@ fn catalog_contains(chats: &[Chat], scope: HistoryScope) -> bool {
                 None => chat.direct,
                 Some(topic_id) => chat.topics.iter().any(|topic| topic.id == topic_id),
             }
+    })
+}
+
+/// Разрешает только известную пару канала и темы либо доступный маршрут личной переписки.
+fn reference_scope(chats: &[Chat], target: ConversationReference) -> Option<HistoryScope> {
+    let (chat, exact_topic) = match target {
+        ConversationReference::Stream(id) => (chats.iter().find(|chat| chat.id == id)?, None),
+        ConversationReference::Topic {
+            stream_id,
+            topic_id,
+        } => (
+            chats.iter().find(|chat| {
+                stream_id.is_none_or(|id| id == chat.id)
+                    && chat.topics.iter().any(|topic| topic.id == topic_id)
+            })?,
+            Some(topic_id),
+        ),
+        ConversationReference::Contact(id) => (
+            chats
+                .iter()
+                .find(|chat| chat.direct && chat.metadata.direct_peer_id == Some(id))?,
+            None,
+        ),
+    };
+    let topic_id = exact_topic.or_else(|| default_topic(chat));
+    (chat.direct || topic_id.is_some()).then_some(HistoryScope {
+        stream_id: chat.id,
+        topic_id,
     })
 }
 

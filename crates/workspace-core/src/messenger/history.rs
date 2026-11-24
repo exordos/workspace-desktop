@@ -17,8 +17,8 @@ use crate::{
         HistoryDirection, HistoryEdge, HistoryMessage, HistoryPageEdges, HistoryPageOutcome,
         HistoryPageTarget, HistoryScope, HistoryWindow,
         media::{
-            LinkHistoryCursor, LinkHistoryPage, MediaCache, MediaHistoryCursor, MediaHistoryPage,
-            MediaKind,
+            GalleryCounts, LinkHistoryCursor, LinkHistoryPage, MediaCache, MediaHistoryCursor,
+            MediaHistoryPage, MediaKind,
         },
     },
     sync::{HistoryRequest, Sync, SyncError},
@@ -240,6 +240,17 @@ impl LatestHistoryOpening<'_> {
 }
 
 impl MessengerSource {
+    /// Считает известные позиции в области, с которой откроется галерея.
+    pub fn gallery_counts(
+        &self,
+        sync: &Sync,
+        access: &MediaAccess,
+    ) -> Result<GalleryCounts, OpenMediaError> {
+        access.list_gallery(sync, false, true, None, |cache, scope, _| {
+            Ok(cache.gallery_counts(&access.owner, scope)?)
+        })
+    }
+
     /// Возвращает известные вложения по допуску подтверждённой темы или её стрима.
     pub fn list_media(
         &self,

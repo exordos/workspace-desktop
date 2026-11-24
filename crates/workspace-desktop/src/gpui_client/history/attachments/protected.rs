@@ -3,12 +3,16 @@
 use std::{cell::RefCell, collections::VecDeque, rc::Rc, sync::Arc};
 
 use gpui::{App, Context, Entity, IntoElement, Render, Task, Window, div, prelude::*};
-use workspace_core::messenger::{
-    encryption::{EncryptionActivation, ProtectedMessage},
-    files::{MediaFile, OpenMediaError},
-    history::MediaAccess,
+use workspace_core::{
+    messenger::{
+        encryption::{EncryptionActivation, ProtectedMessage},
+        files::{MediaFile, OpenMediaError},
+        history::MediaAccess,
+    },
+    storage::media::MediaKind,
 };
 
+use super::super::media_album::Tile;
 use super::{
     AttachmentKey, Conversation, ProtectedPicture, decode_protected_thumbnail, protected_photo,
 };
@@ -155,6 +159,8 @@ impl ProtectedAttachment {
 /// Миниатюра на месте одной видимой карточки. Изменение уведомляет этот лист GPUI.
 struct Thumbnail {
     source: ProtectedAttachment,       // Проверка источника при каждом paint.
+    kind: MediaKind,                   // Изображение или первый кадр видео.
+    tile: Option<Tile>,                // Геометрия кадра в альбоме прямого сообщения.
     picture: Option<ProtectedPicture>, // Кадр в памяти с версией исходного файла.
     active: Rc<std::cell::Cell<bool>>, // Закрытие окна блокирует готовый элемент и будущий ответ.
     load: Option<Task<()>>,            // Снимает HTTPS-запрос сразу при отзыве карточки.
@@ -177,12 +183,18 @@ impl Render for Thumbnail {
     /// Рисует только полученный кадр, не передавая его в общий кэш истории.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::for_window(window, cx);
-        let frame = div().size_full().flex().items_center().justify_center();
+        let frame = div()
+            .relative()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center();
         if let Some(picture) = &self.picture {
             frame
                 .child(protected_photo(
                     picture.clone(),
                     self.active.clone(),
+                    self.tile,
                     #[cfg(all(test, feature = "gpui-test"))]
                     self.paints.clone(),
                 ))
@@ -199,8 +211,10 @@ impl Render for Thumbnail {
                         ),
                     }
                 })
+        } else if self.kind == MediaKind::Video {
+            frame
         } else {
-            frame.child(Icon::Attach.element(gpui::px(20.), palette.text_secondary))
+            frame.child(Icon::Image.element(gpui::px(24.), palette.text_secondary))
         }
     }
 }
@@ -252,6 +266,8 @@ impl ProtectedThumbnails {
     pub(super) fn render(
         &self,
         source: &ProtectedAttachment,
+        kind: MediaKind,
+        tile: Option<Tile>,
         load: &PreviewLoad,
         app: &mut App,
     ) -> impl IntoElement + use<> {
@@ -261,6 +277,12 @@ impl ProtectedThumbnails {
             && let Some((_, entry)) = entries.remove(index)
         {
             if entry.read(app).source.same_source(source) {
+                if entry.read(app).tile.map(|tile| tile.corners) != tile.map(|tile| tile.corners) {
+                    entry.update(app, |thumbnail, cx| {
+                        thumbnail.tile = tile;
+                        cx.notify();
+                    });
+                }
                 entries.push_back((key, entry.clone()));
                 return entry;
             }
@@ -287,10 +309,12 @@ impl ProtectedThumbnails {
                             .open(&services, &load.access, &load.activation)
                             .await
                             .ok()?;
-                        tokio::task::spawn_blocking(move || decode_protected_thumbnail(file))
-                            .await
-                            .ok()
-                            .flatten()
+                        tokio::task::spawn_blocking(move || {
+                            decode_protected_thumbnail(file, kind, tile)
+                        })
+                        .await
+                        .ok()
+                        .flatten()
                     })
                     .await;
                 let _ = entry.update(cx, |thumbnail, cx| {
@@ -306,6 +330,8 @@ impl ProtectedThumbnails {
             });
             Thumbnail {
                 source,
+                kind,
+                tile,
                 picture: None,
                 active,
                 load: Some(task),

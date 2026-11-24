@@ -19,8 +19,8 @@ use super::super::{
 pub(super) const CATEGORIES: [GalleryCategory; 4] = [
     GalleryCategory::Photos,
     GalleryCategory::Videos,
-    GalleryCategory::Links,
     GalleryCategory::Files,
+    GalleryCategory::Links,
 ];
 
 /// Действие пользователя внутри сведений или каталога вложений.
@@ -96,8 +96,8 @@ impl Gallery {
         &handles[match self.category {
             GalleryCategory::Photos => 0,
             GalleryCategory::Videos => 1,
-            GalleryCategory::Links => 2,
-            GalleryCategory::Files => 3,
+            GalleryCategory::Files => 2,
+            GalleryCategory::Links => 3,
         }]
     }
 
@@ -146,6 +146,51 @@ impl Invalidation {
 }
 
 impl Conversation {
+    /// Перечитывает счётчики только для открытой панели и текущего допуска.
+    pub(in crate::gpui_client::conversation) fn refresh_gallery_counts(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(access) = self.gallery_access() else {
+            return;
+        };
+        let Some(panel) = self.details.as_mut().filter(|panel| panel.is_present(cx)) else {
+            return;
+        };
+        let id = Uuid::new_v4();
+        let runtime = panel.runtime.clone();
+        let address = self.address.clone();
+        log::debug!("gpui_gallery op_id={id} event=counts_requested");
+        let task = cx.spawn(async move |view, cx| {
+            let reply = gallery_source::load_counts(runtime, address, access).await;
+            let _ = view.update(cx, |view, cx| {
+                let Some(counts) = reply.for_current(Some(&view.address)) else {
+                    return;
+                };
+                let Some(panel) = view.details.as_mut().filter(|panel| panel.is_present(cx)) else {
+                    return;
+                };
+                if !panel
+                    .gallery_counts_request
+                    .as_ref()
+                    .is_some_and(|(current, _)| *current == id)
+                {
+                    return;
+                }
+                log::debug!(
+                    "gpui_gallery op_id={id} event=counts_completed success={}",
+                    counts.is_some()
+                );
+                panel.gallery_counts_request = None;
+                if panel.gallery_counts != counts {
+                    panel.gallery_counts = counts;
+                    cx.notify();
+                }
+            });
+        });
+        panel.gallery_counts_request = Some((id, task));
+    }
+
     /// Обрабатывает действие только для живого раздела и текущего доступа.
     pub(super) fn handle_gallery_action(
         &mut self,
@@ -243,6 +288,33 @@ impl Conversation {
         change: &SyncChange,
         cx: &mut Context<Self>,
     ) {
+        let current = self.address.route.scope;
+        let includes = |scope: HistoryScope, whole_stream: bool| {
+            scope.stream_id == current.stream_id
+                && (whole_stream
+                    || current.topic_id.is_none()
+                    || scope.topic_id == current.topic_id)
+        };
+        let counts_changed = match change {
+            SyncChange::HistoryMessageCreated { scope, .. } => includes(*scope, false),
+            SyncChange::HistoryMessageChanged { .. } | SyncChange::MediaFileInvalidated { .. } => {
+                true
+            }
+            SyncChange::HistoryAccessRevoked(HistoryRevocation::Topic {
+                stream_id,
+                topic_id,
+            }) => includes(
+                HistoryScope {
+                    stream_id: *stream_id,
+                    topic_id: Some(*topic_id),
+                },
+                false,
+            ),
+            _ => false,
+        };
+        if counts_changed {
+            self.refresh_gallery_counts(cx);
+        }
         let Some(gallery) = self
             .details
             .as_mut()
@@ -250,13 +322,7 @@ impl Conversation {
         else {
             return;
         };
-        let current = self.address.route.scope;
-        let includes = |scope: HistoryScope| {
-            scope.stream_id == current.stream_id
-                && (gallery.whole_stream
-                    || current.topic_id.is_none()
-                    || scope.topic_id == current.topic_id)
-        };
+        let includes = |scope| includes(scope, gallery.whole_stream);
         let invalidation = match change {
             SyncChange::HistoryMessageCreated { scope, .. } if includes(*scope) => {
                 self.mark_open_gallery_needs_refresh(cx);
@@ -483,6 +549,13 @@ impl Conversation {
 
 #[cfg(all(test, feature = "gpui-test"))]
 impl Conversation {
+    /// Возвращает числа, которые панель передала строкам вложений.
+    pub(in crate::gpui_client) fn tested_gallery_counts(
+        &self,
+    ) -> Option<workspace_core::storage::media::GalleryCounts> {
+        self.details.as_ref()?.gallery_counts
+    }
+
     /// Даёт фактическое состояние галереи проверке рабочего окна.
     pub(in crate::gpui_client) fn tested_gallery(&self) -> Option<(bool, usize, bool)> {
         let gallery = self.details.as_ref()?.gallery.as_ref()?;

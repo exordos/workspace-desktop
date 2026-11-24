@@ -126,7 +126,7 @@ impl Conversation {
             .source_author(id, self.reply_peer())
             .and_then(|author| match author {
                 ReplyText::Source(text) => Some(text),
-                ReplyText::Label(_) | ReplyText::Mixed(_) => None,
+                _ => None,
             })
             .unwrap_or_default();
         let original = ForwardOrigin {

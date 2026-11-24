@@ -294,6 +294,41 @@ fn click(ui: &mut VisualTestContext, selector: &'static str) {
     ui.run_until_parked();
 }
 
+/// Нажатие по видимому моменту открывает панель времени, а клик вне её закрывает панель.
+#[gpui::test]
+fn references_open_shared_time_from_the_visible_history(cx: &mut TestAppContext) {
+    let address = address(ChatEntry::Latest);
+    let (view, ui, requests) = scenario(cx, &address);
+    let mut snapshot = window(
+        address.route.scope,
+        10..11,
+        HistoryEdge::End,
+        HistoryEdge::End,
+    );
+    let id = snapshot.messages[0].id;
+    snapshot.messages[0].body =
+        MessageBody::Markdown("До urn:time:2026-10-13T10:02:00Z после".into());
+    answer(
+        request(&requests, Load::Open(ChatEntry::Latest)),
+        snapshot,
+        ui,
+    );
+    let position = ui.read(|cx| {
+        view.read(cx)
+            .viewport
+            .tested_text_layout(id)
+            .expect("отрисована строка ссылки")
+            .position_for_index("До ".len() + 2)
+            .expect("локальная подпись времени")
+    }) + gpui::point(px(1.), px(4.));
+    ui.simulate_click(position, Modifiers::none());
+    ui.run_until_parked();
+    assert!(ui.debug_bounds("history-reference-time-panel").is_some());
+    ui.simulate_click(gpui::point(px(3.), px(3.)), Modifiers::none());
+    ui.run_until_parked();
+    assert!(ui.debug_bounds("history-reference-time-panel").is_none());
+}
+
 /// Прокручивает сам список, чтобы его рабочий обработчик мог запросить страницу.
 fn scroll_history(ui: &mut VisualTestContext, delta: f32) {
     let position = ui
@@ -770,6 +805,40 @@ fn fixed_topic_groups_and_wraps_at_both_panel_sizes(cx: &mut TestAppContext) {
         narrow.size.height > wide.size.height,
         "Длинная строка переносится: {wide:?} → {narrow:?}"
     );
+}
+
+/// Показывает разделитель на местной полуночи и объединяет следующие строки того же дня.
+#[gpui::test]
+fn shows_date_separator_at_local_midnight(cx: &mut TestAppContext) {
+    let address = address(ChatEntry::Latest);
+    let (_, ui, requests) = scenario(cx, &address);
+    let mut page = window(
+        address.route.scope,
+        1..4,
+        HistoryEdge::End,
+        HistoryEdge::End,
+    );
+    for (message, (date, time)) in page.messages.iter_mut().zip([
+        ("2026-12-31", "23:59"),
+        ("2027-01-01", "00:00"),
+        ("2027-01-01", "00:01"),
+    ]) {
+        message.metadata.created_at = crate::platform::message_time::parse_local_time(date, time)
+            .expect("Дата стенда должна существовать в системном часовом поясе");
+    }
+    answer(request(&requests, Load::Open(ChatEntry::Latest)), page, ui);
+
+    assert!(
+        ui.debug_bounds("history-message-00000000-0000-0000-0000-000000000003")
+            .is_some()
+    );
+    for (selector, expected) in [
+        ("history-date-00000000-0000-0000-0000-000000000001", true),
+        ("history-date-00000000-0000-0000-0000-000000000002", true),
+        ("history-date-00000000-0000-0000-0000-000000000003", false),
+    ] {
+        assert_eq!(ui.debug_bounds(selector).is_some(), expected, "{selector}");
+    }
 }
 
 /// Проверяет, что при открытии без кэша скелетон сменяется первым настоящим сообщением.

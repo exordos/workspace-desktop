@@ -19,7 +19,7 @@ use super::{
     folder_menu::{RowAction, RowActions, option},
 };
 use crate::gpui_client::{
-    conversation::{ContactPanel, ContactRequest},
+    conversation::{ContactPanel, ContactRequest, ContactTarget},
     preferences::{Language, Preferences},
     right_panel::RightPanel,
 };
@@ -306,13 +306,14 @@ impl Sidebar {
                         let sidebar = cx.weak_entity();
                         let request = ContactRequest {
                             session: session.clone(),
-                            stream_id,
+                            target: ContactTarget::Direct(stream_id),
                             opener,
-                            message: Rc::new(move |app| {
+                            message: Some(Rc::new(move |app| {
                                 let _ = sidebar.update(app, |sidebar, cx| {
                                     sidebar.open_contact_chat(&source, stream_id, cx);
                                 });
-                            }),
+                            })),
+                            origin: None,
                         };
                         ContactPanel::open(&host, runtime.clone(), request, window, cx);
                     }

@@ -1,29 +1,41 @@
 //! Компоненты чатов: аватары, счётчики, строки каталога и пузыри сообщений.
 
 use gpui::{
-    AnyElement, App, Div, ElementId, FocusHandle, Hsla, ImageSource, ObjectFit, SharedString, Stateful, Window,
-    div, img, prelude::*, px,
+    AnyElement, App, Corners, Div, ElementId, FocusHandle, Hsla, ImageSource, ObjectFit, Pixels,
+    SharedString, Stateful, Window, div, img, prelude::*, px, rgba,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::gpui_client::preferences::Language;
+use crate::{
+    gpui_client::preferences::Language,
+    platform::message_time::{CalendarDate, LocalTime},
+};
 
 use super::{
     Icon, Palette, TextRole,
     controls::activate,
     label,
     theme::{
-        CONTROL_BORDER, MESSAGE_BUBBLE_RADIUS, PANEL_RADIUS, SURFACE_RADIUS, ellipsized_label,
+        CONTROL_BORDER, MESSAGE_BUBBLE_MAX_WIDTH, MESSAGE_BUBBLE_RADIUS, PANEL_RADIUS, SURFACE_RADIUS,
+        ellipsized_label,
     },
 };
 
 /// Показывает календарную дату из ISO-строки Workspace на языке профиля.
-pub(in crate::gpui_client) fn profile_joined_date(value: &str, language: Language) -> Option<String> {
-    let date = value.get(..10)?;
-    let mut parts = date.split('-');
-    let year = parts.next()?;
-    let month = parts.next()?.parse::<usize>().ok()?.checked_sub(1)?;
-    let day = parts.next()?.parse::<u8>().ok()?;
+pub(in crate::gpui_client) fn profile_joined_date(
+    value: &str,
+    language: Language,
+) -> Option<String> {
+    LocalTime::system()
+        .profile_date(value)
+        .map(|date| calendar_date_label(date, language))
+}
+
+/// Подставляет местные календарные поля в шаблон языка аккаунта.
+pub(in crate::gpui_client) fn calendar_date_label(
+    date: CalendarDate,
+    language: Language,
+) -> String {
     let month_key = [
         "desktop.profile.joinedMonths.jan",
         "desktop.profile.joinedMonths.feb",
@@ -37,16 +49,15 @@ pub(in crate::gpui_client) fn profile_joined_date(value: &str, language: Languag
         "desktop.profile.joinedMonths.oct",
         "desktop.profile.joinedMonths.nov",
         "desktop.profile.joinedMonths.dec",
-    ]
-    .get(month)?;
-    Some(language.tr_with(
+    ][usize::from(date.month - 1)];
+    language.tr_with(
         "desktop.profile.joinedDate",
         &[
-            ("year", year),
+            ("year", &date.year.to_string()),
             ("month", language.tr(month_key)),
-            ("day", &day.to_string()),
+            ("day", &date.day.to_string()),
         ],
-    ))
+    )
 }
 
 #[cfg(test)]
@@ -56,7 +67,7 @@ mod date_tests {
     /// Использует подпись месяца и порядок частей даты из выбранного каталога.
     #[test]
     fn profile_joined_date_uses_locale_template() {
-        let date = "2025-05-01T04:05:06Z";
+        let date = "2025-05-01";
         assert_eq!(
             profile_joined_date(date, Language::Ru).as_deref(),
             Some("1 мая 2025 г.")
@@ -517,6 +528,75 @@ impl MessageBubble {
         self.render_body_with_overlay(palette, content, ends_group, accessory, Some(overlay.into_any_element()))
     }
 
+    /// Расставляет скругления только на углах, где медиа совпадает с краем пузыря.
+    pub(in crate::gpui_client) fn media_corners(
+        &self,
+        ends_group: bool,
+        has_footer: bool,
+    ) -> Corners<Pixels> {
+        let mut corners = message_bubble_radii(self.own, ends_group);
+        if self.author.is_some() {
+            corners.top_left = px(0.);
+            corners.top_right = px(0.);
+        }
+        if has_footer {
+            corners.bottom_left = px(0.);
+            corners.bottom_right = px(0.);
+        }
+        corners
+    }
+
+    /// Прижимает медиа к краям пузыря, а подпись и имя рисует с обычными отступами.
+    pub(in crate::gpui_client) fn render_with_media(
+        self,
+        palette: Palette,
+        media: Div,
+        caption: Option<AnyElement>,
+        ends_group: bool,
+        accessory: Option<AnyElement>,
+        overlay: Option<AnyElement>,
+    ) -> Div {
+        let time_on_media = caption.is_none();
+        let metadata = self.metadata(palette, time_on_media);
+        let (media_metadata, caption_metadata) = if time_on_media {
+            (metadata, None)
+        } else {
+            (None, metadata)
+        };
+        let bubble = self
+            .surface(palette, ends_group)
+            .w_full()
+            .children(
+                self.author_label(palette)
+                    .map(|author| author.px(px(12.)).pt(px(8.)).pb_1()),
+            )
+            .child(media.relative().children(media_metadata.map(|time| {
+                time.absolute()
+                    .right_2()
+                    .bottom_2()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_full()
+                    .bg(rgba(0x000000a6))
+                    .debug_selector(|| "history-media-time".into())
+            })))
+            .children(caption.map(|caption| {
+                message_body(caption, caption_metadata)
+                    .px(px(12.))
+                    .py(px(8.))
+            }))
+            .children(accessory.map(|accessory| {
+                div()
+                    .px(px(12.))
+                    .pb(px(8.))
+                    .when(time_on_media, |footer| footer.pt(px(8.)))
+                    .child(accessory)
+            }))
+            .children(overlay)
+            .debug_selector(|| "history-media-bubble".into());
+        self.align(bubble)
+    }
+
     /// Готовит одинаковый текстовый элемент для обычного и раскрытого пузыря.
     fn plain_body(&self, palette: Palette) -> Div {
         label(palette, TextRole::Body, self.body.clone())
@@ -544,56 +624,77 @@ impl MessageBubble {
         accessory: Option<AnyElement>,
         overlay: Option<AnyElement>,
     ) -> Div {
-        let status = self.delivery.filter(|_| self.own).map(|state| match state {
-            DeliveryMark::Pending | DeliveryMark::Unknown => {
-                Icon::Pending.element(px(16.), palette.message_time)
-            }
-            DeliveryMark::Sent => Icon::Check.element(px(16.), palette.message_time),
-            DeliveryMark::Delivered => Icon::DoneAll.element(px(16.), palette.message_time),
-            DeliveryMark::Read => Icon::DoneAll.element(px(16.), palette.accent),
-            DeliveryMark::Failed => Icon::Error.element(px(16.), palette.danger),
-        });
-        let body = div()
-            .flex()
-            .flex_wrap()
-            .items_end()
-            .gap_x(px(8.))
-            .gap_y(px(2.))
-            .child(content)
-            .when(self.time.is_some() || status.is_some(), |body| {
-                body.child(
-                    div()
-                        .ml_auto()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .gap(px(4.))
-                        .children(self.time.map(|time| {
-                            label(palette, TextRole::Caption, time).text_color(palette.message_time)
-                        }))
-                        .children(status),
-                )
-            });
-        let bubble = message_bubble_surface(self.own, ends_group)
-            .relative()
-            .max_w(px(680.))
-            .min_w_0()
+        let body = message_body(content, self.metadata(palette, false));
+        let bubble = self
+            .surface(palette, ends_group)
             .px(px(12.))
             .py(px(8.))
+            .children(self.author_label(palette))
+            .child(body)
+            .children(accessory)
+            .children(overlay);
+        self.align(bubble)
+    }
+
+    /// Показывает время и статус с цветом фона текста или кадра.
+    pub(super) fn metadata(&self, palette: Palette, on_media: bool) -> Option<Div> {
+        let color = if on_media {
+            rgba(0xffffffff).into()
+        } else {
+            palette.message_time
+        };
+        let status = self.delivery.filter(|_| self.own).map(|state| match state {
+            DeliveryMark::Pending | DeliveryMark::Unknown => Icon::Pending.element(px(16.), color),
+            DeliveryMark::Sent => Icon::Check.element(px(16.), color),
+            DeliveryMark::Delivered => Icon::DoneAll.element(px(16.), color),
+            DeliveryMark::Read => {
+                Icon::DoneAll.element(px(16.), if on_media { color } else { palette.accent })
+            }
+            DeliveryMark::Failed => {
+                Icon::Error.element(px(16.), if on_media { color } else { palette.danger })
+            }
+        });
+        (self.time.is_some() || status.is_some()).then(|| {
+            div()
+                .ml_auto()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(4.))
+                .children(
+                    self.time
+                        .clone()
+                        .map(|time| label(palette, TextRole::Caption, time).text_color(color)),
+                )
+                .children(status)
+        })
+    }
+
+    /// Ограничивает ширину сообщения и подставляет цвет отправителя.
+    fn surface(&self, palette: Palette, ends_group: bool) -> Div {
+        message_bubble_surface(self.own, ends_group)
+            .relative()
+            .max_w(MESSAGE_BUBBLE_MAX_WIDTH)
+            .min_w_0()
             .bg(if self.own {
                 palette.message_own
             } else {
                 palette.message
             })
-            .children(self.author.map(|author| {
-                label(palette, TextRole::Label, one_line(&author))
-                    .text_color(palette.accent)
-                    .whitespace_nowrap()
-                    .overflow_hidden()
-            }))
-            .child(body)
-            .children(accessory)
-            .children(overlay);
+    }
+
+    /// Показывает автора в начале группы сообщений.
+    pub(super) fn author_label(&self, palette: Palette) -> Option<Div> {
+        self.author.as_ref().map(|author| {
+            label(palette, TextRole::Label, one_line(author))
+                .text_color(palette.accent)
+                .whitespace_nowrap()
+                .overflow_hidden()
+        })
+    }
+
+    /// Оставляет входящие слева и исходящие справа в ширине той же строки.
+    pub(super) fn align(&self, bubble: impl IntoElement) -> Div {
         div()
             .w_full()
             .min_w_0()
@@ -603,15 +704,43 @@ impl MessageBubble {
     }
 }
 
+/// Размещает подпись и время в одной строке, когда для них достаточно места.
+fn message_body(content: impl IntoElement, metadata: Option<Div>) -> Div {
+    div()
+        .flex()
+        .flex_wrap()
+        .items_end()
+        .gap_x(px(8.))
+        .gap_y(px(2.))
+        .child(content)
+        .children(metadata)
+}
+
 /// Уменьшает радиус со стороны автора, чтобы соседние пузыри выглядели как группа.
 fn message_bubble_surface(own: bool, ends_group: bool) -> Div {
-    let surface = div().rounded(MESSAGE_BUBBLE_RADIUS);
-    match (own, ends_group) {
-        (true, true) => surface.rounded_br(PANEL_RADIUS),
-        (false, true) => surface.rounded_bl(PANEL_RADIUS),
-        (true, false) => surface.rounded_r(SURFACE_RADIUS),
-        (false, false) => surface.rounded_l(SURFACE_RADIUS),
+    let corners = message_bubble_radii(own, ends_group);
+    div()
+        .rounded_tl(corners.top_left)
+        .rounded_tr(corners.top_right)
+        .rounded_bl(corners.bottom_left)
+        .rounded_br(corners.bottom_right)
+}
+
+/// Возвращает общую форму для фона пузыря и крайних кадров альбома.
+fn message_bubble_radii(own: bool, ends_group: bool) -> Corners<Pixels> {
+    let mut radii = Corners::all(MESSAGE_BUBBLE_RADIUS);
+    let (top, bottom) = if own {
+        (&mut radii.top_right, &mut radii.bottom_right)
+    } else {
+        (&mut radii.top_left, &mut radii.bottom_left)
+    };
+    if ends_group {
+        *bottom = PANEL_RADIUS;
+    } else {
+        *top = SURFACE_RADIUS;
+        *bottom = SURFACE_RADIUS;
     }
+    radii
 }
 
 #[cfg(test)]

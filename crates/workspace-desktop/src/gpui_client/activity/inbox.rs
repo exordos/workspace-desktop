@@ -213,7 +213,9 @@ fn row_button(
             format!("{name} · {topic}")
         },
     );
-    let time = row.updated_at.and_then(|time| time.as_str().get(11..16));
+    let time = row
+        .updated_at
+        .and_then(crate::platform::message_time::short_time);
     let button = div()
         .id(gpui::SharedString::from(selector.clone()))
         .debug_selector(move || selector.clone())
@@ -234,7 +236,7 @@ fn row_button(
                 .flex_1()
                 .min_w_0()
                 .child(label(palette, TextRole::Body, title).truncate())
-                .children(time.map(|time| label(palette, TextRole::Caption, time.to_owned()))),
+                .children(time.map(|time| label(palette, TextRole::Caption, time))),
         )
         .children(unread_badge(
             palette,

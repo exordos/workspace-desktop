@@ -68,6 +68,11 @@ fn toolbar_formats_text_without_submitting_or_disturbing_ime(cx: &mut TestAppCon
     {
         assert_eq!(pair[1].left() - pair[0].right(), px(gap));
     }
+    let time = ui.debug_bounds("composer-insert-time").unwrap();
+    assert_eq!(time.size, size(px(32.), px(32.)));
+    assert_eq!(time.origin.y, toolbar.origin.y);
+    assert_eq!(time.left(), commands.last().unwrap().right());
+    assert!(time.right() <= toolbar.right());
 
     click(ui, "composer-format-bold");
     assert_eq!(draft(&view, ui), "**Отбор 🧩**");

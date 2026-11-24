@@ -1,11 +1,14 @@
 //! Собирает редактор сообщения, состояние проверки темы и типизированные действия отправки.
 //! Экран разговора передаёт эти действия в рабочий поток; здесь остаются текст и его версия.
 
+mod attachment_upload;
 mod draft;
 mod editor;
 mod fragments;
+mod reference_source;
 mod replies;
 mod source;
+mod time_insert;
 mod toolbar;
 mod toolbar_preferences;
 
@@ -30,9 +33,12 @@ pub(super) use self::source::{
     DestinationError, QueueWriteOutcome, ResolvedDestination, SendSource,
 };
 use self::{
+    attachment_upload::AttachmentState,
     draft::{DraftSend, DraftSession},
-    editor::{EditPreviousRequested, SubmitRequested},
+    editor::{EditPreviousRequested, PasteImageRequested, SubmitRequested},
+    reference_source::ReferenceDirectory,
     replies::Replies,
+    time_insert::TimeInsert,
 };
 use super::{
     contracts::{ConversationAddress, ConversationReply},
@@ -171,6 +177,9 @@ pub(super) struct Composer {
     edit: Option<ProtectedEdit>,  // Правка защищённого сообщения до сохранения или отзыва.
     fragment_new_key: bool, // Нужен свежий локальный ключ только для следующей смешанной отправки.
     toolbar: Toolbar,       // Кнопка раскрытия, команды и их клавиатурный фокус.
+    reference_directory: ReferenceDirectory, // Состояние запроса справочника для @.
+    time_insert: Option<TimeInsert>, // Открытая форма выбора местной даты и времени.
+    attachment_upload: AttachmentState, // Файл на выборе или в передаче для этого черновика.
     writing: Option<Attempt>, // Текущая запись; None позволяет начать следующую.
     write_failure: Option<(u64, u64, WriteFailure)>, // Версии ввода и вкладок при отказе записи.
     _editor_observer: Subscription, // Обновляет доступность кнопки после редактирования.
@@ -178,6 +187,7 @@ pub(super) struct Composer {
     renders: usize, // Вызовы настоящего Render в проверках изоляции GPUI.
     _editor_submit: Subscription, // Связывает Enter с тем же действием, что и кнопку отправки.
     _editor_edit: Subscription, // Запрашивает правку со стрелки вверх в пустом редакторе.
+    _editor_paste_image: Subscription, // Передаёт картинку из буфера в обычный upload.
 }
 
 impl Composer {
@@ -206,9 +216,15 @@ impl Composer {
 
     /// Создаёт редактор привязанного к открытому разговору черновика.
     pub fn new(address: ConversationAddress, cx: &mut Context<Self>) -> Self {
-        let editor = cx.new(Editor::for_composer);
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::for_composer(cx);
+            editor.set_reference_owner(address.route.owner.clone());
+            editor
+        });
         let observer = cx.observe(&editor, |composer, _, cx| {
             composer.persist_draft(cx);
+            composer.load_mention_directory(cx);
+            composer.validate_attachment_target(cx);
             cx.notify();
         });
         let submit = cx.subscribe(&editor, |composer, _, _: &SubmitRequested, cx| {
@@ -220,6 +236,9 @@ impl Composer {
             {
                 cx.emit(ComposerEvent::EditPrevious);
             }
+        });
+        let paste = cx.subscribe(&editor, |composer, _, image: &PasteImageRequested, cx| {
+            composer.paste_attachment(image.0.clone(), cx);
         });
         Self {
             address,
@@ -233,11 +252,15 @@ impl Composer {
             edit: None,
             fragment_new_key: false,
             toolbar: Toolbar::new(cx),
+            reference_directory: ReferenceDirectory::default(),
+            time_insert: None,
+            attachment_upload: AttachmentState::default(),
             writing: None,
             write_failure: None,
             _editor_observer: observer,
             _editor_submit: submit,
             _editor_edit: edit,
+            _editor_paste_image: paste,
             #[cfg(all(test, feature = "gpui-test"))]
             renders: 0,
         }
@@ -417,6 +440,10 @@ impl Composer {
         self.persist_draft(cx);
         self.plain_target = None;
         self.destination = Destination::Unchecked;
+        self.editor
+            .update(cx, |editor, cx| editor.set_reference_suggestions(false, cx));
+        self.attachment_upload.cancel();
+        self.time_insert = None;
         cx.emit(ComposerEvent::DestinationChanged);
         cx.notify();
     }
@@ -497,6 +524,18 @@ impl Composer {
                 Destination::Unavailable(error)
             }
         };
+        self.editor.update(cx, |editor, cx| {
+            editor.set_reference_suggestions(
+                matches!(
+                    self.destination,
+                    Destination::Ready {
+                        encrypted: false,
+                        ..
+                    }
+                ),
+                cx,
+            );
+        });
         cx.emit(ComposerEvent::DestinationChanged);
         log::debug!(
             "gpui_send op_id={op_id} event=destination_finished available={}",
@@ -533,6 +572,7 @@ impl Composer {
             && markers_supported
             && self.edit.as_ref().is_none_or(|edit| edit.access.current())
             && self.writing.is_none()
+            && !self.attachment_upload.pending()
             && !editor.composing()
             && self.replies.has_answer(editor.text())
             && !over_limit(&markdown)
@@ -657,6 +697,8 @@ impl Composer {
                 ) =>
             {
                 self.destination = Destination::Unavailable(error);
+                self.editor
+                    .update(cx, |editor, cx| editor.set_reference_suggestions(false, cx));
                 cx.emit(ComposerEvent::DestinationChanged);
             }
             _ => {}
@@ -723,15 +765,23 @@ impl Render for Composer {
         let target = cx.entity().downgrade();
         let edit_target = target.clone();
         let toolbar = expanded.then(|| {
-            div()
-                .flex()
-                .items_center()
-                .child(self.toolbar.row(palette, can_format, locale, window, cx))
-                .children(self.fragment_toolbar(palette, locale, can_format, cx))
+            let [time, file, fragment] = self.toolbar.extra_focus();
+            let extras = [
+                Some(
+                    self.time_button(palette, locale, can_format, &time, cx)
+                        .into_any_element(),
+                ),
+                self.attachment_button(palette, locale, &file, cx)
+                    .map(|button| button.into_any_element()),
+                self.fragment_toolbar(palette, locale, can_format, &fragment, cx),
+            ];
+            self.toolbar
+                .row(palette, can_format, locale, extras, window, cx)
         });
         // Сетка сначала задаёт общую ширину поля и пояснения. От неё зависит высота переносов.
         // Явная ширина нужна и при отдельной раскладке композера из кэша GPUI.
         div()
+            .id("conversation-composer-drop-zone")
             .grid()
             .grid_cols(1)
             .flex_none()
@@ -742,6 +792,15 @@ impl Render for Composer {
             .rounded(SURFACE_RADIUS)
             .bg(palette.surface)
             .debug_selector(|| "conversation-composer".into())
+            .when(self.can_drop_attachments(cx), |composer| {
+                composer
+                    .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| {
+                        style.bg(palette.accent_soft)
+                    })
+                    .on_drop(cx.listener(|composer, paths: &gpui::ExternalPaths, _, cx| {
+                        composer.drop_attachments(paths.paths(), cx);
+                    }))
+            })
             .children(self.edit.as_ref().map(|_| {
                 div()
                     .flex()
@@ -764,6 +823,12 @@ impl Render for Composer {
             }))
             .children(self.render_replies(palette, window, cx))
             .children(self.fragment_key_option(palette, locale, cx))
+            .children(
+                self.time_insert
+                    .as_ref()
+                    .map(|picker| picker.render(palette, locale, cx)),
+            )
+            .children(self.attachments_panel(palette, locale, cx))
             .child(
                 div()
                     .flex()

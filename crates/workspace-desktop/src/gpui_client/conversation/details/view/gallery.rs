@@ -5,7 +5,9 @@ use gpui::{
     prelude::*, px,
 };
 
-use super::{Dispatch, PanelAction};
+use workspace_core::storage::{HistoryTime, media::GalleryCounts};
+
+use super::{Dispatch, GalleryTriggers, PanelAction};
 use crate::gpui_client::{
     conversation::{
         Conversation,
@@ -15,9 +17,10 @@ use crate::gpui_client::{
     preferences::Language,
     ui::{
         Button, ButtonAppearance, Icon, Palette, TextRole, activate, ellipsized_label, label,
-        popup::tooltip,
+        popup::tooltip, sidebar_item,
     },
 };
+use crate::platform::message_time::{CalendarDate, LocalTime};
 
 /// Ширина сетки сохраняется и в последней неполной строке месяца.
 const COLUMNS: usize = 3;
@@ -27,12 +30,17 @@ pub(in crate::gpui_client::conversation::details) fn title(
     category: GalleryCategory,
     language: Language,
 ) -> &'static str {
-    language.tr(match category {
+    language.tr(category_key(category))
+}
+
+/// Даёт общий ключ заголовка раздела и его числовых форм в сайдбаре.
+fn category_key(category: GalleryCategory) -> &'static str {
+    match category {
         GalleryCategory::Photos => "desktop.conversation.gallery.photos",
         GalleryCategory::Videos => "desktop.conversation.gallery.videos",
         GalleryCategory::Links => "desktop.conversation.gallery.links",
         GalleryCategory::Files => "desktop.conversation.gallery.files",
-    })
+    }
 }
 
 /// Возвращает стабильный идентификатор входа в раздел.
@@ -47,46 +55,75 @@ fn trigger_id(category: GalleryCategory) -> &'static str {
 
 /// Добавляет четыре доступных раздела в прокручиваемые сведения разговора.
 pub(super) fn triggers(
-    focus: &[FocusHandle; 4],
+    data: GalleryTriggers<'_>,
     palette: Palette,
     language: Language,
     dispatch: &Dispatch,
 ) -> Div {
     div()
+        .debug_selector(|| "conversation-gallery-triggers".into())
         .flex()
         .flex_col()
-        .gap_1()
-        .child(
-            label(
-                palette,
-                TextRole::Label,
-                language.tr("desktop.conversation.gallery.title"),
-            )
-            .px_2()
-            .mb_1(),
+        .px_2()
+        .gap_2()
+        .children(
+            CATEGORIES
+                .into_iter()
+                .zip(data.focus)
+                .map(|(category, focus)| {
+                    trigger(category, focus, data.counts, palette, language, dispatch)
+                }),
         )
-        .children(CATEGORIES.into_iter().zip(focus).map(|(category, focus)| {
-            let id = trigger_id(category);
-            let trigger = div()
-                .id(id)
-                .debug_selector(move || id.into())
-                .h(px(36.))
-                .px_3()
-                .flex()
-                .justify_between()
-                .items_center()
-                .rounded_md()
-                .border_1()
-                .border_color(gpui::transparent_black())
-                .bg(palette.card)
-                .hover(|style| style.bg(palette.card_hover))
-                .child(label(palette, TextRole::Body, title(category, language)))
-                .child(Icon::ChevronRight.element(px(16.), palette.icon));
-            let dispatch = dispatch.clone();
-            activate(trigger, Some(focus), palette, move |window, app| {
-                dispatch(PanelAction::Gallery(Action::Open(category)), window, app);
-            })
-        }))
+}
+
+/// Рисует строку категории и открывает её из мыши или с клавиатуры.
+fn trigger(
+    category: GalleryCategory,
+    focus: &FocusHandle,
+    counts: Option<GalleryCounts>,
+    palette: Palette,
+    language: Language,
+    dispatch: &Dispatch,
+) -> Stateful<Div> {
+    let id = trigger_id(category);
+    let (icon, count) = match category {
+        GalleryCategory::Photos => (Icon::GalleryPhoto, counts.map(|count| count.photos)),
+        GalleryCategory::Videos => (Icon::GalleryVideo, counts.map(|count| count.videos)),
+        GalleryCategory::Files => (Icon::GalleryFile, counts.map(|count| count.files)),
+        GalleryCategory::Links => (Icon::GalleryLink, counts.map(|count| count.links)),
+    };
+    let caption = count.map_or_else(
+        || title(category, language).to_owned(),
+        |count| language.plural(category_key(category), count),
+    );
+    let row = sidebar_item(
+        palette,
+        icon.element(px(32.), palette.icon),
+        label(palette, TextRole::Body, caption)
+            .line_height(px(16.))
+            .truncate(),
+        px(12.),
+    )
+    .id(id)
+    .debug_selector(move || id.into())
+    .h(px(32.))
+    .rounded_md()
+    .when(count.is_some(), |row| {
+        row.tooltip(move |_, app| {
+            tooltip(
+                palette,
+                language.tr("desktop.conversation.gallery.coverage").into(),
+                app,
+            )
+        })
+    });
+    let dispatch = dispatch.clone();
+    activate(row, Some(focus), palette, move |window, app| {
+        dispatch(PanelAction::Gallery(Action::Open(category)), window, app);
+    })
+    .when(palette.keyboard_focus_visible(), |row| {
+        row.focus(|style| style.bg(palette.card_hover))
+    })
 }
 
 /// Рисует открытый раздел. Признак неполноты остаётся над прокруткой и пустым состоянием.
@@ -247,20 +284,21 @@ fn months(
     language: Language,
     dispatch: &Dispatch,
 ) -> Vec<Div> {
-    let first_year = gallery
+    let local = LocalTime::system();
+    let entries: Vec<_> = gallery
         .entries
-        .first()
-        .and_then(|entry| date(entry).map(|date| date.year));
-    let last_year = gallery
-        .entries
-        .last()
-        .and_then(|entry| date(entry).map(|date| date.year));
-    let show_year = first_year != last_year;
-    gallery
-        .entries
-        .chunk_by(|left, right| month_key(left) == month_key(right))
+        .iter()
+        .map(|entry| (entry, date(entry, &local)))
+        .collect();
+    let mut years = entries
+        .iter()
+        .filter_map(|(_, date)| date.map(|date| date.year));
+    let first_year = years.next();
+    let show_year = years.any(|year| Some(year) != first_year);
+    entries
+        .chunk_by(|left, right| month_key(left.1) == month_key(right.1))
         .map(|entries| {
-            let heading = month_label(month_key(&entries[0]), show_year, language);
+            let heading = month_label(month_key(entries[0].1), show_year, language);
             let grid = matches!(
                 gallery.category,
                 GalleryCategory::Photos | GalleryCategory::Videos
@@ -274,7 +312,7 @@ fn months(
                         div()
                             .flex()
                             .gap_2()
-                            .children(row.iter().map(|entry| {
+                            .children(row.iter().map(|(entry, _)| {
                                 tile(
                                     conversation,
                                     entry,
@@ -293,11 +331,13 @@ fn months(
                             }))
                     }))
             } else {
-                div().flex().flex_col().gap_1().children(
-                    entries
-                        .iter()
-                        .map(|entry| row(conversation, entry, palette, language, dispatch)),
-                )
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .children(entries.iter().map(|(entry, date)| {
+                        row(conversation, entry, *date, palette, language, dispatch)
+                    }))
             };
             div()
                 .flex()
@@ -393,6 +433,7 @@ fn tile(
 fn row(
     conversation: &Conversation,
     entry: &Entry,
+    date: Option<CalendarDate>,
     palette: Palette,
     language: Language,
     dispatch: &Dispatch,
@@ -422,7 +463,7 @@ fn row(
                     size_label(size, language),
                 ));
             }
-            if let Some(date) = date(entry) {
+            if let Some(date) = date {
                 details = details.child(label(
                     palette,
                     TextRole::Caption,
@@ -512,13 +553,6 @@ fn activate_entry(
     })
 }
 
-/// Дата сообщения из нормализованного серверного времени.
-struct Date {
-    year: u16, // Год разделяет одинаковые месяцы разных лет.
-    month: u8, // Месяц с января по декабрь, от 1 до 12.
-    day: u8,   // День месяца для подписи файла.
-}
-
 /// Ключи двух форм названия месяца для заголовка и даты строки.
 const MONTHS: [(&str, &str); 12] = [
     (
@@ -590,7 +624,7 @@ fn month_label(date: Option<(u16, u8)>, show_year: bool, language: Language) -> 
 }
 
 /// Формирует подпись даты файла, оставляя порядок частей каталогу.
-fn day_label(date: &Date, language: Language) -> String {
+fn day_label(date: &CalendarDate, language: Language) -> String {
     language.tr_with(
         "desktop.conversation.gallery.day",
         &[
@@ -601,21 +635,19 @@ fn day_label(date: &Date, language: Language) -> String {
 }
 
 /// Берёт год и месяц записи для группировки списка.
-fn month_key(entry: &Entry) -> Option<(u16, u8)> {
-    date(entry).map(|date| (date.year, date.month))
+fn month_key(date: Option<CalendarDate>) -> Option<(u16, u8)> {
+    date.map(|date| (date.year, date.month))
 }
 
-/// Получает календарный день из подтверждённой строки UTC без угадывания неизвестной даты.
-fn date(entry: &Entry) -> Option<Date> {
+/// Переводит время исходного сообщения в местный день для группы и подписи файла.
+fn date(entry: &Entry, local: &LocalTime) -> Option<CalendarDate> {
     let time = match &entry.item {
         GalleryItem::Media { item, .. } => &item.created_at,
         GalleryItem::Link(link) => &link.created_at,
     };
-    let mut parts = time.get(..10)?.split('-');
-    let year = parts.next()?.parse().ok()?;
-    let month = parts.next()?.parse().ok()?;
-    let day = parts.next()?.parse().ok()?;
-    ((1..=12).contains(&month) && (1..=31).contains(&day)).then_some(Date { year, month, day })
+    local
+        .history_stamp(&HistoryTime::parse(time)?)
+        .map(|stamp| stamp.date)
 }
 
 /// Подставляет размер в шаблон локальной единицы и использует десятичный разделитель языка.
@@ -647,7 +679,7 @@ mod tests {
     /// Использует каталог для названия месяца, порядка даты и единицы размера.
     #[test]
     fn gallery_metadata_uses_the_conversation_locale() {
-        let date = Date {
+        let date = CalendarDate {
             year: 2026,
             month: 3,
             day: 22,

@@ -831,7 +831,7 @@ fn protected_presentation_uses_exact_quote_file_and_sidebar_keys(cx: &mut TestAp
         ui.debug_bounds("history-protected-thumbnail-00000000-0000-0000-0000-0000000000ba-0").is_some()
     });
     let photo = |ui: &VisualTestContext| ui.read(|app| {
-        client.read(app).conversation.as_ref().unwrap().read(app).tested_photo()
+        client.read(app).conversation.as_ref().unwrap().read(app).tested_photo(app)
     });
     let wire = server.state.protected_wire.as_ref().unwrap();
     click_protected(ui, FILE_CARD);
@@ -913,7 +913,7 @@ fn protected_presentation_uses_exact_quote_file_and_sidebar_keys(cx: &mut TestAp
             sidebar_text(ui).is_none()
                 && ui.read(|app| {
                     let view = client.read(app).conversation.as_ref().unwrap().read(app);
-                    !view.tested_photo().0
+                    !view.tested_photo(app).0
                         && view.tested_history_encryption_state(SEALED_A) == Some("locked")
                 })
         },
@@ -1039,7 +1039,7 @@ fn protected_preview_after_commit(cx: &mut TestAppContext, change: PreviewInvali
         });
         client.update(app, |client, cx| client.attach(subscription, cx));
     });
-    ui.simulate_resize(size(px(1150.), px(900.)));
+    ui.simulate_resize(size(px(1150.), px(1300.)));
     until(
         ui,
         "защищённый чат виден в каталоге",
@@ -1085,12 +1085,25 @@ fn protected_preview_after_commit(cx: &mut TestAppContext, change: PreviewInvali
         "история показала карточку защищённого файла",
         |ui| ui.debug_bounds(card).is_some(),
     );
-    click_protected(ui, card);
+    if card == DIRECT_CARD {
+        let album = ui
+            .debug_bounds("history-media-album-00000000-0000-0000-0000-0000000000ba")
+            .expect("у прямого защищённого вложения есть полноширинный альбом");
+        let tile = ui.debug_bounds(card).unwrap();
+        assert_eq!((tile.left(), tile.right()), (album.left(), album.right()));
+    }
+    ui.update(|window, app| window.draw(app).clear());
+    let tile = ui.debug_bounds(card).unwrap();
+    let history = ui.debug_bounds("conversation-history-focus").unwrap();
+    assert!(tile.intersects(&history), "видна часть кадра для клика");
+    let point = tile.intersect(&history).center();
+    ui.simulate_mouse_move(point, None, Modifiers::none());
+    ui.simulate_click(point, Modifiers::none());
     let view_state = |ui: &VisualTestContext| {
         ui.read(|app| {
             let view = client.read(app).conversation.as_ref().unwrap().read(app);
             (
-                view.tested_photo(),
+                view.tested_photo(app),
                 view.tested_protected_photo_paints(),
                 view.tested_protected_quote_text(SEALED_A),
                 view.tested_history_encryption_state(SEALED_A),

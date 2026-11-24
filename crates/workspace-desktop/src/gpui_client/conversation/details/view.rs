@@ -11,7 +11,10 @@ use gpui::{
     prelude::*, px,
 };
 use uuid::Uuid;
-use workspace_core::{directory::ProfilePresence, messenger::details::TopicSummaryBlock};
+use workspace_core::{
+    directory::ProfilePresence, messenger::details::TopicSummaryBlock,
+    storage::media::GalleryCounts,
+};
 
 use super::{
     Conversation,
@@ -193,11 +196,18 @@ pub(super) enum PanelAction {
 
 type Dispatch = Rc<dyn Fn(PanelAction, &mut Window, &mut App)>;
 
+/// Данные и фокус четырёх переходов в разделы вложений.
+#[derive(Clone, Copy)]
+pub(super) struct GalleryTriggers<'a> {
+    pub focus: &'a [FocusHandle; 4], // Фокус каждой строки в порядке показа.
+    pub counts: Option<GalleryCounts>, // Числа известной истории, если их удалось прочитать.
+}
+
 /// Рисует готовые сведения. Загрузкой данных и фокусом оболочки владеет экран.
 pub(super) fn render(
     content: &PanelContent,
     palette: Palette,
-    gallery_triggers: Option<&[FocusHandle; 4]>,
+    gallery_triggers: Option<GalleryTriggers<'_>>,
     dispatch: impl Fn(PanelAction, &mut Window, &mut App) + 'static,
 ) -> Div {
     let dispatch: Dispatch = Rc::new(dispatch);
@@ -218,7 +228,7 @@ pub(super) fn render_encrypted(
     actions: Div,
     keys: Div,
     palette: Palette,
-    gallery_triggers: Option<&[FocusHandle; 4]>,
+    gallery_triggers: Option<GalleryTriggers<'_>>,
     dispatch: impl Fn(PanelAction, &mut Window, &mut App) + 'static,
 ) -> Div {
     let dispatch: Dispatch = Rc::new(dispatch);

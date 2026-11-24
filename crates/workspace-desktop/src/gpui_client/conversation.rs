@@ -4,7 +4,9 @@
 mod attachments;
 mod calls;
 mod details;
-pub(in crate::gpui_client) use details::{ContactPanel, ContactRequest};
+pub(in crate::gpui_client) use details::{
+    ContactOrigin, ContactPanel, ContactRequest, ContactTarget,
+};
 #[path = "history/forward.rs"]
 mod forward;
 pub(super) use forward::OpenForwardOriginal;
@@ -18,10 +20,14 @@ mod heading;
 mod history_fixtures;
 #[path = "history/lab.rs"]
 pub mod history_lab;
+#[path = "history/inline_references.rs"]
+mod inline_references;
 #[path = "history/key_exchange.rs"]
 mod key_exchange;
 #[path = "history/loading.rs"]
 mod loading;
+#[path = "history/media_album.rs"]
+mod media_album;
 #[path = "history/message_delete.rs"]
 mod message_delete;
 #[path = "history/message_menu.rs"]
@@ -36,6 +42,9 @@ mod quick_actions;
 mod reactions;
 #[path = "history/reply.rs"]
 mod reply;
+#[path = "history/references.rs"]
+mod references;
+pub(super) use references::OpenConversationReference;
 #[path = "history/source.rs"]
 mod source;
 #[path = "history/viewport.rs"]
@@ -215,6 +224,7 @@ pub struct Conversation {
     reactions: Reactions,     // Популярность и ожидающие реакции открытого разговора.
     message_delete: message_delete::MessageDelete, // Подтверждение и ход удаления одного сообщения.
     forward_original: Option<Task<()>>, // Переход к последнему выбранному оригиналу пересылки.
+    time_reference: Option<references::TimeReference>, // Панель момента из активной строки истории.
     sending: Option<Sending>, // Рабочий редактор; изолированные тесты истории могут его не подключать.
     heading: Heading,         // Отображаемые названия из текущего каталога.
     heading_details: Option<Arc<SidebarDetails>>, // Подтверждённое присутствие или состав.
@@ -340,6 +350,7 @@ impl Conversation {
             reactions: Reactions::default(),
             message_delete: message_delete::MessageDelete::default(),
             forward_original: None,
+            time_reference: None,
             sending: None,
             heading: Heading::default(),
             heading_details: None,
@@ -516,6 +527,9 @@ impl Conversation {
             .and(catalog)
             .filter(|catalog| catalog.generation == self.address.generation)
             .and_then(|catalog| catalog.chats.as_ref());
+        if let Some(sending) = &self.sending {
+            sending.view.update(cx, |composer, cx| composer.set_reference_chats(chats.cloned(), cx));
+        }
         let heading = chats
             .and_then(|chats| chats.iter().find(|chat| chat.id == scope.stream_id))
             .map(|chat| Heading::from_chat(chat, scope));
@@ -681,6 +695,9 @@ impl Conversation {
             SyncChange::MessengerReset => self.restart(cx),
             SyncChange::QuickReactionUsageChanged => self.load_reaction_usage(cx),
             SyncChange::SidebarDetailsChanged { stream_id } if scope.stream_id == stream_id => {
+                if let Some(sending) = &self.sending {
+                    sending.view.update(cx, |composer, cx| composer.refresh_mention_members(false, cx));
+                }
                 self.refresh_open_details(cx);
                 self.refresh_heading_details(cx);
                 if self.reset_key_reply_permissions(None) {
@@ -775,6 +792,7 @@ impl Conversation {
             sending.view.update(cx, |composer, cx| {
                 composer.cancel_protected_edit(None, cx);
                 composer.revoke_draft(cx);
+                composer.refresh_mention_members(true, cx);
             });
         }
         self.invalidate_send_destination(cx);
@@ -1077,6 +1095,7 @@ impl Conversation {
         }
         let first_view = !self.has_access();
         self.state = State::Ready(window);
+        self.refresh_gallery_counts(cx);
         if first_view {
             self.refresh_heading_details(cx);
         }
@@ -1581,6 +1600,21 @@ impl Conversation {
                 root.child(centered.child(self.render_problem(palette, Some(*cause), cx)))
             }
             State::Ready(history) => {
+                if self.viewport.time_zone_changed() {
+                    let position = if history.newer == HistoryEdge::End && self.viewport.at_tail() {
+                        Position::Tail
+                    } else {
+                        Position::Reading
+                    };
+                    self.viewport.replace(
+                        history,
+                        &self.outbox,
+                        self.address.route.owner.user_id.parse().ok(),
+                        position,
+                        Uuid::new_v4(),
+                        self.encryption.as_ref(),
+                    );
+                }
                 let route = &self.address.route;
                 let background = Preferences::read_for(cx, &route.owner)
                     .appearance
@@ -1679,6 +1713,11 @@ impl Conversation {
                                     .unwrap_or_default(),
                                 jitsi: self.calls.settings().cloned(),
                                 fragments,
+                                mention_names: self
+                                    .details
+                                    .as_ref()
+                                    .map(Panel::mention_names)
+                                    .unwrap_or_default(),
                                 locale,
                             },
                             images,
@@ -1771,6 +1810,7 @@ impl Render for Conversation {
             }
         }
         let menu = self.render_message_menu(window, palette, cx);
+        let time_reference = self.render_reference_time(window, palette, cx);
         if let Some(restore) = self.attachments.take_restore() {
             let focus = match &restore {
                 PhotoReturn::Gallery(focus) => focus,
@@ -1803,6 +1843,7 @@ impl Render for Conversation {
             }))
             .child(self.render_chat(palette, cx))
             .children(menu.into_iter().flatten())
+            .children(time_reference.into_iter().flatten())
             .children(photo)
     }
 }

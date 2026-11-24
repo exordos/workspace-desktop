@@ -462,7 +462,11 @@ impl Conversation {
             Action::Copy => {
                 if let MessageBody::Markdown(text) = row.body {
                     let selection = selection.filter(|_| fragment_display_spans(&text).is_empty());
-                    cx.write_to_clipboard(ClipboardItem::new_string(selection.unwrap_or(text)));
+                    let language = Preferences::read_for(cx, &self.address.route.owner).language;
+                    let copied = selection.unwrap_or_else(|| {
+                        super::inline_references::localize_copied_times(text, language)
+                    });
+                    cx.write_to_clipboard(ClipboardItem::new_string(copied));
                 }
             }
             Action::Permalink => {

@@ -384,7 +384,7 @@ impl ActivityDrafts {
         let time = draft
             .updated_at
             .as_ref()
-            .and_then(|time| time.as_str().get(11..16));
+            .and_then(crate::platform::message_time::short_time);
         let initial = name
             .chars()
             .next()
@@ -446,8 +446,7 @@ impl ActivityDrafts {
                                     .justify_between()
                                     .child(label(palette, TextRole::Caption, title).truncate())
                                     .children(time.map(|time| {
-                                        label(palette, TextRole::Caption, time.to_owned())
-                                            .flex_none()
+                                        label(palette, TextRole::Caption, time).flex_none()
                                     })),
                             )
                             .child(label(

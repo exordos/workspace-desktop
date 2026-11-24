@@ -4,8 +4,10 @@ use uuid::Uuid;
 use workspace_core::messenger::catalog::{
     Chat, MessagePreview, PreviewPart, SidebarKeyServiceKind, SidebarPreviewBody,
 };
+use workspace_core::storage::HistoryTime;
 
 use super::preferences::Language;
+use crate::platform::message_time::format_local_time;
 
 impl Language {
     /// Показывает название личных заметок по собственной локали, сохраняя остальные имена.
@@ -19,7 +21,7 @@ impl Language {
 
     /// Показывает короткое превью на языке текущего аккаунта.
     pub fn preview_text(self, preview: &MessagePreview) -> String {
-        render_preview(preview, |key| self.tr(key))
+        render_preview(preview, self, |key| self.tr(key))
     }
 
     /// Добавляет подпись состояния ключа, когда каталог ещё не показывает обычный текст.
@@ -41,18 +43,28 @@ impl Language {
 /// Собирает готовую строку из типизированных частей, используя каталог для служебных слов.
 fn render_preview<'a>(
     preview: &'a MessagePreview,
+    language: Language,
     label: impl Fn(&'static str) -> &'a str,
 ) -> String {
-    preview
-        .parts()
-        .iter()
-        .map(|part| match part {
-            PreviewPart::Text(text) => text.as_str(),
-            PreviewPart::Link => label("desktop.preview.link"),
-            PreviewPart::ProtectedFragment => label("e2ee.secretFragment"),
-            PreviewPart::Forwarded => label("message.forwarded"),
-        })
-        .collect()
+    let mut result = String::new();
+    for part in preview.parts() {
+        match part {
+            PreviewPart::Text(text) => result.push_str(text),
+            PreviewPart::Link => result.push_str(label("desktop.preview.link")),
+            PreviewPart::ProtectedFragment => result.push_str(label("e2ee.secretFragment")),
+            PreviewPart::Forwarded => result.push_str(label("message.forwarded")),
+            PreviewPart::UnknownMention => {
+                result.push('@');
+                result.push_str(label("message.unknownMention"));
+            }
+            PreviewPart::Time(time) => {
+                if let Some(time) = HistoryTime::parse(time) {
+                    result.push_str(&format_local_time(&time, language.code()));
+                }
+            }
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -69,7 +81,7 @@ mod tests {
             "Зашифрованный фрагмент Encrypted fragment"
         );
         assert_eq!(
-            render_preview(&preview, |key| {
+            render_preview(&preview, Language::En, |key| {
                 assert_eq!(key, "e2ee.secretFragment");
                 "Fragmento cifrado"
             }),

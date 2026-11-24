@@ -20,6 +20,40 @@ const STREAM: Uuid = Uuid::from_u128(1);
 const MESSAGE: Uuid = Uuid::from_u128(2);
 const DIRECT_TOPIC: Uuid = Uuid::from_u128(9);
 
+/// Открывает только доступную точную тему и игнорирует ссылку со старого экрана.
+#[test]
+fn reference_topic_checks_parent_and_conversation_revision() {
+    let (mut shell, a, _) = setup();
+    let Some(ShellEffect::OpenConversation(first)) =
+        shell.handle_action(ShellAction::Sidebar(SidebarAction::OpenChat {
+            route: route(&a.session, ChatEntry::Latest),
+            generation: a.session.generation,
+        }))
+    else {
+        panic!("первый разговор открыт")
+    };
+    let wrong = ConversationReference::Topic {
+        stream_id: Some(Uuid::from_u128(11)),
+        topic_id: DIRECT_TOPIC,
+    };
+    assert!(shell.open_conversation_reference(&first, wrong).is_none());
+    let exact = ConversationReference::Topic {
+        stream_id: None,
+        topic_id: DIRECT_TOPIC,
+    };
+    let Some(ShellEffect::OpenConversation(second)) =
+        shell.open_conversation_reference(&first, exact)
+    else {
+        panic!("ссылка ведёт к доступной теме")
+    };
+    assert_eq!(second.route.scope.topic_id, Some(DIRECT_TOPIC));
+    assert!(
+        shell
+            .open_conversation_reference(&first, ConversationReference::Stream(STREAM))
+            .is_none()
+    );
+}
+
 /// Готовит сводку тестового входа с одним непрочитанным сообщением.
 fn account(name: &str, generation: u64) -> AccountSnapshot {
     AccountSnapshot {

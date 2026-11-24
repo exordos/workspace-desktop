@@ -5,6 +5,7 @@ use zeroize::Zeroize;
 use crate::messenger::{
     encryption::fragments::{FragmentDisplayKind, fragment_display_spans},
     forward::forward_spans,
+    references::{WorkspaceReferenceTarget, workspace_references},
 };
 
 /// Часть превью без адресов и содержимого защищённых фрагментов.
@@ -14,6 +15,8 @@ pub enum PreviewPart {
     Link,              // Адрес или ссылка без собственной подписи.
     ProtectedFragment, // Закрытый фрагмент сообщения.
     Forwarded,         // Карточка пересланного сообщения.
+    Time(String),      // Нормализованный момент UTC для отображения в поясе получателя.
+    UnknownMention,    // Старое упоминание без имени в исходном тексте.
 }
 
 /// Текст превью, в котором интерфейс может перевести только служебные вставки.
@@ -33,6 +36,11 @@ impl MessagePreview {
 
     /// Сохраняет буквальный снимок пересылки, заменяя только найденные служебные ссылки.
     pub fn plain_forward(markdown: &str) -> Self {
+        Self::project(markdown, false)
+    }
+
+    /// Расставляет служебные подписи и сохраняет ссылки превью без адресов и снимков.
+    fn project(markdown: &str, include_inline: bool) -> Self {
         let fragments = fragment_display_spans(markdown).into_iter().map(|span| {
             let part = (span.kind != FragmentDisplayKind::Definition)
                 .then_some(PreviewPart::ProtectedFragment);
@@ -42,6 +50,31 @@ impl MessagePreview {
             .into_iter()
             .map(|span| (span.range, Some(PreviewPart::Forwarded)));
         let mut spans: Vec<_> = fragments.chain(forwards).collect();
+        if include_inline {
+            spans.extend(workspace_references(markdown).into_iter().map(|reference| {
+                let part = match reference.target {
+                    WorkspaceReferenceTarget::Time(time) => {
+                        PreviewPart::Time(time.as_str().to_owned())
+                    }
+                    WorkspaceReferenceTarget::User {
+                        user_id,
+                        silent: false,
+                    } if reference.range.len() == 39
+                        && reference.label.eq_ignore_ascii_case(&user_id.to_string()) =>
+                    {
+                        PreviewPart::UnknownMention
+                    }
+                    WorkspaceReferenceTarget::User { silent: false, .. }
+                        if !reference.label.starts_with('@') =>
+                    {
+                        PreviewPart::Text(format!("@{}", reference.label))
+                    }
+                    _ if reference.label.is_empty() => PreviewPart::Link,
+                    _ => PreviewPart::Text(reference.label),
+                };
+                (reference.range, Some(part))
+            }));
+        }
         // Если диапазоны вложены, внешняя служебная ссылка закрывает их целиком.
         spans.sort_by_key(|(range, _)| (range.start, std::cmp::Reverse(range.end)));
         let mut end = 0;
@@ -60,7 +93,7 @@ impl MessagePreview {
 
     /// Убирает адреса и лишние пробелы, считая каждую служебную вставку одной частью лимита.
     pub(in crate::messenger) fn short(markdown: &str, limit: usize) -> Self {
-        let source = zeroize::Zeroizing::new(Self::plain_forward(markdown));
+        let source = zeroize::Zeroizing::new(Self::project(markdown, true));
         let mut projected = zeroize::Zeroizing::new(Self::default());
         for part in source.parts() {
             match part {
@@ -177,7 +210,7 @@ impl MessagePreview {
         }
         // Удалённая часть защищённого превью не остаётся в освобождаемой строке.
         for part in &mut self.0[kept..] {
-            if let PreviewPart::Text(text) = part {
+            if let PreviewPart::Text(text) | PreviewPart::Time(text) = part {
                 text.zeroize();
             }
         }
@@ -213,7 +246,7 @@ impl Zeroize for MessagePreview {
     /// Стирает авторский текст, когда закрывается отзывное зашифрованное превью.
     fn zeroize(&mut self) {
         for part in &mut self.0 {
-            if let PreviewPart::Text(text) = part {
+            if let PreviewPart::Text(text) | PreviewPart::Time(text) = part {
                 text.zeroize();
             }
         }
@@ -255,6 +288,22 @@ mod tests {
             &[
                 PreviewPart::Text("доподписьпосле Ссылка ".into()),
                 PreviewPart::Link,
+            ]
+        );
+    }
+
+    /// Оставляет имена и момент для локали получателя, не включая UUID и URI в превью.
+    #[test]
+    fn short_preview_localizes_reference_parts_without_targets() {
+        let id = uuid::Uuid::from_u128(1);
+        let body = format!("[Анна](urn:user:{id}) [Борис](urn:user:{id} \"silent\") <@{id}> urn:time:2026-10-13T10:02:00Z");
+        assert_eq!(
+            MessagePreview::short(&body, 240).parts(),
+            &[
+                PreviewPart::Text("@Анна Борис ".into()),
+                PreviewPart::UnknownMention,
+                PreviewPart::Text(" ".into()),
+                PreviewPart::Time("2026-10-13T10:02:00.000000Z".into()),
             ]
         );
     }

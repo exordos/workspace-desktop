@@ -1,4 +1,4 @@
-//! Показывает вложения подтверждённого сообщения и открывает одно фото через кэш Core.
+//! Показывает вложения в ленте и открывает фото и видео через кэш Core.
 //! Здесь находятся карточка, состояние просмотра, загрузка и ограниченное декодирование.
 
 use std::{
@@ -10,11 +10,13 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, Bounds, Context, Corners, Div, FocusHandle, ImageSource, IntoElement,
-    MouseButton, ObjectFit, RenderImage, SharedString, Stateful, Task, WeakEntity, Window, actions,
-    anchored, canvas, deferred, div, img, point, prelude::*, px, rgba, size,
+    AnyElement, App, Context, Corners, Div, FocusHandle, ImageSource, IntoElement, MouseButton,
+    ObjectFit, RenderImage, SharedString, Stateful, Task, WeakEntity, Window, actions, anchored,
+    canvas, deferred, div, img, point, prelude::*, px, rgba, size,
 };
-use image::{DynamicImage, Frame, ImageFormat, ImageReader, Limits, RgbaImage, imageops};
+use image::{
+    DynamicImage, Frame, ImageDecoder, ImageFormat, ImageReader, Limits, RgbaImage, imageops,
+};
 use uuid::Uuid;
 use workspace_core::{
     messenger::{
@@ -28,10 +30,15 @@ use workspace_core::{
 
 use super::super::contracts::ConversationAddress;
 use super::Conversation;
+use super::media_album::Tile;
 #[path = "attachments/clipboard.rs"]
 mod clipboard;
+#[path = "attachments/inline.rs"]
+mod inline;
 #[path = "attachments/protected.rs"]
 mod protected;
+#[path = "attachments/video.rs"]
+mod video;
 use crate::gpui_client::{
     preferences::{Language, Preferences},
     runtime::RuntimeClient,
@@ -152,7 +159,8 @@ pub(super) struct Attachments {
     viewer: Option<Viewer>,          // Открытое фото, по одному на разговор.
     task: Option<Task<()>>,          // Закрытие отменяет ожидание результата.
     clipboard: clipboard::CopyState, // Последний запрос копирования фото из текущей истории.
-    preview: Option<(AttachmentKey, Arc<RenderImage>)>, // Последнее маленькое превью.
+    inline_thumbs: inline::Thumbnails, // Кадры обычных фото и видео в виртуальном списке.
+    video: video::Playback,          // Подготовка и нативное окно текущего видео.
     protected_thumbs: ProtectedThumbnails, // Кадры и запросы только для отрисованных защищённых ссылок.
     gallery_preview: Option<(AttachmentKey, Arc<RenderImage>)>, // Превью только что открытой плитки.
     focus: Rc<RefCell<HashMap<CardAddress, FocusHandle>>>, // Устойчивый фокус исходных и цитируемых карточек.
@@ -171,7 +179,8 @@ impl Attachments {
             viewer: None,
             task: None,
             clipboard: clipboard::CopyState::default(),
-            preview: None,
+            inline_thumbs: inline::Thumbnails::default(),
+            video: video::Playback::default(),
             protected_thumbs: ProtectedThumbnails::default(),
             gallery_preview: None,
             focus: Rc::default(),
@@ -204,7 +213,15 @@ impl Attachments {
         Cards {
             target: cx.entity().downgrade(),
             enabled: self.runtime.is_some() && self.access.is_some(),
-            preview: self.preview.clone(),
+            inline_thumbs: self.inline_thumbs.clone(),
+            inline_load: self.runtime.as_ref().zip(self.access.as_ref()).map(
+                |(runtime, access)| inline::Load {
+                    runtime: runtime.clone(),
+                    access: access.clone(),
+                    address: address.clone(),
+                },
+            ),
+            video_state: self.video.card_state(),
             protected_thumbs: self.protected_thumbs.clone(),
             protected_load: self
                 .runtime
@@ -248,6 +265,7 @@ impl Attachments {
 
     /// Снимает просмотр, который потерял ключ, даже если его загрузка ещё не завершилась.
     pub(super) fn invalidate_revoked(&mut self, cx: &mut Context<Conversation>) {
+        self.video.invalidate_revoked(cx);
         self.protected_thumbs
             .retain(|source| source.with_current(|| ()).is_some(), cx);
         if self.viewer.as_ref().is_some_and(|viewer| {
@@ -266,6 +284,8 @@ impl Attachments {
         cx: &mut Context<Conversation>,
     ) {
         self.clipboard.invalidate(&affected);
+        self.inline_thumbs.retain(|key| !affected(key), cx);
+        self.video.invalidate(|key| !affected(key), cx);
         self.protected_thumbs
             .retain(|source| !affected(source.key), cx);
         if self
@@ -275,12 +295,6 @@ impl Attachments {
         {
             self.close(cx);
             self.restore = Some(PhotoReturn::Conversation);
-        }
-        if self.preview.as_ref().is_some_and(|(key, _)| affected(*key))
-            && let Some((_, image)) = self.preview.take()
-        {
-            cx.defer(move |app| app.drop_image(image, None));
-            cx.notify();
         }
         if self
             .gallery_preview
@@ -312,6 +326,8 @@ impl Attachments {
         protected: impl Fn(&ProtectedAttachment) -> bool,
         cx: &mut Context<Conversation>,
     ) {
+        self.inline_thumbs.retain(&contains, cx);
+        self.video.retain_sources(&contains, &protected, cx);
         if self.viewer.as_ref().is_some_and(|viewer| {
             !viewer.from_gallery
                 && match &viewer.holder {
@@ -320,15 +336,6 @@ impl Attachments {
                 }
         }) {
             self.close(cx);
-        }
-        if self
-            .preview
-            .as_ref()
-            .is_some_and(|(key, _)| !contains(*key))
-            && let Some((_, image)) = self.preview.take()
-        {
-            cx.defer(move |app| app.drop_image(image, None));
-            cx.notify();
         }
         self.focus
             .borrow_mut()
@@ -389,6 +396,7 @@ impl Attachments {
                     .child(protected_photo(
                         picture.clone(),
                         viewer.mounted.clone(),
+                        None,
                         #[cfg(all(test, feature = "gpui-test"))]
                         viewer.protected_paints.clone(),
                     ))
@@ -505,37 +513,108 @@ impl Attachments {
 pub(super) struct Cards {
     target: WeakEntity<Conversation>, // Действие исчезает вместе с разговором.
     enabled: bool,                    // Только действующая область может открыть фото.
-    preview: Option<(AttachmentKey, Arc<RenderImage>)>, // Изображение последнего открытия.
+    inline_thumbs: inline::Thumbnails, // Кадры обычных фото и видео.
+    inline_load: Option<inline::Load>, // Допуск на запрос из видимой строки.
+    video_state: Option<(CardAddress, video::CardState)>, // Подсказка у нажатого видео.
     protected_thumbs: ProtectedThumbnails, // Независимое представление защищённой миниатюры.
     protected_load: Option<PreviewLoad>, // Адрес загрузки и ключ только для открытой истории.
     focus: Rc<RefCell<HashMap<CardAddress, FocusHandle>>>, // Фокус переживает перерисовку строки.
 }
 
 impl Cards {
-    /// Показывает стабильную карточку. Лишь фото открывает просмотр этого среза.
+    /// Проверяет, что ссылка может стать кадром в пузыре.
+    pub(super) fn shows_inline(&self, reference: &MediaReference) -> bool {
+        self.inline_load.is_some() && matches!(reference.kind, MediaKind::Image | MediaKind::Video)
+    }
+
+    /// Проверяет допуск открытой истории на защищённые кадры.
+    pub(super) fn shows_protected_inline(&self) -> bool {
+        self.protected_load.is_some()
+    }
+
+    /// Готовит карточку медиа из URL или обычное вложение с именем файла.
     pub(super) fn render(
         &self,
         key: AttachmentKey,
         reference: &MediaReference,
+        tile: Option<Tile>,
         palette: Palette,
         language: Language,
         app: &mut App,
     ) -> Stateful<Div> {
-        let is_photo = reference.kind == MediaKind::Image;
         let name: SharedString = reference
             .name
             .as_deref()
             .or_else(|| (!reference.label.trim().is_empty()).then_some(reference.label.as_str()))
             .unwrap_or_else(|| {
-                language.tr(if is_photo {
-                    "desktop.messenger.history.photo"
-                } else {
-                    "desktop.messenger.history.attachment"
+                language.tr(match reference.kind {
+                    MediaKind::Image => "desktop.messenger.history.photo",
+                    MediaKind::Video => "desktop.messenger.history.video",
+                    _ => "desktop.messenger.history.attachment",
                 })
             })
             .to_owned()
             .into();
-        self.render_card(key, is_photo, name, None, palette, app)
+        if let Some((tile, load)) = tile.zip(self.inline_load.clone()) {
+            let thumbnail = self.inline_thumbs.render(
+                key,
+                inline::Frame {
+                    kind: reference.kind,
+                    name: name.clone(),
+                    language,
+                    tile,
+                },
+                load,
+                self.target.clone(),
+                palette,
+                app,
+            );
+            let address = (key, None);
+            let card = tile.round(
+                card_element(address)
+                    .overflow_hidden()
+                    .bg(palette.card)
+                    .child(thumbnail),
+            );
+            return self.activate_card(
+                self.video_hint(card, address, palette, language),
+                address,
+                reference.kind,
+                name,
+                None,
+                palette,
+                app,
+            );
+        }
+        self.render_file_card(key, name, None, palette, app)
+    }
+
+    /// Показывает статус запуска видео поверх его кадра.
+    fn video_hint(
+        &self,
+        card: Stateful<Div>,
+        address: CardAddress,
+        palette: Palette,
+        language: Language,
+    ) -> Stateful<Div> {
+        let Some((_, state)) = self.video_state.filter(|(target, _)| *target == address) else {
+            return card;
+        };
+        let status = language.tr(match state {
+            video::CardState::Loading => "desktop.messenger.history.videoOpening",
+            video::CardState::Failed => "desktop.messenger.history.videoUnavailable",
+        });
+        card.child(
+            div()
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .bg(palette.card)
+                .px_2()
+                .py_1()
+                .child(label(palette, TextRole::Caption, status)),
+        )
     }
 
     /// Показывает карточку защищённого файла без передачи имени, URL или превью общему кэшу.
@@ -543,60 +622,62 @@ impl Cards {
         &self,
         source: ProtectedAttachment,
         kind: MediaKind,
+        tile: Option<Tile>,
         palette: Palette,
         language: Language,
         app: &mut App,
     ) -> Stateful<Div> {
-        let photo = kind == MediaKind::Image;
-        let name = language.tr(if photo {
-            "desktop.messenger.history.photo"
-        } else {
-            "desktop.messenger.history.attachment"
+        let name = language.tr(match kind {
+            MediaKind::Image => "desktop.messenger.history.photo",
+            MediaKind::Video => "desktop.messenger.history.video",
+            _ => "desktop.messenger.history.attachment",
         });
-        self.render_card(source.key, photo, name.into(), Some(source), palette, app)
+        if matches!(kind, MediaKind::Image | MediaKind::Video)
+            && let Some(load) = self.protected_load.as_ref()
+            && source.with_current(|| ()).is_some()
+        {
+            let address = source.card_address();
+            let thumbnail = self.protected_thumbs.render(&source, kind, tile, load, app);
+            let card = match tile {
+                Some(tile) => tile.round(card_element(address).overflow_hidden().bg(palette.card)),
+                None => media_card(address, size(px(260.), px(176.)), palette),
+            }
+            .child(thumbnail)
+            .when(kind == MediaKind::Video, |card| {
+                card.child(inline::play_indicator())
+            });
+            return self.activate_card(
+                self.video_hint(card, address, palette, language),
+                address,
+                kind,
+                name.into(),
+                Some(source),
+                palette,
+                app,
+            );
+        }
+        self.render_file_card(source.key, name.into(), Some(source), palette, app)
     }
 
-    /// Рисует общий внешний вид и подключает загрузку только для действующего источника.
-    fn render_card(
+    /// Показывает заголовок файла и подключает сохранение для защищённой ссылки.
+    fn render_file_card(
         &self,
         key: AttachmentKey,
-        is_photo: bool,
         name: SharedString,
         protected: Option<ProtectedAttachment>,
         palette: Palette,
         app: &mut App,
     ) -> Stateful<Div> {
-        let thumbnail = protected
-            .as_ref()
-            .zip(self.protected_load.as_ref())
-            .filter(|(source, _)| is_photo && source.with_current(|| ()).is_some())
-            .map(|(source, load)| self.protected_thumbs.render(source, load, app));
         let address = protected
             .as_ref()
             .map_or((key, None), ProtectedAttachment::card_address);
-        let selector: SharedString = match address.1 {
-            Some(slot) => format!(
-                "history-protected-quote-attachment-{}-{}-{}",
-                slot.message, slot.position, key.position
-            ),
-            None => format!("history-attachment-{}-{}", key.message, key.position),
-        }
-        .into();
-        let selector_name = selector.clone();
-        let card = div()
-            .id(selector)
-            .debug_selector(move || selector_name.to_string())
-            .w(px(242.))
-            .max_w_full()
-            .h(px(60.))
+        let card = media_card(address, size(px(242.), px(60.)), palette)
             .px_2()
             .flex()
             .items_center()
             .gap_2()
-            .rounded(px(8.))
             .border_1()
             .border_color(palette.border)
-            .bg(palette.card)
             .child(
                 div()
                     .w(px(48.))
@@ -605,26 +686,7 @@ impl Cards {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .map(|slot| {
-                        if let Some(thumbnail) = thumbnail {
-                            slot.child(thumbnail)
-                        } else {
-                            match self
-                                .preview
-                                .as_ref()
-                                .filter(|(shown, _)| *shown == key && protected.is_none())
-                            {
-                                Some((_, image)) => slot.child(
-                                    img(ImageSource::Render(image.clone()))
-                                        .size_full()
-                                        .object_fit(ObjectFit::Contain)
-                                        .debug_selector(|| "history-attachment-preview".into()),
-                                ),
-                                None => slot
-                                    .child(Icon::Attach.element(px(20.), palette.text_secondary)),
-                            }
-                        }
-                    }),
+                    .child(Icon::Attach.element(px(20.), palette.text_secondary)),
             )
             .child(
                 label(palette, TextRole::Label, name.clone())
@@ -632,9 +694,33 @@ impl Cards {
                     .whitespace_nowrap()
                     .overflow_hidden(),
             );
-        if !self.enabled || (!is_photo && protected.is_none()) {
+        if !self.enabled || protected.is_none() {
             return card;
         }
+        self.activate_card(
+            card,
+            address,
+            MediaKind::File,
+            name,
+            protected,
+            palette,
+            app,
+        )
+    }
+
+    /// Подключает к карточке запуск просмотра или действие с защищённым файлом.
+    #[allow(clippy::too_many_arguments)]
+    fn activate_card(
+        &self,
+        card: Stateful<Div>,
+        address: CardAddress,
+        kind: MediaKind,
+        name: SharedString,
+        protected: Option<ProtectedAttachment>,
+        palette: Palette,
+        app: &mut App,
+    ) -> Stateful<Div> {
+        let key = address.0;
         let focus = self
             .focus
             .borrow_mut()
@@ -650,8 +736,10 @@ impl Cards {
             palette,
             move |window, app| {
                 let _ = target.update(app, |view, cx| {
-                    if let Some(holder) = &protected {
-                        if is_photo {
+                    if kind == MediaKind::Video {
+                        view.open_history_video(key, name.clone(), protected.clone(), cx);
+                    } else if let Some(holder) = &protected {
+                        if kind == MediaKind::Image {
                             view.open_protected_attachment(
                                 name.clone(),
                                 trigger.clone(),
@@ -677,6 +765,37 @@ impl Cards {
             app.stop_propagation();
         })
     }
+}
+
+/// Рисует отдельную карточку для файла или вложения в защищённой цитате.
+fn media_card(
+    address: CardAddress,
+    frame: gpui::Size<gpui::Pixels>,
+    palette: Palette,
+) -> Stateful<Div> {
+    card_element(address)
+        .w(frame.width)
+        .h(frame.height)
+        .max_w_full()
+        .rounded(px(8.))
+        .overflow_hidden()
+        .bg(palette.card)
+}
+
+/// Даёт карточке устойчивый селектор в истории или в цитате.
+fn card_element(address: CardAddress) -> Stateful<Div> {
+    let (key, quote) = address;
+    let selector = match quote {
+        Some(slot) => format!(
+            "history-protected-quote-attachment-{}-{}-{}",
+            slot.message, slot.position, key.position
+        ),
+        None => format!("history-attachment-{}-{}", key.message, key.position),
+    };
+    div()
+        .id(SharedString::from(selector.clone()))
+        .debug_selector(move || selector.clone())
+        .relative()
 }
 
 impl Conversation {
@@ -734,7 +853,7 @@ impl Conversation {
 
     /// Позволяет приёмке дождаться актуального кадра или закрытия просмотра.
     #[cfg(all(test, feature = "gpui-test"))]
-    pub(in crate::gpui_client) fn tested_photo(&self) -> (bool, bool, bool) {
+    pub(in crate::gpui_client) fn tested_photo(&self, app: &App) -> (bool, bool, bool) {
         let viewer = self.attachments.viewer.as_ref();
         (
             viewer.is_some(),
@@ -744,7 +863,8 @@ impl Conversation {
                     PictureState::Ready(_) | PictureState::Protected(..)
                 )
             }),
-            self.attachments.preview.is_some() || self.attachments.gallery_preview.is_some(),
+            self.attachments.inline_thumbs.has_ready(app)
+                || self.attachments.gallery_preview.is_some(),
         )
     }
 
@@ -895,11 +1015,7 @@ impl Conversation {
                 if !mounted {
                     return;
                 }
-                let preview = if from_gallery {
-                    &mut view.attachments.gallery_preview
-                } else {
-                    &mut view.attachments.preview
-                };
+                let preview = &mut view.attachments.gallery_preview;
                 viewer.state = match result.unwrap_or(Err(PictureError::Unavailable)) {
                     Ok(Photo::Protected(picture)) if picture.is_current() => {
                         PictureState::Protected(picture)
@@ -907,8 +1023,12 @@ impl Conversation {
                     Ok(Photo::Protected(_)) => return,
                     Ok(Photo::Plain { full, thumb }) => {
                         log::debug!("gpui_media op_id={attempt} event=viewer_ready");
-                        if let Some((_, image)) = preview.replace((key, thumb)) {
-                            cx.defer(move |app| app.drop_image(image, None));
+                        if from_gallery {
+                            if let Some((_, image)) = preview.replace((key, thumb)) {
+                                cx.defer(move |app| app.drop_image(image, None));
+                            }
+                        } else {
+                            view.attachments.inline_thumbs.fill_failed(key, thumb, cx);
                         }
                         PictureState::Ready(full)
                     }
@@ -916,7 +1036,8 @@ impl Conversation {
                         log::debug!(
                             "gpui_media op_id={attempt} event=viewer_failed reason={error:?}"
                         );
-                        if preview.as_ref().is_some_and(|(shown, _)| *shown == key)
+                        if from_gallery
+                            && preview.as_ref().is_some_and(|(shown, _)| *shown == key)
                             && let Some((_, image)) = preview.take()
                         {
                             cx.defer(move |app| app.drop_image(image, None));
@@ -943,12 +1064,21 @@ fn decode_original(file: &mut MediaFile) -> Result<DynamicImage, PictureError> {
     if bytes.len() as u64 > MAX_ENCODED_BYTES {
         return Err(PictureError::TooLarge);
     }
+    if matches!(
+        bytes.get(4..12),
+        Some(b"ftypheic" | b"ftypheix" | b"ftypmif1" | b"ftypmsf1" | b"ftypavif" | b"ftypavis")
+    ) {
+        let png = crate::platform::media::heif_preview(&bytes, MAX_VIEW_SIDE)
+            .ok_or(PictureError::Unsupported)?;
+        return image::load_from_memory_with_format(&png, ImageFormat::Png)
+            .map_err(|_| PictureError::Unsupported);
+    }
     let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|_| PictureError::Unsupported)?;
     if !matches!(
         reader.format(),
-        Some(ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP)
+        Some(ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP | ImageFormat::Gif)
     ) {
         return Err(PictureError::Unsupported);
     }
@@ -956,8 +1086,22 @@ fn decode_original(file: &mut MediaFile) -> Result<DynamicImage, PictureError> {
     limits.max_image_width = Some(MAX_SOURCE_SIDE);
     limits.max_image_height = Some(MAX_SOURCE_SIDE);
     limits.max_alloc = Some(64 * 1024 * 1024);
-    reader.limits(limits);
-    reader.decode().map_err(|_| PictureError::Unsupported)
+    reader.limits(limits.clone());
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|_| PictureError::Unsupported)?;
+    limits
+        .reserve(decoder.total_bytes())
+        .map_err(|_| PictureError::TooLarge)?;
+    decoder
+        .set_limits(limits)
+        .map_err(|_| PictureError::TooLarge)?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut image = DynamicImage::from_decoder(decoder).map_err(|_| PictureError::Unsupported)?;
+    image.apply_orientation(orientation);
+    Ok(image)
 }
 
 /// Возвращает маленький кадр для плитки, если локальное фото удалось прочитать.
@@ -967,9 +1111,17 @@ pub(super) fn decode_thumbnail(mut file: MediaFile) -> Option<Arc<RenderImage>> 
 }
 
 /// Уменьшает защищённое фото и переносит из файла только короткий отзывный допуск.
-fn decode_protected_thumbnail(mut file: MediaFile) -> Option<ProtectedPicture> {
-    let decoded = decode_original(&mut file).ok()?;
-    let image = render_image(decoded.thumbnail(96, 91).into_rgba8());
+fn decode_protected_thumbnail(
+    mut file: MediaFile,
+    kind: MediaKind,
+    tile: Option<Tile>,
+) -> Option<ProtectedPicture> {
+    let pixels = inline::decode_pixels(&mut file, kind).ok()?;
+    let pixels = match tile {
+        Some(tile) => inline::crop_to_tile(pixels, tile.ratio),
+        None => pixels,
+    };
+    let image = render_image(pixels);
     let permit = file.protected_preview_permit()?;
     Some(ProtectedPicture { image, permit })
 }
@@ -1006,6 +1158,7 @@ fn decode(mut file: MediaFile, protected: bool) -> Result<Photo, PictureError> {
 fn protected_photo(
     picture: ProtectedPicture,
     mounted: Rc<Cell<bool>>,
+    tile: Option<Tile>,
     #[cfg(all(test, feature = "gpui-test"))] paints: PaintCounts,
 ) -> impl IntoElement {
     canvas(
@@ -1014,17 +1167,13 @@ fn protected_photo(
             if !mounted.get() {
                 return;
             }
-            let image_size = picture.image.size(0);
-            let width = image_size.width.0 as f32;
-            let height = image_size.height.0 as f32;
-            let scale =
-                (f32::from(bounds.size.width) / width).min(f32::from(bounds.size.height) / height);
-            let size = size(px(width * scale), px(height * scale));
-            let origin = bounds.origin
-                + point(
-                    (bounds.size.width - size.width) / 2.,
-                    (bounds.size.height - size.height) / 2.,
-                );
+            let (bounds, corners) = match tile {
+                Some(tile) => (bounds, tile.corners.clamp_radii_for_quad_size(bounds.size)),
+                None => (
+                    ObjectFit::Contain.get_bounds(bounds, picture.image.size(0)),
+                    Corners::default(),
+                ),
+            };
             #[cfg(all(test, feature = "gpui-test"))]
             {
                 let (attempts, admitted) = paints.get();
@@ -1036,13 +1185,7 @@ fn protected_photo(
                     let (attempts, admitted) = paints.get();
                     paints.set((attempts, admitted + 1));
                 }
-                window.paint_image(
-                    Bounds { origin, size },
-                    Corners::default(),
-                    picture.image.clone(),
-                    0,
-                    false,
-                )
+                window.paint_image(bounds, corners, picture.image.clone(), 0, false)
             });
         },
     )

@@ -13,7 +13,7 @@ use crate::gpui_client::{
     right_panel::{PanelKey, RightPanel, Scope},
     runtime::RuntimeClient,
     sidebar::Sidebar,
-    ui::{Icon, Palette, TextRole, activate, label},
+    ui::{Icon, Palette, TextRole, activate, label, sidebar_item},
 };
 
 use super::Client;
@@ -464,43 +464,22 @@ impl Profile {
         let language = Preferences::read(cx).language;
         let title = language.tr(row.title);
         let subtitle = self.row_subtitle(row, language);
+        let text = div()
+            .child(label(palette, TextRole::Label, title).text_color(title_color))
+            .when(!subtitle.is_empty(), |text| {
+                text.child(
+                    label(palette, TextRole::Body, subtitle)
+                        .mt(px(2.))
+                        .text_color(palette.text_muted),
+                )
+            });
         activate(
-            div()
+            sidebar_item(palette, icon_slot(row.icon, icon_color), text, px(8.))
                 .id(row.id)
                 .debug_selector(move || row.id.into())
-                .relative()
-                .w_full()
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_2()
                 .px_4()
                 .py(px(6.))
-                .hover(|style| style.bg(palette.card_hover))
                 .when(divider, |item| item.child(hairline(palette)))
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(icon_slot(row.icon, icon_color))
-                        .child(
-                            div()
-                                .min_w_0()
-                                .child(
-                                    label(palette, TextRole::Label, title).text_color(title_color),
-                                )
-                                .when(!subtitle.is_empty(), |text| {
-                                    text.child(
-                                        label(palette, TextRole::Body, subtitle)
-                                            .mt(px(2.))
-                                            .text_color(palette.text_muted),
-                                    )
-                                }),
-                        ),
-                )
                 .when(has_chevron, |item| {
                     item.child(
                         div()

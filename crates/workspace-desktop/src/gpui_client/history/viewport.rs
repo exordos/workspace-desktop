@@ -9,13 +9,15 @@ use std::{
 
 use gpui::{
     AnyElement, App, Bounds, Div, ImageSource, IntoElement, ListAlignment, ListOffset, ListState,
-    MouseButton, Pixels, Point, SharedString, StyledText, TextLayout, WeakEntity, canvas, div, list, point, prelude::*, px,
+    MouseButton, Pixels, Point, SharedString, Stateful, StyledText, TextLayout, WeakEntity, canvas,
+    div, list, point, prelude::*, px,
 };
 use uuid::Uuid;
 use workspace_core::{
     messenger::{
         calls::JitsiSettings,
-        references::{MediaReference, media_references},
+        encryption::ProtectedMessage,
+        references::{MediaReference, WorkspaceReferenceTarget, media_references},
     },
     storage::{
         DeliveryStatus, HistoryWindow, KeyServicePayload, MessageBody, OutboxEntry, SendBlock,
@@ -24,13 +26,15 @@ use workspace_core::{
 
 use super::{
     Conversation, ReadingAnchor,
-    attachments::{AttachmentKey, Cards},
+    attachments::{AttachmentKey, Cards, ProtectedAttachment},
     calls::join_card,
     encryption::{EncryptedPresentation, HistoryEncryption},
-    message_menu::MenuHit,
     fragments::{FragmentRuntime, FragmentViews},
+    inline_references::{InlineRender, InlineSelection, InlineText, MentionNames},
     key_exchange::{KeyAction, KeyActionState, KeyPermission},
-    protected_body::ProtectedLayout,
+    media_album::{self, Tile},
+    message_menu::MenuHit,
+    protected_body::{ProtectedLayout, ProtectedReferenceControls},
     protected_quotes::{QuotePresentation, QuoteSlot, render_quote},
     quick_actions::{QuickActions, QuickCommand, QuickReactions, reaction_chips},
     reactions::ReactionControls,
@@ -65,6 +69,8 @@ use crate::gpui_client::{
     },
 };
 
+use crate::platform::message_time::{CalendarDate, LocalTime};
+
 const DATE_SPACE: Pixels = px(32.);
 const BOTTOM_PADDING: Pixels = px(12.);
 
@@ -75,7 +81,7 @@ struct Row {
     own: bool,                                // Сообщение текущего пользователя.
     author: Option<Uuid>, // UUID для группировки, неизвестные авторы не объединяются.
     topic: Uuid,          // Смена темы начинает новую группу.
-    date: Option<String>, // День создания UTC в ISO-порядке, если сообщение принято сервером.
+    date: Option<CalendarDate>, // Местный календарный день сообщения, если он известен.
     body: Rc<Body>,       // Данные обычного тела из снимка; не зависят от координаты строки.
     encrypted: Option<EncryptedPresentation>, // Состояние E2EE; None для обычной строки.
     service: Option<KeyServiceRow>, // Видимая часть служебного сообщения без криптографического тела.
@@ -92,16 +98,16 @@ struct Row {
 /// Подпись рядом с отметкой доставки.
 #[derive(Clone, Eq, PartialEq)]
 enum RowTime {
-    Sent(String),          // Время сервера для принятого сообщения.
+    Sent(Option<String>),  // Местное время принятого сообщения, если оно известно.
     Pending(&'static str), // Ключ пояснения для локального сообщения.
 }
 
 impl RowTime {
     /// Подставляет текст очереди на языке видимой истории.
-    fn caption(&self, language: Language) -> SharedString {
+    fn caption(&self, language: Language) -> Option<SharedString> {
         match self {
-            Self::Sent(time) => time.clone().into(),
-            Self::Pending(key) => language.tr(key).into(),
+            Self::Sent(time) => time.clone().map(Into::into),
+            Self::Pending(key) => Some(language.tr(key).into()),
         }
     }
 }
@@ -155,11 +161,17 @@ pub(super) struct HistoryControls {
     pub protected: HashMap<Uuid, Arc<ProtectedLayout>>, // Безопасная структура конкретных раскрытых баблов.
     pub quotes: HashMap<QuoteSlot, QuotePresentation>, // Отдельный доступ к разрешённым оригиналам.
     pub fragments: Option<FragmentRuntime>, // Рабочая сессия для спойлеров обычного Markdown.
+    pub mention_names: MentionNames,        // Уже известные имена старых упоминаний с одним UUID.
     pub jitsi: Option<Arc<JitsiSettings>>, // Проверенный сервер конференций для карточек этой истории.
     pub locale: Language,                  // Язык подписей открытой истории.
 }
 
 impl Row {
+    /// Сообщает, что строка уже есть на сервере и доступна для действий истории.
+    fn confirmed(&self) -> bool {
+        matches!(self.time, RowTime::Sent(_))
+    }
+
     /// Возвращает высоту частей строки перед сообщением, чтобы выровнять сам пузырь.
     fn inset(&self) -> Pixels {
         let gap = if self.starts_group { px(6.) } else { px(3.) };
@@ -172,6 +184,7 @@ impl Row {
             && self.author == other.author
             && self.topic == other.topic
             && self.date == other.date
+            && self.confirmed() == other.confirmed()
     }
 
     /// Возвращает автора строки, возле которой рисуется фото входящей группы.
@@ -234,6 +247,7 @@ pub(super) struct Viewport {
     reflow_anchor: Rc<Cell<Option<ReflowAnchor>>>, // Опора между сменами ширины без жеста.
     ordinary_views: Rc<RefCell<TextRows>>, // Представления обычных баблов рядом с E2EE.
     pub(super) fragment_views: FragmentViews, // Отдельные элементы спойлеров со своим состоянием.
+    time_zone: String,               // Пояс, в котором рассчитаны даты текущих строк.
     prepared_bodies: HashMap<Uuid, CachedBody>, // Подготовка последних снимков текущего разговора.
 }
 
@@ -253,6 +267,7 @@ impl Viewport {
             reflow_anchor: Rc::default(),
             ordinary_views: Rc::default(),
             fragment_views: FragmentViews::default(),
+            time_zone: String::new(),
             prepared_bodies: HashMap::new(),
         }
     }
@@ -344,10 +359,15 @@ impl Viewport {
             })
     }
 
+    /// Проверяет, пересчитать ли сохранённые подписи и разделители в текущем поясе.
+    pub(super) fn time_zone_changed(&self) -> bool {
+        self.time_zone != LocalTime::system().name()
+    }
+
     /// Возвращает опору, которую сервер сможет открыть по UUID.
     pub(super) fn saved_anchor(&self) -> Option<ReadingAnchor> {
         self.anchor(&self.index)
-            .filter(|anchor| self.rows[self.index[&anchor.id]].date.is_some())
+            .filter(|anchor| self.rows[self.index[&anchor.id]].confirmed())
     }
 
     /// Обновляет только изменившийся отрезок и переносит опору в его новый индекс.
@@ -360,7 +380,16 @@ impl Viewport {
         op_id: Uuid,
         encryption: Option<&HistoryEncryption>,
     ) {
-        let rows = build_rows(history, outbox, user, encryption, &mut self.prepared_bodies);
+        let local = LocalTime::system();
+        self.time_zone = local.name().to_owned();
+        let rows = build_rows(
+            history,
+            outbox,
+            user,
+            encryption,
+            &mut self.prepared_bodies,
+            &local,
+        );
         let previous_count = self.rows.len();
         let index: HashMap<_, _> = rows
             .iter()
@@ -420,7 +449,7 @@ impl Viewport {
         }
         self.selection.borrow_mut().retain_current(|id| {
             let row = self.rows.get(*index.get(&id)?)?;
-            (row.date.is_some()
+            (row.confirmed()
                 && row.service.is_none()
                 && row.encrypted.is_none()
                 && !row.body.text.trim().is_empty())
@@ -553,7 +582,33 @@ impl Viewport {
     pub(super) fn has_forward_source(&self, row: Uuid, source: Uuid) -> bool {
         self.index.get(&row).is_some_and(|&index| {
             let row = &self.rows[index];
-            row.date.is_some() && row.body.contains_forward(source)
+            row.confirmed() && row.body.contains_forward(source)
+        })
+    }
+
+    /// Проверяет цель у того же подтверждённого сообщения видимого разговора.
+    pub(super) fn has_inline_reference(
+        &self,
+        row: Uuid,
+        target: &WorkspaceReferenceTarget,
+    ) -> bool {
+        self.index.get(&row).is_some_and(|&index| {
+            let row = &self.rows[index];
+            row.confirmed() && row.body.contains_reference(target)
+        })
+    }
+
+    /// Сверяет ссылку защищённого сообщения с тем же конвертом и действующим разрешением.
+    pub(super) fn has_protected_inline_source(
+        &self,
+        row: Uuid,
+        access: &Arc<ProtectedMessage>,
+    ) -> bool {
+        self.index.get(&row).is_some_and(|&index| {
+            let row = &self.rows[index];
+            row.confirmed()
+                && matches!(&row.encrypted, Some(EncryptedPresentation::Ready(current)) if Arc::ptr_eq(access, current))
+                && access.with_current(|| ()).is_some()
         })
     }
 
@@ -988,20 +1043,19 @@ fn same_offset(a: ListOffset, b: ListOffset) -> bool {
 fn row_container(row: &Row, palette: Palette, locale: Language) -> Div {
     div().relative().w_full().px_3().pt(row.inset()).children(
         row.date
-            .as_deref()
             .filter(|_| row.starts_day)
             .map(|date| date_separator(palette, date, row.id, locale)),
     )
 }
 
 /// Рисует дату перед первым сообщением дня, не добавляя отдельный адрес в список.
-fn date_separator(palette: Palette, date: &str, id: Uuid, locale: Language) -> Div {
+fn date_separator(palette: Palette, date: CalendarDate, id: Uuid, locale: Language) -> Div {
     let caption = locale.tr_with(
         "desktop.conversation.history.date",
         &[
-            ("year", &date[..4]),
-            ("month", &date[5..7]),
-            ("day", &date[8..10]),
+            ("year", &format!("{:04}", date.year)),
+            ("month", &format!("{:02}", date.month)),
+            ("day", &format!("{:02}", date.day)),
         ],
     );
     div()
@@ -1059,14 +1113,40 @@ fn message_row(
             ..palette
         }
     };
-    let confirmed = controls.reply.as_ref().filter(|_| row.date.is_some() && row.service.is_none());
+    let confirmed = controls
+        .reply
+        .as_ref()
+        .filter(|_| row.confirmed() && row.service.is_none());
     let reply = confirmed.filter(|_| row.encrypted.is_none() && !row.body.text.trim().is_empty());
     let bubble = MessageBubble {
         author: (!row.own && row.starts_group).then_some(author),
         body: row.body.text.clone(),
-        time: Some(row.time.caption(controls.locale)),
+        time: row.time.caption(controls.locale),
         own: row.own,
         delivery: row.delivery,
+    };
+    let protected_album = match &row.encrypted {
+        Some(EncryptedPresentation::Ready(text))
+            if extras.media.is_some_and(Cards::shows_protected_inline)
+                && text.with_current(|| ()).is_some() =>
+        {
+            controls.protected.get(&id).map(|layout| (text, layout))
+        }
+        _ => None,
+    };
+    let media: Vec<_> = if let Some((_, layout)) = protected_album {
+        layout.album().collect()
+    } else {
+        row.media
+            .iter()
+            .enumerate()
+            .filter(|(_, reference)| {
+                extras
+                    .media
+                    .is_some_and(|cards| cards.shows_inline(reference))
+            })
+            .map(|(index, reference)| (index, media_album::reference_ratio(reference)))
+            .collect()
     };
     let (rows, index) = history;
     let mut text_layout = None;
@@ -1074,7 +1154,11 @@ fn message_row(
     let content = if let Some(state) = &row.encrypted {
         let text = match state {
             EncryptedPresentation::Ready(text) if text.with_current(|| ()).is_some() => {
+                readable = true;
+                let separate_album = protected_album.is_some() && !media.is_empty();
+                let mut has_body = true;
                 let body = if let Some(layout) = controls.protected.get(&id) {
+                    has_body = !separate_album || layout.has_footer();
                     layout.render(
                         id,
                         text,
@@ -1082,8 +1166,14 @@ fn message_row(
                         row.own,
                         extras
                             .media
-                            .zip(extras.app)
+                            .zip(extras.app.as_deref_mut())
                             .map(|(cards, app)| (cards, app, controls.locale)),
+                        separate_album,
+                        ProtectedReferenceControls {
+                            conversation: controls.conversation.as_ref(),
+                            language: controls.locale,
+                            names: &controls.mention_names,
+                        },
                         |position, palette, own, media| {
                             let slot = QuoteSlot {
                                 message: id,
@@ -1106,8 +1196,7 @@ fn message_row(
                         .child(ProtectedText(text.clone()))
                 };
                 let call = row
-                    .date
-                    .is_some()
+                    .confirmed()
                     .then(|| {
                         join_card(
                             id,
@@ -1119,24 +1208,32 @@ fn message_row(
                         )
                     })
                     .flatten();
-                Some(if let Some(call) = call {
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(body)
-                        .child(call)
-                        .into_any_element()
+                if let Some(call) = call {
+                    Some(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .children(has_body.then_some(body))
+                            .child(call)
+                            .into_any_element(),
+                    )
                 } else {
-                    body.into_any_element()
-                })
+                    has_body.then(|| body.into_any_element())
+                }
             }
             _ => None,
         };
-        readable = text.is_some();
-        Some(text.unwrap_or_else(|| {
-            encrypted_placeholder(id, matches!(state, EncryptedPresentation::Failed), bubble_palette, controls)
-        }))
+        if readable {
+            text
+        } else {
+            Some(encrypted_placeholder(
+                id,
+                matches!(state, EncryptedPresentation::Failed),
+                bubble_palette,
+                controls,
+            ))
+        }
     } else if let Some(service) = &row.service {
         Some(key_service_body(id, service, bubble_palette, controls))
     } else if let Some(cards) = extras.media.filter(|_| !row.media.is_empty()) {
@@ -1146,15 +1243,37 @@ fn message_row(
             .caption
             .as_ref()
             .expect("подпись для строки с медиа");
-        let caption = if let Some(reply) = reply.filter(|_| row.body.plain()) {
-            caption.children(prepared.spans.iter().map(|(span, visible)| {
-                reply.selectable_span(
-                    id,
-                    &row.body.text,
-                    span.clone(),
-                    visible.clone(),
-                    bubble_palette,
-                )
+        let caption = if let Some(reply) = reply.filter(|_| row.body.selectable_caption()) {
+            caption.children(prepared.spans.iter().map(|span| {
+                if let Some(inline) = &span.inline {
+                    inline
+                        .render(InlineRender {
+                            id: SharedString::from(format!(
+                                "history-inline-{id}-{}",
+                                span.range.start
+                            ))
+                            .into(),
+                            row: id,
+                            palette: bubble_palette,
+                            language: controls.locale,
+                            conversation: controls.conversation.as_ref(),
+                            names: &controls.mention_names,
+                            selection: Some(InlineSelection {
+                                controls: reply,
+                                body: &row.body.text,
+                                offset: span.range.start,
+                            }),
+                        })
+                        .0
+                } else {
+                    reply.selectable_span(
+                        id,
+                        &row.body.text,
+                        span.range.clone(),
+                        span.text.clone(),
+                        bubble_palette,
+                    )
+                }
             }))
         } else {
             let content = quote_content(
@@ -1172,46 +1291,53 @@ fn message_row(
             });
             caption.children(content)
         };
-        Some(
-            caption
-                .children(row.media.iter().enumerate().map(|(position, reference)| {
-                    let key = AttachmentKey {
-                        message: id,
-                        file: reference.file_id,
-                        position,
-                    };
-                    let card = cards.render(
-                        key,
-                        reference,
-                        bubble_palette,
-                        controls.locale,
-                        extras
-                            .app
-                            .as_deref_mut()
-                            .expect("контекст карточек истории"),
-                    );
-                    let Some(conversation) = controls.conversation.clone().filter(|_| {
-                        reference.kind == workspace_core::storage::media::MediaKind::Image
-                    }) else {
-                        return card;
-                    };
-                    let original = reference
-                        .name
-                        .as_deref()
-                        .unwrap_or(&reference.label)
-                        .rsplit_once('.')
-                        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("heic") || ext.eq_ignore_ascii_case("heif"));
-                    card.on_mouse_down(MouseButton::Right, move |event, window, cx| {
-                        let _ = conversation.update(cx, |view, cx| {
-                            view.open_message_menu(id, event.position, MenuHit::Image { key, original }, window, cx)
-                        });
-                        cx.stop_propagation();
-                    })
-                }))
-                .into_any_element(),
-        )
+        let mut files = row
+            .media
+            .iter()
+            .enumerate()
+            .filter(|(_, reference)| !cards.shows_inline(reference))
+            .peekable();
+        if prepared.text.trim().is_empty() && files.peek().is_none() {
+            None
+        } else {
+            Some(
+                caption
+                    .children(files.map(|(position, reference)| {
+                        attachment_card(
+                            cards,
+                            controls,
+                            id,
+                            position,
+                            reference,
+                            None,
+                            bubble_palette,
+                            extras
+                                .app
+                                .as_deref_mut()
+                                .expect("контекст карточек истории"),
+                        )
+                    }))
+                    .into_any_element(),
+            )
+        }
     } else {
-        if row.body.plain() && !row.body.text.trim().is_empty() {
+        if let [BodyPart::Inline(text)] = row.body.parts.as_slice() {
+            let (body, layout) = text.render(InlineRender {
+                id: SharedString::from(format!("history-inline-{id}-0")).into(),
+                row: id,
+                palette: bubble_palette,
+                language: controls.locale,
+                conversation: controls.conversation.as_ref(),
+                names: &controls.mention_names,
+                selection: reply.map(|controls| InlineSelection {
+                    controls,
+                    body: &row.body.text,
+                    offset: 0,
+                }),
+            });
+            text_layout = Some(layout);
+            Some(body.into_any_element())
+        } else if row.body.plain() && !row.body.text.trim().is_empty() {
             let (body, layout) = if let Some(controls) = reply {
                 let (body, layout) = controls.selectable(id, &row.body.text, bubble_palette);
                 (body.min_w_0().max_w_full().into_any_element(), layout)
@@ -1255,7 +1381,7 @@ fn message_row(
             .into_any_element(),
         )
     });
-    let confirmed_message = row.date.is_some() && row.service.is_none();
+    let confirmed_message = row.confirmed() && row.service.is_none();
     let reactions = controls.reactions.as_ref().filter(|_| {
         confirmed_message && (row.encrypted.is_none() || readable)
     });
@@ -1276,18 +1402,84 @@ fn message_row(
     });
     let has_reactions = reactions.is_some();
     let show_quick_actions = !commands.is_empty() || has_reactions;
-    let mut bubble = match (content, accessory, show_quick_actions) {
-        (content, accessory, true) => bubble.render_with_overlay(
-            bubble_palette, content, row.ends_group, accessory,
-            div().absolute().inset_0()
-                .debug_selector(move || format!("history-quick-bubble-{id}"))
-                .child(QuickActions { id, own: row.own, palette, commands, reactions }),
-        ),
-        (content, Some(accessory), false) => {
-            bubble.render_with_accessory(bubble_palette, content, row.ends_group, accessory)
+    let overlay = show_quick_actions.then(|| {
+        div()
+            .absolute()
+            .inset_0()
+            .debug_selector(move || format!("history-quick-bubble-{id}"))
+            .child(QuickActions {
+                id,
+                own: row.own,
+                palette,
+                commands,
+                reactions,
+            })
+            .into_any_element()
+    });
+    let mut bubble = if let Some(cards) = extras.media.filter(|_| !media.is_empty()) {
+        let corners =
+            bubble.media_corners(row.ends_group, content.is_some() || accessory.is_some());
+        let album = media_album::render(&media, corners, |position, tile| {
+            let app = extras
+                .app
+                .as_deref_mut()
+                .expect("контекст карточек истории");
+            if let Some((text, layout)) = protected_album {
+                let (file, kind) = layout
+                    .album_file(position)
+                    .expect("позиция плитки взята из альбома");
+                let key = AttachmentKey {
+                    message: id,
+                    file,
+                    position,
+                };
+                cards.render_protected(
+                    ProtectedAttachment::direct(key, text.clone()),
+                    kind,
+                    Some(tile),
+                    bubble_palette,
+                    controls.locale,
+                    app,
+                )
+            } else {
+                attachment_card(
+                    cards,
+                    controls,
+                    id,
+                    position,
+                    &row.media[position],
+                    Some(tile),
+                    bubble_palette,
+                    app,
+                )
+            }
+        })
+        .debug_selector(move || format!("history-media-album-{id}"));
+        bubble.render_with_media(
+            bubble_palette,
+            album,
+            content,
+            row.ends_group,
+            accessory,
+            overlay,
+        )
+    } else {
+        match (content, accessory, overlay) {
+            (content, accessory, Some(overlay)) => bubble.render_with_overlay(
+                bubble_palette,
+                content,
+                row.ends_group,
+                accessory,
+                overlay,
+            ),
+            (content, Some(accessory), None) => {
+                bubble.render_with_accessory(bubble_palette, content, row.ends_group, accessory)
+            }
+            (Some(content), None, None) => {
+                bubble.render_with_body(bubble_palette, content, row.ends_group)
+            }
+            (None, None, None) => bubble.render_in_group(bubble_palette, row.ends_group),
         }
-        (Some(content), None, false) => bubble.render_with_body(bubble_palette, content, row.ends_group),
-        (None, None, false) => bubble.render_in_group(bubble_palette, row.ends_group),
     }
     .debug_selector(move || format!("history-message-{id}"));
     if row.delivery == Some(DeliveryMark::Unknown) {
@@ -1328,6 +1520,53 @@ fn message_row(
                 .child(bubble),
         );
     (message, text_layout)
+}
+
+/// Соединяет плитку с открытием файла и меню изображения по её исходной позиции.
+#[allow(clippy::too_many_arguments)]
+fn attachment_card(
+    cards: &Cards,
+    controls: &HistoryControls,
+    id: Uuid,
+    position: usize,
+    reference: &MediaReference,
+    tile: Option<Tile>,
+    palette: Palette,
+    app: &mut App,
+) -> Stateful<Div> {
+    let key = AttachmentKey {
+        message: id,
+        file: reference.file_id,
+        position,
+    };
+    let card = cards.render(key, reference, tile, palette, controls.locale, app);
+    let Some(conversation) = controls
+        .conversation
+        .clone()
+        .filter(|_| reference.kind == workspace_core::storage::media::MediaKind::Image)
+    else {
+        return card;
+    };
+    let original = reference
+        .name
+        .as_deref()
+        .unwrap_or(&reference.label)
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| {
+            ext.eq_ignore_ascii_case("heic") || ext.eq_ignore_ascii_case("heif")
+        });
+    card.on_mouse_down(MouseButton::Right, move |event, window, cx| {
+        let _ = conversation.update(cx, |view, cx| {
+            view.open_message_menu(
+                id,
+                event.position,
+                MenuHit::Image { key, original },
+                window,
+                cx,
+            )
+        });
+        cx.stop_propagation();
+    })
 }
 
 /// Выбирает команду для открытого текста или запроса ключа у закрытого сообщения.
@@ -1538,6 +1777,8 @@ struct FragmentContent<'a> {
     app: Option<&'a mut App>,         // Контекст при создании элемента из строки списка.
     locale: Language,                 // Язык нейтрального заполнителя.
     conversation: Option<&'a WeakEntity<Conversation>>, // Владелец переходов к оригиналам.
+    inline_index: usize, // Место текстового блока с действиями, включая вложенные пересылки.
+    mention_names: &'a MentionNames, // Имена участников из снимка текущего входа.
 }
 
 impl<'a> FragmentContent<'a> {
@@ -1553,7 +1794,26 @@ impl<'a> FragmentContent<'a> {
             app,
             locale: controls.locale,
             conversation: controls.conversation.as_ref(),
+            inline_index: 0,
+            mention_names: &controls.mention_names,
         }
+    }
+
+    /// Выдаёт текстовым элементам разные ключи внутри одного сообщения.
+    fn inline(&mut self, row: Uuid, text: &InlineText, palette: Palette) -> AnyElement {
+        let id = SharedString::from(format!("history-inline-{row}-{}", self.inline_index));
+        self.inline_index += 1;
+        text.render(InlineRender {
+            id: id.into(),
+            row,
+            palette,
+            language: self.locale,
+            conversation: self.conversation,
+            names: self.mention_names,
+            selection: None,
+        })
+        .0
+        .into_any_element()
     }
 
     /// Показывает один спойлер, скрывая адрес даже в истории без исполнительного процесса.
@@ -1611,6 +1871,10 @@ fn quote_content(
                     .into_any_element(),
             ),
             BodyPart::Text(text) => body = body.child(label(palette, TextRole::Body, text.clone())),
+            BodyPart::Inline(text) if row.body.has_fragments => {
+                inline.push(fragments.inline(id, text, palette));
+            }
+            BodyPart::Inline(text) => body = body.child(fragments.inline(id, text, palette)),
             BodyPart::Preview(preview) => {
                 body = body.child(label(
                     palette,
@@ -1646,7 +1910,7 @@ fn quote_content(
                     .map(|&index| &rows[index])
                     .filter(|source| {
                         source.id != id
-                            && source.date.is_some()
+                            && source.confirmed()
                             && source.encrypted.is_none()
                             && source.service.is_none()
                     });
@@ -1749,6 +2013,7 @@ fn forward_card(
                         .into_any_element(),
                 );
             }
+            BodyPart::Inline(text) => inline.push(fragments.inline(id, text, palette)),
             BodyPart::Preview(preview) => inline.push(
                 label(
                     palette,
@@ -1802,6 +2067,7 @@ fn build_rows(
     user: Option<Uuid>,
     encryption: Option<&HistoryEncryption>,
     prepared: &mut HashMap<Uuid, CachedBody>,
+    local: &LocalTime,
 ) -> Vec<Row> {
     let mut rows: Vec<_> = history
         .messages
@@ -1835,7 +2101,7 @@ fn build_rows(
                 }),
                 _ => None,
             };
-            let stamp = message.metadata.created_at.as_str();
+            let stamp = local.history_stamp(&message.metadata.created_at);
             let (body, media) =
                 prepare_row_body(prepared, message.id, text, true, encrypted.is_some());
             let plain_text =
@@ -1845,14 +2111,14 @@ fn build_rows(
                 own,
                 author: message.metadata.author_id,
                 topic: message.topic_id,
-                date: Some(stamp[..10].to_owned()),
+                date: stamp.as_ref().map(|local| local.date),
                 body,
                 encrypted,
                 service,
                 retry_send: None,
                 plain_text,
                 media,
-                time: RowTime::Sent(stamp[11..16].to_owned()),
+                time: RowTime::Sent(stamp.map(|local| local.short_time())),
                 delivery: own.then_some(DeliveryMark::Sent),
                 starts_day: false,
                 starts_group: false,
@@ -1978,5 +2244,53 @@ fn delivery_caption_key(status: DeliveryStatus) -> &'static str {
             "desktop.messenger.history.deliveryPlaintextUnavailable"
         }
         DeliveryStatus::Rejected(_) => "desktop.messenger.history.deliveryRejected",
+    }
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::*;
+    use crate::gpui_client::conversation::history_fixtures::fixture_rows;
+    use workspace_core::storage::{HistoryEdge, HistoryScope, HistoryTime};
+
+    /// Группирует сообщения по полуночи читателя и сохраняет серверный порядок строк.
+    #[test]
+    fn groups_history_by_the_readers_day() {
+        let scope = HistoryScope {
+            stream_id: Uuid::from_u128(2001),
+            topic_id: Some(Uuid::from_u128(2002)),
+        };
+        let mut messages = fixture_rows(scope, 1, 3);
+        for (message, utc) in messages.iter_mut().zip([
+            "2026-12-31T20:59:00Z",
+            "2026-12-31T21:00:00Z",
+            "2027-01-01T00:01:00Z",
+        ]) {
+            message.metadata.author_id = Some(Uuid::from_u128(900));
+            message.metadata.created_at = HistoryTime::parse(utc).unwrap();
+        }
+        let history = HistoryWindow {
+            id: 1,
+            scope,
+            messages,
+            older: HistoryEdge::End,
+            newer: HistoryEdge::End,
+            needs_refresh: false,
+        };
+        let local = LocalTime::for_test("Europe/Moscow");
+        let rows = build_rows(&history, &[], None, None, &mut HashMap::new(), &local);
+        assert_eq!(
+            rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [1, 2, 3].map(Uuid::from_u128)
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.starts_day).collect::<Vec<_>>(),
+            [true, true, false]
+        );
+        assert!(rows[1].starts_group);
+        assert!(!rows[2].starts_group);
+        for (row, time) in rows.iter().zip(["23:59", "00:00", "03:01"]) {
+            assert_eq!(row.time.caption(Language::Ru).unwrap().as_ref(), time);
+        }
     }
 }

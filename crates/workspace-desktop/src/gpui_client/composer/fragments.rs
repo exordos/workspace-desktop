@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use gpui::{AnyElement, Context, IntoElement, Window, div, prelude::*};
+use gpui::{AnyElement, Context, FocusHandle, IntoElement, Window, div, prelude::*, px};
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 use workspace_core::{
@@ -126,6 +126,7 @@ impl Composer {
         palette: Palette,
         locale: Language,
         can_format: bool,
+        focus: &FocusHandle,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
         if self
@@ -148,7 +149,7 @@ impl Composer {
         button.disabled = !can_format;
         Some(
             button
-                .render(palette, None, move |window: &mut Window, cx| {
+                .render(palette, Some(focus), move |window: &mut Window, cx| {
                     let _ = target.update(cx, |composer, cx| {
                         composer.editor.update(cx, |editor, cx| {
                             editor.apply_format(Format::EncryptedSpoiler, cx)
@@ -157,6 +158,9 @@ impl Composer {
                         composer.focus_editor(window, cx);
                     });
                 })
+                .size(px(32.))
+                .p_0()
+                .flex_none()
                 .tooltip(move |_, cx| {
                     cx.new(|_| super::SendTooltip {
                         palette,

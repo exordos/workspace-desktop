@@ -26,21 +26,6 @@ use record::{ChatRecord, Pending};
 const SERVICE: &str = "com.workspace.desktop.chat-keys";
 const ITEM_NOT_FOUND: i32 = -25300;
 
-/// Форматирует время первого сохранения ключа локальными средствами macOS.
-pub(crate) fn key_date(unix_ms: u64) -> String {
-    use objc2_foundation::{NSDate, NSDateFormatter, NSDateFormatterStyle};
-    // Foundation принимает секунды и возвращает строки с часовым поясом системы.
-    unsafe {
-        let date = NSDate::dateWithTimeIntervalSince1970(unix_ms as f64 / 1000.);
-        NSDateFormatter::localizedStringFromDate_dateStyle_timeStyle(
-            &date,
-            NSDateFormatterStyle::NSDateFormatterShortStyle,
-            NSDateFormatterStyle::NSDateFormatterShortStyle,
-        )
-        .to_string()
-    }
-}
-
 /// Возвращает стабильный UUID профиля. Вызывать под блокировкой открытого профиля.
 pub(crate) fn device_id(directory: &Path) -> io::Result<Uuid> {
     let path = directory.join("chat-device-id");

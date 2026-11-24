@@ -28,7 +28,7 @@ use super::{
     avatars::AvatarImages,
     contracts::{
         AccountSession, ChatEntry, ChatRoute, ConversationAddress, FolderCommand,
-        FolderCommandError, FolderRailPreferences, SidebarAction,
+        FolderCommandError, FolderRailPreferences, SidebarAction, default_topic,
     },
     preferences::{ChatClick, Language, Preferences as AppPreferences, appearance::ChatDensity},
     runtime::RuntimeClient,
@@ -1567,13 +1567,6 @@ fn measured(row: Stateful<Div>, key: RowKey, bounds: &RowBounds) -> Div {
         })
 }
 
-/// Возвращает общую тему, если она есть в доступном каталоге разговора.
-fn default_topic(chat: &Chat) -> Option<Uuid> {
-    chat.metadata
-        .default_topic_id
-        .filter(|id| chat.topics.iter().any(|topic| topic.id == *id))
-}
-
 /// Проверяет, доступна ли общая тема или старый маршрут личного чата.
 fn has_general_route(chat: &Chat) -> bool {
     chat.direct || default_topic(chat).is_some()
@@ -1662,11 +1655,7 @@ fn message_details(
             },
             text: language.sidebar_preview_text(&preview.text).into(),
         }),
-        time: preview
-            .created_at
-            .as_str()
-            .get(11..16)
-            .map(|time| time.to_owned().into()),
+        time: crate::platform::message_time::short_time(&preview.created_at).map(Into::into),
         ..RowDetails::default()
     }
 }

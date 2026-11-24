@@ -23,8 +23,8 @@ use crate::gpui_client::{
     preferences::{Language, Preferences},
     runtime::RuntimeClient,
     ui::{
-        Button, ButtonAppearance, Icon, PANEL_RADIUS, Palette, TextRole, activate, label,
-        profile_joined_date,
+        Button, ButtonAppearance, Icon, PANEL_RADIUS, Palette, TextRole, activate,
+        calendar_date_label, label,
     },
 };
 
@@ -514,17 +514,18 @@ impl ActivityMessages {
                 .tr("desktop.messenger.composer.draftMessage")
                 .into(),
         };
-        let stamp = message.created_at.as_str();
-        let time = stamp.get(11..16).unwrap_or_default();
-        let time = profile_joined_date(stamp, language).map_or_else(
-            || time.to_owned(),
-            |date| {
+        let time = crate::platform::message_time::LocalTime::system()
+            .history_stamp(&message.created_at)
+            .map(|local| {
                 language.tr_with(
                     "desktop.activity.dateTime",
-                    &[("date", &date), ("time", time)],
+                    &[
+                        ("date", &calendar_date_label(local.date, language)),
+                        ("time", &local.short_time()),
+                    ],
                 )
-            },
-        );
+            })
+            .unwrap_or_default();
         let unread = mentions && !message.read;
         let id = message.id;
         let row = div()

@@ -115,6 +115,22 @@ fn run_in(
             .detach();
         });
         Client::install_settings_input(&client, app);
+        if let Some(main) = objc2_foundation::MainThreadMarker::new() {
+            let (changed, mut changes) = tokio::sync::mpsc::channel(1);
+            let observer =
+                crate::platform::message_time::TimeZoneObserver::subscribe(main, changed);
+            let task = app.spawn(async move |cx| {
+                let _observer = observer;
+                while changes.recv().await.is_some() {
+                    if window.update(cx, |_, window, _| window.refresh()).is_err() {
+                        break;
+                    }
+                }
+            });
+            client.update(app, |_, cx| {
+                cx.on_release(move |_, _| drop(task)).detach();
+            });
+        }
         app.spawn(async move |cx| {
             loop {
                 cx.background_executor()

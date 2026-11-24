@@ -11,9 +11,10 @@ use workspace_core::messenger::{
     },
     forward::{ForwardReference, ForwardSpan, MAX_FORWARD_DEPTH, forward_spans},
     quote::{self, Block},
-    references::MediaReference,
+    references::{MediaReference, WorkspaceReferenceTarget},
 };
 
+use super::super::inline_references::{InlineText, Reference, open_references};
 use crate::gpui_client::{composer::short_reply_text, preferences::Language};
 
 /// Данные тела, которыми могут пользоваться несколько проходов layout и paint.
@@ -31,13 +32,22 @@ pub(super) struct Body {
 pub(super) struct MediaCaption {
     pub text: SharedString, // Подпись без ссылок, представленных отдельными карточками.
     pub parts: Vec<BodyPart>, // Текст и цитаты подписи.
-    pub spans: Vec<(Range<usize>, SharedString)>, // Фрагменты подписи и их исходные байтовые границы.
+    pub spans: Vec<CaptionSpan>, // Фрагменты подписи и их исходные байтовые границы.
+}
+
+/// Отдельный выделяемый участок открытой подписи рядом с медиа.
+#[derive(Eq, PartialEq)]
+pub(super) struct CaptionSpan {
+    pub range: Range<usize>, // Байты участка в исходном Markdown, который проверит Core.
+    pub text: SharedString,  // Исходный текст участка без окружающих отступов.
+    pub inline: Option<InlineText>, // Подготовленные ссылки участка, если они есть.
 }
 
 /// Подготовленная часть обычного тела. Источник цитаты проверяется по текущему окну при показе.
 #[derive(Eq, PartialEq)]
 pub(super) enum BodyPart {
     Text(SharedString),      // Отдельный участок текста для GPUI.
+    Inline(InlineText),      // Та же строка с подготовленными ссылочными участками.
     Preview(MessagePreview), // Открытый снимок пересылки с переводимыми служебными частями.
     Fragment {
         slot: usize,                          // Порядковое место спойлера среди вложений строки.
@@ -66,11 +76,21 @@ impl Body {
         forward_at(&self.parts, source)
     }
 
+    /// Проверяет, осталась ли ссылка в актуальном теле или во вложенной пересылке.
+    pub(super) fn contains_reference(&self, target: &WorkspaceReferenceTarget) -> bool {
+        reference_at(&self.parts, target)
+            || self
+                .caption
+                .as_ref()
+                .is_some_and(|caption| reference_at(&caption.parts, target))
+    }
+
     /// Собирает тело и вырезает ссылки на самостоятельные карточки только при смене снимка.
     pub(super) fn new(text: &str, media: &[MediaReference]) -> Self {
-        let caption = (!media.is_empty()).then(|| MediaCaption::new(text, media));
+        let links = open_references(text);
+        let caption = (!media.is_empty()).then(|| MediaCaption::new(text, media, &links));
         let text: SharedString = text.to_owned().into();
-        let (parts, has_fragments) = parse(&text, 0, &mut 0);
+        let (parts, has_fragments) = parse(&text, 0, &mut 0, &links);
         let excerpt = parts.iter().find_map(|part| match part {
             BodyPart::Text(line) if !line.trim().is_empty() => Some(short_reply_text(line).into()),
             _ => None,
@@ -86,6 +106,13 @@ impl Body {
 
     /// Показывает превью источника, подставляя подпись на языке открытого окна.
     pub(super) fn excerpt(&self, language: Language) -> SharedString {
+        for part in &self.parts {
+            match part {
+                BodyPart::Text(line) if !line.trim().is_empty() => break,
+                BodyPart::Inline(text) => return short_reply_text(&text.visible(language)).into(),
+                _ => {}
+            }
+        }
         self.excerpt.clone().unwrap_or_else(|| {
             language
                 .tr(
@@ -110,6 +137,15 @@ impl Body {
         !self.has_fragments && matches!(self.parts.as_slice(), [BodyPart::Text(_)])
     }
 
+    /// Узнаёт открытую подпись, пригодную для точного выделения фрагментов.
+    pub(super) fn selectable_caption(&self) -> bool {
+        !self.has_fragments
+            && matches!(
+                self.parts.as_slice(),
+                [BodyPart::Text(_) | BodyPart::Inline(_)]
+            )
+    }
+
     /// Возвращает именно тот фрагмент, который может быть смонтирован для этой строки.
     pub(super) fn fragment(&self, position: usize) -> Option<&FragmentReference> {
         let parts = self
@@ -122,9 +158,10 @@ impl Body {
 
 impl MediaCaption {
     /// Собирает подпись и участки точного выделения за один проход по ссылкам.
-    fn new(body: &str, media: &[MediaReference]) -> Self {
+    fn new(body: &str, media: &[MediaReference], links: &[Reference]) -> Self {
         let mut text = String::new();
         let mut spans = Vec::new();
+        let mut shifted = Vec::new();
         let mut previous = 0;
         let ranges = media
             .iter()
@@ -136,17 +173,27 @@ impl MediaCaption {
             let Some(part) = body.get(start..range.start) else {
                 continue;
             };
+            shifted.extend(
+                links
+                    .iter()
+                    .filter_map(|link| link.shift(start..range.start, text.len())),
+            );
             text.push_str(part);
             let left = part.trim_start();
             let visible = left.trim_end();
             let start = start + part.len() - left.len();
             if !visible.is_empty() {
-                spans.push((start..start + visible.len(), visible.to_owned().into()));
+                let text = SharedString::from(visible.to_owned());
+                spans.push(CaptionSpan {
+                    range: start..start + text.len(),
+                    inline: InlineText::new(text.clone(), start, links),
+                    text,
+                });
             }
         }
         let text: SharedString = text.into();
         Self {
-            parts: parse(&text, 0, &mut 0).0,
+            parts: parse(&text, 0, &mut 0, &shifted).0,
             text,
             spans,
         }
@@ -154,21 +201,36 @@ impl MediaCaption {
 }
 
 /// Сохраняет готовые отображаемые фрагменты и пересылки, один раз при чтении сообщения.
-fn parse(markdown: &SharedString, depth: usize, slot: &mut usize) -> (Vec<BodyPart>, bool) {
+fn parse(
+    markdown: &SharedString,
+    depth: usize,
+    slot: &mut usize,
+    links: &[Reference],
+) -> (Vec<BodyPart>, bool) {
     let fragments = fragment_display_spans(markdown);
-    let forwards = forward_spans(markdown);
+    let mut forwards = forward_spans(markdown);
+    // У обычной встроенной ссылки есть переход к оригиналу, но нет карточки со снимком.
+    forwards.retain(|span| {
+        span.reference.is_some()
+            || !links.iter().any(|link| {
+                span.range == link.range
+                    && matches!(link.target, Some(WorkspaceReferenceTarget::Message(_)))
+            })
+    });
     let mut parts = Vec::new();
     for block in quote::blocks(markdown) {
         match block {
             Block::Text(text)
                 if fragments.is_empty() && forwards.is_empty() && text == markdown.as_ref() =>
             {
-                parts.push(BodyPart::Text(markdown.clone()));
+                parts.push(inline_or_text(markdown.clone(), 0, links));
             }
             Block::Text(text) => {
                 // Части цитаты ссылаются на тот же Markdown, что и позиции ссылок.
                 let start = text.as_ptr().addr() - markdown.as_ref().as_ptr().addr();
-                parse_placements(text, start, &fragments, &forwards, &mut parts, depth, slot);
+                parse_placements(
+                    text, start, &fragments, &forwards, links, &mut parts, depth, slot,
+                );
             }
             Block::Quote(reference) => parts.push(BodyPart::Quote {
                 id: reference.message_id,
@@ -187,11 +249,13 @@ enum Placement<'a> {
 }
 
 /// Ставит структурные блоки по порядку, оставляя открытые куски отдельным текстом.
+#[allow(clippy::too_many_arguments)]
 fn parse_placements(
     text: &str,
     start: usize,
     fragments: &[FragmentDisplaySpan],
     forwards: &[ForwardSpan],
+    links: &[Reference],
     parts: &mut Vec<BodyPart>,
     depth: usize,
     slot: &mut usize,
@@ -214,7 +278,11 @@ fn parse_placements(
             continue;
         }
         if range.start > cursor {
-            parts.push(BodyPart::Text(text[cursor..range.start].to_owned().into()));
+            parts.push(inline_or_text(
+                text[cursor..range.start].to_owned().into(),
+                start + cursor,
+                links,
+            ));
         }
         match placement {
             Placement::Fragment(span) if span.kind != FragmentDisplayKind::Definition => {
@@ -241,8 +309,26 @@ fn parse_placements(
         cursor = range.end;
     }
     if cursor < text.len() || (text.is_empty() && fragments.is_empty() && forwards.is_empty()) {
-        parts.push(BodyPart::Text(text[cursor..].to_owned().into()));
+        parts.push(inline_or_text(
+            text[cursor..].to_owned().into(),
+            start + cursor,
+            links,
+        ));
     }
+}
+
+/// Оставляет обычный текст на быстром пути виртуального списка.
+fn inline_or_text(source: SharedString, start: usize, links: &[Reference]) -> BodyPart {
+    InlineText::new(source.clone(), start, links).map_or(BodyPart::Text(source), BodyPart::Inline)
+}
+
+/// Ищет только ссылки, которые представлены пользователю как действия в текущем теле.
+fn reference_at(parts: &[BodyPart], target: &WorkspaceReferenceTarget) -> bool {
+    parts.iter().any(|part| match part {
+        BodyPart::Inline(text) => text.contains(target),
+        BodyPart::Forward(Some(forward)) => reference_at(&forward.parts, target),
+        _ => false,
+    })
 }
 
 /// Разбирает подписанный снимок, не перенося его служебный URL в отображаемое тело.
@@ -252,7 +338,13 @@ fn forward_body(reference: &ForwardReference, depth: usize, slot: &mut usize) ->
             &reference.snapshot,
         ))]
     } else {
-        parse(&reference.snapshot.clone().into(), depth + 1, slot).0
+        parse(
+            &reference.snapshot.clone().into(),
+            depth + 1,
+            slot,
+            &open_references(&reference.snapshot),
+        )
+        .0
     };
     ForwardBody {
         id: reference.id,
@@ -287,6 +379,19 @@ fn fragment_at(parts: &[BodyPart], position: usize) -> Option<&FragmentReference
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Встроенная пересылка ведёт к оригиналу и оставляет снимок вне текста.
+    #[test]
+    fn inline_forward_is_a_link_without_embedded_snapshot() {
+        let original = Uuid::from_u128(42);
+        let wire = format!("До [Оригинал](urn:forward:{original}?snapshot=U2VjcmV0) после");
+        let body = Body::new(&wire, &[]);
+        let [BodyPart::Inline(text)] = body.parts.as_slice() else {
+            panic!("Встроенная ссылка должна остаться в строке с соседним текстом");
+        };
+        assert!(body.contains_reference(&WorkspaceReferenceTarget::Message(original)));
+        assert_eq!(text.visible(Language::Ru), "До Оригинал после");
+    }
 
     /// Переводит служебный текст буквальной пересылки на языке получателя.
     #[test]

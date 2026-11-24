@@ -17,6 +17,7 @@ pub(in crate::gpui_client) const PANEL_RADIUS: Pixels = px(6.);
 pub(in crate::gpui_client) const SURFACE_RADIUS: Pixels = px(10.);
 /// Радиус внешних углов пузыря сообщения.
 pub(super) const MESSAGE_BUBBLE_RADIUS: Pixels = px(18.);
+pub(in crate::gpui_client) const MESSAGE_BUBBLE_MAX_WIDTH: Pixels = px(680.);
 /// Радиус компактных кнопок и полей ввода UI-кита.
 pub(super) const CONTROL_RADIUS: Pixels = px(8.);
 /// Толщина обычной и резервной границы компонентов UI-кита.

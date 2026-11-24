@@ -8,7 +8,7 @@ use gpui::{Context, Div, FocusHandle, Pixels, ScrollHandle, Window, div, prelude
 use uuid::Uuid;
 use workspace_core::{
     messenger::{encryption::ProtectedMessage, quote},
-    storage::HistoryMessage,
+    storage::{HistoryMessage, HistoryTime},
 };
 
 use super::Composer;
@@ -37,11 +37,12 @@ pub(in crate::gpui_client) struct ReplyQuote {
 }
 
 /// Текст цитаты из источника или подпись приложения для текущего языка.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(in crate::gpui_client) enum ReplyText {
     Source(String),      // Текст или имя из истории.
     Label(&'static str), // Ключ подписи интерфейса.
     Mixed(Vec<Self>),    // Текст с отдельными подписями защищённых фрагментов и пересылок.
+    Time(HistoryTime),   // Момент из сообщения, показываемый в поясе читателя.
 }
 
 impl ReplyText {
@@ -50,6 +51,10 @@ impl ReplyText {
         match self {
             Self::Source(text) => Cow::Borrowed(text),
             Self::Label(key) => Cow::Borrowed(language.tr(key)),
+            Self::Time(time) => Cow::Owned(crate::platform::message_time::format_local_time(
+                time,
+                language.code(),
+            )),
             Self::Mixed(parts) => {
                 let mut text = String::new();
                 for part in parts {
@@ -655,6 +660,7 @@ impl Composer {
         if self.editor.read(cx).composing() || !self.replies.reorder(id, insertion) {
             return false;
         }
+        self.validate_attachment_target(cx);
         self.persist_draft(cx);
         cx.notify();
         true

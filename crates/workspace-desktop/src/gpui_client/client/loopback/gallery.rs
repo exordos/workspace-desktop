@@ -2,6 +2,7 @@
 
 use super::*;
 use gpui::{KeyUpEvent, Keystroke};
+use workspace_core::storage::media::GalleryCounts;
 
 const PHOTO: Uuid = Uuid::from_u128(150);
 const DOCUMENT: Uuid = Uuid::from_u128(160);
@@ -70,7 +71,16 @@ pub(super) fn response(
         _ => return None,
     };
     row["topic_uuid"] = json!(topic);
-    Some((json_response(StatusCode::OK, json!([row])), false))
+    // Галерея читает известную историю, а медиа выше экрана не подгружаются лентой.
+    let mut tail = topic_message(
+        user,
+        peer,
+        Uuid::from_u128(if topic == CHANNEL_TOPIC { 162 } else { 163 }),
+        "2026-12-02T10:00:00Z",
+        &"Сообщение без вложений\n".repeat(100),
+    );
+    tail["topic_uuid"] = json!(topic);
+    Some((json_response(StatusCode::OK, json!([tail, row])), false))
 }
 
 /// Галерея меняет область, догружает страницы, читает фото и сохраняет файл по выбору пользователя.
@@ -145,18 +155,38 @@ fn conversation_gallery_uses_known_history_and_downloads_only_on_action(cx: &mut
     click(ui, DETAILS_TRIGGER);
     until(
         ui,
-        "доступна кнопка раздела фото",
+        "видны четыре категории и числа из истории выбранной темы",
         |ui| {
             ui.read(|app| {
-                client.read(app).conversation.as_ref().is_some_and(|view| {
-                    view.read(app)
-                        .tested_details(app, |snapshot| snapshot.is_some())
-                })
-            }) && ui
-                .debug_bounds("conversation-gallery-open-photos")
-                .is_some()
+                client
+                    .read(app)
+                    .conversation
+                    .as_ref()
+                    .and_then(|view| view.read(app).tested_gallery_counts())
+                    == Some(GalleryCounts {
+                        photos: 26,
+                        videos: 1,
+                        files: 1,
+                        links: 1,
+                    })
+            }) && ui.debug_bounds("conversation-gallery-open-links").is_some()
         },
     );
+    let block = ui.debug_bounds("conversation-gallery-triggers").unwrap();
+    let rows = [
+        "conversation-gallery-open-photos",
+        "conversation-gallery-open-videos",
+        "conversation-gallery-open-files",
+        "conversation-gallery-open-links",
+    ];
+    assert_eq!(block.size.height, px(152.));
+    for (index, id) in rows.into_iter().enumerate() {
+        let row = ui.debug_bounds(id).unwrap();
+        assert_eq!(row.top(), block.top() + px(40. * index as f32), "{id}");
+        assert_eq!(row.left(), block.left() + px(8.), "{id}");
+        assert_eq!(row.right(), block.right() - px(8.), "{id}");
+        assert_eq!(row.size.height, px(32.), "{id}");
+    }
     click(ui, "conversation-gallery-open-photos");
     let gallery = |ui: &VisualTestContext| {
         ui.read(|app| {
@@ -206,7 +236,7 @@ fn conversation_gallery_uses_known_history_and_downloads_only_on_action(cx: &mut
                 .read(app)
                 .conversation
                 .as_ref()
-                .map(|view| view.read(app).tested_photo())
+                .map(|view| view.read(app).tested_photo(app))
         })
     };
     click(ui, OTHER_TOPIC_PHOTO);
@@ -235,10 +265,12 @@ fn conversation_gallery_uses_known_history_and_downloads_only_on_action(cx: &mut
     ui.simulate_keystrokes("escape");
     click(ui, "conversation-gallery-back");
 
-    click(ui, "conversation-gallery-open-photos");
+    ui.simulate_event(KeyUpEvent {
+        keystroke: Keystroke::parse("enter").unwrap(),
+    });
     until(
         ui,
-        "раздел доступен при новом открытии",
+        "Назад возвращает фокус к строке, Enter снова открывает фото",
         |ui| {
             gallery(ui).is_some_and(|(whole_stream, count, _)| !whole_stream && count == 24)
                 && ui.debug_bounds(FIRST_PREVIEW).is_some()

@@ -245,7 +245,8 @@ pub(super) fn render_quote(
                 position,
             };
             let attachment = ProtectedAttachment::quoted(key, slot, projection.access.clone());
-            body = body.child(cards.render_protected(attachment, kind, palette, language, app));
+            body =
+                body.child(cards.render_protected(attachment, kind, None, palette, language, app));
         }
     }
     quote_frame(palette, surface, author, body)
