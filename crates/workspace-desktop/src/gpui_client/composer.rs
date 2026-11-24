@@ -730,10 +730,12 @@ impl Render for Composer {
                 .children(self.fragment_toolbar(palette, locale, can_format, cx))
         });
         // Сетка сначала задаёт общую ширину поля и пояснения. От неё зависит высота переносов.
+        // Явная ширина нужна и при отдельной раскладке композера из кэша GPUI.
         div()
             .grid()
             .grid_cols(1)
             .flex_none()
+            .w_full()
             .min_w_0()
             .gap(px(4.))
             .p(COMPOSER_INSET)

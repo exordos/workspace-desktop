@@ -1,5 +1,6 @@
 //! Открывает защищённую личку через штатный каталог и меняет только локальный ключ поколения.
 
+use gpui::{ScrollDelta, ScrollWheelEvent, point};
 use workspace_core::messenger::encryption::GroupKey;
 
 use super::*;
@@ -118,7 +119,7 @@ fn encrypted_history_reacts_to_key_without_opening_plain_composer(cx: &mut TestA
     );
 }
 
-/// Уже открытый композер обычной лички и соседний каталог сохраняют представления при E2EE-дельте.
+/// Дельта ключа переиспользует соседние представления, а прокрутка каталога сохраняет ширину поля.
 #[gpui::test]
 fn mixed_chat_key_event_reuses_active_composer_and_sidebar(cx: &mut TestAppContext) {
     cx.update(bind_keys);
@@ -290,6 +291,27 @@ fn mixed_chat_key_event_reuses_active_composer_and_sidebar(cx: &mut TestAppConte
         unchanged,
         "WSS и перечитывание REST сохраняют подготовку соседних UUID"
     );
+
+    // Прокрутка под открытой подсказкой заставляет GPUI заново разместить кэшированный композер.
+    let position = ui.debug_bounds(CHAT_ROW).unwrap().center();
+    ui.simulate_mouse_move(position, None, Modifiers::none());
+    ui.background_executor
+        .advance_clock(Duration::from_millis(500));
+    ui.run_until_parked();
+    let renders = ui.read(|app| sample(app).0);
+    ui.simulate_event(ScrollWheelEvent {
+        position,
+        delta: ScrollDelta::Pixels(point(px(0.), px(-40.))),
+        ..Default::default()
+    });
+    ui.run_until_parked();
+    assert!(ui.read(|app| sample(app).0) > renders);
+    let panel = ui.debug_bounds("workspace-conversation-panel").unwrap();
+    let composer = ui.debug_bounds("conversation-composer").unwrap();
+    let editor = ui.debug_bounds("workspace-composer-editor").unwrap();
+    assert_eq!(composer.size.width, panel.size.width);
+    assert!(editor.size.width > px(0.));
+
     assert!(server.state.sent.lock().unwrap().is_empty());
     assert_eq!(
         futures::executor::block_on(runtime.shutdown()),
