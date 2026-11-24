@@ -167,8 +167,12 @@ fn forward_dialog_posts_canonical_fragment_and_reveal_uses_origin_key(cx: &mut T
     );
     assert!(!body.contains(SECRET));
 
+    let chevron = ui.debug_bounds(CHANNEL_CHEVRON).unwrap().center();
+    ui.simulate_mouse_move(chevron, None, Modifiers::none());
     click(ui, CHANNEL_CHEVRON);
-    ui.run_until_parked();
+    until(ui, "тема назначения появилась в каталоге", |ui| {
+        ui.debug_bounds(CHANNEL_TOPIC_ROW).is_some()
+    });
     click(ui, CHANNEL_TOPIC_ROW);
     let id = sent["uuid"].as_str().unwrap();
     // GPUI принимает только статический селектор. UUID здесь выдала реальная очередь.
@@ -184,33 +188,6 @@ fn forward_dialog_posts_canonical_fragment_and_reveal_uses_origin_key(cx: &mut T
     let (engine, activation) = runtime.message_encryption(&account).unwrap();
     let key_id = Uuid::parse_str(encryption::KEY).unwrap();
     let origin = Uuid::parse_str(STREAM).unwrap();
-    engine
-        .save_key(&activation, origin, key_id, &GroupKey::from_bytes([7; 32]))
-        .unwrap();
-    // Готовая строка остаётся свёрнутой, поэтому первый успешный клик должен раскрыть её.
-    let ready: &'static str = Box::leak(format!("{spoiler}-ready").into_boxed_str());
-    until(
-        ui,
-        "фрагмент готов под исходным ключом",
-        |ui| ui.debug_bounds(ready).is_some(),
-    );
-    let point = ui.debug_bounds(ready).unwrap().center();
-    ui.simulate_mouse_move(point, None, Modifiers::none());
-    click(ui, ready);
-    until(
-        ui,
-        "кнопка раскрывает фрагмент под исходным ключом",
-        |ui| ui.debug_bounds(revealed).is_some(),
-    );
-    engine.remove_key(&activation, origin, key_id).unwrap();
-    until(
-        ui,
-        "удаление ключа закрывает вложенный спойлер",
-        |ui| {
-            ui.update(|window, app| window.draw(app).clear());
-            ui.debug_bounds(spoiler).is_some() && ui.debug_bounds(revealed).is_none()
-        },
-    );
     let route_before = ui.read(|app| client.read(app).shell.conversation().unwrap().clone());
     let original_header: &'static str =
         Box::leak(format!("forward-original-{id}-{ORIGINAL}").into_boxed_str());
@@ -249,6 +226,32 @@ fn forward_dialog_posts_canonical_fragment_and_reveal_uses_origin_key(cx: &mut T
                             && address.route.scope.topic_id == Some(original_topic)
                     })
             })
+        },
+    );
+    click(ui, CHANNEL_TOPIC_ROW);
+    engine
+        .save_key(&activation, origin, key_id, &GroupKey::from_bytes([7; 32]))
+        .unwrap();
+    // Готовая строка остаётся свёрнутой, поэтому первый успешный клик должен раскрыть её.
+    let ready: &'static str = Box::leak(format!("{spoiler}-ready").into_boxed_str());
+    until(ui, "фрагмент готов под исходным ключом", |ui| {
+        ui.debug_bounds(ready).is_some()
+    });
+    let point = ui.debug_bounds(ready).unwrap().center();
+    ui.simulate_mouse_move(point, None, Modifiers::none());
+    click(ui, ready);
+    until(
+        ui,
+        "кнопка раскрывает фрагмент под исходным ключом",
+        |ui| ui.debug_bounds(revealed).is_some(),
+    );
+    engine.remove_key(&activation, origin, key_id).unwrap();
+    until(
+        ui,
+        "удаление ключа закрывает вложенный спойлер",
+        |ui| {
+            ui.update(|window, app| window.draw(app).clear());
+            ui.debug_bounds(spoiler).is_some() && ui.debug_bounds(revealed).is_none()
         },
     );
     assert_eq!(

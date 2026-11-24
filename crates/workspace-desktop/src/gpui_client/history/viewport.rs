@@ -1734,7 +1734,6 @@ fn forward_card(
                 let _ =
                     conversation.update(cx, |view, cx| view.open_forward_original(id, target, cx));
             })
-            .occlude()
             .debug_selector(move || format!("forward-original-{id}-{target}")),
         )
     } else {
