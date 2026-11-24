@@ -18,6 +18,7 @@ mod self_chat;
 pub(super) mod sidebar;
 mod sidebar_actions;
 mod summary_settings;
+mod upload;
 
 use std::{collections::HashSet, time::Duration};
 

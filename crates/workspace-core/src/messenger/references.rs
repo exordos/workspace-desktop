@@ -1,5 +1,16 @@
-//! Строит постоянные ссылки на сообщения и разбирает вложения и веб-ссылки в Markdown.
+//! Строит постоянные ссылки на сообщения и разбирает ссылки Workspace в Markdown.
 //! Карточки вложений и индекс доступа используют общий разбор файловых ссылок.
+
+mod composer_links;
+mod inline;
+mod time;
+
+pub use composer_links::{parse_workspace_conversation_link, workspace_reference_prose_at};
+pub use inline::{
+    WorkspaceFallbackReference, WorkspaceReference, WorkspaceReferenceTarget,
+    build_workspace_reference_markdown, build_workspace_reference_urn, parse_workspace_reference,
+    workspace_fallback_references, workspace_original_references, workspace_references,
+};
 
 use std::{fmt::Write as _, ops::Range};
 
@@ -69,13 +80,27 @@ pub struct MediaReference {
     pub label: String,        // Текст Markdown-ссылки или alt изображения.
     pub name: Option<String>, // Имя из параметра URN, если оно пригодно для показа.
     pub file_id: Uuid,        // UUID, который Core сверяет с текущей ссылкой сообщения.
-    pub kind: MediaKind,      // Вид, объявленный в URN.
+    pub kind: MediaKind,      // Вид из URN или MIME обычной файловой ссылки.
+    pub metadata: MediaReferenceMetadata, // Подсказки из URL, сервер проверяет файл отдельно.
     pub image_syntax: bool,   // true для изображения Markdown, false для обычной ссылки.
+}
+
+/// Метаданные Workspace, доступные до запроса байтов.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MediaReferenceMetadata {
+    pub content_type: Option<String>, // Заявленный MIME файла.
+    pub width: Option<u32>,           // Ширина исходного кадра в пикселях.
+    pub height: Option<u32>,          // Высота исходного кадра в пикселях.
+    pub size_bytes: Option<u64>,      // Заявленный размер файла в байтах.
 }
 
 /// Выделяет подтверждаемые Core вложения в порядке чтения и сохраняет исходные границы.
 pub fn media_references(text: &str) -> Vec<MediaReference> {
-    if !text.contains("urn") {
+    if !text
+        .as_bytes()
+        .windows(4)
+        .any(|part| part.eq_ignore_ascii_case(b"urn:"))
+    {
         return Vec::new();
     }
     let Ok(document) = to_mdast(text, &ParseOptions::default()) else {
@@ -87,11 +112,7 @@ pub fn media_references(text: &str) -> Vec<MediaReference> {
         let details = match node {
             Node::Blockquote(_) => continue,
             Node::Image(image) => Some((image.url.as_str(), true)),
-            Node::Link(link)
-                if link.url.starts_with("urn:quote:") || link.url.starts_with("urn:forward:") =>
-            {
-                continue;
-            }
+            Node::Link(link) if inline::is_reserved_reference(&link.url) => continue,
             Node::Link(link)
                 if link.position.as_ref().is_some_and(|range| {
                     text.as_bytes().get(range.start.offset) == Some(&b'[')
@@ -105,13 +126,21 @@ pub fn media_references(text: &str) -> Vec<MediaReference> {
             let position = node.position()?;
             let range = position.start.offset..position.end.offset;
             text.get(range.clone())?;
-            let (file_id, kind, name) = parse_media_url(url)?;
+            let (file_id, mut kind, name, metadata) = parse_media_url(url)?;
+            let label = display_label(node);
+            if kind == MediaKind::File {
+                kind = infer_file_kind(
+                    metadata.content_type.as_deref(),
+                    name.as_deref().unwrap_or(&label),
+                );
+            }
             Some(MediaReference {
                 range,
-                label: display_label(node),
+                label,
                 name,
                 file_id,
                 kind,
+                metadata,
                 image_syntax,
             })
         }) {
@@ -154,6 +183,7 @@ pub(crate) fn external_links(text: &str) -> Vec<ExternalLink> {
 /// Видимая веб-ссылка и её местоположение в исходном теле сообщения.
 pub struct ExternalLinkReference {
     pub range: Range<usize>, // Байты всего элемента ссылки в исходном Markdown.
+    pub label_range: Option<Range<usize>>, // Исходная подпись, пригодная для привязки к телу.
     pub url: String,         // Проверенный нормализованный адрес HTTP или HTTPS.
     pub href: String,        // Исходный адрес для копирования без изменения представления.
     pub label: String,       // Имя ссылки, пригодное для показа.
@@ -173,14 +203,21 @@ pub fn external_link_references(text: &str) -> Vec<ExternalLinkReference> {
         match node {
             Node::Blockquote(_) => {}
             Node::Link(link) => {
-                if let Some(url) = external_url(&link.url)
-                    && let Some(position) = &link.position
+                if let Some(position) = &link.position
+                    && let Some(raw) = text.get(position.start.offset..position.end.offset)
                 {
+                    let href = inline::workspace_web_url(&link.url)
+                        .filter(|_| raw.starts_with('['))
+                        .unwrap_or(&link.url);
+                    let Some(url) = external_url(href) else {
+                        continue;
+                    };
                     let label = clean_label(&display_label(node)).unwrap_or_else(|| url.clone());
                     links.push(ExternalLinkReference {
                         range: position.start.offset..position.end.offset,
+                        label_range: inline::link_label_range(link),
                         url,
-                        href: link.url.clone(),
+                        href: href.to_owned(),
                         label,
                     });
                 }
@@ -239,29 +276,91 @@ pub(super) fn display_label(node: &Node) -> String {
     label.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Экранирует знаки Markdown, чтобы метка осталась подписью одного элемента.
+fn escape_link_label(label: &str) -> String {
+    let mut escaped = String::new();
+    for ch in label.chars() {
+        if ch.is_ascii_punctuation() {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+/// Создаёт ссылку на подтверждённое новое вложение в формате редактора Electron.
+pub(super) fn build_media_reference_markdown(
+    id: Uuid,
+    name: &str,
+    mime: &str,
+    size: usize,
+    dimensions: Option<(u32, u32)>,
+) -> String {
+    let (image_marker, kind) = if mime.starts_with("image/") {
+        ("!", "image")
+    } else if mime.starts_with("video/") {
+        ("", "video")
+    } else {
+        ("", "file")
+    };
+    let mut urn = format!(
+        "urn:{kind}:{id}?name={}&content_type={}",
+        form_value(name),
+        form_value(mime)
+    );
+    if kind != "file"
+        && let Some((width, height)) = dimensions.filter(|(w, h)| *w > 0 && *h > 0)
+    {
+        write!(urn, "&w={width}&h={height}").unwrap();
+    }
+    write!(urn, "&size={size}").unwrap();
+    format!("{image_marker}[{}]({urn})", escape_link_label(name))
+}
+
+/// Кодирует параметр UTF-8 по правилам URLSearchParams.
+fn form_value(value: &str) -> String {
+    let mut escaped = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || b"*-._".contains(&byte) {
+            escaped.push(byte.into());
+        } else if byte == b' ' {
+            escaped.push('+');
+        } else {
+            write!(escaped, "%{byte:02X}").unwrap();
+        }
+    }
+    escaped
+}
+
 /// Разбирает только документированные файловые URN и проверяет формат UUID и параметров.
-fn parse_media_url(url: &str) -> Option<(Uuid, MediaKind, Option<String>)> {
-    let (kind, resource) = url.strip_prefix("urn:")?.split_once(':')?;
-    let kind = match kind {
+fn parse_media_url(url: &str) -> Option<(Uuid, MediaKind, Option<String>, MediaReferenceMetadata)> {
+    let (scheme, url) = url.trim().split_once(':')?;
+    if !scheme.eq_ignore_ascii_case("urn") {
+        return None;
+    }
+    let (kind, resource) = url.split_once(':')?;
+    let kind = match kind.to_ascii_lowercase().as_str() {
         "file" => MediaKind::File,
         "image" => MediaKind::Image,
         "video" => MediaKind::Video,
         _ => return None,
     };
-    let (id, name) = match resource.split_once('?') {
-        Some((id, query)) => (id, query_name(query)?),
-        None => (resource, None),
-    };
+    let (id, query) = resource.split_once('?').unwrap_or((resource, ""));
     if id.len() != 36 {
         return None;
     }
     let file_id = Uuid::parse_str(id).ok().filter(|id| !id.is_nil())?;
-    Some((file_id, kind, name))
+    let (name, metadata) = query_metadata(query)?;
+    Some((file_id, kind, name, metadata))
 }
 
-/// Проверяет параметры URN и берёт первое допустимое имя для показа.
-fn query_name(query: &str) -> Option<Option<String>> {
+/// Проверяет синтаксис запроса и берёт первые пригодные подсказки для показа.
+fn query_metadata(query: &str) -> Option<(Option<String>, MediaReferenceMetadata)> {
     let mut name = None;
+    let mut metadata = MediaReferenceMetadata::default();
+    if query.is_empty() {
+        return Some((name, metadata));
+    }
     for pair in query.split('&') {
         let (key, value) = pair.split_once('=')?;
         if key.is_empty()
@@ -272,11 +371,57 @@ fn query_name(query: &str) -> Option<Option<String>> {
             return None;
         }
         let decoded = decode_query_value(value)?;
-        if key == "name" && name.is_none() && !decoded.trim().is_empty() {
-            name = Some(decoded.trim().to_owned());
+        let value = decoded.trim();
+        match key {
+            "name" if name.is_none() && !value.is_empty() => name = Some(value.to_owned()),
+            "content_type" if metadata.content_type.is_none() && !value.is_empty() => {
+                metadata.content_type = Some(value.to_ascii_lowercase());
+            }
+            "w" if metadata.width.is_none() => metadata.width = dimension(value),
+            "h" if metadata.height.is_none() => metadata.height = dimension(value),
+            "size" if metadata.size_bytes.is_none() => metadata.size_bytes = decimal(value),
+            _ => {}
         }
     }
-    Some(name)
+    Some((name, metadata))
+}
+
+/// Принимает только десятичное значение без знака и переполнения.
+fn decimal(value: &str) -> Option<u64> {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then(|| value.parse().ok())
+        .flatten()
+}
+
+/// Нулевая или слишком большая сторона не участвует в раскладке.
+fn dimension(value: &str) -> Option<u32> {
+    u32::try_from(decimal(value)?).ok().filter(|side| *side > 0)
+}
+
+/// Распознаёт обычные файловые ссылки с MIME или именем старого формата.
+fn infer_file_kind(content_type: Option<&str>, name: &str) -> MediaKind {
+    let mime = content_type
+        .and_then(|mime| mime.split(';').next())
+        .map(str::trim);
+    match mime {
+        Some(mime) if mime.starts_with("image/") => MediaKind::Image,
+        Some(mime) if mime.starts_with("video/") => MediaKind::Video,
+        None | Some("" | "application/octet-stream") => {
+            match name
+                .trim()
+                .rsplit_once('.')
+                .map(|(_, ext)| ext.to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("png" | "jpg" | "jpeg" | "webp" | "gif" | "heic" | "heif") => MediaKind::Image,
+                Some("mp4" | "m4v" | "mov" | "webm") => MediaKind::Video,
+                _ => MediaKind::File,
+            }
+        }
+        _ => MediaKind::File,
+    }
 }
 
 /// Декодирует параметр с полными UTF-8 последовательностями, без управляющих символов.
@@ -391,7 +536,8 @@ mod tests {
              > [цитата](urn:video:{excluded})\n\n\
              {tick}[код](urn:file:{excluded}){tick}\n\n\
              \\[экранирование](urn:file:{excluded})\n\n\
-             [invalid](urn:file:{excluded}?name=%ZZ) urn:image:{excluded} <urn:file:{excluded}>"
+             [invalid](urn:file:{excluded}?name=%ZZ) urn:image:{excluded} <urn:file:{excluded}>\n\n\
+             [![скрытый ярлык](urn:image:{excluded})](URN:FORWARD:{excluded}?snapshot=)"
         );
         let ids = media_links(&text)
             .into_iter()
@@ -424,5 +570,37 @@ mod tests {
         assert_eq!(second.label, "Кадр");
         assert_eq!(second.kind, MediaKind::Image);
         assert!(second.image_syntax);
+    }
+
+    /// Использует MIME обычной ссылки и пропускает некорректные подсказки размера.
+    #[test]
+    fn reads_media_metadata_from_workspace_urns() {
+        let id = Uuid::from_u128(10);
+        let text = format!(
+            "[Снимок](urn:file:{id}?name=pasted+image.png&content_type=image%2Fpng&w=1920&h=1080&size=2048)\n\n\
+             [Видео](URN:FILE:{id}?content_type=Video%2FMP4&w=0&h=4294967296&size=0)\n\n\
+             [Старое фото.JPG](urn:file:{id})\n\n\
+             [Документ](urn:file:{id}?name=attachment.png&content_type=application%2Fpdf)"
+        );
+        let references = media_references(&text);
+        let [image, video, legacy, doc] = references.as_slice() else {
+            panic!("четыре ссылки в сообщении")
+        };
+        assert_eq!(image.name.as_deref(), Some("pasted image.png"));
+        assert_eq!(image.kind, MediaKind::Image);
+        assert_eq!(
+            image.metadata,
+            MediaReferenceMetadata {
+                content_type: Some("image/png".into()),
+                width: Some(1920),
+                height: Some(1080),
+                size_bytes: Some(2048),
+            }
+        );
+        assert_eq!(video.kind, MediaKind::Video);
+        assert_eq!(video.metadata.width.zip(video.metadata.height), None);
+        assert_eq!(video.metadata.size_bytes, Some(0));
+        assert_eq!(legacy.kind, MediaKind::Image);
+        assert_eq!(doc.kind, MediaKind::File);
     }
 }

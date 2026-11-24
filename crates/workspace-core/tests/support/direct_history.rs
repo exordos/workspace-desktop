@@ -40,6 +40,8 @@ use workspace_core::{
 
 use super::Fixture;
 
+#[path = "attachment_upload.rs"]
+mod attachment_upload;
 #[path = "avatars.rs"]
 mod avatars;
 #[path = "folder_runtime.rs"]
@@ -102,6 +104,7 @@ struct HistoryApi {
     folders: Option<Arc<folder_runtime::Api>>, // Подмена маршрутов папок и журнала.
     avatars: Option<Arc<avatars::Api>>, // Подмена профиля и файлов для тестов аватаров.
     media: Option<Arc<media_cache::Api>>, // Подмена истории, байтов и журнала для кэша вложений.
+    upload: Option<Arc<attachment_upload::Api>>, // Проверяемый API отправки нового файла.
     key_lifecycle: Option<Arc<key_lifecycle::Api>>, // Управление каналом и ротацией ключа.
 }
 
@@ -156,6 +159,10 @@ async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
     }
     if let Some(media) = &api.media {
         media.reply(socket, request, &method, &headers).await;
+        return;
+    }
+    if let Some(upload) = &api.upload {
+        upload.reply(socket, request, &method, &headers).await;
         return;
     }
     if let Some(lifecycle) = &api.key_lifecycle {

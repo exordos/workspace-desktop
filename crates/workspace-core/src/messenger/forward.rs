@@ -140,6 +140,11 @@ pub fn is_forward_link(url: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PREFIX))
 }
 
+/// Сверяет ссылку открытой пересылки и возвращает только адрес оригинала.
+pub(super) fn forward_original_id(url: &str) -> Option<Uuid> {
+    ForwardReference::parse(url.trim(), String::new()).map(|reference| reference.id)
+}
+
 /// Разбирает отдельные ссылки снимка. Неподдерживаемые размещения скрываются по месту.
 pub fn forward_spans(markdown: &str) -> Vec<ForwardSpan> {
     if !markdown

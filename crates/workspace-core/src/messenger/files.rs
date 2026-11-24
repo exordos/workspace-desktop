@@ -31,7 +31,11 @@ use crate::{
 use super::{MessengerSource, history::MediaAccess, rest::RestClient};
 
 mod protected;
+pub(super) mod upload;
 pub use protected::ProtectedPreviewPermit;
+pub use upload::{
+    AttachmentUpload, MAX_ATTACHMENT_UPLOAD_BYTES, UploadAttachmentError, UploadedAttachment,
+};
 
 /// Причина отказа при открытии вложения.
 #[derive(Debug, Error)]

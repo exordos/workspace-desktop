@@ -18,7 +18,7 @@ use crate::{
 };
 
 const MEDIA_PROJECTION_CONFLICT: i64 = 1;
-const MEDIA_PROJECTION_CURRENT: i64 = 3;
+const MEDIA_PROJECTION_CURRENT: i64 = 4;
 
 /// Область запроса истории. Пустая тема означает весь стрим.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -855,7 +855,7 @@ impl Storage {
                    AND user_id = ?5 AND stream_id = ?6 AND (?7 IS NULL OR topic_id = ?7)
                    AND (?8 IS NULL OR message_id = ?8)
                    AND created_at IS NOT NULL
-                   AND (instr(text, 'urn') > 0 OR instr(text, '://') > 0 OR instr(text, 'www.') > 0)
+                   AND (text GLOB '*[uU][rR][nN]:*' OR instr(text, '://') > 0 OR instr(text, 'www.') > 0)
                    AND NOT EXISTS (
                        SELECT 1 FROM history_changes AS changes
                        WHERE changes.account_id = ?1 AND changes.server = ?2
@@ -2474,6 +2474,68 @@ mod tests {
             )
             .unwrap();
         assert_eq!(references, 0);
+    }
+
+    /// Дополняет индекс из старой базы после появления новых URN, не восстанавливая спорную запись.
+    #[test]
+    fn rebuilds_v3_gallery_links_and_uppercase_attachments() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v3-gallery.sqlite");
+        let owner = owner("A");
+        let (_, topic) = scopes();
+        let file = Uuid::from_u128(71);
+        let mut web = message(topic, 72, "2026-01-01T10:00:00Z");
+        web.body = MessageBody::Markdown("[Документ](URN:URL:https://example.test/guide)".into());
+        let mut media = message(topic, 73, "2026-01-01T10:01:00Z");
+        media.body = MessageBody::Markdown(format!("[Файл](URN:FILE:{file})"));
+        let mut conflicted = message(topic, 74, "2026-01-01T10:02:00Z");
+        conflicted.body =
+            MessageBody::Markdown("[Старая цель](urn:url:https://example.test/stale)".into());
+        let conflicted_id = conflicted.id.to_string();
+        let storage = Storage::open(&path).unwrap();
+        new_window(&storage, &owner, topic, &[web, media, conflicted]);
+        {
+            let db = storage.connection.lock().unwrap();
+            db.execute_batch(
+                "UPDATE history_changes SET media_projection = 3;
+                 DELETE FROM messenger_web_links;
+                 DELETE FROM messenger_media_refs;",
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE history_changes SET media_projection = ?1 WHERE message_id = ?2",
+                params![MEDIA_PROJECTION_CONFLICT, conflicted_id],
+            )
+            .unwrap();
+        }
+        drop(storage);
+
+        let storage = Storage::open(&path).unwrap();
+        let generation = storage.media_history_generation(&owner).unwrap();
+        assert!(
+            storage
+                .index_media_history(&owner, topic, generation, None)
+                .unwrap()
+        );
+        let db = storage.connection.lock().unwrap();
+        let links = db
+            .prepare("SELECT url FROM messenger_web_links")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(links, ["https://example.test/guide"]);
+        let stored_file: String = db
+            .query_row("SELECT file FROM messenger_media_refs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored_file, file.to_string());
+        assert_eq!(
+            message_revision(&db, &owner, &conflicted_id)
+                .unwrap()
+                .media_projection,
+            MEDIA_PROJECTION_CONFLICT,
+        );
     }
 
     /// Хранит служебное размещение за владельцем и сохраняет канонический UUID при неполном снимке.

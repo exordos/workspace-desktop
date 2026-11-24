@@ -343,6 +343,32 @@ fn fragment(text: &str) -> Option<String> {
         .filter(|text| !text.trim().is_empty())
 }
 
+/// Подтверждает адрес открытой цитаты для перехода к оригиналу без показа выдержки.
+pub(super) fn quote_original_id(url: &str) -> Option<Uuid> {
+    const PREFIX: &str = "urn:quote:";
+    let url = url.trim();
+    if !url.get(..PREFIX.len())?.eq_ignore_ascii_case(PREFIX) {
+        return None;
+    }
+    let (id, encoded) = quote_destination(&url[PREFIX.len()..])?;
+    if let Some(text) = encoded.filter(|text| !text.is_empty()) {
+        fragment(text)?;
+    }
+    Some(id)
+}
+
+/// Делит цель цитаты на проверенный UUID и исходный параметр выделенного текста.
+fn quote_destination(destination: &str) -> Option<(Uuid, Option<&str>)> {
+    let (id, encoded) = destination
+        .split_once("?text=")
+        .map_or((destination, None), |(id, encoded)| (id, Some(encoded)));
+    if id.len() != 36 {
+        return None;
+    }
+    let id = Uuid::parse_str(id).ok().filter(|id| !id.is_nil())?;
+    Some((id, encoded))
+}
+
 /// Разбирает ровно одну ссылку, оставляя прочий Markdown текстом.
 fn parse(line: &str) -> Option<Reference> {
     let (author, destination) = line
@@ -361,13 +387,7 @@ fn parse(line: &str) -> Option<Reference> {
     if label.trim().is_empty() {
         return None;
     }
-    let (id, encoded) = destination
-        .split_once("?text=")
-        .map_or((destination, None), |(id, encoded)| (id, Some(encoded)));
-    if id.len() != 36 {
-        return None;
-    }
-    let message_id = Uuid::parse_str(id).ok().filter(|id| !id.is_nil())?;
+    let (message_id, encoded) = quote_destination(destination)?;
     let fragment = match encoded {
         Some(text) => Some(fragment(text)?),
         None => None,
