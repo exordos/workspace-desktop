@@ -7,6 +7,7 @@ pub mod composer;
 pub mod contracts;
 pub mod conversation;
 mod i18n;
+mod message_preview;
 mod notification_audio;
 pub mod platform_window;
 mod preferences;

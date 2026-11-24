@@ -30,15 +30,16 @@ use super::{
         AccountSession, ChatEntry, ChatRoute, ConversationAddress, FolderCommand,
         FolderCommandError, FolderRailPreferences, SidebarAction,
     },
-    preferences::{ChatClick, Preferences as AppPreferences, appearance::ChatDensity},
+    preferences::{ChatClick, Language, Preferences as AppPreferences, appearance::ChatDensity},
     runtime::RuntimeClient,
     ui::{
-        BadgeTone, Button, ButtonAppearance, ChatRowPreview, Icon, PANEL_RADIUS, Palette,
-        TextInput, TextInputChanged, TextRole, label,
+        BadgeTone, Button, ButtonAppearance, ChatRowPreview, Icon, PANEL_RADIUS, Palette, TextInput,
+        TextInputChanged, TextRole, label,
         popup::{MenuInput, menu_layer, menu_navigation, menu_surface, tooltip},
     },
 };
 
+mod catalog_actions;
 mod folder_dialog;
 mod folder_menu;
 mod folder_rail;
@@ -56,7 +57,7 @@ pub(super) use folders::FolderIntent;
 use folders::FolderPane;
 use projection::{ChatGroup, Presentation, TopicToggleFocus, TopicToggleKind};
 use protected_previews::ProtectedPreviews;
-use rows::{ChannelActions, ChannelRow, ChatRowDetails as RowDetails, PreviewAction, TopicRow};
+use rows::{ChatActions, ChatHeader, ChatRowDetails as RowDetails, PreviewAction, TopicRow};
 
 #[cfg(all(test, feature = "gpui-test"))]
 mod tests;
@@ -67,6 +68,7 @@ gpui::actions!(catalog_results, [PreviousResult, NextResult, OpenRowMenu]);
 pub struct Sidebar {
     active: Option<Active>, // Показанный каталог или ожидание выбора входа.
     runtime: Option<RuntimeClient>, // Рабочий поток для фото. None оставляет заглушки.
+    action_panel: Option<gpui::WeakEntity<super::right_panel::RightPanel>>, // Общая панель контакта и диалогов.
     saved: HashMap<AccountSession, Preferences>, // Поиск и раскрытые каналы других входов.
     menu_focus: FocusHandle, // Удерживает клавиатурный ввод внутри открытого меню.
     menu_scroll: ScrollHandle, // Не даёт подсветке уйти за края длинного списка папок.
@@ -85,10 +87,10 @@ struct Preferences {
 
 /// Каталог одного выбранного входа и состояние только его текущего показа.
 struct Active {
-    session: AccountSession,   // Владелец данных и поколение входа.
-    catalog: Option<ChatList>, // Нет снимка до начала или завершения первого чтения.
+    session: AccountSession,              // Владелец данных и поколение входа.
+    catalog: Option<ChatList>,            // Нет снимка до начала или завершения первого чтения.
     protected_previews: Option<ProtectedPreviews>, // Отдельные отзывные подписи текущего каталога.
-    selected: Option<HistoryScope>, // Разговор, который сейчас открыт в окне.
+    selected: Option<HistoryScope>,       // Разговор, который сейчас открыт в окне.
     reveal_route: Option<HistoryScope>, // Внешняя тема, которую нужно показать, когда она станет доступна.
     search_target: Option<HistoryScope>, // Маршрут, открытый из поиска с сохранением ручного раскрытия.
     search: Entity<TextInput>,           // Поле системного ввода, живущее до смены входа.
@@ -106,8 +108,10 @@ struct Active {
     folder_view: Option<Arc<FolderSnapshot>>, // Подтверждённые данные только текущего входа.
     folder_settings: FolderRailPreferences, // Локальные настройки панели этого владельца.
     folder_pending: Option<(Uuid, bool)>, // UUID операции и признак ответа для формы.
-    folder_error: Option<&'static str>, // Безопасная подпись ошибки команды строки.
+    folder_error: Option<&'static str>, // Ключ безопасной подписи ошибки команды строки.
     folder_online: bool, // Авторизация разрешает отправить серверную команду.
+    catalog_pending: Option<Uuid>, // Действие над чатом или темой, которое ждёт ответа.
+    catalog_action_failed: bool, // Строка ошибки последней команды меню.
     #[cfg(all(test, feature = "gpui-test"))]
     fixture_details: HashMap<RowKey, RowDetails>, // Синтетические метаданные этого показа.
 }
@@ -140,9 +144,9 @@ impl RowKey {
 /// Намерение пользователя. Источник и доступность проверяются перед выполнением.
 #[derive(Clone, Copy)]
 enum Intent {
-    Open(RowKey),              // Открыть личный чат, общую тему канала или точную тему.
-    Preview(Uuid, Uuid, Uuid), // Открыть тему канала только для того же сообщения.
-    ToggleChannel(Uuid),       // Раскрыть или свернуть канал без навигации.
+    Open(RowKey),                       // Открыть разговор или точную тему.
+    Preview(Uuid, Uuid, Uuid),          // Открыть тему для того же сообщения.
+    ToggleChat(Uuid),                   // Раскрыть или свернуть темы без навигации.
     Reveal(Uuid, TopicToggleKind, u64), // Выполнить видимую ступень этого кадра.
 }
 
@@ -151,7 +155,7 @@ impl Intent {
     fn chat_id(self) -> Uuid {
         match self {
             Self::Open(key) => key.chat_id(),
-            Self::Preview(id, _, _) | Self::ToggleChannel(id) | Self::Reveal(id, _, _) => id,
+            Self::Preview(id, _, _) | Self::ToggleChat(id) | Self::Reveal(id, _, _) => id,
         }
     }
 }
@@ -174,7 +178,7 @@ impl Active {
         self.chats()?.iter().find(|chat| chat.id == id)
     }
 
-    /// Определяет подпись и действие контекстного меню только для видимой строки.
+    /// Определяет ключ подписи и действие контекстного меню только для видимой строки.
     fn menu_intent(&self, key: RowKey) -> Option<(&'static str, Option<Intent>)> {
         let stream = key.chat_id();
         if !self.presentation.searching() && !self.folder_contains(stream) {
@@ -183,21 +187,23 @@ impl Active {
         let chat = self.chat(stream)?;
         let group = self.presentation.group(chat, self.selected)?;
         match key {
-            RowKey::Chat(_) if chat.direct => Some(("Открыть чат", Some(Intent::Open(key)))),
+            RowKey::Chat(_) if chat.direct && chat.topics.is_empty() => {
+                Some(("desktop.sidebar.openChat", Some(Intent::Open(key))))
+            }
             RowKey::Chat(_) => Some((
                 if group.expanded {
-                    "Свернуть темы"
+                    "desktop.sidebar.collapseTopics"
                 } else {
-                    "Развернуть темы"
+                    "desktop.sidebar.expandTopics"
                 },
                 (!chat.topics.is_empty() && !self.presentation.searching())
-                    .then_some(Intent::ToggleChannel(stream)),
+                    .then_some(Intent::ToggleChat(stream)),
             )),
             RowKey::Topic(_, topic) => group
                 .topics
                 .iter()
                 .any(|entry| entry.id == topic)
-                .then_some(("Открыть тему", Some(Intent::Open(key)))),
+                .then_some(("desktop.sidebar.openTopic", Some(Intent::Open(key)))),
             RowKey::Preview(_)
             | RowKey::Avatar(_)
             | RowKey::Chevron(_)
@@ -206,9 +212,10 @@ impl Active {
     }
 
     /// Возвращает подпись и доступность первого пункта для общего меню с папками.
-    fn menu_action(&self, key: RowKey, _app: &App) -> Option<(&'static str, bool)> {
+    fn menu_action(&self, key: RowKey, app: &App) -> Option<(&'static str, bool)> {
+        let language = AppPreferences::read_for(app, &self.session.owner).language;
         self.menu_intent(key)
-            .map(|(title, intent)| (title, intent.is_some()))
+            .map(|(title, intent)| (language.tr(title), intent.is_some()))
     }
 
     /// Берёт метаданные строки текущего каталога или тестовой сцены.
@@ -327,6 +334,7 @@ impl Sidebar {
         Self {
             active: None,
             runtime: None,
+            action_panel: None,
             saved: HashMap::new(),
             menu_focus: cx.focus_handle(),
             menu_scroll: ScrollHandle::new(),
@@ -459,6 +467,8 @@ impl Sidebar {
                     folder_pending: None,
                     folder_error: None,
                     folder_online: false,
+                    catalog_pending: None,
+                    catalog_action_failed: false,
                     #[cfg(all(test, feature = "gpui-test"))]
                     fixture_details: HashMap::new(),
                 });
@@ -478,33 +488,17 @@ impl Sidebar {
                 .map(|address| address.route.scope);
             let same_snapshot = same_catalog(active.catalog.as_ref(), catalog);
             let route_changed = active.selected != selected;
-            let profile = self
-                .runtime
-                .as_ref()
-                .and_then(|runtime| runtime.message_encryption(&active.session));
+            let profile = self.runtime.as_ref().and_then(|runtime| runtime.message_encryption(&active.session));
             let replaced = match profile {
-                Some((engine, activation))
-                    if active
-                        .protected_previews
-                        .as_ref()
-                        .is_none_or(|previews| !previews.is_activation(&activation)) =>
-                {
-                    active.protected_previews =
-                        Some(ProtectedPreviews::new(engine, activation, cx));
+                Some((engine, activation)) if active.protected_previews.as_ref().is_none_or(|previews| !previews.is_activation(&activation)) => {
+                    active.protected_previews = Some(ProtectedPreviews::new(engine, activation, cx));
                     true
                 }
                 None => active.protected_previews.take().is_some(),
                 _ => false,
             };
-            if (replaced || !same_snapshot)
-                && let Some(previews) = &mut active.protected_previews
-            {
-                previews.update(
-                    catalog
-                        .and_then(|catalog| catalog.chats.as_deref())
-                        .unwrap_or_default(),
-                    cx,
-                );
+            if (replaced || !same_snapshot) && let Some(previews) = &mut active.protected_previews {
+                previews.update(catalog.and_then(|catalog| catalog.chats.as_deref()).unwrap_or_default(), cx);
             }
             if !route_changed && !switched && same_snapshot && !replaced {
                 return;
@@ -521,7 +515,7 @@ impl Sidebar {
                 active.revision = active.revision.wrapping_add(1);
             }
             if let Some(chats) = catalog.and_then(|list| list.chats.as_deref()) {
-                active.presentation.retain_channels(chats);
+                active.presentation.retain_chats(chats);
             }
             active.apply_route_reveal();
             if let Some(menu) = &active.menu
@@ -632,6 +626,9 @@ impl Sidebar {
                     }
                     Some(RowAction::Command(command)) => {
                         self.send_folder_command(command, false, cx)
+                    }
+                    Some(RowAction::Catalog(action)) => {
+                        self.run_catalog_action(&session, menu.key, action, window, cx);
                     }
                     _ => {}
                 }
@@ -781,45 +778,32 @@ impl Sidebar {
         let Some(group) = active.presentation.group(chat, active.selected) else {
             return;
         };
-        let topic_id = match intent {
-            Intent::Open(RowKey::Chat(_)) if chat.direct => None,
+        let (topic_id, reveal) = match intent {
             Intent::Open(RowKey::Chat(_)) => {
                 let action = AppPreferences::read_for(cx, &active.session.owner).chat_click;
-                let Some(id) = channel_topic(chat, action) else {
+                let topic = chat_topic(chat, action);
+                if topic.is_none() && !chat.direct {
                     return;
-                };
-                if action == ChatClick::General && !active.presentation.searching() {
-                    active.presentation.ensure_topic_visible(chat, id);
-                    active.revision = active.revision.wrapping_add(1);
-                    cx.notify();
                 }
-                Some(id)
+                (topic, action == ChatClick::General)
             }
-            Intent::Open(RowKey::Avatar(_)) if !chat.direct => {
-                let Some(id) = default_topic(chat) else {
-                    return;
-                };
-                Some(id)
+            Intent::Open(RowKey::Avatar(_)) if has_general_route(chat) => {
+                (default_topic(chat), true)
             }
             Intent::Open(RowKey::Topic(_, topic))
                 if group.topics.iter().any(|entry| entry.id == topic) =>
             {
-                Some(topic)
+                (Some(topic), false)
             }
             Intent::Preview(_, message, topic)
                 if preview_target(chat) == Some((message, topic)) =>
             {
-                if !active.presentation.searching() {
-                    active.presentation.ensure_topic_visible(chat, topic);
-                    active.revision = active.revision.wrapping_add(1);
-                    cx.notify();
-                }
-                Some(topic)
+                (Some(topic), true)
             }
-            Intent::ToggleChannel(_)
-                if !chat.direct && !chat.topics.is_empty() && !active.presentation.searching() =>
+            Intent::ToggleChat(_)
+                if !chat.topics.is_empty() && !active.presentation.searching() =>
             {
-                active.presentation.toggle_channel(stream_id);
+                active.presentation.toggle_chat(stream_id);
                 active.revision = active.revision.wrapping_add(1);
                 cx.notify();
                 return;
@@ -842,6 +826,14 @@ impl Sidebar {
             }
             _ => return,
         };
+        if let Some(id) = topic_id
+            && reveal
+            && !active.presentation.searching()
+        {
+            active.presentation.ensure_topic_visible(chat, id);
+            active.revision = active.revision.wrapping_add(1);
+            cx.notify();
+        }
         let scope = HistoryScope {
             stream_id,
             topic_id,
@@ -890,9 +882,14 @@ impl Sidebar {
     ) -> Div {
         let chat = group.chat;
         let id = chat.id;
-        let title: SharedString = chat.name.clone().into();
+        let settings = AppPreferences::read_for(cx, &active.session.owner);
+        let language = settings.language;
+        let title: SharedString = language
+            .chat_title(chat, active.session.user_uuid())
+            .to_owned()
+            .into();
         let key = RowKey::Chat(id);
-        let mut details = active.row_details(key, stream_details(chat, &active.session));
+        let mut details = active.row_details(key, stream_details(chat, &active.session, language));
         details.protected_preview = active
             .protected_previews
             .as_ref()
@@ -906,63 +903,57 @@ impl Sidebar {
             );
             details.pinned = item.pinned_at.is_some();
         }
-        let settings = AppPreferences::read_for(cx, &active.session.owner);
         let chat_click = settings.chat_click;
         details.compact = settings.appearance.density == ChatDensity::Compact;
         details.hide_avatar = details.compact && chat_click != ChatClick::LatestTopic;
-        let opens = chat.direct || channel_topic(chat, chat_click).is_some();
+        let opens = chat.direct || chat_topic(chat, chat_click).is_some();
         let focus = opens.then(|| active.row_focus(key, cx));
-        let row = if chat.direct {
+        if chat.direct {
             details.image = chat
                 .metadata
                 .direct_peer_id
                 .and_then(|user| active.avatars.image(user, cx));
-            rows::direct_row(
-                id,
-                title.clone(),
-                details,
-                group.selected,
-                palette,
-                focus.as_ref(),
+        }
+        let expandable = !active.presentation.searching() && !chat.topics.is_empty();
+        let toggle_focus = expandable.then(|| active.row_focus(RowKey::Chevron(id), cx));
+        let preview = preview_target(chat)
+            .filter(|_| !details.compact && details.preview.is_some())
+            .map(|(message, topic)| PreviewAction {
+                id: message,
+                focus: active.row_focus(RowKey::Preview(id), cx),
+                on_open: Self::row_action(active, Intent::Preview(id, message, topic), cx),
+            });
+        let avatar = (chat_click == ChatClick::LatestTopic && has_general_route(chat)).then(|| {
+            let key = RowKey::Avatar(id);
+            (
+                active.row_focus(key, cx),
                 Self::row_action(active, Intent::Open(key), cx),
             )
-        } else {
-            let expandable = !active.presentation.searching() && !chat.topics.is_empty();
-            let toggle_focus = expandable.then(|| active.row_focus(RowKey::Chevron(id), cx));
-            let preview = preview_target(chat)
-                .filter(|_| !details.compact && details.preview.is_some())
-                .map(|(message, topic)| PreviewAction {
-                    id: message,
-                    focus: active.row_focus(RowKey::Preview(id), cx),
-                    on_open: Self::row_action(active, Intent::Preview(id, message, topic), cx),
-                });
-            ChannelRow {
-                id,
-                title: title.clone(),
-                details,
-                selected: group.selected,
-                color: chat.metadata.color,
-                expanded: expandable.then_some(group.expanded),
-            }
-            .render(
-                palette,
-                focus.as_ref(),
-                toggle_focus.as_ref(),
-                ChannelActions {
-                    open: opens.then(|| Self::row_action(active, Intent::Open(key), cx)),
-                    toggle: Self::row_action(active, Intent::ToggleChannel(id), cx),
-                    preview,
-                    avatar: (chat_click == ChatClick::LatestTopic && default_topic(chat).is_some())
-                        .then(|| {
-                            let key = RowKey::Avatar(id);
-                            (
-                                active.row_focus(key, cx),
-                                Self::row_action(active, Intent::Open(key), cx),
-                            )
-                        }),
-                },
-            )
-        };
+        });
+        let row = ChatHeader {
+            id,
+            title: title.clone(),
+            details,
+            selected: group.selected,
+            color: if chat.direct {
+                None
+            } else {
+                chat.metadata.color
+            },
+            expanded: expandable.then_some(group.expanded),
+        }
+        .render(
+            palette,
+            language,
+            focus.as_ref(),
+            toggle_focus.as_ref(),
+            ChatActions {
+                open: opens.then(|| Self::row_action(active, Intent::Open(key), cx)),
+                toggle: Self::row_action(active, Intent::ToggleChat(id), cx),
+                preview,
+                avatar,
+            },
+        );
         let row = Self::context_trigger(row, active, key, title, palette, cx);
         measured(row, key, &active.bounds)
     }
@@ -977,15 +968,15 @@ impl Sidebar {
     ) -> Div {
         let stream_id = chat.id;
         let key = RowKey::Topic(stream_id, topic.id);
-        let mut details = active.row_details(key, topic_details(chat, topic, &active.session));
+        let settings = AppPreferences::read_for(cx, &active.session.owner);
+        let language = settings.language;
+        let mut details =
+            active.row_details(key, topic_details(chat, topic, &active.session, language));
         details.protected_preview = active
             .protected_previews
             .as_ref()
             .and_then(|previews| previews.view(stream_id, topic.metadata.preview.as_ref()));
-        details.compact = AppPreferences::read_for(cx, &active.session.owner)
-            .appearance
-            .density
-            == ChatDensity::Compact;
+        details.compact = settings.appearance.density == ChatDensity::Compact;
         let focus = active.row_focus(key, cx);
         let title: SharedString = topic.name.clone().into();
         let row = TopicRow {
@@ -1020,10 +1011,17 @@ impl Sidebar {
     ) -> Div {
         let key = RowKey::TopicToggle(id);
         let focus = active.row_focus(key, cx);
+        let language = AppPreferences::read_for(cx, &active.session.owner).language;
         let title = match action {
-            TopicToggleKind::ShowMore(count) => format!("Показать ещё темы ({count})"),
-            TopicToggleKind::ShowCompleted(count) => format!("Показать завершённые темы ({count})"),
-            TopicToggleKind::HideExtra => "Скрыть лишние темы".into(),
+            TopicToggleKind::ShowMore(count) => language.tr_with(
+                "desktop.sidebar.showMoreTopics",
+                &[("count", &count.to_string())],
+            ),
+            TopicToggleKind::ShowCompleted(count) => language.tr_with(
+                "desktop.sidebar.showCompletedTopics",
+                &[("count", &count.to_string())],
+            ),
+            TopicToggleKind::HideExtra => language.tr("desktop.sidebar.hideExtraTopics").into(),
         };
         let row = rows::topic_toggle(
             id,
@@ -1050,14 +1048,12 @@ impl Sidebar {
         let settings = AppPreferences::read_for(cx, &active.session.owner);
         let chat_click = settings.chat_click;
         let compact = settings.appearance.density == ChatDensity::Compact;
-        if chat.direct || channel_topic(chat, chat_click).is_some() {
+        let language = settings.language;
+        if chat.direct || chat_topic(chat, chat_click).is_some() {
             visible.push(RowKey::Chat(chat.id));
         }
         let header = Self::chat_row(active, &group, item, palette, cx);
-        if chat.direct {
-            return header;
-        }
-        if chat_click == ChatClick::LatestTopic && default_topic(chat).is_some() {
+        if chat_click == ChatClick::LatestTopic && has_general_route(chat) {
             visible.push(RowKey::Avatar(chat.id));
         }
         if !compact && preview_target(chat).is_some() {
@@ -1066,10 +1062,10 @@ impl Sidebar {
         if !active.presentation.searching() && !chat.topics.is_empty() {
             visible.push(RowKey::Chevron(chat.id));
         }
-        let mut card = rows::channel_card(palette).child(header);
+        let mut card = rows::chat_card(palette).child(header);
         for (index, topic) in group.topics.into_iter().enumerate() {
             if group.divider_before == Some(index) {
-                card = card.child(rows::other_topics_divider(palette));
+                card = card.child(rows::other_topics_divider(palette, language));
             }
             visible.push(RowKey::Topic(chat.id, topic.id));
             card = card.child(Self::topic_row(active, chat, topic, palette, cx));
@@ -1138,7 +1134,7 @@ impl Sidebar {
         let origin = active.session.clone();
         let locale = AppPreferences::read_for(cx, &origin.owner).language;
         let entity = cx.entity().downgrade();
-        let mut retry = Button::new("catalog-retry", locale.text("Повторить", "Retry"));
+        let mut retry = Button::new("catalog-retry", locale.tr("common.retry"));
         retry.appearance = ButtonAppearance::Ghost;
         let retry = retry
             .render(palette, None, move |_, app| {
@@ -1161,17 +1157,14 @@ impl Sidebar {
                 .child(label(
                     palette,
                     TextRole::Caption,
-                    locale.text(
-                        "Не все чаты обновились",
-                        "Some chats could not be refreshed",
-                    ),
+                    locale.tr("sidebar.partialLoadError"),
                 ))
                 .child(retry)
                 .debug_selector(|| "catalog-partial-error".into())
         } else {
             catalog_status(
                 palette,
-                locale.text("Не удалось загрузить чаты", "Could not load chats"),
+                locale.tr("desktop.sidebar.loadFailed"),
                 Some(retry.into_any_element()),
             )
             .debug_selector(|| "catalog-error".into())
@@ -1258,8 +1251,11 @@ impl Render for Sidebar {
 
         self.open_requested_folder_dialog(window, cx);
         let palette = Palette::for_window(window, cx);
-        let locale = AppPreferences::read(cx).language;
-        let t = |ru, en| locale.text(ru, en);
+        let locale = self.active.as_ref().map_or_else(
+            || AppPreferences::read(cx).language,
+            |active| AppPreferences::read_for(cx, &active.session.owner).language,
+        );
+        let t = |key| locale.tr(key);
         let id = self.active.as_ref().map_or_else(
             || "sidebar-unselected".into(),
             |active| ElementId::View(active.search.entity_id()),
@@ -1282,7 +1278,7 @@ impl Render for Sidebar {
             }
             return self.with_folder_rail(panel.child(catalog_status(
                 palette,
-                t("Выберите аккаунт", "Select an account"),
+                t("auth.selectServer"),
                 None,
             )));
         };
@@ -1290,7 +1286,7 @@ impl Render for Sidebar {
             active.search.read(cx).focus(window);
         }
         active.search.update(cx, |search, cx| {
-            search.set_placeholder(t("Найти", "Search"), cx)
+            search.set_placeholder(t("search.find"), cx)
         });
         let channel = self
             .runtime
@@ -1304,7 +1300,7 @@ impl Render for Sidebar {
                     opener: active.search.read(cx).keyboard_focus(),
                 };
                 let sidebar = cx.entity().downgrade();
-                let title = t("Создать защищённый канал", "Create encrypted channel");
+                let title = t("desktop.sidebar.createEncryptedChannel");
                 add.render(palette, None, move |_, app| {
                     let _ = sidebar.update(app, |_, cx| cx.emit(intent.clone()));
                 })
@@ -1312,19 +1308,14 @@ impl Render for Sidebar {
                 .debug_selector(|| "e2ee-create-channel".into())
             });
         panel = panel.child(
-            div().px(px(12.)).pt(px(16.)).pb(px(12.)).flex_none().child(
-                div()
-                    .flex()
-                    .gap_1()
-                    .items_center()
-                    .child(div().flex_1().min_w_0().child(search::render(
-                        &active.search,
-                        palette,
-                        window,
-                        cx,
-                    )))
-                    .children(channel),
-            ),
+            div()
+                .px(px(12.))
+                .pt(px(16.))
+                .pb(px(12.))
+                .flex_none()
+                .child(div().flex().gap_1().items_center()
+                    .child(div().flex_1().min_w_0().child(search::render(&active.search, palette, window, cx)))
+                    .children(channel)),
         );
         let catalog = active.catalog.clone();
         let snapshot = active.folder_view.clone();
@@ -1336,6 +1327,8 @@ impl Render for Sidebar {
         let settings = AppPreferences::read_for(cx, &active.session.owner);
         let sort = settings.appearance.sort;
         let language = settings.language;
+        let user = active.session.user_uuid();
+        active.presentation.set_titles(language, user);
         if active.presentation.set_sort(sort) {
             active.revision = active.revision.wrapping_add(1);
             active.menu = None;
@@ -1348,22 +1341,27 @@ impl Render for Sidebar {
             active.folder,
             searching,
         );
-        order::sort_chats(&mut entries, sort, language);
+        order::sort_chats(&mut entries, sort, language, user);
         let has_rows = !entries.is_empty();
-        if let Some(error) = active.folder_error {
-            panel = panel.child(
-                catalog_status(palette, error, None)
-                    .debug_selector(|| "catalog-folder-error".into()),
-            );
-        }
-        if status == Some(ChatListStatus::Failed) {
-            panel = panel.child(Self::failed_status(active, palette, has_rows, cx));
+        let folder_notice = active
+            .folder_error
+            .or(active
+                .catalog_action_failed
+                .then_some("desktop.sidebar.actions.failed"))
+            .map(|error| {
+                catalog_status(palette, language.tr(error), None)
+                    .debug_selector(|| "catalog-folder-error".into())
+            });
+        let catalog_notice = if status == Some(ChatListStatus::Failed) {
+            Some(Self::failed_status(active, palette, has_rows, cx))
         } else if status != Some(ChatListStatus::Ready) && !has_rows {
-            panel = panel.child(
-                catalog_status(palette, t("Загрузка чатов…", "Loading chats…"), None)
+            Some(
+                catalog_status(palette, t("desktop.sidebar.loading"), None)
                     .debug_selector(|| "catalog-loading".into()),
-            );
-        }
+            )
+        } else {
+            None
+        };
 
         let mut rows = div()
             .w_full()
@@ -1377,6 +1375,9 @@ impl Render for Sidebar {
             .debug_selector(|| "catalog-scroll".into());
         let mut results = Vec::new();
         let mut peers = Vec::new();
+        for notice in [folder_notice, catalog_notice].into_iter().flatten() {
+            panel = panel.child(notice);
+        }
         let mut found = false;
         let mut heading = None;
         let groups_visible = searching && !active.folder.is_nil();
@@ -1390,14 +1391,11 @@ impl Render for Sidebar {
                 heading = Some(outside);
                 let (title, id) = if outside {
                     (
-                        t("В других папках", "In other folders"),
+                        t("desktop.sidebar.otherFolders"),
                         "catalog-search-outside-folder",
                     )
                 } else {
-                    (
-                        t("В этой папке", "In this folder"),
-                        "catalog-search-in-folder",
-                    )
+                    (t("desktop.sidebar.thisFolder"), "catalog-search-in-folder")
                 };
                 rows = rows.child(
                     label(palette, TextRole::Caption, title)
@@ -1423,15 +1421,15 @@ impl Render for Sidebar {
         }
         if !found && status == Some(ChatListStatus::Ready) {
             let message = if searching {
-                t("Ничего не найдено", "No results found")
+                t("search.noResults")
             } else if active.folder.is_nil() {
-                t("У вас пока нет чатов", "You have no chats yet")
+                t("sidebar.emptyAllChats")
             } else {
-                t("В папке пока нет чатов", "This folder has no chats yet")
+                t("sidebar.emptySelectedFolder")
             };
-            panel = panel.child(
-                catalog_status(palette, message, None).debug_selector(|| "catalog-empty".into()),
-            );
+            let empty =
+                catalog_status(palette, message, None).debug_selector(|| "catalog-empty".into());
+            panel = panel.child(empty);
         }
         Self::restore_focus(active, &results, window, cx);
         if searching {
@@ -1514,15 +1512,20 @@ fn measured(row: Stateful<Div>, key: RowKey, bounds: &RowBounds) -> Div {
         })
 }
 
-/// Открывает общую тему, только если она есть в доступном каталоге канала.
+/// Возвращает общую тему, если она есть в доступном каталоге разговора.
 fn default_topic(chat: &Chat) -> Option<Uuid> {
     chat.metadata
         .default_topic_id
         .filter(|id| chat.topics.iter().any(|topic| topic.id == *id))
 }
 
+/// Проверяет, доступна ли общая тема или старый маршрут личного чата.
+fn has_general_route(chat: &Chat) -> bool {
+    chat.direct || default_topic(chat).is_some()
+}
+
 /// Выбирает доступную тему последнего сообщения с запасным переходом в общую тему.
-fn channel_topic(chat: &Chat, action: ChatClick) -> Option<Uuid> {
+fn chat_topic(chat: &Chat, action: ChatClick) -> Option<Uuid> {
     if action == ChatClick::LatestTopic {
         if let Some((_, topic)) = preview_target(chat) {
             return Some(topic);
@@ -1551,10 +1554,10 @@ fn preview_target(chat: &Chat) -> Option<(Uuid, Uuid)> {
 }
 
 /// Готовит сведения строки канала или личного чата из текущего снимка.
-fn stream_details(chat: &Chat, session: &AccountSession) -> RowDetails {
+fn stream_details(chat: &Chat, session: &AccountSession, language: Language) -> RowDetails {
     let metadata = &chat.metadata;
     let muted = order::stream_muted(chat);
-    let mut details = message_details(metadata.preview.as_ref(), session);
+    let mut details = message_details(metadata.preview.as_ref(), session, language);
     details.unread = unread_badge_value(
         metadata.active_unread_count,
         metadata.passive_unread_count,
@@ -1566,10 +1569,15 @@ fn stream_details(chat: &Chat, session: &AccountSession) -> RowDetails {
 }
 
 /// Готовит сведения темы, учитывая режим уведомлений родительского канала.
-fn topic_details(chat: &Chat, topic: &Topic, session: &AccountSession) -> RowDetails {
+fn topic_details(
+    chat: &Chat,
+    topic: &Topic,
+    session: &AccountSession,
+    language: Language,
+) -> RowDetails {
     let metadata = &topic.metadata;
     let muted = order::topic_muted(chat, topic);
-    let mut details = message_details(metadata.preview.as_ref(), session);
+    let mut details = message_details(metadata.preview.as_ref(), session, language);
     details.unread = unread_badge_value(
         metadata.active_unread_count,
         metadata.passive_unread_count,
@@ -1581,7 +1589,11 @@ fn topic_details(chat: &Chat, topic: &Topic, session: &AccountSession) -> RowDet
 }
 
 /// Оформляет безопасное превью и время в том же формате, который использует история.
-fn message_details(preview: Option<&SidebarPreview>, session: &AccountSession) -> RowDetails {
+fn message_details(
+    preview: Option<&SidebarPreview>,
+    session: &AccountSession,
+    language: Language,
+) -> RowDetails {
     let Some(preview) = preview else {
         return RowDetails::default();
     };
@@ -1589,11 +1601,11 @@ fn message_details(preview: Option<&SidebarPreview>, session: &AccountSession) -
     RowDetails {
         preview: Some(ChatRowPreview {
             sender: if own {
-                Some("Вы".into())
+                Some(language.tr("common.you").into())
             } else {
                 preview.author_name.clone().map(Into::into)
             },
-            text: preview.text.fallback_text().to_owned().into(),
+            text: language.sidebar_preview_text(&preview.text).into(),
         }),
         time: preview
             .created_at

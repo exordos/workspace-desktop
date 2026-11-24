@@ -64,28 +64,16 @@ impl TopBarSection {
         Self::Calls,
     ];
 
-    /// Даёт разделу подпись для заголовка.
-    pub const fn title(self) -> &'static str {
-        match self {
-            Self::Chats => "Чаты",
-            Self::Calendar => "Календарь",
-            Self::Mail => "Почта",
-            Self::Contacts => "Контакты",
-            Self::Calls => "Звонки",
-        }
-    }
-
     /// Даёт подпись для текущего языка интерфейса.
     pub(in crate::gpui_client) fn localized_title(self, app: &App) -> &'static str {
         let locale = crate::gpui_client::preferences::Preferences::read(app).language;
-        let english = match self {
-            Self::Chats => "Chats",
-            Self::Calendar => "Calendar",
-            Self::Mail => "Mail",
-            Self::Contacts => "Contacts",
-            Self::Calls => "Calls",
-        };
-        locale.text(self.title(), english)
+        locale.tr(match self {
+            Self::Chats => "desktop.nav.chats",
+            Self::Calendar => "nav.calendar",
+            Self::Mail => "nav.mail",
+            Self::Contacts => "desktop.nav.contacts",
+            Self::Calls => "nav.calls",
+        })
     }
 
     /// Часть идентификатора кнопки и страницы раздела.
@@ -465,7 +453,7 @@ impl TopBar {
                 TextRole::Label,
                 crate::gpui_client::preferences::Preferences::read(cx)
                     .language
-                    .text("Добавить аккаунт", "Add account"),
+                    .tr("desktop.auth.addAccount"),
             ))
     }
 
@@ -611,11 +599,11 @@ impl TopBar {
                     .status_label()
                     .unwrap_or_else(|| {
                         match profile.presence {
-                            Some(ProfilePresence::Active) => language.text("В сети", "Online"),
+                            Some(ProfilePresence::Active) => language.tr("a11y.online"),
                             Some(ProfilePresence::Idle | ProfilePresence::DoNotDisturb) => {
-                                language.text("Отошёл", "Away")
+                                language.tr("a11y.away")
                             }
-                            Some(ProfilePresence::Offline) => language.text("Не в сети", "Offline"),
+                            Some(ProfilePresence::Offline) => language.tr("presence.offline"),
                             None => "",
                         }
                         .to_owned()
@@ -770,11 +758,7 @@ impl Render for TopBar {
                                     let locale =
                                         crate::gpui_client::preferences::Preferences::read(app)
                                             .language;
-                                    tooltip(
-                                        palette,
-                                        locale.text("Выбрать аккаунт", "Select account").into(),
-                                        app,
-                                    )
+                                    tooltip(palette, locale.tr("auth.selectServer").into(), app)
                                 }),
                         )
                     }),

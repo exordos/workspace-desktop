@@ -393,6 +393,11 @@ impl Composer {
         }
     }
 
+    /// Проверяет, открыт ли уже ответ, к которому можно добавить вкладку.
+    pub(in crate::gpui_client) fn has_reply_tabs(&self) -> bool {
+        !self.replies.tabs.is_empty()
+    }
+
     /// Проверяет доступность цитирования для подтверждённой обычной темы.
     pub(in crate::gpui_client) fn reply_available(&self) -> bool {
         self.edit.is_none()

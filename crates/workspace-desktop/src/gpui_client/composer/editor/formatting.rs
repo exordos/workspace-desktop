@@ -2,6 +2,8 @@
 
 use std::ops::Range;
 
+use crate::gpui_client::preferences::Language;
+
 /// Действие панели, которое меняет исходный текст сообщения.
 #[derive(Clone, Copy)]
 pub(in crate::gpui_client::composer) enum Format {
@@ -20,9 +22,9 @@ pub(in crate::gpui_client::composer) enum Format {
 
 impl Format {
     /// Возвращает замену и диапазон выделения относительно её начала в байтах UTF-8.
-    pub(super) fn edit(self, selected: &str) -> (String, Range<usize>) {
+    pub(super) fn edit(self, selected: &str, language: Language) -> (String, Range<usize>) {
         match self {
-            Self::Link => link(selected),
+            Self::Link => link(selected, language),
             Self::Bold => wrap(selected, "**", "**"),
             Self::Italic => wrap(selected, "*", "*"),
             Self::Strike => wrap(selected, "~~", "~~"),
@@ -61,9 +63,9 @@ fn prefix_lines(selected: &str, prefix: impl Fn(usize) -> String) -> (String, Ra
 }
 
 /// Оставляет адрес выделенным, чтобы его можно было сразу заменить.
-fn link(selected: &str) -> (String, Range<usize>) {
+fn link(selected: &str, language: Language) -> (String, Range<usize>) {
     let label = if selected.is_empty() {
-        "текст ссылки"
+        language.tr("composer.linkText")
     } else {
         selected
     };
@@ -123,15 +125,21 @@ mod tests {
             (Format::InlineCode, "`Тест🙂\nмир`"),
             (Format::Spoiler, "||Тест🙂\nмир||"),
         ] {
-            let (result, caret) = action.edit(selected);
+            let (result, caret) = action.edit(selected, Language::Ru);
             assert_eq!(result, expected);
             assert_eq!(caret, expected.len()..expected.len());
         }
-        let (result, address) = Format::Link.edit(selected);
+        let (result, address) = Format::Link.edit(selected, Language::Ru);
         assert_eq!(result, "[Тест🙂\nмир](https://)");
         assert_eq!(&result[address], "https://");
-        assert_eq!(Format::Bold.edit(""), ("****".into(), 2..2));
-        assert_eq!(Format::CodeBlock.edit(""), ("```\n\n```".into(), 4..4));
+        let (link, address) = Format::Link.edit("", Language::En);
+        assert_eq!(link, "[link text](https://)");
+        assert_eq!(&link[address], "https://");
+        assert_eq!(Format::Bold.edit("", Language::Ru), ("****".into(), 2..2));
+        assert_eq!(
+            Format::CodeBlock.edit("", Language::Ru),
+            ("```\n\n```".into(), 4..4)
+        );
     }
 
     /// Проверяет Shift+Enter в пункте списка, выход из пустого пункта и обычный перенос.

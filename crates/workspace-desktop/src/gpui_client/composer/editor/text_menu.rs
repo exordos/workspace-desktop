@@ -6,9 +6,12 @@ use gpui::{
 };
 
 use super::Editor;
-use crate::gpui_client::ui::{
-    Button, ButtonAppearance, Palette,
-    popup::{MenuInput, menu_layer, menu_navigation, menu_surface},
+use crate::gpui_client::{
+    preferences::{Language, Preferences},
+    ui::{
+        Button, ButtonAppearance, Palette,
+        popup::{MenuInput, menu_layer, menu_navigation, menu_surface},
+    },
 };
 
 /// Состояние меню и отдельный фокус, который не принимает текстовый ввод.
@@ -49,13 +52,13 @@ impl Command {
     const ALL: [Self; 4] = [Self::Cut, Self::Copy, Self::Paste, Self::SelectAll];
 
     /// Подпись команды в меню системного редактирования.
-    fn label(self) -> &'static str {
-        match self {
-            Self::Cut => "Вырезать",
-            Self::Copy => "Копировать",
-            Self::Paste => "Вставить",
-            Self::SelectAll => "Выбрать всё",
-        }
+    fn label(self, language: Language) -> &'static str {
+        language.tr(match self {
+            Self::Cut => "composer.cut",
+            Self::Copy => "composer.copy",
+            Self::Paste => "composer.paste",
+            Self::SelectAll => "composer.selectAll",
+        })
     }
 
     /// Стабильное имя строки для сквозных проверок.
@@ -210,6 +213,7 @@ impl Editor {
         let anchor = self.text_menu.anchor?;
         let viewport = window.viewport_size();
         let palette = Palette::for_window(window, cx);
+        let language = Preferences::read(cx).language;
         let target = cx.entity().downgrade();
         let surface = menu_surface("composer-text-menu", palette, viewport, px(180.), px(200.))
             .debug_selector(|| "composer-text-menu".into())
@@ -218,7 +222,7 @@ impl Editor {
                 editor.close_text_menu(false, window, cx);
             }))
             .children(Command::ALL.map(|command| {
-                let mut button = Button::new(command.selector(), command.label());
+                let mut button = Button::new(command.selector(), command.label(language));
                 button.appearance = ButtonAppearance::Ghost;
                 button.disabled = !self.text_command_enabled(command);
                 let selected = !button.disabled && self.text_menu.selected == Some(command);

@@ -84,6 +84,7 @@ pub(super) struct PreferenceValues {
     pub(super) hotkeys: BTreeMap<String, Option<String>>, // Нет записи — стандартное сочетание; None — выключено.
     pub(super) appearance: appearance::AppearancePreferences, // Тема и вид мессенджера.
     pub(super) manual_away: Option<bool>, // Последний явный выбор отсутствия. None — пользователь ещё не выбирал.
+    pub(super) activity_expanded: bool,   // Показывать подписи вместо компактного ряда значков.
 }
 
 impl Default for PreferenceValues {
@@ -100,6 +101,7 @@ impl Default for PreferenceValues {
             hotkeys: BTreeMap::new(),
             appearance: appearance::AppearancePreferences::default(),
             manual_away: None,
+            activity_expanded: false,
         }
     }
 }

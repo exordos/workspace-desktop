@@ -36,13 +36,9 @@ impl Language {
     #[allow(non_upper_case_globals)]
     pub const Ru: Self = Self("ru");
     /// Английский каталог, который уже можно выбрать в сохранённых настройках.
+    #[cfg(test)]
     #[allow(non_upper_case_globals)]
     pub const En: Self = Self("en");
-
-    /// Возвращает подпись из старой пары строк для ещё не перенесённых компонентов.
-    pub fn text(self, ru: &'static str, en: &'static str) -> &'static str {
-        if self == Self::En { en } else { ru }
-    }
 
     /// Перечисляет языки, которые упакованы в текущую сборку Desktop.
     pub fn available() -> impl Iterator<Item = Self> {

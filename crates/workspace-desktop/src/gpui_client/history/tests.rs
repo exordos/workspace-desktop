@@ -294,6 +294,20 @@ fn click(ui: &mut VisualTestContext, selector: &'static str) {
     ui.run_until_parked();
 }
 
+/// Прокручивает сам список, чтобы его рабочий обработчик мог запросить страницу.
+fn scroll_history(ui: &mut VisualTestContext, delta: f32) {
+    let position = ui
+        .debug_bounds("conversation-history-focus")
+        .expect("История видна")
+        .center();
+    ui.simulate_event(gpui::ScrollWheelEvent {
+        position,
+        delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(delta))),
+        ..Default::default()
+    });
+    ui.run_until_parked();
+}
+
 /// Передаёт событие Sync как оболочка с точным адресом открытого экрана.
 fn sync(
     view: &Entity<Conversation>,
@@ -548,6 +562,11 @@ fn preserves_visible_uuid_during_pages_and_updates(cx: &mut TestAppContext) {
         reading(&address, 52..80),
         ui,
     );
+    assert!(ui.debug_bounds("history-older").is_none());
+    assert!(ui.debug_bounds("history-newer").is_none());
+    let heading = ui.debug_bounds("conversation-heading").unwrap();
+    let history = ui.debug_bounds("conversation-history-focus").unwrap();
+    assert!((history.top() - heading.bottom()).abs() <= px(1.));
     let original = ui.read(|cx| view.read(cx).viewport.y(anchor).expect("цель видна"));
     assert!(
         original.abs() <= 1.,
@@ -567,13 +586,14 @@ fn preserves_visible_uuid_during_pages_and_updates(cx: &mut TestAppContext) {
         (before + 11.).abs() <= 1.,
         "Часть опоры скрыта, получено {before} px"
     );
-    click(ui, "history-older");
+    scroll_history(ui, 1.);
     let older = request(&requests, Load::Extend(41, HistoryDirection::Older));
-    click(ui, "history-older");
+    scroll_history(ui, 1.);
     assert!(
         requests.try_recv().is_err(),
-        "Повторный клик не запускает второй запрос"
+        "Повторный жест не запускает второй запрос"
     );
+    let before = ui.read(|cx| view.read(cx).viewport.y(anchor).unwrap());
     older.finish(Err(Failure::Unavailable));
     ui.run_until_parked();
     assert!(
@@ -592,7 +612,17 @@ fn preserves_visible_uuid_during_pages_and_updates(cx: &mut TestAppContext) {
         "После старой страницы дата переехала к началу дня, опора {before} → {after} px"
     );
 
-    click(ui, "history-newer");
+    for _ in 0..60 {
+        scroll_history(ui, -80.);
+        if ui.read(|cx| view.read(cx).active.is_some()) {
+            break;
+        }
+    }
+    let (anchor, before) = ui.read(|cx| {
+        let view = view.read(cx);
+        let anchor = view.viewport.saved_anchor().unwrap().id;
+        (anchor, view.viewport.y(anchor).unwrap())
+    });
     answer(
         request(&requests, Load::Extend(41, HistoryDirection::Newer)),
         reading(&address, 1..100),
@@ -742,6 +772,76 @@ fn fixed_topic_groups_and_wraps_at_both_panel_sizes(cx: &mut TestAppContext) {
     );
 }
 
+/// Проверяет, что при открытии без кэша скелетон сменяется первым настоящим сообщением.
+#[gpui::test]
+fn opening_without_cache_replaces_skeleton_with_messages(cx: &mut TestAppContext) {
+    let address = address(ChatEntry::Latest);
+    let (view, ui, requests) = scenario(cx, &address);
+    let pending = request(&requests, Load::Open(ChatEntry::Latest));
+    let message = "history-message-00000000-0000-0000-0000-000000000001";
+
+    assert!(ui.debug_bounds("history-loading").is_some());
+    assert!(ui.debug_bounds("conversation-history-focus").is_none());
+    assert!(ui.debug_bounds(message).is_none());
+
+    answer(
+        pending,
+        window(
+            address.route.scope,
+            1..2,
+            HistoryEdge::End,
+            HistoryEdge::End,
+        ),
+        ui,
+    );
+
+    assert!(ui.read(|app| matches!(view.read(app).state, State::Ready(_))));
+    assert!(ui.debug_bounds(message).is_some());
+}
+
+/// Оставляет скелетон при пустом кэше до ответа, подтверждающего пустую историю.
+#[gpui::test]
+fn empty_cache_keeps_skeleton_until_server_confirms_empty_history(cx: &mut TestAppContext) {
+    let address = address(ChatEntry::Latest);
+    let (view, ui, requests) = scenario(cx, &address);
+    let pending = request(&requests, Load::Open(ChatEntry::Latest));
+    let empty = window(
+        address.route.scope,
+        0..0,
+        HistoryEdge::End,
+        HistoryEdge::End,
+    );
+    pending
+        .cache
+        .send(Snapshot {
+            media_access: None,
+            window: empty.clone(),
+            outbox: Some(Vec::new()),
+        })
+        .unwrap_or_else(|_| panic!("Экран перестал ждать кэш"));
+    ui.run_until_parked();
+
+    assert!(ui.read(|app| matches!(view.read(app).state, State::Opening)));
+    assert!(ui.debug_bounds("history-loading").is_some());
+    assert!(ui.debug_bounds("history-empty").is_none());
+
+    pending
+        .response
+        .send(ConversationReply {
+            address: pending.address,
+            value: Ok(Some(Snapshot {
+                media_access: None,
+                window: empty,
+                outbox: Some(Vec::new()),
+            })),
+        })
+        .unwrap_or_else(|_| panic!("Экран перестал ждать сервер"));
+    ui.run_until_parked();
+
+    assert!(ui.read(|app| matches!(view.read(app).state, State::Ready(_))));
+    assert!(ui.debug_bounds("history-empty").is_some());
+}
+
 /// Проверяет, что первичная ошибка сменяется по кнопке загрузкой и пустой темой.
 #[gpui::test]
 fn initial_error_retries_into_empty_topic(cx: &mut TestAppContext) {
@@ -781,7 +881,9 @@ fn hides_revoked_and_reset_history_before_network_answers(cx: &mut TestAppContex
         reading(&address, 11..80),
         ui,
     );
-    click(ui, "history-older");
+    ui.update(|window, app| window.focus(&view.read(app).history_focus));
+    ui.simulate_keystrokes("home");
+    ui.run_until_parked();
     let delayed = request(&requests, Load::Extend(41, HistoryDirection::Older));
     let anchor = ui.read(|app| view.read(app).reading_position().unwrap());
     sync(&view, ui, &address, SyncChange::MessengerReset);
@@ -865,9 +967,12 @@ fn missing_target_can_open_latest_and_follow_tail(cx: &mut TestAppContext) {
 /// Показывает подтверждённый кэш до сети и убирает временную строку при подтверждении UUID.
 #[gpui::test]
 fn cached_tail_refreshes_and_deduplicates_outbox(cx: &mut TestAppContext) {
+    use gpui::{ScrollDelta, ScrollWheelEvent, point};
+
     let address = address(ChatEntry::Latest);
     let (view, ui, requests) = scenario(cx, &address);
     let pending = request(&requests, Load::Open(ChatEntry::Latest));
+    assert!(ui.debug_bounds("history-background-loading").is_none());
     let own = OutboxEntry {
         snapshot: PreparedSend {
             canonical_id: Uuid::from_u128(600),
@@ -896,6 +1001,24 @@ fn cached_tail_refreshes_and_deduplicates_outbox(cx: &mut TestAppContext) {
         ui.read(|cx| view.read(cx).viewport.y(own.snapshot.public_id).is_some()),
         "Очередь видна ещё до ответа сервера"
     );
+    let loading = ui
+        .debug_bounds("history-background-loading")
+        .expect("Кэш уже виден, сверка ещё идёт");
+    let frame = ui.debug_bounds("conversation-history-focus").unwrap();
+    let at_tail = ui.read(|app| view.read(app).viewport.at_tail());
+    assert!(at_tail);
+    ui.simulate_event(ScrollWheelEvent {
+        position: loading.center(),
+        delta: ScrollDelta::Pixels(point(px(0.), px(130.))),
+        ..Default::default()
+    });
+    ui.run_until_parked();
+    let (anchor, y) = ui.read(|app| {
+        let view = view.read(app);
+        assert!(!view.viewport.at_tail(), "Плашка пропускает прокрутку");
+        let anchor = view.viewport.saved_anchor().unwrap().id;
+        (anchor, view.tested_message_window_y(anchor).unwrap())
+    });
     pending
         .response
         .send(ConversationReply {
@@ -913,13 +1036,89 @@ fn cached_tail_refreshes_and_deduplicates_outbox(cx: &mut TestAppContext) {
         })
         .unwrap_or_else(|_| panic!("Экран перестал ждать сервер"));
     ui.run_until_parked();
+    assert_eq!(ui.debug_bounds("conversation-history-focus"), Some(frame));
     ui.read(|cx| {
         let view = view.read(cx);
+        assert!(!view.has_background_history_load());
         assert_eq!(
             view.viewport.list().item_count(),
             61,
             "После совпадения UUID остаётся одна строка"
         );
+        assert!((view.tested_message_window_y(anchor).unwrap() - y).abs() <= px(1.));
+    });
+}
+
+/// Удерживает позицию при смене ID кэшированного окна и ошибке фоновой сверки.
+#[gpui::test]
+fn cached_refresh_keeps_the_anchor_after_leaving_the_tail(cx: &mut TestAppContext) {
+    let address = address(ChatEntry::Latest);
+    let (view, ui, requests) = scenario(cx, &address);
+    let scope = address.route.scope;
+    answer(
+        request(&requests, Load::Open(ChatEntry::Latest)),
+        window(scope, 20..80, HistoryEdge::End, HistoryEdge::End),
+        ui,
+    );
+
+    sync(
+        &view,
+        ui,
+        &address,
+        SyncChange::HistoryMessageCreated {
+            scope,
+            message_id: Uuid::from_u128(81),
+        },
+    );
+    let read = request(&requests, Load::Read(41));
+    assert!(ui.debug_bounds("history-background-loading").is_none());
+    answer(
+        read,
+        window(scope, 20..80, HistoryEdge::End, HistoryEdge::Unchecked),
+        ui,
+    );
+    let pending = request(&requests, Load::Open(ChatEntry::Latest));
+    assert!(ui.debug_bounds("history-background-loading").is_some());
+    scroll_history(ui, 260.);
+    let (anchor, before) = ui.read(|app| {
+        let view = view.read(app);
+        assert!(!view.viewport.at_tail());
+        let id = view.viewport.saved_anchor().unwrap().id;
+        (id, view.tested_message_window_y(id).unwrap())
+    });
+
+    let mut fresh_cache = window(scope, 21..82, HistoryEdge::End, HistoryEdge::End);
+    fresh_cache.id = 42;
+    pending
+        .cache
+        .send(Snapshot {
+            window: fresh_cache,
+            media_access: None,
+            outbox: Some(Vec::new()),
+        })
+        .unwrap_or_else(|_| panic!("Экран перестал ждать кэш"));
+    ui.run_until_parked();
+    ui.read(|app| {
+        let view = view.read(app);
+        assert!(matches!(&view.state, State::Ready(history) if history.id == 42));
+        assert!(view.has_background_history_load());
+        assert!((view.tested_message_window_y(anchor).unwrap() - before).abs() <= px(1.));
+    });
+
+    pending
+        .response
+        .send(ConversationReply {
+            address: pending.address,
+            value: Err(Failure::Unavailable),
+        })
+        .unwrap_or_else(|_| panic!("Экран перестал ждать сервер"));
+    ui.run_until_parked();
+    assert!(ui.debug_bounds("history-retry").is_some());
+    ui.read(|app| {
+        let view = view.read(app);
+        assert!(matches!(&view.state, State::Ready(history) if history.id == 42));
+        assert!(!view.has_background_history_load());
+        assert!((view.tested_message_window_y(anchor).unwrap() - before).abs() <= px(1.));
     });
 }
 
@@ -1248,6 +1447,7 @@ fn check_reversed_scroll(cx: &mut TestAppContext, near_newer: bool) {
     let older_ahead = approach(ui, HistoryDirection::Older, 80.);
     assert!(older_ahead > px(0.), "Старые сообщения запрошены до края");
     let old_page = request(&requests, Load::Extend(41, HistoryDirection::Older));
+    assert!(ui.debug_bounds("history-background-loading").is_some());
 
     let old_anchor = ui.read(|app| view.read(app).viewport.saved_anchor().unwrap().id);
     assert!(distance(ui, HistoryDirection::Newer).0 > distance(ui, HistoryDirection::Newer).1);
@@ -1309,6 +1509,7 @@ fn check_reversed_scroll(cx: &mut TestAppContext, near_newer: bool) {
     let settled_y = ui.read(|app| view.read(app).tested_message_window_y(anchor).unwrap());
     assert!((settled_y - y_before).abs() <= px(1.));
     if !near_newer {
+        assert!(!ui.read(|app| view.read(app).has_background_history_load()));
         let (ahead, height) = distance(ui, HistoryDirection::Newer);
         assert!(ahead > height, "После вставки порог ещё не достигнут");
         assert!(
@@ -1323,6 +1524,7 @@ fn check_reversed_scroll(cx: &mut TestAppContext, near_newer: bool) {
         "Новый запрос ушёл заранее"
     );
     let new_page = request(&requests, Load::Extend(41, HistoryDirection::Newer));
+    assert!(ui.read(|app| view.read(app).has_background_history_load()));
     assert!(
         requests.try_recv().is_err(),
         "Запрос вниз отправлен один раз"
@@ -1345,6 +1547,7 @@ fn check_reversed_scroll(cx: &mut TestAppContext, near_newer: bool) {
     final_page.older = HistoryEdge::More("older-next".into());
     final_page.newer = HistoryEdge::End;
     answer(new_page, final_page, ui);
+    assert!(!ui.read(|app| view.read(app).has_background_history_load()));
     assert!(requests.try_recv().is_err());
     let after = ui.read(|app| view.read(app).tested_message_window_y(next_anchor).unwrap());
     assert!((after - before_new_page).abs() <= px(1.));

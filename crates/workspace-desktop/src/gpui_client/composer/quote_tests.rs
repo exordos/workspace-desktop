@@ -52,6 +52,98 @@ fn choose(ui: &mut VisualTestContext, id: Uuid, action: &'static str) {
     click(ui, action);
 }
 
+/// Проверяет меню по месту клика, даже если редактор ещё не подтвердил назначение.
+#[gpui::test]
+fn message_menu_copies_only_the_link_at_the_pointer(cx: &mut TestAppContext) {
+    let (view, ui, requests) = start(cx);
+    let text = "Слева https://example.test Справа";
+    let mut messages = history();
+    messages[0].body = MessageBody::Markdown(text.into());
+    publish(
+        &requests,
+        Load::Open(ChatEntry::Latest),
+        messages,
+        vec![],
+        ui,
+    );
+    allow(&requests, Err(DestinationError::Unavailable), ui);
+
+    let position = ui.update(|_, app| {
+        let layout = view.read(app).viewport.tested_text_layout(MESSAGE).unwrap();
+        let byte = text.find("example").unwrap();
+        layout.position_for_index(byte).unwrap() + point(px(2.), px(6.))
+    });
+    ui.simulate_mouse_down(position, MouseButton::Right, Modifiers::none());
+    ui.simulate_mouse_up(position, MouseButton::Right, Modifiers::none());
+    ui.run_until_parked();
+    assert!(ui.debug_bounds("history-reply-replace").is_some());
+    assert!(ui.debug_bounds("history-reply-add").is_none());
+    assert!(ui.debug_bounds("history-select-message").is_some());
+    assert!(ui.debug_bounds("history-delete-message").is_none());
+
+    click(ui, "history-select-message");
+    assert!(ui.debug_bounds("history-copy-link").is_some());
+    click(ui, "history-copy-link");
+    let copied = ui.update(|_, app| app.read_from_clipboard().and_then(|item| item.text()));
+    assert_eq!(copied.as_deref(), Some("https://example.test"));
+
+    choose(ui, MESSAGE, "history-copy-message");
+    let copied = ui.update(|_, app| app.read_from_clipboard().and_then(|item| item.text()));
+    assert_eq!(copied.as_deref(), Some(text));
+}
+
+/// Пропускает недоступный ответ и пересылку, когда меню открыли клавиатурой.
+#[gpui::test]
+fn message_menu_keyboard_uses_an_enabled_item(cx: &mut TestAppContext) {
+    let (_, ui, requests) = start(cx);
+    publish(
+        &requests,
+        Load::Open(ChatEntry::Latest),
+        history(),
+        vec![],
+        ui,
+    );
+    allow(&requests, Err(DestinationError::Unavailable), ui);
+    ui.update(|window, app| window.draw(app).clear());
+    let row = ui
+        .debug_bounds("history-message-00000000-0000-0000-0000-0000000007d1")
+        .expect("серверная строка");
+    ui.simulate_mouse_down(row.center(), MouseButton::Left, Modifiers::none());
+    ui.simulate_mouse_up(row.center(), MouseButton::Left, Modifiers::none());
+    ui.simulate_keystrokes("shift-f10");
+    ui.run_until_parked();
+    assert!(ui.debug_bounds("history-copy-message").is_some());
+    assert!(ui.debug_bounds("history-copy-link").is_none());
+    ui.simulate_keystrokes("enter");
+    ui.simulate_event(KeyUpEvent {
+        keystroke: Keystroke::parse("enter").unwrap(),
+    });
+    ui.run_until_parked();
+    assert!(ui.debug_bounds("history-copy-message").is_none());
+    let copied = ui.update(|_, app| app.read_from_clipboard().and_then(|item| item.text()));
+    assert_eq!(copied.as_deref(), Some("Первый источник"));
+}
+
+/// Открывает цитату из кнопки над пузырём и сохраняет текст текущего черновика.
+#[gpui::test]
+fn hover_reply_opens_the_live_conversation_composer(cx: &mut TestAppContext) {
+    let (view, ui, requests) = start(cx);
+    publish(&requests, Load::Open(ChatEntry::Latest), history(), vec![], ui);
+    allow(&requests, Ok(TOPIC), ui);
+    paste(ui, "Черновик ответа");
+
+    let bubble = ui
+        .debug_bounds("history-quick-bubble-00000000-0000-0000-0000-0000000007d1")
+        .expect("пузырь с быстрым ответом");
+    let reply = "history-reply-00000000-0000-0000-0000-0000000007d1";
+    assert!(ui.debug_bounds(reply).is_none());
+    ui.simulate_mouse_move(bubble.center(), None, Modifiers::none());
+    ui.run_until_parked();
+    click(ui, reply);
+    assert!(ui.debug_bounds("composer-reply-preview").is_some());
+    assert_eq!(draft(&view, ui), "Черновик ответа");
+}
+
 /// Проверяет восстановление разных текстов, удаление соседней и общей кнопкой закрытия.
 #[gpui::test]
 fn reply_tabs_remove_individually_and_restore_normal_draft(cx: &mut TestAppContext) {
@@ -66,12 +158,7 @@ fn reply_tabs_remove_individually_and_restore_normal_draft(cx: &mut TestAppConte
     allow(&requests, Ok(TOPIC), ui);
 
     paste(ui, "Первый черновик");
-    let row = ui
-        .debug_bounds("history-message-00000000-0000-0000-0000-0000000007d1")
-        .unwrap();
-    ui.simulate_mouse_move(row.center(), None, Modifiers::none());
-    ui.run_until_parked();
-    click(ui, "history-reply-00000000-0000-0000-0000-0000000007d1");
+    choose(ui, MESSAGE, "history-reply-replace");
     assert_eq!(draft(&view, ui), "Первый черновик");
     assert!(ui.debug_bounds("composer-reply-preview").is_some());
     choose(ui, SECOND, "history-reply-add");
@@ -120,11 +207,11 @@ fn reply_tabs_remove_individually_and_restore_normal_draft(cx: &mut TestAppConte
     click(ui, "composer-reply-clear");
     assert_eq!(draft(&view, ui), "Первый черновик");
 
-    choose(ui, SECOND, "history-reply-add");
-    assert!(draft(&view, ui).is_empty());
+    choose(ui, SECOND, "history-reply-replace");
+    assert_eq!(draft(&view, ui), "Первый черновик");
     paste(ui, "Ответ поверх обычного черновика");
     click(ui, "composer-reply-clear");
-    assert_eq!(draft(&view, ui), "Первый черновик");
+    assert_eq!(draft(&view, ui), "Ответ поверх обычного черновика");
     assert!(requests.save.try_recv().is_err());
 }
 
@@ -238,7 +325,8 @@ fn reply_tabs_reveal_focused_pair_after_resize(cx: &mut TestAppContext) {
         ui,
     );
     allow(&requests, Ok(TOPIC), ui);
-    for _ in 0..4 {
+    choose(ui, MESSAGE, "history-reply-replace");
+    for _ in 1..4 {
         choose(ui, MESSAGE, "history-reply-add");
     }
     paste(ui, "Остаюсь в четвёртой вкладке");
@@ -291,7 +379,7 @@ fn disappeared_selection_allows_shortcut_on_current_history_row(cx: &mut TestApp
     ui.simulate_mouse_down(body.center(), MouseButton::Right, Modifiers::none());
     ui.simulate_mouse_up(body.center(), MouseButton::Right, Modifiers::none());
     ui.run_until_parked();
-    assert!(ui.debug_bounds("history-reply-add").is_some());
+    assert!(ui.debug_bounds("history-reply-replace").is_some());
     ui.update(|_, app| {
         view.update(app, |view, cx| {
             let address = view.address().clone();

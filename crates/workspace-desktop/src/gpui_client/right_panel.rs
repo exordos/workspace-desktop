@@ -34,24 +34,6 @@ pub(super) enum Scope {
     Conversation(ConversationAddress), // Доступна только в этом открытии разговора.
 }
 
-/// Отличает экраны по контексту и назначению. Для разных объектов добавляй их ID в ElementId.
-#[derive(Clone, PartialEq, Eq)]
-pub(super) struct PanelKey {
-    pub scope: Scope,  // Владелец экрана и граница его жизни.
-    pub id: ElementId, // Ключ экрана внутри контекста.
-}
-
-impl PanelKey {
-    /// Проверяет, что экран относится к текущему входу и, при необходимости, разговору.
-    fn matches(
-        &self,
-        account: Option<&AccountSession>,
-        conversation: Option<&ConversationAddress>,
-    ) -> bool {
-        self.scope.matches(account, conversation)
-    }
-}
-
 impl Scope {
     /// Проверяет, что экран относится к текущему входу и, при необходимости, разговору.
     fn matches(
@@ -72,10 +54,24 @@ impl Scope {
     }
 }
 
+/// Отличает экраны по контексту и назначению. Для разных объектов добавляй их ID в ElementId.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct PanelKey {
+    pub scope: Scope,  // Владелец экрана и граница его жизни.
+    pub id: ElementId, // Ключ экрана внутри контекста.
+}
+
 type ConversationTitle = Rc<dyn Fn(&App) -> &'static str>;
-type ConversationNested = Rc<dyn Fn(&App) -> bool>;
+type ConversationNested = Rc<dyn Fn(&App) -> Option<ConversationBackButton>>;
 type ConversationBack = Rc<dyn Fn(&mut App) -> bool>;
 type ModalDismiss = Rc<dyn Fn(&App) -> bool>;
+
+/// Размер кнопки перехода к предыдущему экрану разговора.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConversationBackButton {
+    Standard, // Обычная кнопка вложенного экрана сведений.
+    Compact,  // Узкая кнопка в заголовке галереи.
+}
 
 /// Связывает общую рамку с текущим шагом экрана разговора.
 struct ConversationChrome {
@@ -102,7 +98,7 @@ struct Entry {
 /// Один диалог поверх окна. Закрывается вместе со страницей, которая его открыла.
 struct Modal {
     body: AnyView,                 // Диалог с собственной формой и состоянием.
-    scope: Scope,                  // Вход или разговор, к которому относится диалог.
+    scope: Scope,                  // Вход или разговор, которому принадлежит диалог.
     region: FocusHandle,           // Родительская область клавиатурного фокуса.
     opener: FocusHandle,           // Кнопка, к которой вернётся фокус.
     end: FocusHandle,              // Точка для обратного обхода после последней кнопки.
@@ -149,7 +145,7 @@ impl RightPanel {
         self.account = account.cloned();
         self.conversation = conversation.cloned();
         self.hidden_account
-            .retain(|entry| entry.key.matches(account, conversation));
+            .retain(|entry| entry.key.scope.matches(account, conversation));
         if self
             .modal
             .as_ref()
@@ -160,7 +156,7 @@ impl RightPanel {
             self.changed("modal_invalidate", cx);
         }
         self.prune(self.fallback.clone(), cx, |key| {
-            key.matches(account, conversation)
+            key.scope.matches(account, conversation)
         });
     }
 
@@ -238,7 +234,7 @@ impl RightPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !key.matches(self.account.as_ref(), self.conversation.as_ref()) || self.is_active(&key) {
+        if !key.scope.matches(self.account.as_ref(), self.conversation.as_ref()) || self.is_active(&key) {
             return;
         }
 
@@ -350,13 +346,7 @@ impl RightPanel {
         cx: &mut Context<Self>,
         build: impl FnOnce(FocusHandle, &mut Context<Self>) -> Entity<V>,
     ) -> bool {
-        self.open_scoped_modal(
-            Scope::Conversation(address.clone()),
-            opener,
-            window,
-            cx,
-            build,
-        )
+        self.open_scoped_modal(Scope::Conversation(address.clone()), opener, window, cx, build)
     }
 
     /// Проверяет владельца перед созданием содержимого и ставит фокус в диалог.
@@ -368,8 +358,7 @@ impl RightPanel {
         cx: &mut Context<Self>,
         build: impl FnOnce(FocusHandle, &mut Context<Self>) -> Entity<V>,
     ) -> bool {
-        if !scope.matches(self.account.as_ref(), self.conversation.as_ref()) || self.modal.is_some()
-        {
+        if !scope.matches(self.account.as_ref(), self.conversation.as_ref()) || self.modal.is_some() {
             return false;
         }
         let region = cx.focus_handle();
@@ -511,7 +500,7 @@ impl RightPanel {
         &mut self,
         key: &PanelKey,
         title: impl Fn(&App) -> &'static str + 'static,
-        nested: impl Fn(&App) -> bool + 'static,
+        nested: impl Fn(&App) -> Option<ConversationBackButton> + 'static,
         back: impl Fn(&mut App) -> bool + 'static,
     ) {
         if let Some(entry) = self.entries.last_mut().filter(|entry| &entry.key == key) {
@@ -528,6 +517,14 @@ impl RightPanel {
         if let Some(entry) = self.entries.last().filter(|entry| &entry.key == key) {
             window.focus(&entry.close);
         }
+    }
+
+    /// Возвращает фокус кнопки возврата текущей панели.
+    pub fn back_focus(&self, key: &PanelKey) -> Option<FocusHandle> {
+        self.entries
+            .last()
+            .filter(|entry| &entry.key == key)
+            .map(|entry| entry.back.clone())
     }
 
     /// Возвращает из внутренней формы или снимает сам экран.
@@ -649,6 +646,7 @@ impl RightPanel {
         let entry = stack.entries.last()?;
         let overlay = panel_overlays(window);
         let account_page = matches!(entry.key.scope, Scope::Account(_));
+        let nested_page = entry.parent_opener.is_some() && stack.entries.len() > 1;
         let account_back = account_page
             && stack
                 .entries
@@ -667,10 +665,12 @@ impl RightPanel {
         let mut close = Button::new(close_id, "");
         close.icon = Some(Icon::Close);
         close.appearance = ButtonAppearance::Ghost;
-        let conversation_back = entry
+        let conversation_back_button = entry
             .conversation_chrome
             .as_ref()
-            .is_some_and(|chrome| (chrome.nested)(app));
+            .and_then(|chrome| (chrome.nested)(app));
+        let conversation_back = conversation_back_button.is_some();
+        let compact_back = conversation_back_button == Some(ConversationBackButton::Compact);
         let back_id = if conversation_back {
             "conversation-gallery-back"
         } else {
@@ -692,8 +692,9 @@ impl RightPanel {
             "right-panel-close-all",
             language.tr("desktop.profile.closeAll"),
         );
-        let clear_focus = (!account_page && !conversation_back && stack.entries.len() > 1)
-            .then_some(&entry.clear);
+        let clear_focus =
+            (!account_page && !nested_page && !conversation_back && stack.entries.len() > 1)
+                .then_some(&entry.clear);
 
         Some(
             div()
@@ -735,15 +736,13 @@ impl RightPanel {
                         .justify_between()
                         .items_center()
                         .gap_2()
-                        .when(conversation_back, |header| header.gap_1())
+                        .when(compact_back, |header| header.gap_1())
                         .h(px(40.))
                         .mx_2()
                         .px_2()
-                        .children((account_back || conversation_back).then(|| {
+                        .children((account_back || nested_page || conversation_back).then(|| {
                             back.render(palette, Some(&entry.back), click(host, Self::back))
-                                .when(conversation_back, |back| {
-                                    back.px_0().w(px(16.)).min_w(px(16.))
-                                })
+                                .when(compact_back, |back| back.px_0().w(px(16.)).min_w(px(16.)))
                                 .debug_selector(move || back_id.into())
                                 .tooltip(move |_, app| tooltip(palette, back_label.into(), app))
                         }))
@@ -813,7 +812,7 @@ impl RightPanel {
                 let conversation_back = entry
                     .conversation_chrome
                     .as_ref()
-                    .is_some_and(|chrome| (chrome.nested)(cx));
+                    .is_some_and(|chrome| (chrome.nested)(cx).is_some());
                 let first = if entry.parent_opener.is_some() || conversation_back {
                     &entry.back
                 } else if self.entries.len() > 1

@@ -230,7 +230,8 @@ impl Editor {
             return;
         }
         let selection = self.selection();
-        let (text, relative_selection) = format.edit(&self.text[selection.clone()]);
+        let language = Preferences::read(cx).language;
+        let (text, relative_selection) = format.edit(&self.text[selection.clone()], language);
         let inserted = self.replace(selection, &text, cx);
         self.anchor = inserted.start + relative_selection.start;
         self.caret = inserted.start + relative_selection.end;
@@ -789,9 +790,9 @@ fn measure_current_text(
     let text = if !placeholder {
         editor.text()
     } else if editor.framed_probe {
-        locale.text("Сообщение…", "Message…")
+        locale.tr("desktop.messenger.composer.compactPlaceholder")
     } else {
-        locale.text("Написать сообщение…", "Write a message…")
+        locale.tr("desktop.messenger.composer.placeholder")
     };
     let selection = editor.selection();
     let mut boundaries = vec![0, text.len(), selection.start, selection.end];

@@ -11,6 +11,7 @@ use uuid::Uuid;
 use workspace_core::messenger::folders::{ALL_CHATS_ID, FolderKind};
 
 use super::super::ui::{Icon, TextInput, TextInputChanged, TextInputSubmitted, popup::MenuInput};
+use crate::gpui_client::preferences::Preferences;
 
 #[cfg(all(test, feature = "gpui-test"))]
 mod tests;
@@ -40,11 +41,11 @@ pub(super) struct RailEntry {
 impl RailEntry {
     /// Переводит системное имя папки и сохраняет пользовательский текст.
     fn title_for(&self, app: &App) -> &str {
-        let locale = crate::gpui_client::preferences::Preferences::read(app).language;
+        let locale = Preferences::read(app).language;
         match self.kind {
-            FolderKind::All => locale.text("Все чаты", "All chats"),
-            FolderKind::Personal => locale.text("Личные", "Direct messages"),
-            FolderKind::Channels => locale.text("Каналы", "Channels"),
+            FolderKind::All => locale.tr("folder.allChats"),
+            FolderKind::Personal => locale.tr("folder.personal"),
+            FolderKind::Channels => locale.tr("folder.channels"),
             _ => &self.title,
         }
     }
@@ -90,7 +91,7 @@ enum Overlay {
 /// Строка меню с актуальной доступностью.
 struct MenuItem {
     id: &'static str,    // Стабильный идентификатор кнопки.
-    label: &'static str, // Подпись действия.
+    label: &'static str, // Ключ подписи действия.
     icon: Icon,          // Значок в начале строки.
     action: RailAction,  // Событие для оболочки.
     enabled: bool,       // Доступна ли строка клавиатуре и мыши.
@@ -123,7 +124,7 @@ impl RailState {
             .map(|index| self.entries.remove(index))
             .unwrap_or(RailEntry {
                 id: ALL_CHATS_ID,
-                title: "Все чаты".into(),
+                title: String::new(),
                 kind: FolderKind::All,
                 color: None,
                 unread: None,
@@ -143,7 +144,10 @@ impl RailState {
 impl FolderRail {
     /// Создаёт панель и поле быстрого выбора с пустым поиском.
     pub(super) fn new(cx: &mut Context<Self>) -> Self {
-        let query = cx.new(|cx| TextInput::new("folder-rail-query", "Найти папку", false, cx));
+        let placeholder = Preferences::read(cx)
+            .language
+            .tr("desktop.sidebar.folders.find");
+        let query = cx.new(|cx| TextInput::new("folder-rail-query", placeholder, false, cx));
         let changed = cx.subscribe(&query, |rail, _, _: &TextInputChanged, cx| {
             if let Some(Overlay::Quick { active, .. }) = &mut rail.overlay {
                 *active = None;
@@ -243,7 +247,7 @@ impl FolderRail {
         let mut items = vec![
             MenuItem {
                 id: "folder-rename",
-                label: "Переименовать папку",
+                label: "folder.renameFolder",
                 icon: Icon::Folder,
                 action: RailAction::Edit(id),
                 enabled: custom,
@@ -251,9 +255,9 @@ impl FolderRail {
             MenuItem {
                 id: "folder-placement",
                 label: if self.state.vertical {
-                    "Разместить горизонтально"
+                    "folder.displayHorizontal"
                 } else {
-                    "Разместить вертикально"
+                    "folder.displayVertical"
                 },
                 icon: Icon::Folders,
                 action: RailAction::TogglePlacement,
@@ -262,9 +266,9 @@ impl FolderRail {
             MenuItem {
                 id: "folder-system-visibility",
                 label: if self.state.show_system {
-                    "Скрыть системные папки"
+                    "folder.hideSystemFolders"
                 } else {
-                    "Показать системные папки"
+                    "folder.showSystemFolders"
                 },
                 icon: Icon::Folder,
                 action: RailAction::ToggleSystem,
@@ -272,7 +276,7 @@ impl FolderRail {
             },
             MenuItem {
                 id: "folder-delete",
-                label: "Удалить папку",
+                label: "desktop.sidebar.folders.delete",
                 icon: Icon::Close,
                 action: RailAction::Delete(id),
                 enabled: custom,
@@ -281,7 +285,7 @@ impl FolderRail {
         if self.state.needs_refresh {
             items.push(MenuItem {
                 id: "folder-refresh",
-                label: "Обновить папки",
+                label: "desktop.sidebar.folders.refresh",
                 icon: Icon::Folders,
                 action: RailAction::Retry,
                 enabled: self.state.can_manage,
@@ -384,11 +388,7 @@ impl FolderRail {
         if self.serial != serial || self.state.visible().next().is_none() {
             return;
         }
-        let locale = crate::gpui_client::preferences::Preferences::read(cx).language;
-        self.query.update(cx, |query, cx| {
-            query.set_placeholder(locale.text("Найти папку", "Find a folder"), cx);
-            query.clear(cx);
-        });
+        self.query.update(cx, TextInput::clear);
         self.quick_scroll = ScrollHandle::new();
         if let Some(index) = self
             .state

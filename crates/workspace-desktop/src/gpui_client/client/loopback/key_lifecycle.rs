@@ -1,4 +1,4 @@
-//! Приёмка создания, ротации и локального удаления ключей через штатные окна GPUI.
+//! Приёмка создания канала, его панели сведений, ротации и локального удаления ключей в GPUI.
 
 use super::*;
 use workspace_core::messenger::encryption::DecryptionError;
@@ -78,6 +78,15 @@ impl Fixture {
                 self.invites.fetch_add(1, Ordering::SeqCst);
                 return json_response(StatusCode::OK, json!({}));
             }
+            if path == format!("{STREAMS}{id}") && method == Method::PUT {
+                let patch = parse(request).await;
+                let mut stream = self.stream.lock().unwrap();
+                let stream = stream.as_mut().unwrap();
+                let next = !stream["allow_key_sharing_by_holders"].as_bool().unwrap();
+                assert_eq!(patch, json!({ "allow_key_sharing_by_holders": next }));
+                stream["allow_key_sharing_by_holders"] = next.into();
+                return json_response(StatusCode::OK, stream.clone());
+            }
             if path == format!("{STREAMS}{id}") {
                 return json_response(StatusCode::OK, stream.unwrap());
             }
@@ -145,57 +154,35 @@ impl Fixture {
 fn rejected_channel_creation_allows_a_new_attempt(cx: &mut TestAppContext) {
     cx.update(bind_keys);
     let server = Server::serve(Received {
-        lifecycle_wire: Some(Fixture {
-            reject_first: true,
-            ..Default::default()
-        }),
+        lifecycle_wire: Some(Fixture { reject_first: true, ..Default::default() }),
         ..Default::default()
     });
     let fixture = server.state.lifecycle_wire.as_ref().unwrap();
     let profile = tempfile::tempdir().unwrap();
-    let (runtime, events) =
-        start_runtime(profile.path(), saved_account(&server, USER, Uuid::nil()));
-    let (client, ui) =
-        cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
+    let (runtime, events) = start_runtime(profile.path(), saved_account(&server, USER, Uuid::nil()));
+    let (client, ui) = cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
     ui.update(|_, app| {
         let subscription = events.attach(&client, app, Client::handle_runtime);
         client.update(app, |view, cx| view.attach(subscription, cx));
     });
-    until(
-        ui,
-        "доступно создание из каталога",
-        |ui| ui.debug_bounds("e2ee-create-channel").is_some(),
-    );
+    until(ui, "доступно создание из каталога", |ui| ui.debug_bounds("e2ee-create-channel").is_some());
     click(ui, "e2ee-create-channel");
     let member = format!("e2ee-invite-member-{PEER}").leak();
-    until(ui, "форма готова", |ui| {
-        ui.debug_bounds(member).is_some()
-    });
+    until(ui, "форма готова", |ui| ui.debug_bounds(member).is_some());
     click(ui, "e2ee-channel-name");
     ui.simulate_input("GPUI encrypted channel");
     click(ui, "e2ee-channel-submit");
-    until(
-        ui,
-        "форма показывает известный отказ без продолжения",
-        |ui| {
-            fixture.creates.load(Ordering::SeqCst) == 1
-                && ui.debug_bounds("e2ee-channel-failure").is_some()
-                && ui.debug_bounds("e2ee-channel-resume").is_none()
-        },
-    );
+    until(ui, "форма показывает известный отказ без продолжения", |ui| {
+        fixture.creates.load(Ordering::SeqCst) == 1
+            && ui.debug_bounds("e2ee-channel-failure").is_some()
+            && ui.debug_bounds("e2ee-channel-resume").is_none()
+    });
     assert!(fixture.stream.lock().unwrap().is_none());
     click(ui, "e2ee-channel-submit");
-    until(
-        ui,
-        "сервер получил новый запрос",
-        |_| fixture.creates.load(Ordering::SeqCst) == 2,
-    );
+    until(ui, "сервер получил новый запрос", |_| fixture.creates.load(Ordering::SeqCst) == 2);
     let requested = fixture.requested_ids.lock().unwrap().clone();
     assert_ne!(requested[0], requested[1]);
-    assert_eq!(
-        futures::executor::block_on(runtime.shutdown()),
-        RuntimeExit::Clean
-    );
+    assert_eq!(futures::executor::block_on(runtime.shutdown()), RuntimeExit::Clean);
 }
 
 /// Декодирует только синтетический HTTP body в памяти.
@@ -214,7 +201,7 @@ fn profile(id: &str, name: &str) -> Value {
     json!({"uuid":id,"username":name.to_lowercase(),"first_name":name,"status":"idle"})
 }
 
-/// Потеря ответа создания переживает повтор. Ротация сохраняет старый ключ до явного удаления.
+/// Созданный канал открывает защищённые сведения и позволяет удалить только выбранное поколение.
 #[gpui::test]
 fn encrypted_channel_creation_rotation_and_removal_use_normal_routes(cx: &mut TestAppContext) {
     cx.update(bind_keys);
@@ -279,49 +266,181 @@ fn encrypted_channel_creation_rotation_and_removal_use_normal_routes(cx: &mut Te
         let scope = client.read(app).shell.conversation().unwrap().route.scope;
         scope.stream_id == stream && scope.topic_id == Some(topic_id)
     }));
-    click(ui, "conversation-details-trigger");
+    let shown = |ui: &mut VisualTestContext, id| ui.debug_bounds(id).is_some();
+    let screen = |ui: &VisualTestContext| {
+        ui.read(|app| {
+            client
+                .read(app)
+                .conversation
+                .as_ref()
+                .and_then(|view| view.read(app).tested_details_screen(app))
+        })
+    };
+    let modal_open =
+        |ui: &VisualTestContext| ui.read(|app| client.read(app).right_panel.read(app).has_modal());
+    const INFO: &str = "conversation-encrypted-info";
+    const SETTINGS: &str = "conversation-encrypted-settings";
+    const SETTINGS_SCREEN: &str = "conversation-encrypted-settings-screen";
+    const SHARING: &str = "conversation-encrypted-settings-key-sharing";
+    const KEYS_ROW: &str = "conversation-encrypted-settings-keys";
+    const LOCAL_KEYS: &str = "conversation-local-keys";
+    const FILES: &str = "conversation-gallery-open-files";
+    const ROTATE: &str = "conversation-rotate-key";
+    const CONFIRM: &str = "conversation-key-confirm";
+    const CANCEL: &str = "conversation-key-cancel";
+    click(ui, DETAILS_TRIGGER);
     until(
         ui,
-        "панель показала состояние локальных ключей",
-        |ui| ui.debug_bounds("conversation-chat-keys").is_some(),
+        "в защищённых сведениях видны настройки, текущий ключ, участники и вложения",
+        |ui| {
+            screen(ui) == Some("info")
+                && [
+                    INFO,
+                    SETTINGS,
+                    ROTATE,
+                    "conversation-details-members",
+                    FILES,
+                ]
+                .into_iter()
+                .all(|id| shown(ui, id))
+        },
     );
-    click(ui, "conversation-chat-keys");
+    assert!(!shown(ui, "conversation-details-channel"));
+    assert!(!shown(ui, "details-topics-toggle"));
+    assert!(!shown(ui, LOCAL_KEYS));
+    click(ui, FILES);
     until(
         ui,
-        "для владельца доступна ротация",
-        |ui| ui.debug_bounds("conversation-rotate-key").is_some(),
+        "категория файлов открылась в той же панели",
+        |ui| screen(ui) == Some("gallery") && shown(ui, "conversation-gallery-panel"),
     );
-    click(ui, "conversation-rotate-key");
-    click(ui, "conversation-rotate-key");
+    click(ui, "conversation-gallery-back");
     until(
         ui,
-        "сервер подтвердил объявление",
-        |_| !wire.announcements.lock().unwrap().is_empty(),
+        "из файлов вернулись в сведения",
+        |ui| screen(ui) == Some("info") && shown(ui, FILES),
+    );
+    click(ui, ROTATE);
+    until(
+        ui,
+        "открыто подтверждение ротации",
+        |ui| modal_open(ui) && shown(ui, CONFIRM),
+    );
+    ui.simulate_keystrokes("escape");
+    until(ui, "Escape отменил ротацию", |ui| {
+        !modal_open(ui)
+    });
+    assert!(wire.announcements.lock().unwrap().is_empty());
+    click(ui, ROTATE);
+    until(
+        ui,
+        "ротацию можно подтвердить повторно",
+        |ui| modal_open(ui) && shown(ui, CONFIRM),
+    );
+    click(ui, CONFIRM);
+    until(
+        ui,
+        "сервер подтвердил объявление и окно ротации закрылось",
+        |ui| !wire.announcements.lock().unwrap().is_empty() && !modal_open(ui),
     );
     let new_id: Uuid = serde_json::from_value(
         wire.announcements.lock().unwrap()[0]["payload"]["key_uuid"].clone(),
     )
     .unwrap();
     assert_ne!(new_id, key_id);
-    let old = format!("conversation-remove-key-{key_id}").leak();
-    let new = format!("conversation-remove-key-{new_id}").leak();
+
+    click(ui, SETTINGS);
+    until(
+        ui,
+        "настройки открылись отдельным экраном",
+        |ui| screen(ui) == Some("settings") && shown(ui, SETTINGS_SCREEN) && shown(ui, SHARING),
+    );
+    click(ui, SHARING);
+    until(
+        ui,
+        "в сведениях подтверждён сервером запрет выдачи ключей",
+        |ui| {
+            ui.read(|app| {
+                let conversation = client.read(app).conversation.as_ref().unwrap().read(app);
+                conversation.tested_details(app, |snapshot| {
+                    matches!(snapshot, Some(SidebarDetails::Channel(channel))
+                    if channel.allow_key_sharing_by_holders == Some(false))
+                })
+            })
+        },
+    );
+    assert!(!shown(
+        ui,
+        "conversation-encrypted-settings-key-sharing-error"
+    ));
+    click(ui, KEYS_ROW);
+    until(
+        ui,
+        "из настроек открыли экран ключей",
+        |ui| screen(ui) == Some("keys") && shown(ui, LOCAL_KEYS),
+    );
+    ui.simulate_keystrokes("escape");
+    until(
+        ui,
+        "Escape из ключей вернул настройки",
+        |ui| screen(ui) == Some("settings"),
+    );
+    press_enter(ui);
+    until(
+        ui,
+        "экран ключей снова доступен",
+        |ui| screen(ui) == Some("keys"),
+    );
+    click(ui, LOCAL_KEYS);
+    let old_row = format!("conversation-local-key-{key_id}").leak();
+    let new_row = format!("conversation-local-key-{new_id}").leak();
     until(
         ui,
         "старое и новое поколения доступны локально",
-        |ui| ui.debug_bounds(old).is_some() && ui.debug_bounds(new).is_some(),
+        |ui| shown(ui, old_row) && shown(ui, new_row),
     );
-    click(ui, old);
-    click(ui, old);
-    let account = ui.read(|app| client.read(app).shell.selected().unwrap().clone());
-    let (engine, activation) = runtime.message_encryption(&account).unwrap();
+    click(ui, old_row);
+    let remove_old = format!("conversation-remove-key-{key_id}").leak();
     until(
         ui,
-        "удалено только старое поколение",
-        |_| {
-            matches!(
-                engine.prepare(&activation, stream, key_id),
-                Err(DecryptionError::MissingKey)
-            ) && engine.prepare(&activation, stream, new_id).is_ok()
+        "открыта карточка конкретного локального ключа",
+        |ui| {
+            screen(ui) == Some("local-key")
+                && shown(ui, "conversation-local-key-details")
+                && shown(ui, remove_old)
+        },
+    );
+    let account = ui.read(|app| client.read(app).shell.selected().unwrap().clone());
+    let (engine, activation) = runtime.message_encryption(&account).unwrap();
+    click(ui, remove_old);
+    until(ui, "удаление можно отменить", |ui| {
+        modal_open(ui) && shown(ui, CANCEL)
+    });
+    click(ui, CANCEL);
+    until(
+        ui,
+        "после отмены открыта прежняя карточка",
+        |ui| screen(ui) == Some("local-key") && !modal_open(ui),
+    );
+    assert!(engine.prepare(&activation, stream, key_id).is_ok());
+    click(ui, remove_old);
+    until(
+        ui,
+        "удаление можно подтвердить",
+        |ui| modal_open(ui) && shown(ui, CONFIRM),
+    );
+    click(ui, CONFIRM);
+    until(
+        ui,
+        "удалено только старое поколение и снова виден список ключей",
+        |ui| {
+            screen(ui) == Some("keys")
+                && !modal_open(ui)
+                && matches!(
+                    engine.prepare(&activation, stream, key_id),
+                    Err(DecryptionError::MissingKey)
+                )
+                && engine.prepare(&activation, stream, new_id).is_ok()
         },
     );
     assert_eq!(

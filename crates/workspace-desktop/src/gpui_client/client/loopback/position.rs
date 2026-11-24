@@ -124,14 +124,10 @@ fn restores_same_message_and_y_after_switching_chats_and_prefetch(cx: &mut TestA
         ui.debug_bounds(CHAT_ROW).is_some() && server.state.ready.load(Ordering::SeqCst) > 0
     });
     click(ui, CHAT_ROW);
-    until(
-        ui,
-        "личка показала хвост и маркер",
-        |ui| {
-            ui.debug_bounds("history-older").is_some()
-                && message_y(ui, &client, Uuid::from_u128(LAST)).is_some()
-        },
-    );
+    until(ui, "личка показала хвост", |ui| {
+        message_y(ui, &client, Uuid::from_u128(LAST)).is_some()
+    });
+    assert!(ui.debug_bounds("history-older").is_none());
     let original = ui.read(|app| client.read(app).conversation.clone().unwrap());
 
     // Останавливаемся за порогом, чтобы первый запрос начался уже после возврата в A.

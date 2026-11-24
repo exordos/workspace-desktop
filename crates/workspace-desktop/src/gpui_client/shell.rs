@@ -80,13 +80,9 @@ impl Shell {
         self.conversation.as_ref()
     }
 
-    /// Даёт оболочке безопасный текст ошибки цели уведомления.
-    pub fn route_error(&self) -> Option<&'static str> {
-        Some(match self.route_error? {
-            NotificationRouteError::InactiveSession => "Аккаунт из уведомления недоступен",
-            NotificationRouteError::TargetUnavailable => "Сообщение из уведомления недоступно",
-            NotificationRouteError::LookupFailed => "Не удалось открыть уведомление",
-        })
+    /// Возвращает безопасную категорию ошибки цели уведомления для перевода в окне.
+    pub fn route_error(&self) -> Option<NotificationRouteError> {
+        self.route_error
     }
 
     /// Обрабатывает действие пользователя из переключателя, каталога или системного меню.
@@ -95,6 +91,9 @@ impl Shell {
             ShellAction::SelectAccount(session) => self.select(session),
             ShellAction::Sidebar(SidebarAction::OpenChat { route, generation }) => {
                 self.open_sidebar_route(route, generation)
+            }
+            ShellAction::Sidebar(SidebarAction::OpenCreatedTopic { session, stream_id, topic }) => {
+                self.open_created_topic(&session, stream_id, topic)
             }
             ShellAction::Sidebar(SidebarAction::RetryCatalog(session)) => {
                 (self.selected() == Some(&session) && self.is_active(&session))
@@ -287,32 +286,19 @@ impl Shell {
         })
     }
 
-    /// Открывает точную тему, которую Core подтвердил при создании защищённого канала.
-    pub(super) fn open_created_encrypted_channel(
-        &mut self,
-        session: &AccountSession,
-        stream_id: Uuid,
-        topic_id: Uuid,
+    /// Открывает точную тему, которую Core подтвердил при создании темы или канала.
+    pub(super) fn open_created_topic(
+        &mut self, session: &AccountSession, stream_id: Uuid, topic_id: Uuid,
     ) -> Option<ShellEffect> {
-        if self.selected() != Some(session)
-            || !self.is_active(session)
-            || stream_id.is_nil()
-            || topic_id.is_nil()
-        {
+        if self.selected() != Some(session) || !self.is_active(session) || stream_id.is_nil() || topic_id.is_nil() {
             return None;
         }
         self.begin_navigation();
-        Some(self.open_conversation(
-            ChatRoute {
-                owner: session.owner.clone(),
-                scope: HistoryScope {
-                    stream_id,
-                    topic_id: Some(topic_id),
-                },
-                entry: ChatEntry::Latest,
-            },
-            session.generation,
-        ))
+        Some(self.open_conversation(ChatRoute {
+            owner: session.owner.clone(),
+            scope: HistoryScope { stream_id, topic_id: Some(topic_id) },
+            entry: ChatEntry::Latest,
+        }, session.generation))
     }
 
     /// Открывает оригинал пересылки из того же экрана и активного входа.
@@ -480,15 +466,13 @@ fn matches_notification(route: &ChatRoute, target: &NotificationTarget) -> bool 
         && matches!(route.entry, ChatEntry::Around(id) if target.message_id.parse::<Uuid>() == Ok(id))
 }
 
-/// Проверяет, что каталог содержит личный чат или тему её канала.
+/// Проверяет тему в её разговоре или адрес личного чата без темы.
 fn catalog_contains(chats: &[Chat], scope: HistoryScope) -> bool {
     chats.iter().any(|chat| {
         chat.id == scope.stream_id
             && match scope.topic_id {
                 None => chat.direct,
-                Some(topic_id) => {
-                    !chat.direct && chat.topics.iter().any(|topic| topic.id == topic_id)
-                }
+                Some(topic_id) => chat.topics.iter().any(|topic| topic.id == topic_id),
             }
     })
 }

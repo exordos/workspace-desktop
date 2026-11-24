@@ -301,7 +301,7 @@ impl Conversation {
                 *source == entry.source && Arc::ptr_eq(parent, &entry.parent)
             }) && visible
                 .get(&slot.message)
-                .is_some_and(|citing| *citing == entry.citing.as_ref())
+                .is_some_and(|citing| citing.same_content(entry.citing.as_ref()))
         });
         let mut captured = HashMap::new();
         for (slot, (source, parent)) in requests {

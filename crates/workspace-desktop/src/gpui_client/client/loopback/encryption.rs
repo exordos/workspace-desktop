@@ -10,6 +10,7 @@ const SEALED_A: Uuid = Uuid::from_u128(186);
 const SEALED_B: Uuid = Uuid::from_u128(188);
 const LOCKED_A: &str = "history-encrypted-00000000-0000-0000-0000-0000000000ba-locked";
 const LOCKED_B: &str = "history-encrypted-00000000-0000-0000-0000-0000000000bc-locked";
+const READABLE_A: &str = "history-encrypted-00000000-0000-0000-0000-0000000000ba-readable";
 // Вектор получен через Node/OpenSSL, с тестовым ключом [7;32].
 const CIPHERTEXT: &str = "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM1BE3iAOkrgJ3KRf/RmAQZdeFqucTcLZYqkvZLUm+5hT2YqTPupmbNHVCmw77C/ZSMcN1WTelv3nhrIi1blpcecnNKAV8=";
 // Синтетические конверты Node/OpenSSL с разными поколениями: цитата + изображение и точный оригинал.
@@ -305,7 +306,7 @@ pub(super) struct ProtectedWire {
     held_invitation: Mutex<Option<HeldInvitation>>, // Задерживает подтверждение одного E2EE POST.
     presentation: bool, // Обычный каталог использует синтетическое вложение и другую версию оригинала.
     file_reads: AtomicUsize, // Число запросов файла для проверенного защищённого источника.
-    quoted_file: bool,  // Оригинал цитаты содержит свой отдельный файл.
+    quoted_file: bool, // Оригинал цитаты содержит свой отдельный файл.
     bulk: bool,         // Дополнительная тема известна SQLite, но отсутствует на открытой странице.
     unavailable_reply: Mutex<Option<Uuid>>, // Один точный запрос подтверждения вернёт временный отказ.
 }
@@ -343,8 +344,7 @@ impl ProtectedWire {
                 }),
             ));
         }
-        let originals =
-            format!("/api/workspace/v1/messenger/files/{PROTECTED_FILE}/actions/download");
+        let originals = format!("/api/workspace/v1/messenger/files/{PROTECTED_FILE}/actions/download");
         let quoted = format!("/api/workspace/v1/messenger/files/{QUOTED_FILE}/actions/download");
         if self.presentation && (path == originals || (self.quoted_file && path == quoted)) {
             assert_eq!(request.method(), Method::GET);
@@ -380,11 +380,7 @@ impl ProtectedWire {
         let mut sample = history(user, peer, &HashMap::new());
         sample[1]["payload"]["key_uuid"] = json!(OTHER_KEY);
         if self.presentation {
-            sample[1]["payload"]["content"] = json!(if self.quoted_file {
-                ORIGINAL_WITH_FILE
-            } else {
-                ORIGINAL_BODY
-            });
+            sample[1]["payload"]["content"] = json!(if self.quoted_file { ORIGINAL_WITH_FILE } else { ORIGINAL_BODY });
             sample[3]["payload"]["content"] = json!(QUOTING_BODY);
             for row in sample.as_array_mut().unwrap() {
                 row["source_name"] = json!("native");
@@ -626,10 +622,6 @@ fn bulk_key_grants_use_persisted_requests_from_other_topics(cx: &mut TestAppCont
         |ui| ui.debug_bounds(inline).is_some(),
     );
     click(ui, "conversation-details-trigger");
-    until(ui, "список ключей загружен", |ui| {
-        ui.debug_bounds("conversation-chat-keys").is_some()
-    });
-    click(ui, "conversation-chat-keys");
     let results = requests
         .each_ref()
         .map(|(id, _)| format!("bulk-key-result-{id}").leak() as &'static str);
@@ -642,6 +634,7 @@ fn bulk_key_grants_use_persisted_requests_from_other_topics(cx: &mut TestAppCont
                 .all(|result| ui.debug_bounds(result).is_some())
         },
     );
+    assert!(ui.debug_bounds("conversation-encrypted-info").is_some());
     assert!(ui.debug_bounds(results[2]).is_none());
     click(ui, "bulk-grant-chat-keys");
     until(ui, "сервер принял обе выдачи", |_| {
@@ -654,6 +647,25 @@ fn bulk_key_grants_use_persisted_requests_from_other_topics(cx: &mut TestAppCont
             .count()
             == 2
     });
+    click(ui, "conversation-encrypted-settings");
+    until(
+        ui,
+        "можно перейти к ключам из настроек",
+        |ui| {
+            ui.debug_bounds("conversation-encrypted-settings-keys")
+                .is_some()
+        },
+    );
+    click(ui, "conversation-encrypted-settings-keys");
+    until(
+        ui,
+        "выданные ключи попали в историю запросов",
+        |ui| {
+            ui.debug_bounds("conversation-key-requests-granted")
+                .is_some()
+        },
+    );
+    click(ui, "conversation-key-requests-granted");
     let granted = requests
         .each_ref()
         .map(|(id, _)| format!("bulk-key-granted-{id}").leak() as &'static str);
@@ -774,35 +786,31 @@ fn protected_presentation_uses_exact_quote_file_and_sidebar_keys(cx: &mut TestAp
     const FILE_CARD: &str = "history-attachment-00000000-0000-0000-0000-0000000000ba-0";
     const QUOTE: &str = "history-protected-quote-00000000-0000-0000-0000-0000000000ba-0";
     const REPLY: &str = "reply-protected-message-00000000-0000-0000-0000-0000000000ba";
+    const QUICK_BUBBLE: &str = "history-quick-bubble-00000000-0000-0000-0000-0000000000ba";
     until(
         ui,
-        "каталог, файл и ответ используют ключ цитирующей строки",
-        |ui| {
-            ui.debug_bounds("catalog-encrypted-preview-ready").is_some()
-                && ui.debug_bounds(FILE_CARD).is_some()
-                && ui.debug_bounds(REPLY).is_some()
-        },
+        "в каталоге раскрыто превью цитирующей строки",
+        |ui| ui.debug_bounds("catalog-encrypted-preview-ready").is_some(),
     );
+    until(ui, "в сообщении появилось защищённое вложение", |ui| {
+        ui.debug_bounds(FILE_CARD).is_some()
+    });
+    until(
+        ui,
+        "у цитирующей строки появилась панель быстрых действий",
+        |ui| ui.debug_bounds(QUICK_BUBBLE).is_some(),
+    );
+    let card = ui.debug_bounds(FILE_CARD).unwrap();
+    ui.simulate_mouse_move(card.center(), None, gpui::Modifiers::none());
+    ui.run_until_parked();
+    assert!(ui.debug_bounds(REPLY).is_some());
     assert!(ui.debug_bounds(QUOTE).is_none());
-    until(
-        ui,
-        "защищённое фото получило миниатюру в бабле",
-        |ui| {
-            ui.debug_bounds("history-protected-thumbnail-00000000-0000-0000-0000-0000000000ba-0")
-                .is_some()
-        },
-    );
-    let photo = |ui: &VisualTestContext| {
-        ui.read(|app| {
-            client
-                .read(app)
-                .conversation
-                .as_ref()
-                .unwrap()
-                .read(app)
-                .tested_photo()
-        })
-    };
+    until(ui, "защищённое фото получило миниатюру в бабле", |ui| {
+        ui.debug_bounds("history-protected-thumbnail-00000000-0000-0000-0000-0000000000ba-0").is_some()
+    });
+    let photo = |ui: &VisualTestContext| ui.read(|app| {
+        client.read(app).conversation.as_ref().unwrap().read(app).tested_photo()
+    });
     let wire = server.state.protected_wire.as_ref().unwrap();
     click_protected(ui, FILE_CARD);
     assert!(photo(ui).0, "карточка сообщения открывает просмотр");
@@ -815,11 +823,9 @@ fn protected_presentation_uses_exact_quote_file_and_sidebar_keys(cx: &mut TestAp
     click(ui, "media-viewer-save-protected");
     let destination = profile.path().join("protected-photo.png");
     ui.simulate_new_path_selection(|_| Some(destination.clone()));
-    until(
-        ui,
-        "явно выбранный путь содержит защищённый оригинал",
-        |_| std::fs::read(&destination).ok().as_deref() == Some(AVATAR_PNG),
-    );
+    until(ui, "явно выбранный путь содержит защищённый оригинал", |_| {
+        std::fs::read(&destination).ok().as_deref() == Some(AVATAR_PNG)
+    });
     click(ui, "media-viewer-close");
     engine
         .save_key(&activation, stream, original, &key)
@@ -852,24 +858,12 @@ fn protected_presentation_uses_exact_quote_file_and_sidebar_keys(cx: &mut TestAp
         quote_text(ui).as_deref(),
         Some("Точный оригинал другой версии ключа")
     );
-    const QUOTED_CARD: &str =
-        "history-protected-quote-attachment-00000000-0000-0000-0000-0000000000ba-0-0";
-    until(
-        ui,
-        "карточка цитаты получила своё фото из оригинала",
-        |ui| {
-            ui.debug_bounds(
-                "history-protected-quote-thumbnail-00000000-0000-0000-0000-0000000000ba-0-0",
-            )
-            .is_some()
-        },
-    );
+    const QUOTED_CARD: &str = "history-protected-quote-attachment-00000000-0000-0000-0000-0000000000ba-0-0";
+    until(ui, "карточка цитаты получила своё фото из оригинала", |ui| {
+        ui.debug_bounds("history-protected-quote-thumbnail-00000000-0000-0000-0000-0000000000ba-0-0").is_some()
+    });
     click_protected(ui, QUOTED_CARD);
-    until(
-        ui,
-        "фото из оригинала открылось в просмотре",
-        |ui| photo(ui).1,
-    );
+    until(ui, "фото из оригинала открылось в просмотре", |ui| photo(ui).1);
     click(ui, "media-viewer-save-protected");
     assert!(ui.did_prompt_for_new_path());
     let revoked = profile.path().join("revoked-quoted-photo.png");
@@ -904,23 +898,24 @@ fn protected_presentation_uses_exact_quote_file_and_sidebar_keys(cx: &mut TestAp
     );
     assert_eq!(std::fs::read(&destination).unwrap(), AVATAR_PNG);
     engine.save_key(&activation, stream, parent, &key).unwrap();
-    until(
-        ui,
-        "после восстановления ключа доступен прежний бабл и композер",
-        |ui| {
-            ui.read(|app| {
-                let view = client.read(app).conversation.as_ref().unwrap().read(app);
-                view.tested_history_encryption_state(SEALED_A) == Some("readable")
-                    && view.tested_composer().is_some_and(|composer| {
-                        composer.read(app).tested_send_state(app).0.is_some()
-                    })
-            })
-        },
+    until(ui, "после восстановления ключа доступен прежний бабл и композер", |ui| {
+        ui.read(|app| {
+            let view = client.read(app).conversation.as_ref().unwrap().read(app);
+            view.tested_history_encryption_state(SEALED_A) == Some("readable")
+                && view.tested_composer().is_some_and(|composer| composer.read(app).tested_send_state(app).0.is_some())
+        })
+    });
+    open_history_context_menu(ui, READABLE_A);
+    assert!(
+        ui.debug_bounds("copy-protected-message-00000000-0000-0000-0000-0000000000ba")
+            .is_none()
     );
-    const COPY: &str = "copy-protected-message-00000000-0000-0000-0000-0000000000ba";
-    click_protected(ui, COPY);
+    click(ui, "history-copy-message");
     let copied = ui.update(|_, app| app.read_from_clipboard().and_then(|item| item.text()));
     assert!(copied.is_some_and(|body| body.contains("Подпись")));
+    let bubble = ui.debug_bounds(READABLE_A).unwrap().center();
+    ui.simulate_mouse_move(bubble, None, Modifiers::none());
+    ui.run_until_parked();
     click_protected(ui, REPLY);
     ui.simulate_input("Ответ из защищённой темы");
     click(ui, "conversation-send");
@@ -1323,10 +1318,8 @@ fn protected_quote_excerpt_stays_out_of_clipboard_and_editor_after_original_key_
     let clipboard = |ui: &mut VisualTestContext| {
         ui.update(|_, app| app.read_from_clipboard().and_then(|item| item.text()))
     };
-    click_protected(
-        ui,
-        "copy-protected-message-00000000-0000-0000-0000-0000000000ba",
-    );
+    open_history_context_menu(ui, READABLE_A);
+    click(ui, "history-copy-message");
     assert_eq!(clipboard(ui).as_deref(), Some(safe.as_str()));
     until(
         ui,
@@ -1347,10 +1340,13 @@ fn protected_quote_excerpt_stays_out_of_clipboard_and_editor_after_original_key_
             })
         },
     );
-    click_protected(
-        ui,
-        "edit-protected-message-00000000-0000-0000-0000-0000000000ba",
+    ui.update(|window, app| window.draw(app).clear());
+    assert!(
+        ui.debug_bounds("edit-protected-message-00000000-0000-0000-0000-0000000000ba")
+            .is_none()
     );
+    open_history_context_menu(ui, READABLE_A);
+    click(ui, "history-edit-message");
     assert!(ui.read(|app| {
         let composer = client
             .read(app)
@@ -1648,29 +1644,24 @@ fn encrypted_composer_and_key_exchange_use_authenticated_wire(cx: &mut TestAppCo
             .unwrap()
     );
 
-    let action = format!("edit-protected-message-{id}").leak();
+    let bubble = format!("history-encrypted-{id}-readable").leak();
     until(
         ui,
-        "новое сообщение доступно для правки",
-        |ui| ui.debug_bounds(action).is_some(),
-    );
-    until(
-        ui,
-        "после отправки редактор вернулся к пустому полю",
+        "сообщение видно, а редактор готов открыть его по стрелке вверх",
         |ui| {
-            ui.read(|app| {
-                client
-                    .read(app)
-                    .conversation
-                    .as_ref()
-                    .unwrap()
-                    .read(app)
-                    .tested_composer()
-                    .unwrap()
-                    .read(app)
-                    .draft(app)
-                    .is_empty()
-            })
+            ui.debug_bounds(bubble).is_some()
+                && ui.read(|app| {
+                    let composer = client
+                        .read(app)
+                        .conversation
+                        .as_ref()
+                        .unwrap()
+                        .read(app)
+                        .tested_composer()
+                        .unwrap()
+                        .read(app);
+                    composer.can_edit_protected() && composer.draft(app).is_empty()
+                })
         },
     );
     ui.update(|window, app| {

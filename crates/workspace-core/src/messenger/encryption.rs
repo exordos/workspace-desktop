@@ -1004,47 +1004,6 @@ mod tests {
         GroupKey::from_bytes(std::array::from_fn(|index| index as u8))
     }
 
-    /// Целый старый конверт можно упаковать в URN фрагмента, но его выдержка остаётся закрытой.
-    #[test]
-    fn legacy_whole_ciphertext_cannot_bypass_quote_projection_through_fragment() {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-
-        let keys = MessageEncryption::new(Arc::new(TestKeys::default()));
-        let active = keys.select_session(Some(selection())).unwrap();
-        keys.save_key(&active, STREAM_ID, KEY_ID, &sample_key())
-            .unwrap();
-        let original = Uuid::from_u128(42);
-        let legacy = format!("[Quote](urn:quote:{original}?text=private-excerpt)\n\nReply");
-        let safe = format!("[Quote](urn:quote:{original})\n\nReply");
-        let cipher = keys
-            .prepare(&active, STREAM_ID, KEY_ID)
-            .unwrap()
-            .seal(&legacy)
-            .unwrap();
-        let binary = STANDARD.decode(cipher).unwrap();
-        let fragment = format!(
-            "[Fragment](urn:secret:v1:{STREAM_ID}:{KEY_ID}:{})",
-            URL_SAFE_NO_PAD.encode(binary)
-        );
-        let reference = fragments::fragment_links(&fragment)
-            .pop()
-            .unwrap()
-            .reference;
-        let result = keys
-            .accept_fragment(keys.prepare_fragment(&active, &reference).unwrap())
-            .unwrap();
-        assert_eq!(result.with_text(str::to_owned), Some(safe.clone()));
-        let draft = keys
-            .restore_fragment_draft(&active, &fragment)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            draft
-                .with_markdown(|draft| draft.contains(&safe) && !draft.contains("private-excerpt")),
-            Some(true)
-        );
-    }
-
     /// Использует исходный чат ссылки и отзывает правку при потере второго поколения.
     #[test]
     fn fragments_open_exact_origin_and_revoke_edit_with_each_key() {

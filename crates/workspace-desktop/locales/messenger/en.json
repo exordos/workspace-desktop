@@ -92,7 +92,6 @@
   "message.forwardNoDestinations": "No available chats or topics",
   "message.forwardUnavailable": "Couldn't forward the message",
   "message.forwarded": "Forwarded message",
-  "message.openForwardOriginal": "Open original message",
   "message.reactionError": "Reaction error",
   "message.reply": "Reply",
   "message.retrySend": "Retry send",

@@ -234,7 +234,7 @@ impl Sidebar {
             && &active.session == session
             && active.folder_settings == value
         {
-            active.folder_error = Some("Настройка папок действует в этом окне, но не сохранилась");
+            active.folder_error = Some("desktop.sidebar.folders.preferencesNotSaved");
             cx.notify();
         }
     }
@@ -318,7 +318,7 @@ impl Sidebar {
         self.update_folder_rail(cx);
     }
 
-    /// Передаёт панели готовые подписи и абсолютные счётчики Core.
+    /// Передаёт панели имена от сервера и абсолютные счётчики Core.
     fn update_folder_rail(&mut self, cx: &mut Context<Self>) {
         if let Some(active) = &self.active {
             let view = active.folder_view.as_deref();
@@ -328,12 +328,7 @@ impl Sidebar {
                 .flatten()
                 .map(|folder| RailEntry {
                     id: folder.id,
-                    title: match folder.kind {
-                        FolderKind::All => "Все чаты".into(),
-                        FolderKind::Personal => "Личные".into(),
-                        FolderKind::Channels => "Каналы".into(),
-                        _ => folder.title.clone(),
-                    },
+                    title: folder.title.clone(),
                     kind: folder.kind,
                     color: folder.background_color_value,
                     unread: view.and_then(|snapshot| snapshot.unread_count(folder.id)),
@@ -344,7 +339,7 @@ impl Sidebar {
                     0,
                     RailEntry {
                         id: Uuid::nil(),
-                        title: "Все чаты".into(),
+                        title: String::new(),
                         kind: FolderKind::All,
                         color: None,
                         unread: view.and_then(|snapshot| snapshot.all_chats_unread),
@@ -587,14 +582,14 @@ pub(super) fn folder_rows<'a>(
     rows
 }
 
-/// Переводит ошибку команды строки в короткое состояние сайдбара.
+/// Возвращает ключ подписи ошибки, чтобы язык выбирался при показе.
 fn folder_error(error: FolderCommandError) -> &'static str {
     match error {
-        FolderCommandError::Unknown => "Результат неизвестен. Обновите папки перед повтором",
-        FolderCommandError::Refresh => "Действие выполнено. Обновите папки",
-        FolderCommandError::Rejected => "Сервер отклонил изменение папки",
+        FolderCommandError::Unknown => "desktop.sidebar.folders.resultUnknown",
+        FolderCommandError::Refresh => "desktop.sidebar.folders.needsRefresh",
+        FolderCommandError::Rejected => "desktop.sidebar.folders.rejected",
         FolderCommandError::Unavailable | FolderCommandError::WorkerUnavailable => {
-            "Папка или аккаунт недоступны"
+            "desktop.sidebar.folders.unavailable"
         }
     }
 }

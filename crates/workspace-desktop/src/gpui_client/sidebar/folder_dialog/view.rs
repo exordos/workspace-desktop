@@ -2,12 +2,13 @@
 //! Кнопки направляют действия обратно в состояние диалога.
 
 use gpui::{
-    AnyElement, Context, Div, Render, Stateful, Window, anchored, deferred, div, point, prelude::*,
-    px, rgb, rgba,
+    AnyElement, Context, Div, Render, SharedString, Stateful, Window, anchored, deferred, div,
+    point, prelude::*, px, rgb, rgba,
 };
 
-use crate::gpui_client::ui::{
-    Button, ButtonAppearance, Icon, Palette, SURFACE_RADIUS, TextRole, label, popup,
+use crate::gpui_client::{
+    preferences::{Language, Preferences},
+    ui::{Button, ButtonAppearance, Icon, Palette, SURFACE_RADIUS, TextRole, label, popup},
 };
 
 use super::{
@@ -34,6 +35,10 @@ impl Render for FolderDialog {
 
         let viewport = window.viewport_size();
         let palette = Palette::for_window(window, cx);
+        let language = Preferences::read(cx).language;
+        self.name.update(cx, |input, cx| {
+            input.set_placeholder(language.tr("folder.folderName"), cx);
+        });
         let backdrop = div()
             .id("folder-dialog-backdrop")
             .debug_selector(|| "folder-dialog-backdrop".into())
@@ -71,10 +76,10 @@ impl Render for FolderDialog {
             .on_action(
                 cx.listener(|view, _: &Previous, window, cx| view.cycle_focus(true, window, cx)),
             )
-            .child(self.header(dialog, palette, cx))
-            .child(self.content(dialog, palette, cx))
-            .children(self.notice(dialog, palette, cx))
-            .child(self.footer(dialog, palette, cx));
+            .child(self.header(dialog, palette, language, cx))
+            .child(self.content(dialog, palette, language, cx))
+            .children(self.notice(dialog, palette, language, cx))
+            .child(self.footer(dialog, palette, language, cx));
         let layer = div()
             .relative()
             .w(viewport.width)
@@ -93,12 +98,18 @@ impl Render for FolderDialog {
 
 impl FolderDialog {
     /// Показывает заголовок сценария и крестик пока запрос не выполняется.
-    fn header(&self, dialog: &OpenDialog, palette: Palette, cx: &Context<Self>) -> Div {
-        let title = match dialog.mode {
-            Mode::Create(_) => "Создать папку",
-            Mode::Edit { .. } => "Редактировать папку",
-            Mode::Delete { .. } => "Удалить папку?",
-        };
+    fn header(
+        &self,
+        dialog: &OpenDialog,
+        palette: Palette,
+        language: Language,
+        cx: &Context<Self>,
+    ) -> Div {
+        let title = language.tr(match dialog.mode {
+            Mode::Create(_) => "folder.createFolder",
+            Mode::Edit { .. } => "desktop.sidebar.folders.edit",
+            Mode::Delete { .. } => "folder.deleteConfirmTitle",
+        });
         let mut close = Button::new("folder-dialog-close", "");
         close.appearance = ButtonAppearance::Ghost;
         close.icon = Some(Icon::Close);
@@ -111,23 +122,34 @@ impl FolderDialog {
             .child(label(palette, TextRole::Heading, title))
             .child(
                 self.button(close, palette, &self.close, Self::dismiss, cx)
-                    .tooltip(move |_, app| popup::tooltip(palette, "Закрыть".into(), app)),
+                    .tooltip(move |_, app| {
+                        popup::tooltip(palette, language.tr("common.close").into(), app)
+                    }),
             )
     }
 
     /// Показывает поля цветной формы или текст явного подтверждения удаления.
-    fn content(&self, dialog: &OpenDialog, palette: Palette, cx: &Context<Self>) -> AnyElement {
+    fn content(
+        &self,
+        dialog: &OpenDialog,
+        palette: Palette,
+        language: Language,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         if let Mode::Delete { title, .. } = &dialog.mode {
             return label(
                 palette,
                 TextRole::Body,
-                format!("Папка «{title}» будет удалена. Чаты останутся в мессенджере."),
+                language.tr_with(
+                    "desktop.sidebar.folders.deleteDescription",
+                    &[("title", title)],
+                ),
             )
             .into_any_element();
         }
         let title = self.name.read(cx).text().trim();
         let preview = if title.is_empty() {
-            "Пример"
+            language.tr("folder.preview")
         } else {
             title
         }
@@ -141,10 +163,14 @@ impl FolderDialog {
             .flex_col()
             .gap(px(8.))
             .child(self.name.clone())
-            .child(label(palette, TextRole::Caption, "Цвет"))
+            .child(label(
+                palette,
+                TextRole::Caption,
+                language.tr("folder.color"),
+            ))
             .child(div().flex().flex_wrap().gap(px(8.)).children(
                 COLORS.into_iter().enumerate().map(|(index, (argb, name))| {
-                    self.swatch(dialog, palette, (index, argb, name), cx)
+                    self.swatch(dialog, palette, (index, argb, language.tr(name)), cx)
                 }),
             ))
             .child(
@@ -216,27 +242,31 @@ impl FolderDialog {
         &self,
         dialog: &OpenDialog,
         palette: Palette,
+        language: Language,
         cx: &Context<Self>,
     ) -> Option<Stateful<Div>> {
-        let text = match dialog.status {
+        let key = match dialog.status {
             Status::Error(FolderCommandError::Unknown) if dialog.can_retry_create() => {
-                "Результат не подтверждён. Можно повторить то же действие."
+                "desktop.sidebar.folders.createUnconfirmed"
             }
-            Status::Error(FolderCommandError::Unknown) => {
-                "Результат неизвестен. Обновите папки перед повтором."
-            }
-            Status::Error(FolderCommandError::Rejected) => "Сервер отклонил изменение.",
-            Status::Error(FolderCommandError::Unavailable) => "Эта папка или сессия недоступна.",
-            Status::Error(FolderCommandError::Refresh) => {
-                "Изменение принято. Обновить список не удалось."
-            }
+            Status::Error(FolderCommandError::Unknown) => "desktop.sidebar.folders.resultUnknown",
+            Status::Error(FolderCommandError::Rejected) => "desktop.sidebar.folders.rejected",
+            Status::Error(FolderCommandError::Unavailable) => "desktop.sidebar.folders.unavailable",
+            Status::Error(FolderCommandError::Refresh) => "desktop.sidebar.folders.refreshFailed",
             Status::Error(FolderCommandError::WorkerUnavailable) => {
-                "Не удалось отправить команду. Попробуйте снова."
+                "desktop.sidebar.folders.dispatchFailed"
             }
             _ if self.name.read(cx).text().trim().chars().count() > MAX_TITLE_LENGTH => {
-                "В названии может быть до 64 символов."
+                "desktop.sidebar.folders.nameTooLong"
             }
             _ => return None,
+        };
+        let text: SharedString = if key == "desktop.sidebar.folders.nameTooLong" {
+            language
+                .tr_with(key, &[("max", &MAX_TITLE_LENGTH.to_string())])
+                .into()
+        } else {
+            language.tr(key).into()
         };
         Some(
             label(palette, TextRole::Caption, text)
@@ -247,24 +277,32 @@ impl FolderDialog {
     }
 
     /// Показывает отмену и подтверждение с доступностью по состоянию запроса.
-    fn footer(&self, dialog: &OpenDialog, palette: Palette, cx: &Context<Self>) -> Div {
+    fn footer(
+        &self,
+        dialog: &OpenDialog,
+        palette: Palette,
+        language: Language,
+        cx: &Context<Self>,
+    ) -> Div {
         let pending = matches!(dialog.status, Status::Pending);
-        let title = match (&dialog.mode, &dialog.status) {
-            (Mode::Create(_), Status::Error(FolderCommandError::Unknown)) => "Повторить",
-            (Mode::Create(_), Status::Pending) => "Создание…",
-            (Mode::Edit { .. }, Status::Pending) => "Сохранение…",
-            (Mode::Delete { .. }, Status::Pending) => "Удаление…",
-            (Mode::Create(_), _) => "Создать",
-            (Mode::Edit { .. }, _) => "Сохранить",
-            (Mode::Delete { .. }, _) => "Удалить",
-        };
-        let dismiss_label = if matches!(dialog.status, Status::Error(FolderCommandError::Unknown))
-            && !dialog.can_retry_create()
-        {
-            "Закрыть"
-        } else {
-            "Отмена"
-        };
+        let title = language.tr(match (&dialog.mode, &dialog.status) {
+            (Mode::Create(_), Status::Error(FolderCommandError::Unknown)) => "common.retry",
+            (Mode::Create(_), Status::Pending) => "desktop.sidebar.folders.creating",
+            (Mode::Edit { .. }, Status::Pending) => "desktop.sidebar.folders.saving",
+            (Mode::Delete { .. }, Status::Pending) => "desktop.sidebar.folders.deleting",
+            (Mode::Create(_), _) => "common.create",
+            (Mode::Edit { .. }, _) => "common.save",
+            (Mode::Delete { .. }, _) => "common.delete",
+        });
+        let dismiss_label = language.tr(
+            if matches!(dialog.status, Status::Error(FolderCommandError::Unknown))
+                && !dialog.can_retry_create()
+            {
+                "common.close"
+            } else {
+                "common.cancel"
+            },
+        );
         let mut cancel = Button::new("folder-dialog-cancel", dismiss_label);
         cancel.disabled = pending;
         let mut submit = Button::new("folder-dialog-submit", title);

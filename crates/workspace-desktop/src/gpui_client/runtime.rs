@@ -315,10 +315,7 @@ impl RuntimeClient {
     }
 
     /// Переключает вход шифрования вместе с оболочкой и отзывает результаты прежнего входа.
-    pub(super) fn select_encryption_session(
-        &self,
-        account: Option<&AccountSession>,
-    ) -> Option<EncryptionActivation> {
+    pub(super) fn select_encryption_session(&self, account: Option<&AccountSession>) -> Option<EncryptionActivation> {
         self.encryption.get()?.select(account)
     }
 

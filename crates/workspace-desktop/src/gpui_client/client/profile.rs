@@ -8,7 +8,7 @@ use gpui::{
 use workspace_core::directory::{ProfilePresence, UserProfile};
 
 use crate::gpui_client::{
-    contracts::AccountSession,
+    contracts::{AccountSession, ConversationAddress},
     preferences::{Language, Preferences},
     right_panel::{PanelKey, RightPanel, Scope},
     runtime::RuntimeClient,
@@ -182,6 +182,47 @@ impl Profile {
                 cx,
             );
             host.set_translation_key(ROOT_TITLE);
+        });
+    }
+
+    /// Открывает текущему пользователю редактор из карточки своего профиля в чате.
+    pub(super) fn open_personal(
+        host: &Entity<RightPanel>,
+        address: ConversationAddress,
+        session: AccountSession,
+        opener: FocusHandle,
+        services: ProfileServices,
+        window: &mut Window,
+        app: &mut App,
+    ) {
+        let weak = host.downgrade();
+        let key = PanelKey {
+            scope: Scope::Conversation(address),
+            id: PERSONAL.id.into(),
+        };
+        host.update(app, |host, cx| {
+            let title = Preferences::read(cx).language.tr(PERSONAL.title);
+            host.open(
+                key,
+                title,
+                opener.clone(),
+                |cx| {
+                    cx.new(|cx| {
+                        Personal::new(
+                            weak,
+                            session,
+                            services.runtime,
+                            services.account_label,
+                            services.client,
+                            cx,
+                        )
+                    })
+                },
+                window,
+                cx,
+            );
+            host.set_parent_opener(opener);
+            host.set_translation_key(PERSONAL.title);
         });
     }
 

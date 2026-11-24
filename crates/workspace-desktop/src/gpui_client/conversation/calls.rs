@@ -1,29 +1,45 @@
-//! Подключает защищённый звонок к шапке, панели сведений и строке истории.
+//! Подключает звонок к шапке и панели сведений, а защищённое приглашение — к истории.
 //! Core проверяет приглашение, а экран открывает ссылку только для ещё живого адреса.
 
 use std::{sync::Arc, time::Duration};
 
 use gpui::{
-    AnyElement, App, Context, Div, FocusHandle, IntoElement, Stateful, Task, WeakEntity, div,
-    prelude::*,
+    AnyElement, App, Context, Div, FocusHandle, IntoElement, Stateful, Task, WeakEntity, prelude::*,
 };
 use uuid::Uuid;
 use workspace_core::{
     messenger::{
-        calls::{CallError, JitsiSettings},
+        calls::{CallError, DeliveredJitsiCall, DeliveredPlainJitsiCall, JitsiSettings},
         encryption::ProtectedMessage,
     },
     runtime::SourceError,
 };
 
-use super::{Conversation, State, action, encryption::EncryptedPresentation};
+use super::{Conversation, State, action, encryption::EncryptedPresentation, heading::icon_button};
 use crate::gpui_client::{
     preferences::{Language, Preferences},
     runtime::RuntimeClient,
-    ui::{Button, ButtonAppearance, Icon, Palette, TextRole, label},
+    ui::{Button, Icon, Palette, TextRole, label, popup::tooltip},
 };
 
 const SETTINGS_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Приглашение, которое ядро разрешило открыть после проверки квитанции.
+enum ConfirmedInvitation {
+    Plain(DeliveredPlainJitsiCall), // Отправленная ссылка в обычном сообщении.
+    Protected(DeliveredJitsiCall),  // Отправленная ссылка в защищённом сообщении.
+}
+
+impl ConfirmedInvitation {
+    /// Передаёт адрес системному адаптеру под проверкой действующего разрешения.
+    fn open(&self, cx: &mut App) -> Option<()> {
+        let open = |url: &str| cx.open_url(url);
+        match self {
+            Self::Plain(call) => call.with_url(open),
+            Self::Protected(call) => call.with_url(open),
+        }
+    }
+}
 
 /// Состояние звонка одного открытого разговора.
 pub(super) struct Calls {
@@ -74,7 +90,7 @@ impl Calls {
 }
 
 impl Conversation {
-    /// Читает настройки только когда у показанного окна есть защищённое содержимое или режим.
+    /// Читает настройки для доступного чата с приглашениями Jitsi.
     pub(super) fn load_call_settings(&mut self, cx: &mut Context<Self>) {
         let Some(runtime) = self.calls.runtime.clone() else {
             return;
@@ -82,7 +98,7 @@ impl Conversation {
         if self.calls.checked
             || self.calls.settings_task.is_some()
             || !self.has_access()
-            || !(self.protected_call_route(cx) || self.has_encrypted_history())
+            || (self.favorites_presentation && !self.has_encrypted_history())
         {
             return;
         }
@@ -132,116 +148,141 @@ impl Conversation {
         }));
     }
 
-    /// Строит общую кнопку действия для шапки и сведений.
+    /// Строит кнопку звонка в шапке открытого разговора.
     pub(super) fn call_trigger(
         &self,
-        details: bool,
         palette: Palette,
         cx: &Context<Self>,
     ) -> Option<Stateful<Div>> {
-        if !self.has_access() || self.calls.settings.is_none() || !self.protected_call_route(cx) {
+        let protected = self.protected_call_route(cx);
+        if !self.has_access() || self.calls.settings.is_none() || self.favorites_presentation {
             return None;
         }
         let locale = Preferences::read_for(cx, &self.address.route.owner).language;
-        let (id, focus) = if details {
-            ("protected-call-details", &self.calls.details_focus)
+        let hint = if self.calls.pending.is_some() {
+            locale.tr("desktop.conversation.calls.sendingInvitation")
         } else {
-            ("protected-call-heading", &self.calls.header_focus)
+            locale.tr("call.call")
         };
-        let mut button = Button::new(
+        let disabled = self.calls.pending.is_some() || self.send_topic_for_call(cx).is_none();
+        let id = if protected {
+            "protected-call-heading"
+        } else {
+            "conversation-call-heading"
+        };
+        Some(icon_button(
             id,
-            if self.calls.pending.is_some() {
-                locale.text("Отправляем приглашение…", "Sending invitation…")
-            } else {
-                locale.text("Позвонить", "Start call")
-            },
-        );
-        button.icon = Some(Icon::Phone);
-        button.appearance = ButtonAppearance::Ghost;
-        button.disabled = self.calls.pending.is_some() || self.call_topic(cx).is_none();
-        Some(
-            button
-                .render(palette, Some(focus), action(cx, Self::start_protected_call))
-                .flex_none()
-                .debug_selector(move || id.into()),
-        )
+            Icon::Phone,
+            hint.into(),
+            &self.calls.header_focus,
+            disabled,
+            palette,
+            action(cx, Self::start_call),
+        ))
     }
 
-    /// Показывает границу защиты текста и вложений в сведениях о защищённом чате.
-    pub(super) fn protected_call_details(
+    /// Показывает действие звонка в карточке защищённого чата, включая недоступное состояние.
+    pub(super) fn protected_call_button(
         &self,
         palette: Palette,
         cx: &Context<Self>,
-    ) -> Option<Div> {
-        if !self.has_access() || !self.protected_call_route(cx) {
-            return None;
-        }
+    ) -> Stateful<Div> {
         let locale = Preferences::read_for(cx, &self.address.route.owner).language;
-        Some(div().flex().flex_none().flex_col().gap_1().px_2().py_2()
-            .children(self.call_trigger(true, palette, cx))
-            .child(label(palette, TextRole::Caption, locale.text(
-                "Текст сообщений и ссылки внутри защищены сквозным шифрованием.",
-                "Message text and links are protected by end-to-end encryption.",
-            )))
-            .child(label(palette, TextRole::Caption, locale.text(
-                "Изображения, видео, файлы и их метаданные хранятся без сквозного шифрования.",
-                "Images, videos, files and their metadata are stored without end-to-end encryption.",
-            )))
-            .debug_selector(|| "protected-chat-boundary".into()))
-    }
-
-    /// Оставляет отказ в чате и возвращает возможность нажать кнопку ещё раз.
-    pub(super) fn call_error(&self, palette: Palette, cx: &Context<Self>) -> Option<Div> {
-        if !self.calls.failed || !self.has_access() {
-            return None;
-        }
-        let locale = Preferences::read_for(cx, &self.address.route.owner).language;
-        Some(
-            label(
+        let hint = if self.calls.pending.is_some() {
+            locale.tr("desktop.conversation.calls.sendingInvitation")
+        } else {
+            locale.tr("call.call")
+        };
+        let id = "protected-call-details";
+        let mut button = Button::new(id, "");
+        button.disabled = !self.has_access()
+            || !self.protected_call_route(cx)
+            || self.favorites_presentation
+            || self.calls.settings.is_none()
+            || self.calls.pending.is_some()
+            || self.send_topic_for_call(cx).is_none();
+        let color = if button.disabled {
+            palette.disabled
+        } else {
+            palette.text
+        };
+        button
+            .render(
                 palette,
-                TextRole::Caption,
-                locale.text(
-                    "Не удалось подтвердить приглашение в звонок",
-                    "Could not confirm the call invitation",
-                ),
+                Some(&self.calls.details_focus),
+                action(cx, Self::start_call),
             )
-            .px_4()
-            .py_1()
-            .debug_selector(|| "protected-call-error".into()),
-        )
+            .h(gpui::px(48.))
+            .flex_1()
+            .child(Icon::Phone.element(gpui::px(32.), color))
+            .tooltip(move |_, app| tooltip(palette, hint.into(), app))
+            .debug_selector(move || id.into())
     }
 
-    /// Запускает одну подготовку из точной темы композера и ждёт подтверждения Core.
-    fn start_protected_call(&mut self, cx: &mut Context<Self>) {
-        if !self.has_access() || self.calls.pending.is_some() || self.calls.settings.is_none() {
+    /// Возвращает доступность звонка в карточке текущего собеседника.
+    pub(super) fn peer_call_availability(&self, cx: &App) -> Option<bool> {
+        (self.has_access()
+            && !self.favorites_presentation
+            && self.calls.settings.is_some()
+            && !self.protected_call_route(cx))
+        .then(|| self.calls.pending.is_none() && self.send_topic_for_call(cx).is_some())
+    }
+
+    /// Запускает общий сценарий звонка из шапки или правой панели.
+    pub(super) fn start_call(&mut self, cx: &mut Context<Self>) {
+        if !self.has_access()
+            || self.favorites_presentation
+            || self.calls.pending.is_some()
+            || self.calls.settings.is_none()
+        {
             return;
         }
-        let (Some(topic), Some(runtime), Some(encryption)) = (
-            self.call_topic(cx),
-            self.calls.runtime.clone(),
-            self.encryption.as_ref(),
-        ) else {
+        let (Some(topic), Some(runtime)) =
+            (self.send_topic_for_call(cx), self.calls.runtime.clone())
+        else {
             return;
         };
-        let activation = encryption.activation.clone();
+        let activation = if self.protected_call_route(cx) {
+            let Some(encryption) = self.encryption.as_ref() else {
+                return;
+            };
+            Some(encryption.activation.clone())
+        } else {
+            None
+        };
         let address = self.address.clone();
         self.calls.failed = false;
         self.calls.pending = Some(cx.spawn(async move |target, cx| {
             let reply = runtime
                 .conversation(address, move |services, address| async move {
-                    let pending = services
-                        .messenger
-                        .prepare_encrypted_call(
-                            &services.sync,
-                            &activation,
-                            address.route.scope,
-                            topic,
-                        )
-                        .await?;
-                    services
-                        .messenger
-                        .wait_for_call_invitation(&services.sync, pending)
-                        .await
+                    if let Some(activation) = activation {
+                        let pending = services
+                            .messenger
+                            .prepare_encrypted_call(
+                                &services.sync,
+                                &activation,
+                                address.route.scope,
+                                topic,
+                            )
+                            .await?;
+                        services
+                            .messenger
+                            .wait_for_call_invitation(&services.sync, pending)
+                            .await
+                            .map(ConfirmedInvitation::Protected)
+                    } else {
+                        services
+                            .messenger
+                            .send_jitsi_invitation(
+                                &services.sync,
+                                &address.route.owner,
+                                address.generation,
+                                address.route.scope,
+                                topic,
+                            )
+                            .await
+                            .map(ConfirmedInvitation::Plain)
+                    }
                 })
                 .await;
             let _ = target.update(cx, |view, cx| {
@@ -255,12 +296,30 @@ impl Conversation {
                 view.calls.failed = result
                     .ok()
                     .and_then(Result::ok)
-                    .and_then(|call| call.with_url(|url| cx.open_url(url)))
+                    .and_then(|call| call.open(cx))
                     .is_none();
                 view.refresh_call_controls(cx);
             });
         }));
         self.refresh_call_controls(cx);
+    }
+
+    /// Оставляет отказ в чате и возвращает возможность нажать кнопку ещё раз.
+    pub(super) fn call_error(&self, palette: Palette, cx: &Context<Self>) -> Option<Div> {
+        if !self.calls.failed || !self.has_access() {
+            return None;
+        }
+        let locale = Preferences::read_for(cx, &self.address.route.owner).language;
+        Some(
+            label(
+                palette,
+                TextRole::Caption,
+                locale.tr("desktop.conversation.calls.couldNotConfirmTheCallInvitation"),
+            )
+            .px_4()
+            .py_1()
+            .debug_selector(|| "conversation-call-error".into()),
+        )
     }
 
     /// Повторно проверяет ту же видимую версию сообщения непосредственно перед открытием.
@@ -322,8 +381,11 @@ impl Conversation {
     }
 
     /// Берёт уже подтверждённое назначение из того же редактора.
-    fn call_topic(&self, cx: &App) -> Option<Uuid> {
-        self.sending.as_ref()?.view.read(cx).protected_send_topic()
+    fn send_topic_for_call(&self, cx: &App) -> Option<Uuid> {
+        let composer = self.sending.as_ref()?.view.read(cx);
+        composer
+            .protected_send_topic()
+            .or_else(|| composer.plain_send_topic())
     }
 
     /// Определяет защищённый режим цели даже при временном отсутствии ключа.
@@ -359,7 +421,7 @@ pub(super) fn join_card(
     let expected = Arc::clone(text);
     let mut button = Button::new(
         (gpui::ElementId::Uuid(id), "join-jitsi"),
-        locale.text("Войти в звонок", "Join call"),
+        locale.tr("message.joinCall"),
     );
     button.icon = Some(Icon::Phone);
     Some(

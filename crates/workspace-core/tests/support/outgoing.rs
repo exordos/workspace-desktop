@@ -2243,6 +2243,7 @@ fn topic_revocation_prevents_first_claim_for_matching_scope() {
 #[tokio::test]
 async fn protected_quote_permit_tracks_committed_original_without_ui_refresh() {
     let mut test = Test::new().await;
+    let profile_store = Arc::downgrade(&test.fixture.stores);
     let (keys, activation) = test.enable_encryption();
     let (_, sync) = test.open();
     let generation = test.session().generation;
@@ -2438,4 +2439,9 @@ async fn protected_quote_permit_tracks_committed_original_without_ui_refresh() {
     );
     assert!(parent.with_body(|text| text.contains("Ответ")).unwrap());
     assert!(resolve().await.is_err());
+
+    drop(sync);
+    drop(test);
+    assert!(profile_store.upgrade().is_none());
+    assert!(after_edit.with_current(|| ()).is_none());
 }

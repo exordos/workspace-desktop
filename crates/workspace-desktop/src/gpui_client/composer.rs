@@ -36,6 +36,7 @@ use self::{
 };
 use super::{
     contracts::{ConversationAddress, ConversationReply},
+    preferences::{Language, Preferences},
     runtime::RuntimeClient,
     ui::{
         Button, ButtonAppearance, CONTROL_BORDER, FieldAppearance, Icon, Palette, SURFACE_RADIUS,
@@ -97,6 +98,7 @@ pub(super) struct Submission {
 pub(super) enum ComposerEvent {
     Send(Box<Submission>), // Просьба сохранить подготовленный текст в очереди.
     DestinationChanged,    // Экрану нужно обновить нижнюю область и действия ответа.
+    DraftRestored,         // Истории нужно заполнить доступные предпросмотры восстановленных цитат.
     EditPrevious,          // Пустой защищённый редактор просит точную версию последнего сообщения.
 }
 
@@ -110,20 +112,16 @@ enum WriteFailure {
 
 impl WriteFailure {
     /// Подсказывает, нужно ли восстановить цитату или повторить попытку.
-    fn text(self) -> &'static str {
-        match self {
-            Self::Queue => "Не удалось сохранить сообщение. Повторите отправку",
-            Self::Edit => "Не удалось сохранить правку. Проверьте сообщение",
-            Self::Quote(SourceCheckError::Missing) => {
-                "Источник цитаты недоступен. Уберите цитату или выберите сообщение заново"
-            }
-            Self::Quote(SourceCheckError::Changed) => {
-                "Выделенный текст цитаты изменился. Выберите фрагмент заново"
-            }
+    fn text(self, language: Language) -> &'static str {
+        language.tr(match self {
+            Self::Queue => "desktop.messenger.composer.queueFailed",
+            Self::Edit => "desktop.messenger.composer.editFailed",
+            Self::Quote(SourceCheckError::Missing) => "desktop.messenger.composer.quoteMissing",
+            Self::Quote(SourceCheckError::Changed) => "desktop.messenger.composer.quoteChanged",
             Self::Quote(SourceCheckError::Unavailable) => {
-                "Не удалось проверить цитаты. Повторите отправку"
+                "desktop.messenger.composer.quoteCheckFailed"
             }
-        }
+        })
     }
 }
 
@@ -146,7 +144,7 @@ impl EditAccess {
     /// Проверяет права на дальнейшую работу с открытой строкой.
     fn current(&self) -> bool {
         match self {
-            Self::Whole(access) => access.with_current(|| ()).is_some(),
+            Self::Whole(access) => access.with_body(|_| ()).is_some(),
             Self::Fragments(edit) => edit.with_markdown(|_| ()).is_some(),
         }
     }
@@ -184,8 +182,8 @@ pub(super) struct Composer {
 
 impl Composer {
     /// Использует язык владельца этого разговора для подписей редактора.
-    fn language(&self, app: &App) -> super::preferences::Language {
-        super::preferences::Preferences::read_for(app, &self.address.route.owner).language
+    fn language(&self, app: &App) -> Language {
+        Preferences::read_for(app, &self.address.route.owner).language
     }
 
     /// Возвращает число сборок настоящего GPUI-представления для проверки изоляции.
@@ -304,6 +302,18 @@ impl Composer {
             Destination::Ready {
                 topic,
                 encrypted: true,
+                ..
+            } => Some(topic),
+            _ => None,
+        }
+    }
+
+    /// Возвращает точную тему, которой уже разрешена обычная отправка.
+    pub(super) fn plain_send_topic(&self) -> Option<Uuid> {
+        match self.destination {
+            Destination::Ready {
+                topic,
+                encrypted: false,
                 ..
             } => Some(topic),
             _ => None,
@@ -678,19 +688,16 @@ impl Render for Composer {
         }
 
         let palette = Palette::for_window(window, cx);
-        let locale = super::preferences::Preferences::read(cx).language;
+        let locale = self.language(cx);
         let editor = self.editor.read(cx);
         let expanded = ToolbarPreferences::expanded(cx);
         let can_format = editor.can_format();
         let too_long = over_limit(&self.replies.markdown(editor.text()));
         let write_failure = self.current_write_failure(cx);
         let explanation = if too_long {
-            Some(locale.text(
-                "Текст длиннее 40 000 символов",
-                "The message exceeds 40,000 characters",
-            ))
+            Some(locale.tr("composer.messageTooLong"))
         } else {
-            write_failure.map(WriteFailure::text)
+            write_failure.map(|failure| failure.text(locale))
         };
         let appearance = if too_long || write_failure.is_some() {
             FieldAppearance::Invalid
@@ -719,7 +726,7 @@ impl Render for Composer {
             div()
                 .flex()
                 .items_center()
-                .child(self.toolbar.row(palette, can_format, window, cx))
+                .child(self.toolbar.row(palette, can_format, locale, window, cx))
                 .children(self.fragment_toolbar(palette, locale, can_format, cx))
         });
         // Сетка сначала задаёт общую ширину поля и пояснения. От неё зависит высота переносов.
@@ -741,10 +748,10 @@ impl Render for Composer {
                     .child(label(
                         palette,
                         TextRole::Caption,
-                        locale.text("Редактирование сообщения", "Editing message"),
+                        locale.tr("desktop.messenger.composer.editingMessage"),
                     ))
                     .child(
-                        Button::new("cancel-protected-edit", locale.text("Отменить", "Cancel"))
+                        Button::new("cancel-protected-edit", locale.tr("message.cancelEdit"))
                             .render(palette, None, move |_, cx| {
                                 let _ = edit_target.update(cx, |composer, cx| {
                                     composer.cancel_protected_edit(None, cx)
@@ -776,7 +783,7 @@ impl Render for Composer {
                                 .child(div().min_w_0().flex_1().child(self.editor.clone()))
                                 .children((!expanded).then(|| {
                                     self.toolbar
-                                        .toggle(false, palette, cx)
+                                        .toggle(false, palette, locale, cx)
                                         .mb(px(4.) - CONTROL_BORDER)
                                 })),
                         )
@@ -804,9 +811,9 @@ impl Render for Composer {
                             app.new(|_| SendTooltip {
                                 palette,
                                 text: if saving {
-                                    locale.text("Сохраняем сообщение…", "Saving message…")
+                                    locale.tr("desktop.messenger.composer.savingMessage")
                                 } else {
-                                    locale.text("Отправить (Enter)", "Send (Enter)")
+                                    locale.tr("desktop.messenger.composer.sendWithEnter")
                                 }
                                 .into(),
                             })

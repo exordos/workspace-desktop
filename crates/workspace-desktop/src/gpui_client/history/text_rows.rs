@@ -104,8 +104,13 @@ impl TextRows {
                 && same_photo(view.photo.as_ref(), input.photo.as_ref())
                 && view.controls.locale == input.controls.locale
                 && view.controls.reply.is_some() == input.controls.reply.is_some()
-                && (!input.row.own
-                    || view.controls.fragment_edit_topic == input.controls.fragment_edit_topic)
+                && view.controls.quick_reply == input.controls.quick_reply
+                && view.controls.quick_hidden == input.controls.quick_hidden
+                && match (&view.controls.reactions, &input.controls.reactions) {
+                    (Some(previous), Some(current)) => previous.same_row(current, input.row.id),
+                    (None, None) => true,
+                    _ => false,
+                }
         });
         let entity = if let Some(same) = same {
             let view = same.read(cx);

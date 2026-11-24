@@ -5,7 +5,9 @@ use std::sync::Arc;
 use uuid::Uuid;
 use workspace_core::{
     directory::UserProfile,
-    messenger::details::{DetailsError, SidebarDetails, StreamNotificationMode},
+    messenger::details::{
+        DetailsError, SidebarDetails, SidebarTopicAction, StreamNotificationMode,
+    },
 };
 
 use crate::gpui_client::{
@@ -25,8 +27,10 @@ pub(super) enum Problem {
 /// Команда изменения подтверждённых сведений о канале.
 pub(super) enum Mutation {
     Notifications(StreamNotificationMode), // Настройка уведомлений для всего стрима.
+    KeySharing(bool),                      // Могут ли держатели ключей передавать их участникам.
     AddMembers(Vec<Uuid>),                 // Выбранные пользователи проекта.
     RemoveMember(Uuid),                    // Идентификатор привязки участника.
+    Topic(Uuid, SidebarTopicAction),       // Изменение проверенной темы канала.
 }
 
 /// Запрашивает снимок стрима у core под владельцем и поколением разговора.
@@ -88,6 +92,11 @@ pub(super) async fn mutate(
                             .update_sidebar_notifications(sync, owner, generation, stream_id, mode)
                             .await
                     }
+                    Mutation::KeySharing(allow) => {
+                        messenger
+                            .update_sidebar_key_sharing(sync, owner, generation, stream_id, allow)
+                            .await
+                    }
                     Mutation::AddMembers(ids) => {
                         messenger
                             .add_sidebar_members(sync, owner, generation, stream_id, &ids)
@@ -96,6 +105,13 @@ pub(super) async fn mutate(
                     Mutation::RemoveMember(binding_id) => {
                         messenger
                             .remove_sidebar_member(sync, owner, generation, stream_id, binding_id)
+                            .await
+                    }
+                    Mutation::Topic(topic_id, action) => {
+                        messenger
+                            .update_sidebar_topic(
+                                sync, owner, generation, stream_id, topic_id, action,
+                            )
                             .await
                     }
                 }

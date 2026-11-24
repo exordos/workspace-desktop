@@ -14,8 +14,8 @@ use super::{
         popup::{menu_layer, menu_navigation, menu_surface, tooltip},
         unread_badge,
     },
-    CloseQuickList, FolderRail, KeepQuickFocus, NextFolder, OpenMenu, Overlay, PreviousFolder,
-    RailAction, RailEntry,
+    CloseQuickList, FolderRail, KeepQuickFocus, NextFolder, OpenMenu, Overlay, Preferences,
+    PreviousFolder, RailAction, RailEntry,
 };
 
 impl FolderRail {
@@ -136,7 +136,16 @@ impl FolderRail {
                     palette.disabled
                 },
             ))
-            .tooltip(move |_, app| tooltip(palette, "Создать папку".into(), app))
+            .tooltip(move |_, app| {
+                tooltip(
+                    palette,
+                    Preferences::read(app)
+                        .language
+                        .tr("folder.createFolder")
+                        .into(),
+                    app,
+                )
+            })
             .debug_selector(|| "folder-rail-create".into())
     }
 
@@ -153,7 +162,16 @@ impl FolderRail {
             .w(px(32.))
             .flex_none()
             .child(Icon::FolderList.element(px(24.), palette.icon_hover))
-            .tooltip(move |_, app| tooltip(palette, "Список папок".into(), app))
+            .tooltip(move |_, app| {
+                tooltip(
+                    palette,
+                    Preferences::read(app)
+                        .language
+                        .tr("hotkeys.actions.navigation.folderList")
+                        .into(),
+                    app,
+                )
+            })
             .debug_selector(|| "folder-rail-quick".into())
     }
 
@@ -273,6 +291,7 @@ impl FolderRail {
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         let items = self.menu_items(id);
+        let language = Preferences::read(cx).language;
         let mut menu = menu_surface(
             "folder-rail-menu",
             palette,
@@ -325,7 +344,7 @@ impl FolderRail {
                     .when(active == Some(action), |row| row.bg(palette.card_selected))
                     .child(item.icon.element(px(16.), tone))
                     .child(
-                        label(palette, TextRole::Caption, item.label)
+                        label(palette, TextRole::Caption, language.tr(item.label))
                             .text_color(tone)
                             .truncate(),
                     )
@@ -395,12 +414,12 @@ impl FolderRail {
             );
         }
         if rows.is_empty() {
-            let locale = crate::gpui_client::preferences::Preferences::read(cx).language;
+            let locale = Preferences::read(cx).language;
             list = list.child(
                 label(
                     palette,
                     TextRole::Caption,
-                    locale.text("Папки не найдены", "No folders found"),
+                    locale.tr("sidebar.noFoldersAvailable"),
                 )
                 .px_2()
                 .py_1()
@@ -459,6 +478,10 @@ impl Render for FolderRail {
                     .children(menu_layer(viewport, anchor, menu))
             }
             Some(Overlay::Quick { anchor, .. }) => {
+                let language = Preferences::read(cx).language;
+                self.query.update(cx, |query, cx| {
+                    query.set_placeholder(language.tr("desktop.sidebar.folders.find"), cx);
+                });
                 let menu = self.quick_surface(palette, window, cx);
                 panel.children(menu_layer(viewport, anchor, menu))
             }

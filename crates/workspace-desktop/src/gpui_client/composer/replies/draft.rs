@@ -89,12 +89,10 @@ impl Composer {
         for tab in self.replies.tabs.iter_mut().filter(|tab| tab.restored) {
             let quote = quote_source(tab.quote.id, tab.quote.fragment.as_deref());
             let (author, preview) = quote.map_or_else(
-                || {
-                    (
-                        ReplyText::Label("desktop.messenger.composer.draftMessage"),
-                        ReplyText::Label("desktop.messenger.composer.draftSourceUnavailable"),
-                    )
-                },
+                || (
+                    ReplyText::Label("desktop.messenger.composer.draftMessage"),
+                    ReplyText::Label("desktop.messenger.composer.draftSourceUnavailable"),
+                ),
                 |quote| (quote.author, quote.preview),
             );
             if (&tab.quote.author, &tab.quote.preview) != (&author, &preview) {

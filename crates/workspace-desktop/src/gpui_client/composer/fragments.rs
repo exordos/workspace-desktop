@@ -161,10 +161,7 @@ impl Composer {
                     cx.new(|_| super::SendTooltip {
                         palette,
                         text: locale
-                            .text(
-                                "Защитите текст перед вводом, чтобы он не попал в черновик",
-                                "Protect text before typing to keep it out of drafts",
-                            )
+                            .tr("desktop.messenger.composer.protectBeforeTyping")
                             .into(),
                     })
                     .into()
@@ -201,7 +198,7 @@ impl Composer {
         let target = cx.entity().downgrade();
         let mut option = Button::new(
             "composer-new-fragment-key",
-            locale.text("Создать новый ключ", "Create a new key"),
+            locale.tr("composer.createSecretKey"),
         );
         option.appearance = if self.fragment_new_key {
             ButtonAppearance::Neutral

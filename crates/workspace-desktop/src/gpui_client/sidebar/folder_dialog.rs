@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::gpui_client::{
     contracts::{FolderCommand, FolderCommandError},
+    preferences::Preferences,
     ui::{TextInput, TextInputChanged, TextInputSubmitted},
 };
 
@@ -22,14 +23,14 @@ const KEY_CONTEXT: &str = "WorkspaceFolderDialog";
 const MAX_TITLE_LENGTH: usize = 64;
 // Значения серверного ARGB из палитры FolderFormModal.
 const COLORS: [(u32, &str); 8] = [
-    (0xff2563eb, "Синий"),
-    (0xff4f46e5, "Индиго"),
-    (0xff0d9488, "Бирюзовый"),
-    (0xff059669, "Зелёный"),
-    (0xfff59e0b, "Янтарный"),
-    (0xffdc2626, "Красный"),
-    (0xff6b7280, "Серый"),
-    (0xff334155, "Графитовый"),
+    (0xff2563eb, "desktop.sidebar.folders.colors.blue"),
+    (0xff4f46e5, "desktop.sidebar.folders.colors.indigo"),
+    (0xff0d9488, "desktop.sidebar.folders.colors.teal"),
+    (0xff059669, "desktop.sidebar.folders.colors.green"),
+    (0xfff59e0b, "desktop.sidebar.folders.colors.amber"),
+    (0xffdc2626, "desktop.sidebar.folders.colors.red"),
+    (0xff6b7280, "desktop.sidebar.folders.colors.gray"),
+    (0xff334155, "desktop.sidebar.folders.colors.graphite"),
 ];
 
 /// Определяет действие и начальные данные открытого диалога.
@@ -99,7 +100,8 @@ impl EventEmitter<FolderCommand> for FolderDialog {}
 impl FolderDialog {
     /// Создаёт закрытый диалог и подписывается на события поля названия.
     pub(in crate::gpui_client) fn new(cx: &mut Context<Self>) -> Self {
-        let name = cx.new(|cx| TextInput::new("folder-dialog-name", "Название папки", false, cx));
+        let placeholder = Preferences::read(cx).language.tr("folder.folderName");
+        let name = cx.new(|cx| TextInput::new("folder-dialog-name", placeholder, false, cx));
         let changed = cx.subscribe(&name, |dialog, _, _: &TextInputChanged, cx| {
             dialog.changed(cx);
         });

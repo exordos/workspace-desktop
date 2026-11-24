@@ -382,6 +382,7 @@ impl Composer {
                 let text = self.replies.restore_draft(saved, cx);
                 self.editor
                     .update(cx, |editor, cx| editor.show_reply(&text, cx));
+                cx.emit(super::ComposerEvent::DraftRestored);
             }
             if !newly_protected {
                 session.stamp = Some((self.editor.read(cx).version(), self.replies.revision));

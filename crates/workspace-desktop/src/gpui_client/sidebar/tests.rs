@@ -102,6 +102,9 @@ fn initialize(cx: &mut TestAppContext) -> Harness<'_> {
                     Recorded::Open(route.clone(), *generation)
                 }
                 SidebarAction::RetryCatalog(session) => Recorded::Retry(session.clone()),
+                SidebarAction::OpenCreatedTopic { .. } => {
+                    return;
+                }
             };
             recorded.borrow_mut().push(event);
         })
@@ -688,11 +691,22 @@ fn row_menu_uses_navigation_and_ignores_click_through(cx: &mut TestAppContext) {
 /// Проверяет разные маршруты строки и превью, а также независимую стрелку канала.
 #[gpui::test]
 fn stream_header_preview_and_chevron_have_separate_actions(cx: &mut TestAppContext) {
+    check_header_actions(cx, false);
+}
+
+/// Проверяет те же маршруты и кнопки в личном чате.
+#[gpui::test]
+fn personal_header_uses_the_same_topic_actions(cx: &mut TestAppContext) {
+    check_header_actions(cx, true);
+}
+
+/// Проверяет раздельные действия общего заголовка в обоих видах разговоров.
+fn check_header_actions(cx: &mut TestAppContext, direct: bool) {
     use workspace_core::storage::HistoryTime;
 
     let (sidebar, ui, events) = initialize(cx);
     let a = session("a", 11);
-    let mut stream = chat(2, "Канал", false, &[(3, "Общая"), (4, "Обсуждение")]);
+    let mut stream = chat(2, "Разговор", direct, &[(3, "Общая"), (4, "Обсуждение")]);
     let message_id = Uuid::from_u128(90);
     stream.metadata.default_topic_id = Some(Uuid::from_u128(3));
     stream.metadata.last_message_id = Some(message_id);
@@ -754,6 +768,66 @@ fn stream_header_preview_and_chevron_have_separate_actions(cx: &mut TestAppConte
             open(&a, 2, Some(3))
         ]
     );
+}
+
+/// Раскрывает все темы личного чата и открывает скрытую тему через поиск.
+#[gpui::test]
+fn personal_topics_expand_and_remain_searchable_when_collapsed(cx: &mut TestAppContext) {
+    let (sidebar, ui, events) = initialize(cx);
+    let a = session("a", 11);
+    let mut direct = chat(
+        2,
+        "Коллега",
+        true,
+        &[
+            (3, "Общая"),
+            (4, "Дата"),
+            (5, "Задача"),
+            (6, "Итоги встречи"),
+            (7, "Архив"),
+        ],
+    );
+    direct.metadata.default_topic_id = Some(Uuid::from_u128(3));
+    direct.topics.last_mut().unwrap().metadata.is_done = true;
+    let snapshot = catalog(&a, ChatListStatus::Ready, vec![direct]);
+    let meeting =
+        "catalog-topic-00000000-0000-0000-0000-000000000002-00000000-0000-0000-0000-000000000006";
+    let archived =
+        "catalog-topic-00000000-0000-0000-0000-000000000002-00000000-0000-0000-0000-000000000007";
+    ui.simulate_resize(size(px(280.), px(600.)));
+    publish(&sidebar, ui, &a, &snapshot);
+
+    click(ui, CHANNEL_CHEVRON);
+    assert!(ui.debug_bounds(row(2, Some(3))).is_some());
+    assert!(ui.debug_bounds(meeting).is_none());
+    click(ui, TOPICS_TOGGLE);
+    assert!(ui.debug_bounds(meeting).is_some());
+    assert!(ui.debug_bounds(archived).is_none());
+    click(ui, TOPICS_TOGGLE);
+    assert!(ui.debug_bounds(archived).is_some());
+    assert!(events.borrow().is_empty());
+
+    click(ui, CHANNEL_CHEVRON);
+    ui.run_until_parked();
+    let meeting_key = RowKey::Topic(Uuid::from_u128(2), Uuid::from_u128(6));
+    // GPUI хранит debug_bounds и для строк из прежних кадров.
+    let topic_is_visible = |app: &gpui::App| {
+        sidebar
+            .read(app)
+            .active
+            .as_ref()
+            .unwrap()
+            .bounds
+            .borrow()
+            .contains_key(&meeting_key)
+    };
+    assert!(!ui.read(topic_is_visible));
+    click(ui, "catalog-search");
+    ui.simulate_input("ИТогИ");
+    ui.run_until_parked();
+    assert!(ui.read(topic_is_visible));
+    click(ui, meeting);
+    assert_eq!(events.borrow().as_slice(), &[open(&a, 2, Some(6))]);
 }
 
 /// Проверяет переход по результатам и возврат фокуса после показа и скрытия остальных тем.

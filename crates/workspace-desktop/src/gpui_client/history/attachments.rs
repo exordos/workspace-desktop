@@ -28,6 +28,8 @@ use workspace_core::{
 
 use super::super::contracts::ConversationAddress;
 use super::Conversation;
+#[path = "attachments/clipboard.rs"]
+mod clipboard;
 #[path = "attachments/protected.rs"]
 mod protected;
 use crate::gpui_client::{
@@ -149,6 +151,7 @@ pub(super) struct Attachments {
     region: FocusHandle,             // Область клавиш и блокировки фона.
     viewer: Option<Viewer>,          // Открытое фото, по одному на разговор.
     task: Option<Task<()>>,          // Закрытие отменяет ожидание результата.
+    clipboard: clipboard::CopyState, // Последний запрос копирования фото из текущей истории.
     preview: Option<(AttachmentKey, Arc<RenderImage>)>, // Последнее маленькое превью.
     protected_thumbs: ProtectedThumbnails, // Кадры и запросы только для отрисованных защищённых ссылок.
     gallery_preview: Option<(AttachmentKey, Arc<RenderImage>)>, // Превью только что открытой плитки.
@@ -167,6 +170,7 @@ impl Attachments {
             region: cx.focus_handle(),
             viewer: None,
             task: None,
+            clipboard: clipboard::CopyState::default(),
             preview: None,
             protected_thumbs: ProtectedThumbnails::default(),
             gallery_preview: None,
@@ -261,6 +265,7 @@ impl Attachments {
         affected: impl Fn(AttachmentKey) -> bool,
         cx: &mut Context<Conversation>,
     ) {
+        self.clipboard.invalidate(&affected);
         self.protected_thumbs
             .retain(|source| !affected(source.key), cx);
         if self

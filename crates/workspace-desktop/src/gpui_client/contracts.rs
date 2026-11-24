@@ -115,10 +115,16 @@ impl<T> ConversationReply<T> {
 }
 
 /// Действие каталога, для которого требуется решение оболочки или core.
+#[derive(Clone)]
 pub enum SidebarAction {
     OpenChat {
         route: ChatRoute,              // Маршрут, выбранный мышью или клавиатурой.
         generation: SessionGeneration, // Поколение входа, чей каталог показан в момент выбора.
+    },
+    OpenCreatedTopic {
+        session: AccountSession, // Вход, который получил подтверждение создания.
+        stream_id: Uuid,          // UUID разговора, из меню которого создали тему.
+        topic: Uuid,              // UUID новой темы, подтверждённый Core.
     },
     RetryCatalog(AccountSession), // Повторить загрузку того входа, чей каталог показан.
 }

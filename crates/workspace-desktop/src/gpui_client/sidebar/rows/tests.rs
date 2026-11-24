@@ -38,8 +38,8 @@ impl Render for Fixture {
     /// Показывает длинный заголовок и непрочитанное в слоте стрелки.
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::for_mode(ThemeMode::Light);
-        channel_card(palette).max_w(px(264.)).child(
-            ChannelRow {
+        chat_card(palette).max_w(px(264.)).child(
+            ChatHeader {
                 id: Uuid::from_u128(1),
                 title: "Название тестового канала должно помещаться в карточку".into(),
                 details: ChatRowDetails {
@@ -56,9 +56,10 @@ impl Render for Fixture {
             }
             .render(
                 palette,
+                Language::Ru,
                 Some(&self.open_focus),
                 Some(&self.expand_focus),
-                ChannelActions {
+                ChatActions {
                     open: Some(Self::record(cx, Action::Open)),
                     toggle: Self::record(cx, Action::Expand),
                     preview: self.preview_id.map(|id| PreviewAction {
@@ -91,6 +92,14 @@ fn channel_child_actions_do_not_open_the_parent_route(cx: &mut TestAppContext) {
     let (root, ui) = cx.add_window_view(fixture);
     ui.run_until_parked();
 
+    let title = ui.debug_bounds("chat-row-title").expect("название канала");
+    let caption = ui.debug_bounds("chat-row-preview").expect("текст превью");
+    let preview = ui
+        .debug_bounds("catalog-stream-preview-00000000-0000-0000-0000-000000000001")
+        .expect("кнопка превью");
+    assert_eq!(caption.left(), title.left());
+    assert_eq!(caption.left() - preview.left(), px(6.));
+
     for selector in [
         "catalog-stream-avatar-00000000-0000-0000-0000-000000000001",
         "catalog-stream-preview-00000000-0000-0000-0000-000000000001",
@@ -105,7 +114,6 @@ fn channel_child_actions_do_not_open_the_parent_route(cx: &mut TestAppContext) {
     ui.simulate_event(KeyUpEvent {
         keystroke: Keystroke::parse("enter").expect("клавиша Enter"),
     });
-    let title = ui.debug_bounds("chat-row-title").expect("название канала");
     ui.simulate_click(title.center(), Modifiers::none());
     ui.run_until_parked();
     ui.read(|app| {

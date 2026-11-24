@@ -8,6 +8,7 @@ mod gallery;
 mod key_lifecycle;
 mod media;
 mod position;
+mod reactions;
 
 use std::{
     convert::Infallible,
@@ -321,6 +322,7 @@ struct DetailsFixture {
     live: Mutex<Option<broadcast::Sender<RecoverySignal>>>, // Кадры журнала аккаунта A.
     membership: Option<ChannelMembership>, // Сценарий приглашения, удаления и выхода.
     notifications_muted: AtomicBool, // Последняя настройка канала на сервере.
+    topic_followed: AtomicBool, // Участник включил отслеживание через меню второй темы.
     channel_requests: AtomicUsize, // Число чтений тем для построения сведений.
     omit_stream_user: AtomicBool, // Имитирует старый ответ, который не подтверждает владельца.
 }
@@ -350,20 +352,23 @@ impl DetailsFixture {
 struct Received {
     media: Option<media::Fixture>, // Карточка фото из обычного сообщения и наблюдения HTTPS.
     drafting: Option<drafts::Fixture>, // Сообщения и задержка проверки цитаты для черновиков.
-    encrypted_history: bool,       // Штатный каталог и история защищённой лички.
+    encrypted_history: bool,                         // Штатный каталог и история защищённой лички.
     fragment_forward: Option<fragment_forward::Fixture>, // Снимок и отправка защищённого фрагмента.
     protected_wire: Option<encryption::ProtectedWire>, // Служебные сообщения и очередь E2EE.
-    meet_url: Option<&'static str>, // Публичный источник Jitsi в сценарии звонка.
+    meet_url: Option<&'static str>,                  // Публичный источник Jitsi в сценарии звонка.
     meet_settings_failure: AtomicBool, // Первый ответ настройки звонка временно недоступен.
-    meet_settings_seen: AtomicBool, // Сервер действительно вернул временный отказ.
+    meet_settings_seen: AtomicBool,    // Сервер действительно вернул временный отказ.
+    plain_call: Option<calls::PlainCallFixture>, // Задерживает подтверждение строки обычного звонка.
     lifecycle_wire: Option<key_lifecycle::Fixture>, // Создание и ротация ключей нативного канала.
     encrypted_edits: Mutex<HashMap<Uuid, &'static str>>, // Текущие REST-версии защищённых сообщений.
     encryption_live: Option<broadcast::Sender<RecoverySignal>>, // Правки шифротекста через настоящий WSS.
     history_position: Option<position::Fixture>, // Длинная личка и управляемая догрузка старой страницы.
+    reactions: Option<reactions::Fixture>, // Реакция в истории и её серверные команды.
     sent: Mutex<Vec<(Uuid, &'static str)>>, // Публичный UUID и тема принятого POST в порядке поступления.
     ready: AtomicUsize,                     // Сколько подключений подтвердили готовность через WSS.
     targets: AtomicUsize,                   // Сколько проверок доступа к стриму вернул HTTPS.
     direct_topic_changed: AtomicBool,       // Стрим лички объявляет другую тему по умолчанию.
+    direct_topics: bool,                   // Каталог возвращает общую и дополнительную темы лички.
     direct_encrypted: AtomicBool, // После открытия редактора обычный текст может стать недоступен.
     direct_unavailable: AtomicBool, // Проверка стрима лички временно отвечает 503.
     delayed: Option<DelayedHistory>, // Сценарий позднего ответа, если тест его включил.
@@ -648,6 +653,11 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
     {
         return forward.response(request, user, peer).await;
     }
+    if let Some(reactions) = &state.reactions
+        && reactions.handles(&request)
+    {
+        return reactions.response(request, user, peer).await;
+    }
     if path == FOLDERS && request.method() == Method::POST {
         let bytes = request.into_body().collect().await.unwrap().to_bytes();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
@@ -665,6 +675,9 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
     if path == MESSAGES && request.method() == Method::POST {
         let bytes = request.into_body().collect().await.unwrap().to_bytes();
         let post: Value = serde_json::from_slice(&bytes).unwrap();
+        if let Some(call) = &state.plain_call {
+            return call.accept(post).await;
+        }
         if let Some(drafting) = &state.drafting {
             return drafting.accept(user, post);
         }
@@ -821,6 +834,14 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
             details.notifications_muted.store(true, Ordering::SeqCst);
             return json_response(StatusCode::OK, json!({}));
         }
+        if path == format!("{TOPICS}{CHANNEL_DEFAULT}/actions/notifications/invoke") {
+            assert_eq!(request.method(), Method::POST);
+            let bytes = request.into_body().collect().await.unwrap().to_bytes();
+            let data: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(data["notification_mode"], "follow");
+            details.topic_followed.store(true, Ordering::SeqCst);
+            return json_response(StatusCode::OK, json!({}));
+        }
         if path == BINDINGS && query_value(&request, "stream_uuid") == Some(CHANNEL) {
             if let Some(membership) = &details.membership {
                 return json_response(StatusCode::OK, membership.bindings());
@@ -843,6 +864,9 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
             second["unread_count"] = json!(2);
             second["active_unread_count"] = json!(0);
             second["passive_unread_count"] = json!(2);
+            if details.topic_followed.load(Ordering::SeqCst) {
+                second["notification_mode"] = json!("follow");
+            }
             return json_response(StatusCode::OK, json!([selected, second]));
         }
     }
@@ -861,11 +885,7 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         stream["owner"] = json!(PEER);
         stream["current_encryption_key_uuid"] = json!(encryption::KEY);
         stream["allow_key_sharing_by_holders"] = json!(true);
-        if let Some(preview) = state
-            .protected_wire
-            .as_ref()
-            .and_then(encryption::ProtectedWire::preview)
-        {
+        if let Some(preview) = state.protected_wire.as_ref().and_then(encryption::ProtectedWire::preview) {
             stream["last_message_uuid"] = json!(preview);
         }
     }
@@ -886,6 +906,12 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         }
         STREAMS if state.topic.is_some() => json!([stream, topic_channel(user, false)]),
         STREAMS => json!([stream]),
+        TOPICS if state.direct_topics => json!([
+            {"uuid": TOPIC, "stream_uuid": STREAM, "project_id": PROJECT, "user_uuid": user,
+                "name": "Общая", "is_default": true},
+            {"uuid": NEXT_DIRECT_TOPIC, "stream_uuid": STREAM, "project_id": PROJECT,
+                "user_uuid": user, "name": "Вторая тема"},
+        ]),
         TOPICS if state.topic.is_some() => json!([channel_topic(user, TopicGate::Open)]),
         MESSAGES
             if state.topic.is_some() && query_value(&request, "stream_uuid") == Some(CHANNEL) =>
@@ -969,6 +995,7 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
             }])
         }
         MESSAGES => json!(state.sent.lock().unwrap().iter().enumerate().rev()
+            .filter(|(_, (_, topic))| query_value(&request, "topic_uuid").is_none_or(|id| id == *topic))
             .map(|(position, (id, topic))| direct_message(*id, topic, position))
             .collect::<Vec<_>>()),
         "/api/workspace/v1/events/" if state.recovery.is_some() => {
@@ -1148,6 +1175,16 @@ fn click(ui: &mut VisualTestContext, selector: &'static str) {
         .unwrap_or_else(|| panic!("Нет элемента для клика: {selector}"))
         .center();
     ui.simulate_click(point, Modifiers::none());
+}
+
+/// Открывает контекстное меню правым кликом по отрисованному сообщению.
+fn open_history_context_menu(ui: &mut VisualTestContext, selector: &'static str) {
+    ui.update(|window, app| window.draw(app).clear());
+    let position = ui.debug_bounds(selector).expect("сообщение в истории").center();
+    ui.simulate_mouse_move(position, None, Modifiers::none());
+    ui.simulate_mouse_down(position, gpui::MouseButton::Right, Modifiers::none());
+    ui.simulate_mouse_up(position, gpui::MouseButton::Right, Modifiers::none());
+    ui.run_until_parked();
 }
 
 /// Доходит клавишей Tab до поиска, включая новые кнопки папок в общем обходе.
@@ -1369,6 +1406,83 @@ fn folder_creation_reaches_https_and_returns_through_the_core_snapshot(cx: &mut 
     assert_eq!(folder["title"], "Папка проверки");
 }
 
+/// Открывает дополнительную тему личной переписки и отправляет сообщение в неё.
+#[gpui::test]
+fn direct_topic_click_and_submission_preserve_exact_topic(cx: &mut TestAppContext) {
+    const EXPAND: &str = "catalog-stream-expand-10000000-0000-4000-8000-000000000005";
+    const SECOND_TOPIC: &str =
+        "catalog-topic-10000000-0000-4000-8000-000000000005-10000000-0000-4000-8000-000000000014";
+
+    cx.update(bind_keys);
+    let server = Server::serve(Received {
+        direct_topics: true,
+        ..Received::default()
+    });
+    let profile = tempfile::tempdir().unwrap();
+    let (runtime, events) =
+        start_runtime(profile.path(), saved_account(&server, USER, Uuid::nil()));
+    let (client, ui) =
+        cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
+    ui.update(|_, app| {
+        let subscription = events.attach(&client, app, Client::handle_runtime);
+        client.update(app, |client, cx| client.attach(subscription, cx));
+    });
+    ui.simulate_resize(size(px(1440.), px(900.)));
+    until(
+        ui,
+        "кнопка раскрытия тем личного чата",
+        |ui| ui.debug_bounds(EXPAND).is_some(),
+    );
+    click(ui, EXPAND);
+    until(
+        ui,
+        "дополнительная тема личного чата",
+        |ui| ui.debug_bounds(SECOND_TOPIC).is_some(),
+    );
+    click(ui, SECOND_TOPIC);
+    let topic = Uuid::parse_str(NEXT_DIRECT_TOPIC).unwrap();
+    until(
+        ui,
+        "редактор конкретной темы личного чата",
+        |ui| {
+            ui.read(|app| {
+                let client = client.read(app);
+                client
+                    .shell
+                    .conversation()
+                    .is_some_and(|address| address.route.scope.topic_id == Some(topic))
+                    && client.conversation.as_ref().is_some_and(|view| {
+                        view.read(app).tested_composer().is_some_and(|composer| {
+                            composer.read(app).tested_send_state(app).0 == Some(topic)
+                        })
+                    })
+            })
+        },
+    );
+    click(ui, "workspace-composer-editor");
+    ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(MARKER.to_owned())));
+    ui.simulate_keystrokes("cmd-v");
+    ui.run_until_parked();
+    click(ui, "conversation-send");
+    until(
+        ui,
+        "сервер принял сообщение в выбранную тему",
+        |_| {
+            server
+                .state
+                .sent
+                .lock()
+                .unwrap()
+                .first()
+                .is_some_and(|(_, id)| *id == NEXT_DIRECT_TOPIC)
+        },
+    );
+    assert_eq!(
+        futures::executor::block_on(runtime.shutdown()),
+        RuntimeExit::Clean
+    );
+}
+
 /// Открывает чат, проверяет редактор после сужения и сохраняет черновик при повторной попытке.
 #[gpui::test]
 fn catalog_click_and_submission_reach_https_queue(cx: &mut TestAppContext) {
@@ -1426,6 +1540,20 @@ fn catalog_click_and_submission_reach_https_queue(cx: &mut TestAppContext) {
     ui.run_until_parked();
     assert_eq!(
         ui.update(|window, app| conversation.read(app).tested_details_focus(window, app)),
+        Some("заголовок")
+    );
+    press_enter(ui);
+    assert!(ui.read(|app| conversation.read(app).tested_details_is_open(app)));
+    ui.simulate_keystrokes("escape");
+    ui.run_until_parked();
+    assert_eq!(
+        ui.update(|window, app| conversation.read(app).tested_details_focus(window, app)),
+        Some("заголовок")
+    );
+    ui.simulate_keystrokes("tab");
+    ui.run_until_parked();
+    assert_eq!(
+        ui.update(|window, app| conversation.read(app).tested_details_focus(window, app)),
         Some("сведения")
     );
     ui.simulate_keystrokes("tab");
@@ -1455,8 +1583,14 @@ fn catalog_click_and_submission_reach_https_queue(cx: &mut TestAppContext) {
     );
     ui.simulate_keystrokes("shift-tab");
     ui.run_until_parked();
+    assert_eq!(
+        ui.update(|window, app| conversation.read(app).tested_details_focus(window, app)),
+        Some("заголовок")
+    );
+    ui.simulate_keystrokes("shift-tab");
+    ui.run_until_parked();
     assert!(ui.update(|window, _| row_focus.is_focused(window)));
-    ui.simulate_keystrokes("tab tab tab");
+    ui.simulate_keystrokes("tab tab tab tab");
     ui.run_until_parked();
     assert!(ui.update(|window, _| editor_focus.is_focused(window)));
     ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(MARKER.to_owned())));
@@ -1833,6 +1967,7 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
         topic: Some(TopicAcceptance::default()),
         details: Some(DetailsFixture {
             live: Mutex::new(Some(live.clone())),
+            omit_stream_user: AtomicBool::new(true),
             ..DetailsFixture::default()
         }),
         ..Received::default()
@@ -1917,7 +2052,6 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
             .expect("В середине истории нужна видимая опора")
     });
 
-    details.omit_stream_user.store(true, Ordering::SeqCst);
     click(ui, DETAILS_TRIGGER);
     until(
         ui,
@@ -1988,6 +2122,14 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
         ui.update(|window, app| first.read(app).tested_details_focus(window, app)),
         Some("закрыть")
     );
+    click(ui, "details-profile-copy-1");
+    ui.run_until_parked();
+    assert_eq!(
+        ui.update(|_, app| app.read_from_clipboard().and_then(|item| item.text()))
+            .as_deref(),
+        Some("peer@fixture.test")
+    );
+    assert!(ui.debug_bounds("details-profile-copied-1").is_some());
     ui.simulate_keystrokes("escape");
     until(ui, "Escape закрыл панель", |ui| {
         !ui.read(|app| first.read(app).tested_details_is_open(app))
@@ -2094,6 +2236,9 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
     click_account(&client, ui, &b_id);
     assert!(ui.read(|app| client.read(app).conversation.is_none()));
     ui.read(|app| assert!(client.read(app).right_panel.read(app).is_empty()));
+    let reads_before = details.user_reads(PEER, USER);
+    let (release, unblock) = watch::channel(false);
+    *details.unblock.lock().unwrap() = Some(unblock);
     click(ui, CHAT_ROW);
     until(
         ui,
@@ -2108,9 +2253,6 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
             })
         },
     );
-    let reads_before = details.user_reads(PEER, USER);
-    let (release, unblock) = watch::channel(false);
-    *details.unblock.lock().unwrap() = Some(unblock);
     click(ui, DETAILS_TRIGGER);
     until(
         ui,
@@ -2216,7 +2358,7 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
     }
     assert_eq!(
         ui.update(|window, app| topic.read(app).tested_details_focus(window, app)),
-        Some("сведения")
+        Some("заголовок")
     );
     press_enter(ui);
     until(
@@ -2267,6 +2409,16 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
         ui.update(|window, app| topic.read(app).tested_details_focus(window, app)),
         Some("закрыть"),
     );
+    click(ui, "details-summary-toggle");
+    assert_eq!(
+        ui.read(|app| topic.read(app).tested_details_summary_expanded()),
+        Some(false)
+    );
+    click(ui, "details-summary-toggle");
+    assert_eq!(
+        ui.read(|app| topic.read(app).tested_details_summary_expanded()),
+        Some(true)
+    );
     click(ui, "conversation-details-close");
     assert!(!ui.read(|app| topic.read(app).tested_details_is_open(app)));
 
@@ -2301,6 +2453,25 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
     );
     ui.simulate_resize(size(px(1440.), px(900.)));
     ui.run_until_parked();
+    let topic_position = ui.debug_bounds(CHANNEL_SECOND_TOPIC_ROW).unwrap().center();
+    ui.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Right,
+        position: topic_position,
+        ..Default::default()
+    });
+    ui.run_until_parked();
+    assert!(ui.debug_bounds("details-topic-menu").is_some());
+    click(ui, "details-topic-notification-follow");
+    until(ui, "контекстное меню меняет уведомления указанной темы", |ui| {
+        details.topic_followed.load(Ordering::SeqCst)
+            && ui.read(|app| topic.read(app).tested_details(app, |snapshot| matches!(
+                snapshot,
+                Some(SidebarDetails::Channel(channel)) if channel.topics.iter().any(|row|
+                    row.id.to_string() == CHANNEL_DEFAULT &&
+                    row.notification_mode == workspace_core::messenger::details::TopicNotificationMode::Follow
+                )
+            )))
+    });
     let reads = details.channel_requests.load(Ordering::SeqCst);
     click(ui, CHANNEL_SECOND_TOPIC_ROW);
     until(
@@ -2436,7 +2607,14 @@ fn sidebar_members_offer_only_allowed_actions_and_refresh_after_changes(cx: &mut
             })
         },
     );
-    click(ui, "details-add-members");
+    click_member_action(ui, "details-add-members");
+    let panel_with_dialog = ui.debug_bounds(DETAILS_PANEL).unwrap();
+    assert!(ui.debug_bounds("details-member-picker-dialog").is_some());
+    ui.simulate_keystrokes("escape");
+    ui.run_until_parked();
+    assert!(ui.debug_bounds("details-member-picker-dialog").is_none());
+    assert_eq!(ui.debug_bounds(DETAILS_PANEL), Some(panel_with_dialog));
+    press_enter(ui);
     until(
         ui,
         "приглашение предлагает нового сотрудника",
@@ -2448,14 +2626,17 @@ fn sidebar_members_offer_only_allowed_actions_and_refresh_after_changes(cx: &mut
     ui.run_until_parked();
     click(ui, PICK_INVITEE);
     click(ui, "details-member-picker-submit");
+    until(ui, "выбранный пользователь отправлен на сервер", |_| {
+        membership.invited.load(Ordering::SeqCst)
+    });
     until(
         ui,
         "подтверждённый POST добавляет привязку в панель",
-        |ui| {
-            membership.invited.load(Ordering::SeqCst)
-                && channel_matches(ui, &|channel| channel.members.len() == 3)
-        },
+        |ui| channel_matches(ui, &|channel| channel.members.len() == 3),
     );
+    until(ui, "подтверждённое приглашение закрывает диалог", |ui| {
+        ui.read(|app| !client.read(app).right_panel.read(app).has_modal())
+    });
     click_member_action(ui, REMOVE_INVITEE);
     until(
         ui,
@@ -2642,6 +2823,11 @@ fn explicit_topic_accepts_mouse_and_keyboard_in_each_account(cx: &mut TestAppCon
     );
     ui.simulate_keystrokes("tab");
     let conversation = ui.read(|app| client.read(app).conversation.as_ref().unwrap().clone());
+    assert_eq!(
+        ui.update(|window, app| conversation.read(app).tested_details_focus(window, app)),
+        Some("заголовок")
+    );
+    ui.simulate_keystrokes("tab");
     assert_eq!(
         ui.update(|window, app| conversation.read(app).tested_details_focus(window, app)),
         Some("сведения")

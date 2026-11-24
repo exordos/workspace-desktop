@@ -96,7 +96,6 @@
   "message.forwardNoDestinations": "Нет доступных чатов или тем",
   "message.forwardUnavailable": "Не удалось переслать сообщение",
   "message.forwarded": "Пересланное сообщение",
-  "message.openForwardOriginal": "Открыть исходное сообщение",
   "message.reactionError": "Ошибка реакции",
   "message.reply": "Ответить",
   "message.retrySend": "Повторить отправку",

@@ -9,13 +9,13 @@ use workspace_core::{
     storage::HistoryScope,
 };
 
-use crate::gpui_client::preferences::appearance::SidebarSort;
+use crate::gpui_client::preferences::{Language, appearance::SidebarSort};
 
 use super::order::sort_topics;
 
 const INITIAL_TOPIC_COUNT: usize = 3;
 
-/// Независимые ступени показа тем внутри раскрытого канала.
+/// Независимые ступени показа тем внутри раскрытого разговора.
 #[derive(Clone, Copy, Default)]
 enum Reveal {
     #[default]
@@ -53,13 +53,21 @@ pub(super) enum TopicToggleFocus {
 #[derive(Default)]
 pub(super) struct Presentation {
     query: String,                  // Нормализованный запрос для сравнения строк.
-    expanded: HashSet<Uuid>,        // Раскрытые вручную каналы вне поиска.
+    expanded: HashSet<Uuid>,        // Раскрытые вручную разговоры вне поиска.
     reveals: HashMap<Uuid, Reveal>, // Временные ступени раскрытия отдельных тем.
-    search_reveals: HashSet<Uuid>, // Каналы, в которых показаны также несовпавшие темы текущего запроса.
-    sort: SidebarSort,             // Режим порядка тем из настроек выбранного входа.
+    search_reveals: HashSet<Uuid>,  // Разговоры, где видны и темы, не совпавшие с запросом.
+    sort: SidebarSort,              // Режим порядка тем из настроек выбранного входа.
+    language: Language,             // Язык системных названий, которые участвуют в поиске.
+    user: Option<Uuid>,             // UUID текущего пользователя для поиска чата с собой.
 }
 
 impl Presentation {
+    /// Использует в поиске те же названия системных чатов, что и на экране.
+    pub(super) fn set_titles(&mut self, language: Language, user: Option<Uuid>) {
+        self.language = language;
+        self.user = user;
+    }
+
     /// Применяет новый порядок тем и сообщает об изменении видимых строк.
     pub(super) fn set_sort(&mut self, sort: SidebarSort) -> bool {
         std::mem::replace(&mut self.sort, sort) != sort
@@ -81,32 +89,29 @@ impl Presentation {
         !self.query.is_empty()
     }
 
-    /// Возвращает раскрытые вне поиска каналы для сохранения между показами.
+    /// Возвращает раскрытые вне поиска разговоры для сохранения между показами.
     pub(super) fn expanded(&self) -> &HashSet<Uuid> {
         &self.expanded
     }
 
-    /// Восстанавливает раскрытые каналы из настроек этого входа.
-    pub(super) fn set_expanded(&mut self, channels: HashSet<Uuid>) {
-        self.expanded = channels;
+    /// Восстанавливает раскрытые разговоры из настроек этого входа.
+    pub(super) fn set_expanded(&mut self, chats: HashSet<Uuid>) {
+        self.expanded = chats;
         self.reveals.clear();
     }
 
-    /// Проверяет обычное раскрытие канала независимо от поисковых результатов.
-    pub(super) fn is_expanded(&self, channel: Uuid) -> bool {
-        self.expanded.contains(&channel)
+    /// Проверяет обычное раскрытие разговора независимо от поисковых результатов.
+    pub(super) fn is_expanded(&self, chat: Uuid) -> bool {
+        self.expanded.contains(&chat)
     }
 
-    /// Раскрывает канал, когда пользователь открывает его основной разговор.
-    pub(super) fn ensure_expanded(&mut self, channel: Uuid) {
-        self.expanded.insert(channel);
+    /// Раскрывает разговор, когда пользователь открывает его общую тему.
+    pub(super) fn ensure_expanded(&mut self, chat: Uuid) {
+        self.expanded.insert(chat);
     }
 
     /// Открывает достаточную ступень для темы, в которую перешли из другого экрана.
     pub(super) fn ensure_topic_visible(&mut self, chat: &Chat, target: Uuid) -> bool {
-        if chat.direct {
-            return false;
-        }
         let Some((index, topic)) = sort_topics(chat, self.sort)
             .into_iter()
             .enumerate()
@@ -130,27 +135,23 @@ impl Presentation {
     }
 
     /// Переключает вложенную часть, сбрасывая ступень показа при сворачивании.
-    pub(super) fn toggle_channel(&mut self, channel: Uuid) {
+    pub(super) fn toggle_chat(&mut self, chat: Uuid) {
         if self.searching() {
             return;
         }
-        if self.expanded.remove(&channel) {
-            self.reveals.remove(&channel);
+        if self.expanded.remove(&chat) {
+            self.reveals.remove(&chat);
         } else {
-            self.expanded.insert(channel);
+            self.expanded.insert(chat);
         }
     }
 
-    /// Забывает состояние каналов, которых больше нет в полном снимке.
-    pub(super) fn retain_channels(&mut self, chats: &[Chat]) {
-        let channels: HashSet<_> = chats
-            .iter()
-            .filter(|chat| !chat.direct)
-            .map(|chat| chat.id)
-            .collect();
-        self.expanded.retain(|id| channels.contains(id));
-        self.reveals.retain(|id, _| channels.contains(id));
-        self.search_reveals.retain(|id| channels.contains(id));
+    /// Забывает состояние разговоров, которых больше нет в полном снимке.
+    pub(super) fn retain_chats(&mut self, chats: &[Chat]) {
+        let ids: HashSet<_> = chats.iter().map(|chat| chat.id).collect();
+        self.expanded.retain(|id| ids.contains(id));
+        self.reveals.retain(|id, _| ids.contains(id));
+        self.search_reveals.retain(|id| ids.contains(id));
     }
 
     /// Строит видимые группы в том же порядке, в котором их передал каталог.
@@ -172,9 +173,7 @@ impl Presentation {
         chat: &'a Chat,
         selected: Option<HistoryScope>,
     ) -> Option<ChatGroup<'a>> {
-        let expanded = !chat.direct
-            && !chat.topics.is_empty()
-            && (self.searching() || self.is_expanded(chat.id));
+        let expanded = !chat.topics.is_empty() && (self.searching() || self.is_expanded(chat.id));
         let mut group = ChatGroup {
             chat,
             expanded,
@@ -242,7 +241,7 @@ impl Presentation {
     /// Отбирает совпавшие темы и добавляет остальные только по кнопке.
     fn project_search(&self, group: &mut ChatGroup<'_>) -> Option<()> {
         let chat = group.chat;
-        let name_matches = self.matches(&chat.name)
+        let name_matches = self.matches(self.language.chat_title(chat, self.user))
             || (chat.direct
                 && [
                     chat.metadata.direct_peer_username.as_deref(),

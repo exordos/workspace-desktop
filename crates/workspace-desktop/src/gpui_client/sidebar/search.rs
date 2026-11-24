@@ -57,7 +57,7 @@ pub(super) fn render(
                     let locale = crate::gpui_client::preferences::Preferences::read(app).language;
                     crate::gpui_client::ui::popup::tooltip(
                         palette,
-                        locale.text("Очистить поиск", "Clear search").into(),
+                        locale.tr("desktop.sidebar.clearSearch").into(),
                         app,
                     )
                 })

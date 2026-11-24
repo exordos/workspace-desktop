@@ -14,6 +14,7 @@ use crate::gpui_client::contracts::ConversationReply;
 
 const STREAM: Uuid = Uuid::from_u128(1);
 const MESSAGE: Uuid = Uuid::from_u128(2);
+const DIRECT_TOPIC: Uuid = Uuid::from_u128(9);
 
 /// Готовит сводку тестового входа с одним непрочитанным сообщением.
 fn account(name: &str, generation: u64) -> AccountSnapshot {
@@ -69,26 +70,34 @@ fn setup() -> (Shell, AccountSnapshot, AccountSnapshot) {
             .map(|account| {
                 (
                     account.session.owner.clone(),
-                    ChatList {
-                        generation: account.session.generation,
-                        status: ChatListStatus::Ready,
-                        chats: Some(Arc::new([Chat {
-                            id: STREAM,
-                            name: "Тестовый чат".into(),
-                            direct: true,
-                            topics: vec![Topic {
-                                id: Uuid::from_u128(9),
-                                name: "Другая тема".into(),
-                                metadata: Default::default(),
-                            }],
-                            metadata: Default::default(),
-                        }])),
-                    },
+                    direct_catalog(&account.session, None),
                 )
             })
             .collect(),
     ));
     (shell, a, b)
+}
+
+/// Даёт снимок личного чата с дополнительной темой и необязательным собеседником.
+fn direct_catalog(session: &AccountSession, peer: Option<Uuid>) -> ChatList {
+    ChatList {
+        generation: session.generation,
+        status: ChatListStatus::Ready,
+        chats: Some(Arc::new([Chat {
+            id: STREAM,
+            name: "Тестовый чат".into(),
+            direct: true,
+            topics: vec![Topic {
+                id: DIRECT_TOPIC,
+                name: "Другая тема".into(),
+                metadata: Default::default(),
+            }],
+            metadata: workspace_core::messenger::catalog::ChatMetadata {
+                direct_peer_id: peer,
+                ..Default::default()
+            },
+        }])),
+    }
 }
 
 /// Имитирует выбор личного чата в каталоге и извлекает адрес видимой истории.
@@ -101,6 +110,32 @@ fn open_sidebar(shell: &mut Shell, session: &AccountSession) -> ConversationAddr
         Some(ShellEffect::OpenConversation(address)) => address,
         _ => panic!("Клик по личному чату не открыл историю"),
     }
+}
+
+/// Открывает только существующую тему личного чата и восстанавливает точный адрес.
+#[test]
+fn opens_and_restores_a_direct_topic_from_the_catalog() {
+    let (mut shell, a, _) = setup();
+    let mut selected = route(&a.session, ChatEntry::Latest);
+    selected.scope.topic_id = Some(DIRECT_TOPIC);
+    let mut missing = selected.clone();
+    missing.scope.topic_id = Some(Uuid::from_u128(100));
+    let open = |route| {
+        ShellAction::Sidebar(SidebarAction::OpenChat {
+            route,
+            generation: a.session.generation,
+        })
+    };
+    assert!(matches!(
+        shell.handle_action(open(selected.clone())),
+        Some(ShellEffect::OpenConversation(address)) if address.route == selected
+    ));
+    assert!(shell.handle_action(open(missing)).is_none());
+    shell.restore_navigation(None).unwrap();
+    assert!(matches!(
+        shell.restore_navigation(Some(&selected)),
+        Ok(Some(ShellEffect::OpenConversation(address))) if address.route == selected
+    ));
 }
 
 /// При открытии темы оболочка использует тот же актуальный снимок, что и сайдбар.
@@ -315,7 +350,7 @@ fn invalid_notification_reports_error_without_replacing_open_conversation() {
     });
     assert_eq!(
         shell.route_error(),
-        Some("Сообщение из уведомления недоступно")
+        Some(NotificationRouteError::TargetUnavailable)
     );
     assert_eq!(shell.conversation(), Some(&route_a));
     assert_eq!(shell.selected(), Some(&a.session));
@@ -325,7 +360,10 @@ fn invalid_notification_reports_error_without_replacing_open_conversation() {
         request: pending,
         result: Err(NotificationRouteError::LookupFailed),
     });
-    assert_eq!(shell.route_error(), Some("Не удалось открыть уведомление"));
+    assert_eq!(
+        shell.route_error(),
+        Some(NotificationRouteError::LookupFailed)
+    );
     assert_eq!(shell.conversation(), Some(&route_a));
 }
 

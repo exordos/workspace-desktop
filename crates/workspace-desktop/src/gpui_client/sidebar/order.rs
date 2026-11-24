@@ -3,6 +3,7 @@
 
 use std::cmp::Ordering;
 
+use uuid::Uuid;
 use workspace_core::messenger::{
     catalog::{Chat, Topic},
     folders::FolderItem,
@@ -14,14 +15,24 @@ use crate::gpui_client::preferences::{Language, appearance::SidebarSort};
 pub(super) type FolderRow<'a> = (&'a Chat, Option<&'a FolderItem>, bool);
 
 /// Сортирует строки внутри группы поиска с учётом закреплений и режима уведомлений.
-pub(super) fn sort_chats(rows: &mut [FolderRow<'_>], mode: SidebarSort, language: Language) {
+pub(super) fn sort_chats(
+    rows: &mut [FolderRow<'_>],
+    mode: SidebarSort,
+    language: Language,
+    user: Option<Uuid>,
+) {
     rows.sort_by(|(a, a_item, a_other), (b, b_item, b_other)| {
         a_other
             .cmp(b_other)
             .then_with(|| pinned(*b_item).cmp(&pinned(*a_item)))
             .then_with(|| {
                 if mode == SidebarSort::Alphabetical {
-                    return compare_names(&a.name, &b.name, language).then_with(|| a.id.cmp(&b.id));
+                    return compare_names(
+                        language.chat_title(a, user),
+                        language.chat_title(b, user),
+                        language,
+                    )
+                    .then_with(|| a.id.cmp(&b.id));
                 }
                 let a_muted = stream_muted(a);
                 let b_muted = stream_muted(b);
@@ -143,6 +154,7 @@ pub(super) fn topic_muted(chat: &Chat, topic: &Topic) -> bool {
 
 /// Сравнивает названия без учёта регистра, используя язык для русского алфавита и цифр.
 fn compare_names(mut a: &str, mut b: &str, language: Language) -> Ordering {
+    let cyrillic_first = language.code().split('-').next() == Some("ru");
     while let (Some(a_start), Some(b_start)) = (a.chars().next(), b.chars().next()) {
         if a_start.is_ascii_digit() && b_start.is_ascii_digit() {
             let a_tail = a.trim_start_matches(|c: char| c.is_ascii_digit());
@@ -160,7 +172,7 @@ fn compare_names(mut a: &str, mut b: &str, language: Language) -> Ordering {
             b = b_tail;
         } else {
             let character = |c: char| {
-                let latin_after_cyrillic = language == Language::Ru && c.is_ascii_alphabetic();
+                let latin_after_cyrillic = cyrillic_first && c.is_ascii_alphabetic();
                 let c = c.to_lowercase().next().unwrap_or(c);
                 (latin_after_cyrillic, if c == 'ё' { 'е' } else { c })
             };
@@ -199,18 +211,18 @@ mod tests {
         let b = chat(2, "Стрим 2", 1);
         let other = chat(1, "Стрим 1", 1);
         let mut rows = vec![(&a, None, false), (&b, None, false), (&other, None, true)];
-        sort_chats(&mut rows, SidebarSort::LastMessage, Language::Ru);
+        sort_chats(&mut rows, SidebarSort::LastMessage, Language::Ru, None);
         assert_eq!(
             rows.iter().map(|row| row.0.id).collect::<Vec<_>>(),
             [a.id, b.id, other.id]
         );
-        sort_chats(&mut rows, SidebarSort::UnreadFirst, Language::Ru);
+        sort_chats(&mut rows, SidebarSort::UnreadFirst, Language::Ru, None);
         assert_eq!(
             rows.iter().map(|row| row.0.id).collect::<Vec<_>>(),
             [b.id, a.id, other.id]
         );
         rows.swap(0, 1);
-        sort_chats(&mut rows, SidebarSort::Alphabetical, Language::Ru);
+        sort_chats(&mut rows, SidebarSort::Alphabetical, Language::Ru, None);
         assert_eq!(
             rows.iter().map(|row| row.0.id).collect::<Vec<_>>(),
             [b.id, a.id, other.id]

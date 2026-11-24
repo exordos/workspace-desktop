@@ -156,6 +156,11 @@ fn long_history_keeps_reading_position_and_input(cx: &mut TestAppContext) {
     );
     allow(&requests, Ok(TOPIC), ui);
 
+    // У старого края запрос начинается сам. Пока он в пути, читатель может уйти от края.
+    ui.update(|window, app| window.focus(&view.read(app).history_focus));
+    ui.simulate_keystrokes("home");
+    ui.run_until_parked();
+    let prepend = request_id(&view, ui, "prepend");
     ui.update(|_, app| {
         view.update(app, |view, cx| {
             view.viewport.list().scroll_to(ListOffset {
@@ -175,8 +180,6 @@ fn long_history_keeps_reading_position_and_input(cx: &mut TestAppContext) {
     let mut typed = String::new();
     let mut max_dispatch_us = 0;
 
-    click(ui, "history-older");
-    let prepend = request_id(&view, ui, "prepend");
     click(ui, "workspace-composer-editor");
     type_burst(ui, &mut typed, 0, 16, &mut max_dispatch_us);
     let mut messages = fixture_rows(scope, 1, LAST_ROW);
@@ -246,6 +249,8 @@ fn long_history_keeps_reading_position_and_input(cx: &mut TestAppContext) {
     verify_anchor(&view, ui, "incoming_reading", incoming, before);
     frames.push(frame_us(ui, "incoming_reading", incoming));
 
+    let latest = ui.debug_bounds("history-latest").expect("Стрелка видна");
+    assert!(latest.size.width <= px(40.));
     click(ui, "history-latest");
     ui.read(|app| {
         let viewport = &view.read(app).viewport;

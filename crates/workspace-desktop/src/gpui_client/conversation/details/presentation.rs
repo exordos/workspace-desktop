@@ -20,9 +20,9 @@ use super::{
 };
 use crate::gpui_client::{
     contracts::ConversationAddress,
-    preferences::{Preferences, appearance::SidebarSort},
+    preferences::{Language, Preferences, appearance::SidebarSort},
     sidebar::order::sort_topics,
-    ui::{AvatarPresence, Icon},
+    ui::{AvatarPresence, Icon, profile_joined_date},
 };
 
 /// Показывает обычные темы перед приглушёнными, используя активный режим и превью каталога.
@@ -78,11 +78,14 @@ pub(super) fn content(
     details: &SidebarDetails,
     address: &ConversationAddress,
     app: &App,
+    peer_call: Option<bool>,
 ) -> PanelContent {
     match details {
-        SidebarDetails::Peer(peer) => PanelContent::Peer(peer_content(panel, peer, address, app)),
+        SidebarDetails::Peer(peer) => {
+            PanelContent::Peer(peer_content(panel, peer, address, app, peer_call))
+        }
         SidebarDetails::Channel(channel) => {
-            PanelContent::Channel(channel_content(panel, channel, address, app))
+            PanelContent::Channel(Box::new(channel_content(panel, channel, address, app)))
         }
     }
 }
@@ -93,8 +96,9 @@ fn peer_content(
     peer: &DirectSidebar,
     address: &ConversationAddress,
     app: &App,
+    peer_call: Option<bool>,
 ) -> PeerView {
-    let profile = &peer.profile;
+    let language = Preferences::read_for(app, &address.route.owner).language;
     let share = if sidebar_profile_link(&address.route.owner, peer.user_id).is_ok() {
         Availability::Enabled
     } else {
@@ -104,69 +108,95 @@ fn peer_content(
         PeerActions {
             share,
             share_copied: panel.share_feedback.is_some(),
-            favorites: Availability::Disabled,
-            edit: Availability::Disabled,
+            favorites: Availability::Enabled,
+            edit: Availability::Enabled,
             ..PeerActions::default()
         }
     } else {
         PeerActions {
             message: Availability::Enabled,
-            call: Availability::Disabled,
+            call: available(true, peer_call == Some(true)),
             share,
             share_copied: panel.share_feedback.is_some(),
             ..PeerActions::default()
         }
     };
-    PeerView {
-        name: profile.display_name.clone().into(),
-        avatar: avatar(
-            &profile.display_name,
-            Some(profile),
-            panel.avatars.image(peer.user_id, app),
-        ),
-        custom_status: custom_status(profile).map(Into::into),
-        presence: presence_label(profile.presence).map(Into::into),
-        fields: vec![
-            field(
-                "Идентификатор пользователя",
-                Icon::At,
-                Some(peer.user_id.to_string()),
-            ),
-            field("Электронная почта", Icon::Mail, profile.email.clone()),
-            field("Телефон", Icon::Phone, None),
-            field("Должность", Icon::BusinessCenter, None),
-            field("Руководитель", Icon::Handshake, None),
-            field("Роль", Icon::Account, None),
-            field("Тип аккаунта", Icon::Group, None),
-            field("Статус аккаунта", Icon::Info, None),
-            field("Часовой пояс", Icon::GlobeLocation, None),
-            field("Местное время", Icon::Pending, None),
-            field(
-                "Дата присоединения",
-                Icon::Calendar,
-                profile.created_at.as_deref().and_then(joined_date),
-            ),
-            field("День рождения", Icon::Celebration, None),
-        ],
-        actions,
-    }
+    let mut card = peer_card(peer, panel.avatars.image(peer.user_id, app), language);
+    card.copied_fields = panel.copy_feedback.keys().copied().collect();
+    card.actions = actions;
+    card
 }
 
-/// Показывает дату как в профиле Workspace без исходного времени сервера.
-fn joined_date(timestamp: &str) -> Option<String> {
-    let date = timestamp.get(..10)?;
-    let mut parts = date.split('-');
-    let year = parts.next()?;
-    let month = parts.next()?;
-    let day = parts.next()?;
-    let month_value: u8 = month.parse().ok()?;
-    let day_value: u8 = day.parse().ok()?;
-    let _: u16 = year.parse().ok()?;
-    (year.len() == 4
-        && parts.next().is_none()
-        && (1..=12).contains(&month_value)
-        && (1..=31).contains(&day_value))
-    .then(|| format!("{day}.{month}.{year}"))
+/// Готовит общие поля карточки собеседника до подключения действий экрана.
+pub(super) fn peer_card(peer: &DirectSidebar, image: Option<ImageSource>, language: Language) -> PeerView {
+    let profile = &peer.profile;
+    let mut avatar = avatar(&profile.display_name, Some(profile), image);
+    if profile.presence == Some(ProfilePresence::Offline) {
+        avatar.presence = AvatarPresence::Offline;
+    } else if profile.presence == Some(ProfilePresence::DoNotDisturb) {
+        avatar.presence = AvatarPresence::Away;
+    }
+    PeerView {
+        name: profile.display_name.clone().into(),
+        avatar,
+        custom_status: profile.status_label().map(Into::into),
+        presence: profile.presence,
+        fields: vec![
+            field(
+                language.tr("info.userId"),
+                Icon::AlternateEmail,
+                Some(peer.user_id.to_string()),
+            ),
+            field(
+                language.tr("common.email"),
+                Icon::Envelope,
+                profile.email.clone(),
+            ),
+            field(language.tr("info.phone"), Icon::Phone, None),
+            field(
+                language.tr("info.jobTitle"),
+                Icon::BusinessCenter,
+                None,
+            ),
+            field(
+                language.tr("info.manager"),
+                Icon::Handshake,
+                None,
+            ),
+            field(language.tr("info.role"), Icon::Account, None),
+            field(
+                language.tr("info.accountType"),
+                Icon::Group,
+                None,
+            ),
+            field(
+                language.tr("info.accountStatus"),
+                Icon::Info,
+                None,
+            ),
+            field(
+                language.tr("info.timezone"),
+                Icon::GlobeLocation,
+                None,
+            ),
+            field(
+                language.tr("info.localTime"),
+                Icon::Pending,
+                None,
+            ),
+            field(
+                language.tr("info.joined"),
+                Icon::Calendar,
+                profile
+                    .created_at
+                    .as_deref()
+                    .and_then(|date| profile_joined_date(date, language)),
+            ),
+            field(language.tr("info.birthday"), Icon::Celebration, None),
+        ],
+        language,
+        ..PeerView::default()
+    }
 }
 
 /// Готовит строку профиля и разрешает копирование для известного значения.
@@ -186,7 +216,7 @@ fn field(label: &'static str, icon: Icon, value: Option<String>) -> ProfileField
 }
 
 /// Готовит список тем, участников и режим уведомлений канала.
-fn channel_content(
+pub(super) fn channel_content(
     panel: &Panel,
     channel: &ChannelSidebar,
     address: &ConversationAddress,
@@ -194,8 +224,10 @@ fn channel_content(
 ) -> ChannelView {
     let can_change = matches!(panel.state, Some(State::Ready)) && panel.mutation.is_none();
     let current_topic = address.route.scope.topic_id;
+    let language = Preferences::read_for(app, &address.route.owner).language;
     ChannelView {
         name: channel.name.clone().into(),
+        language,
         avatar: avatar(&channel.name, None, None),
         color: channel
             .color
@@ -216,30 +248,42 @@ fn channel_content(
         topics_expanded: panel.topics_expanded,
         topics: panel_topics(panel, channel, address, app)
             .into_iter()
-            .map(|topic| TopicView {
-                id: topic.id,
-                title: topic.name.clone().into(),
-                selected: current_topic == Some(topic.id),
-                muted: Some(channel_topic_muted(channel, topic)),
-                unread: u64::from(if topic.active_unread_count > 0 {
-                    topic.active_unread_count
-                } else {
-                    topic.passive_unread_count
-                }),
-                unread_muted: topic.active_unread_count == 0 && topic.passive_unread_count > 0,
-                mentioned: false,
+            .filter_map(|topic| {
+                Some(TopicView {
+                    id: topic.id,
+                    focus: panel.topic_menu.focus(topic.id)?.clone(),
+                    title: topic.name.clone().into(),
+                    selected: current_topic == Some(topic.id),
+                    muted: Some(channel_topic_muted(channel, topic)),
+                    unread: u64::from(if topic.active_unread_count > 0 {
+                        topic.active_unread_count
+                    } else {
+                        topic.passive_unread_count
+                    }),
+                    unread_muted: topic.active_unread_count == 0 && topic.passive_unread_count > 0,
+                    mentioned: false,
+                })
             })
             .collect(),
+        topic_error: (panel.mutation_error == Some(MutationKind::Topic)).then(|| {
+            language
+                .tr("desktop.conversation.details.couldNotUpdateTheTopic")
+                .into()
+        }),
         selected_topic: channel
             .topics
             .iter()
-            .find(|topic| {
-                Some(topic.id) == current_topic && (topic.done || topic.summary.is_some())
-            })
+            .find(|topic| !channel.encrypted && Some(topic.id) == current_topic)
             .map(|topic| SelectedTopicView {
                 title: topic.name.clone().into(),
                 done: topic.done,
-                summary: topic.summary.clone().map(Into::into),
+                summary: panel.summary_content.clone(),
+                expanded: panel.summary_expanded.unwrap_or(topic.summary.is_some()),
+                summary_enabled: topic.summary_enabled,
+                summary_has_new_messages: topic.summary_has_new_messages,
+                summary_settings: channel
+                    .can_edit_summary(topic.id)
+                    .then(|| panel.summary_settings.clone()),
             }),
         notifications: Some(NotificationsView {
             level: match channel.notification_mode {
@@ -248,17 +292,31 @@ fn channel_content(
                 StreamNotificationMode::Muted => NotificationLevel::Muted,
             },
             editable: can_change,
-            error: (panel.mutation_error == Some(MutationKind::Notifications))
-                .then(|| "Не удалось изменить уведомления".into()),
+            error: (panel.mutation_error == Some(MutationKind::Notifications)).then(|| {
+                language
+                    .tr("desktop.conversation.details.couldNotUpdateNotifications")
+                    .into()
+            }),
         }),
         members: channel
             .members
             .iter()
-            .map(|member| member_view(member, can_change, panel.avatars.image(member.user_id, app)))
+            .map(|member| {
+                member_view(
+                    member,
+                    can_change,
+                    panel.avatars.image(member.user_id, app),
+                    language,
+                )
+            })
             .collect(),
         add_members: available(channel.can_add_members, can_change),
-        member_error: (panel.mutation_error == Some(MutationKind::Remove))
-            .then(|| "Не удалось удалить участника".into()),
+        add_members_focus: Some(panel.add_members_focus.clone()),
+        member_error: (panel.mutation_error == Some(MutationKind::Remove)).then(|| {
+            language
+                .tr("desktop.conversation.details.couldNotRemoveTheMember")
+                .into()
+        }),
     }
 }
 
@@ -272,22 +330,27 @@ pub(super) fn stream_mode(level: NotificationLevel) -> StreamNotificationMode {
 }
 
 /// Представляет привязку даже до появления её профиля в справочнике.
-fn member_view(member: &SidebarMember, can_change: bool, image: Option<ImageSource>) -> MemberView {
+fn member_view(
+    member: &SidebarMember,
+    can_change: bool,
+    image: Option<ImageSource>,
+    language: Language,
+) -> MemberView {
     let profile = member.profile.as_ref();
     let name = profile
         .map(|profile| profile.display_name.clone())
         .unwrap_or_else(|| member.user_id.to_string());
     let secondary = profile.and_then(|profile| {
-        presence_label(profile.presence)
+        presence_label(profile.presence, language)
             .map(str::to_owned)
             .or_else(|| profile.email.clone())
     });
     let role = match member.role {
-        StreamRole::Guest => Some("Гость"),
-        StreamRole::Member => Some("Участник"),
-        StreamRole::Moderator => Some("Модератор"),
-        StreamRole::Administrator => Some("Администратор"),
-        StreamRole::Owner => Some("Владелец"),
+        StreamRole::Guest => Some(language.tr("roles.guest")),
+        StreamRole::Member => Some(language.tr("roles.member")),
+        StreamRole::Moderator => Some(language.tr("roles.moderator")),
+        StreamRole::Administrator => Some(language.tr("roles.admin")),
+        StreamRole::Owner => Some(language.tr("roles.owner")),
         StreamRole::Unknown => None,
     };
     MemberView {
@@ -320,7 +383,8 @@ fn avatar(name: &str, profile: Option<&UserProfile>, image: Option<ImageSource>)
     let presence = match profile.and_then(|profile| profile.presence) {
         Some(ProfilePresence::Active) => AvatarPresence::Online,
         Some(ProfilePresence::Idle) => AvatarPresence::Away,
-        _ => AvatarPresence::Hidden,
+        Some(ProfilePresence::Offline | ProfilePresence::DoNotDisturb) => AvatarPresence::Offline,
+        None => AvatarPresence::Hidden,
     };
     AvatarView {
         initials: initial,
@@ -329,22 +393,12 @@ fn avatar(name: &str, profile: Option<&UserProfile>, image: Option<ImageSource>)
     }
 }
 
-/// Собирает статус, когда пользователь указал текст, эмодзи или оба.
-fn custom_status(profile: &UserProfile) -> Option<String> {
-    match (&profile.status_emoji, &profile.status_text) {
-        (Some(emoji), Some(text)) => Some(format!("{emoji} {text}")),
-        (Some(emoji), None) => Some(emoji.clone()),
-        (None, Some(text)) => Some(text.clone()),
-        (None, None) => None,
-    }
-}
-
 /// Переводит известное серверное присутствие в подпись пользователя.
-fn presence_label(presence: Option<ProfilePresence>) -> Option<&'static str> {
+fn presence_label(presence: Option<ProfilePresence>, language: Language) -> Option<&'static str> {
     Some(match presence? {
-        ProfilePresence::Active => "В сети",
-        ProfilePresence::Idle => "Отошёл",
-        ProfilePresence::Offline => "Не в сети",
-        ProfilePresence::DoNotDisturb => "Не беспокоить",
+        ProfilePresence::Active => language.tr("a11y.online"),
+        ProfilePresence::Idle => language.tr("a11y.away"),
+        ProfilePresence::Offline => language.tr("presence.offline"),
+        ProfilePresence::DoNotDisturb => language.tr("presence.doNotDisturb"),
     })
 }

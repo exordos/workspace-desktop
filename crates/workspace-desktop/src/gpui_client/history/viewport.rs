@@ -9,7 +9,7 @@ use std::{
 
 use gpui::{
     AnyElement, App, Bounds, Div, ImageSource, IntoElement, ListAlignment, ListOffset, ListState,
-    Pixels, SharedString, StyledText, TextLayout, WeakEntity, canvas, div, list, prelude::*, px,
+    MouseButton, Pixels, Point, SharedString, StyledText, TextLayout, WeakEntity, canvas, div, list, point, prelude::*, px,
 };
 use uuid::Uuid;
 use workspace_core::{
@@ -27,10 +27,13 @@ use super::{
     attachments::{AttachmentKey, Cards},
     calls::join_card,
     encryption::{EncryptedPresentation, HistoryEncryption},
+    message_menu::MenuHit,
     fragments::{FragmentRuntime, FragmentViews},
     key_exchange::{KeyAction, KeyActionState, KeyPermission},
     protected_body::ProtectedLayout,
     protected_quotes::{QuotePresentation, QuoteSlot, render_quote},
+    quick_actions::{QuickActions, QuickCommand, QuickReactions, reaction_chips},
+    reactions::ReactionControls,
     reply::{ReplyControls, Selection, history_quote},
 };
 
@@ -56,7 +59,10 @@ use text_rows::{BubbleInput, TextRows};
 use crate::gpui_client::{
     composer::ReplyText,
     preferences::Language,
-    ui::{Avatar, Button, DeliveryMark, Icon, MessageBubble, Palette, TextRole, label, text_role},
+    ui::{
+        Avatar, Button, DeliveryMark, Icon, MessageBubble, Palette, TextRole, activate, label,
+        text_role,
+    },
 };
 
 const DATE_SPACE: Pixels = px(32.);
@@ -69,7 +75,7 @@ struct Row {
     own: bool,                                // Сообщение текущего пользователя.
     author: Option<Uuid>, // UUID для группировки, неизвестные авторы не объединяются.
     topic: Uuid,          // Смена темы начинает новую группу.
-    date: Option<String>, // День создания UTC, если сообщение принято сервером.
+    date: Option<String>, // День создания UTC в ISO-порядке, если сообщение принято сервером.
     body: Rc<Body>,       // Данные обычного тела из снимка; не зависят от координаты строки.
     encrypted: Option<EncryptedPresentation>, // Состояние E2EE; None для обычной строки.
     service: Option<KeyServiceRow>, // Видимая часть служебного сообщения без криптографического тела.
@@ -137,7 +143,10 @@ impl From<String> for PeerLabel {
 /// Действия строки, связанные с текущим экраном и выбранным языком.
 #[derive(Default)]
 pub(super) struct HistoryControls {
-    pub reply: Option<ReplyControls>, // Меню и выделение разрешённых обычных строк.
+    pub reply: Option<ReplyControls>, // Выделение текста и меню подтверждённых строк.
+    pub quick_reply: bool, // Готовый обычный редактор позволяет показать быструю кнопку.
+    pub quick_hidden: bool, // Активное контекстное меню закрывает быстрые действия.
+    pub reactions: Option<ReactionControls>, // Состояние реакций в текущем разговоре.
     pub conversation: Option<WeakEntity<Conversation>>, // Повтор расшифровки в открытом экране.
     pub edit_protected: bool,         // Штатный редактор подтвердил защищённую запись в этой теме.
     pub key_device: Option<String>,   // Устройство активного обмена ключами.
@@ -146,7 +155,6 @@ pub(super) struct HistoryControls {
     pub protected: HashMap<Uuid, Arc<ProtectedLayout>>, // Безопасная структура конкретных раскрытых баблов.
     pub quotes: HashMap<QuoteSlot, QuotePresentation>, // Отдельный доступ к разрешённым оригиналам.
     pub fragments: Option<FragmentRuntime>, // Рабочая сессия для спойлеров обычного Markdown.
-    pub fragment_edit_topic: Option<Uuid>,  // Тема обычного редактора, где доступна правка.
     pub jitsi: Option<Arc<JitsiSettings>>, // Проверенный сервер конференций для карточек этой истории.
     pub locale: Language,                  // Язык подписей открытой истории.
 }
@@ -551,12 +559,16 @@ impl Viewport {
 
     /// Проверяет присутствие той же ссылки в текущем окне разговора.
     pub(super) fn has_attachment(&self, key: AttachmentKey) -> bool {
-        self.index.get(&key.message).is_some_and(|&index| {
-            self.rows[index]
-                .media
-                .get(key.position)
-                .is_some_and(|reference| reference.file_id == key.file)
-        })
+        self.attachment(key).is_some()
+    }
+
+    /// Возвращает данные только для точной карточки на той же позиции сообщения.
+    pub(super) fn attachment(&self, key: AttachmentKey) -> Option<&MediaReference> {
+        let &index = self.index.get(&key.message)?;
+        self.rows[index]
+            .media
+            .get(key.position)
+            .filter(|reference| reference.file_id == key.file)
     }
 
     /// Проверяет, есть ли у карточки показанная строка, куда можно вернуть фокус.
@@ -564,11 +576,17 @@ impl Viewport {
         self.has_attachment(key) && self.has_visible_message(key.message)
     }
 
+    /// Берёт правый край показанной строки для клавиатурного меню.
+    pub(super) fn message_menu_anchor(&self, id: Uuid) -> Option<Point<Pixels>> {
+        let bounds = self.painted.borrow().get(&id).copied()?;
+        bounds
+            .intersects(&self.list.viewport_bounds())
+            .then(|| point(bounds.right(), bounds.center().y))
+    }
+
     /// Проверяет, осталась ли строка видимой после закрытия защищённого просмотра.
     pub(super) fn has_visible_message(&self, id: Uuid) -> bool {
-        self.painted
-            .borrow()
-            .get(&id)
+        self.painted.borrow().get(&id)
             .is_some_and(|bounds| bounds.intersects(&self.list.viewport_bounds()))
     }
 
@@ -665,6 +683,7 @@ impl Viewport {
         let painted_offset = self.painted_offset.clone();
         let measurement = Rc::new(RefCell::new(self.measure.take()));
         let list_state = self.list.clone();
+        let locale = controls.locale;
         let controls = Rc::new(controls);
         let peer = peer.map(PeerLabel::from);
         let images = Rc::new(images);
@@ -724,7 +743,7 @@ impl Viewport {
                     let measured = target.and_then(|target| {
                         let offset = target.measure(bounds.size.width, window, app, |app| {
                             let (message, text) = message(row, app);
-                            (row_container(row, palette).child(message), text)
+                            (row_container(row, palette, locale).child(message), text)
                         })?;
                         Some((target, offset))
                     });
@@ -775,7 +794,7 @@ impl Viewport {
                 let (message, layout) = message(row, app);
                 (message.into_any_element(), RenderedText::Fresh(layout))
             };
-            row_container(row, palette)
+            row_container(row, palette, locale)
                 .child(div().relative().w_full().child(message).child(canvas(|_, _, _| (), move |bounds, (), _, _| {
                     painted.borrow_mut().insert(id, bounds);
                     if let Some(layout) = text_layout.layout() {
@@ -966,17 +985,25 @@ fn same_offset(a: ListOffset, b: ListOffset) -> bool {
 }
 
 /// Задаёт отступы для строки списка и для её пробного измерения.
-fn row_container(row: &Row, palette: Palette) -> Div {
+fn row_container(row: &Row, palette: Palette, locale: Language) -> Div {
     div().relative().w_full().px_3().pt(row.inset()).children(
         row.date
             .as_deref()
             .filter(|_| row.starts_day)
-            .map(|date| date_separator(palette, date, row.id)),
+            .map(|date| date_separator(palette, date, row.id, locale)),
     )
 }
 
 /// Рисует дату перед первым сообщением дня, не добавляя отдельный адрес в список.
-fn date_separator(palette: Palette, date: &str, id: Uuid) -> Div {
+fn date_separator(palette: Palette, date: &str, id: Uuid, locale: Language) -> Div {
+    let caption = locale.tr_with(
+        "desktop.conversation.history.date",
+        &[
+            ("year", &date[..4]),
+            ("month", &date[5..7]),
+            ("day", &date[8..10]),
+        ],
+    );
     div()
         .absolute()
         .top_2()
@@ -985,7 +1012,7 @@ fn date_separator(palette: Palette, date: &str, id: Uuid) -> Div {
         .flex()
         .justify_center()
         .child(
-            label(palette, TextRole::Caption, date.to_owned())
+            label(palette, TextRole::Caption, caption)
                 .px_3()
                 .py_0p5()
                 .rounded_full()
@@ -1032,12 +1059,8 @@ fn message_row(
             ..palette
         }
     };
-    let reply = controls.reply.as_ref().filter(|_| {
-        row.date.is_some()
-            && row.service.is_none()
-            && row.encrypted.is_none()
-            && !row.body.text.trim().is_empty()
-    });
+    let confirmed = controls.reply.as_ref().filter(|_| row.date.is_some() && row.service.is_none());
+    let reply = confirmed.filter(|_| row.encrypted.is_none() && !row.body.text.trim().is_empty());
     let bubble = MessageBubble {
         author: (!row.own && row.starts_group).then_some(author),
         body: row.body.text.clone(),
@@ -1112,13 +1135,7 @@ fn message_row(
         };
         readable = text.is_some();
         Some(text.unwrap_or_else(|| {
-            encrypted_placeholder(
-                id,
-                matches!(state, EncryptedPresentation::Failed),
-                row.date.is_some(),
-                bubble_palette,
-                controls,
-            )
+            encrypted_placeholder(id, matches!(state, EncryptedPresentation::Failed), bubble_palette, controls)
         }))
     } else if let Some(service) = &row.service {
         Some(key_service_body(id, service, bubble_palette, controls))
@@ -1158,12 +1175,13 @@ fn message_row(
         Some(
             caption
                 .children(row.media.iter().enumerate().map(|(position, reference)| {
-                    cards.render(
-                        AttachmentKey {
-                            message: id,
-                            file: reference.file_id,
-                            position,
-                        },
+                    let key = AttachmentKey {
+                        message: id,
+                        file: reference.file_id,
+                        position,
+                    };
+                    let card = cards.render(
+                        key,
                         reference,
                         bubble_palette,
                         controls.locale,
@@ -1171,7 +1189,24 @@ fn message_row(
                             .app
                             .as_deref_mut()
                             .expect("контекст карточек истории"),
-                    )
+                    );
+                    let Some(conversation) = controls.conversation.clone().filter(|_| {
+                        reference.kind == workspace_core::storage::media::MediaKind::Image
+                    }) else {
+                        return card;
+                    };
+                    let original = reference
+                        .name
+                        .as_deref()
+                        .unwrap_or(&reference.label)
+                        .rsplit_once('.')
+                        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("heic") || ext.eq_ignore_ascii_case("heif"));
+                    card.on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                        let _ = conversation.update(cx, |view, cx| {
+                            view.open_message_menu(id, event.position, MenuHit::Image { key, original }, window, cx)
+                        });
+                        cx.stop_propagation();
+                    })
                 }))
                 .into_any_element(),
         )
@@ -1205,126 +1240,54 @@ fn message_row(
             )
         }
     };
-    let accessory = extras
-        .accessory
-        .or_else(|| {
-            if row.encrypted.is_some() || row.service.is_some() || row.date.is_none() {
-                return None;
-            }
-            let conversation = controls.conversation.clone()?;
-            let edit = controls.fragment_edit_topic == Some(row.topic)
-                && row.own
-                && !row.body.text.trim().is_empty();
-            let forward = row.body.can_forward && controls.fragments.is_some();
-            let edit_button = edit.then(|| {
-                let conversation = conversation.clone();
-                Button::new(
-                    (gpui::ElementId::from(id), "edit-fragments"),
-                    controls.locale.tr("message.edit"),
-                )
-                .render(bubble_palette, None, move |window, cx| {
-                    let _ = conversation
-                        .update(cx, |view, cx| view.edit_fragments(id, Some(window), cx));
-                })
-                .debug_selector(move || format!("edit-fragments-{id}"))
-            });
-            let forward_button = forward.then(|| {
-                Button::new(
-                    (gpui::ElementId::from(id), "forward-fragments"),
-                    controls.locale.tr("message.forward"),
-                )
-                .render(bubble_palette, None, move |window, cx| {
-                    cx.stop_propagation();
-                    let _ = conversation
-                        .update(cx, |view, cx| view.open_fragment_forward(id, window, cx));
-                })
-                .occlude()
-                .debug_selector(move || format!("forward-fragments-{id}"))
-            });
-            (edit || forward).then(|| {
-                div()
-                    .flex()
-                    .gap_1()
-                    .children(edit_button)
-                    .children(forward_button)
-                    .into_any_element()
-            })
-        })
-        .or_else(|| {
-            if row.date.is_none() || !readable {
-                return None;
-            }
-            let Some(EncryptedPresentation::Ready(access)) = &row.encrypted else {
-                return None;
-            };
-            let conversation = controls.conversation.clone()?;
-            let (copy, copy_access) = (conversation.clone(), access.clone());
-            let copy_button = Button::new(
-                (gpui::ElementId::from(id), "copy-protected-message"),
-                controls.locale.tr("composer.copy"),
+    let accessory = extras.accessory.or_else(|| {
+        let canonical = row.retry_send?;
+        let conversation = controls.conversation.clone()?;
+        Some(
+            Button::new(
+                (gpui::ElementId::from(id), "retry-protected-send"),
+                controls.locale.tr("message.retrySend"),
             )
             .render(bubble_palette, None, move |_, cx| {
-                let _ = copy.update(cx, |view, cx| {
-                    view.copy_protected_body(id, &copy_access, cx)
-                });
+                let _ = conversation
+                    .update(cx, |view, cx| view.retry_protected_send(canonical, cx));
             })
-            .debug_selector(move || format!("copy-protected-message-{id}"));
-            let reply = controls.edit_protected.then(|| {
-                let (reply, reply_access) = (conversation.clone(), access.clone());
-                Button::new(
-                    (gpui::ElementId::from(id), "reply-protected-message"),
-                    controls.locale.tr("message.reply"),
-                )
-                .render(bubble_palette, None, move |window, cx| {
-                    let _ = reply.update(cx, |view, cx| {
-                        view.reply_to_protected_body(id, reply_access.clone(), window, cx)
-                    });
-                })
-                .debug_selector(move || format!("reply-protected-message-{id}"))
-            });
-            let edit = (controls.edit_protected && row.own).then(|| {
-                Button::new(
-                    (gpui::ElementId::from(id), "edit-protected-message"),
-                    controls.locale.tr("message.edit"),
-                )
-                .render(bubble_palette, None, move |window, cx| {
-                    let _ = conversation.update(cx, |view, cx| {
-                        view.open_protected_edit(id, Some(window), cx)
-                    });
-                })
-                .debug_selector(move || format!("edit-protected-message-{id}"))
-            });
-            Some(
-                div()
-                    .flex()
-                    .gap_1()
-                    .child(copy_button)
-                    .children(reply)
-                    .children(edit)
-                    .into_any_element(),
-            )
-        })
-        .or_else(|| {
-            let canonical = row.retry_send?;
-            let conversation = controls.conversation.clone()?;
-            Some(
-                Button::new(
-                    (gpui::ElementId::from(id), "retry-protected-send"),
-                    controls.locale.tr("message.retrySend"),
-                )
-                .render(bubble_palette, None, move |_, cx| {
-                    let _ = conversation
-                        .update(cx, |view, cx| view.retry_protected_send(canonical, cx));
-                })
-                .into_any_element(),
-            )
-        });
-    let mut bubble = match (content, accessory) {
-        (content, Some(accessory)) => {
+            .into_any_element(),
+        )
+    });
+    let confirmed_message = row.date.is_some() && row.service.is_none();
+    let reactions = controls.reactions.as_ref().filter(|_| {
+        confirmed_message && (row.encrypted.is_none() || readable)
+    });
+    let chips = reactions.and_then(|reactions| reaction_chips(id, reactions, palette, controls.locale));
+    let accessory = match (accessory, chips) {
+        (Some(existing), Some(chips)) => Some(div().flex().flex_col().gap_1().child(existing).child(chips).into_any_element()),
+        (existing, chips) => existing.or(chips),
+    };
+    let commands = (!controls.quick_hidden && confirmed_message)
+        .then(|| quick_command(row, controls, reply.is_some(), readable))
+        .flatten()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let reserve_reaction_corner = reactions.is_some();
+    let reactions = reactions.filter(|_| !controls.quick_hidden).and_then(|reactions| {
+        let target = reactions.clone();
+        QuickReactions::new(reactions.quick(id), move |emoji, cx| target.toggle(id, emoji, cx))
+    });
+    let has_reactions = reactions.is_some();
+    let show_quick_actions = !commands.is_empty() || has_reactions;
+    let mut bubble = match (content, accessory, show_quick_actions) {
+        (content, accessory, true) => bubble.render_with_overlay(
+            bubble_palette, content, row.ends_group, accessory,
+            div().absolute().inset_0()
+                .debug_selector(move || format!("history-quick-bubble-{id}"))
+                .child(QuickActions { id, own: row.own, palette, commands, reactions }),
+        ),
+        (content, Some(accessory), false) => {
             bubble.render_with_accessory(bubble_palette, content, row.ends_group, accessory)
         }
-        (Some(content), None) => bubble.render_with_body(bubble_palette, content, row.ends_group),
-        (None, None) => bubble.render_in_group(bubble_palette, row.ends_group),
+        (Some(content), None, false) => bubble.render_with_body(bubble_palette, content, row.ends_group),
+        (None, None, false) => bubble.render_in_group(bubble_palette, row.ends_group),
     }
     .debug_selector(move || format!("history-message-{id}"));
     if row.delivery == Some(DeliveryMark::Unknown) {
@@ -1333,10 +1296,8 @@ fn message_row(
     if readable {
         bubble = bubble.debug_selector(move || format!("history-encrypted-{id}-readable"));
     }
-    let bubble = match reply {
-        Some(reply) => reply
-            .row(id, bubble, palette, controls.locale)
-            .into_any_element(),
+    let bubble = match confirmed {
+        Some(controls_row) => controls_row.row(id, bubble).into_any_element(),
         None => bubble.into_any_element(),
     };
     let message = div()
@@ -1356,15 +1317,57 @@ fn message_row(
                 )
             }))
         })
-        .child(div().flex_1().min_w_0().child(bubble));
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                // Место для колонки остаётся у угла пузыря и при скрытой панели.
+                .when(reserve_reaction_corner, |slot| {
+                    if row.own { slot.pl(px(20.)) } else { slot.pr(px(20.)) }
+                })
+                .child(bubble),
+        );
     (message, text_layout)
+}
+
+/// Выбирает команду для открытого текста или запроса ключа у закрытого сообщения.
+fn quick_command(row: &Row, controls: &HistoryControls, plain_reply: bool, readable: bool) -> Option<QuickCommand> {
+    let id = row.id;
+    let conversation = controls.conversation.clone()?;
+    let locale = controls.locale;
+    match &row.encrypted {
+        Some(EncryptedPresentation::Ready(access)) if readable && controls.edit_protected => {
+            let access = access.clone();
+            Some(QuickCommand::on_hover("reply-protected-message", locale.tr("message.reply"), move |window, cx| {
+                let _ = conversation.update(cx, |view, cx| {
+                    view.reply_to_protected_body(id, access.clone(), window, cx)
+                });
+            }))
+        }
+        Some(state) if !readable && controls.key_device.is_some() => {
+            let (action, name, caption) = if matches!(state, EncryptedPresentation::Failed) {
+                (KeyAction::Recover, "recover-protected-key", locale.tr("desktop.messenger.history.requestReplacementKey"))
+            } else {
+                (KeyAction::Request, "request-protected-key", locale.tr("e2ee.requestMessageKey"))
+            };
+            let disabled = pending_key(controls.key_actions.get(&id));
+            Some(QuickCommand::on_hover(name, caption, move |_, cx| {
+                let _ = conversation.update(cx, |view, cx| view.key_action(id, action, cx));
+            }).always(Icon::ChatLock, disabled))
+        }
+        None if plain_reply && controls.quick_reply => {
+            Some(QuickCommand::on_hover("history-reply", locale.tr("message.reply"), move |window, cx| {
+                let _ = conversation.update(cx, |view, cx| view.quick_reply(id, window, cx));
+            }))
+        }
+        _ => None,
+    }
 }
 
 /// Показывает безопасную заглушку, сохраняя общее оформление и UUID пузыря.
 fn encrypted_placeholder(
     id: Uuid,
     failed: bool,
-    confirmed: bool,
     palette: Palette,
     controls: &HistoryControls,
 ) -> AnyElement {
@@ -1409,17 +1412,8 @@ fn encrypted_placeholder(
                 let _ = conversation.update(cx, |view, cx| view.retry_encrypted(id, cx));
             })
         }))
-        .children((confirmed && controls.key_device.is_some()).then(|| {
-            let (action, caption) = if failed {
-                (
-                    KeyAction::Recover,
-                    locale.tr("desktop.messenger.history.requestReplacementKey"),
-                )
-            } else {
-                (KeyAction::Request, locale.tr("e2ee.requestAccess"))
-            };
-            key_action_row(id, &[(action, caption)], palette, controls)
-        }))
+        .children(key_action_explanation(controls.key_actions.get(&id), locale)
+            .map(|text| label(palette, TextRole::Caption, text)))
         .into_any_element()
 }
 
@@ -1432,12 +1426,7 @@ fn key_action_row(
 ) -> Div {
     let locale = controls.locale;
     let status = controls.key_actions.get(&id);
-    let terminal = matches!(
-        status,
-        Some(
-            KeyActionState::Running(_) | KeyActionState::Waiting(_) | KeyActionState::ReplySent(_)
-        )
-    );
+    let terminal = pending_key(status);
     let mut row = div().flex().flex_wrap().gap_1();
     if let Some(conversation) = &controls.conversation {
         for (action, caption) in actions.iter().copied() {
@@ -1459,7 +1448,17 @@ fn key_action_row(
             );
         }
     }
-    let explanation = match status {
+    row.children(key_action_explanation(status, locale).map(|text| label(palette, TextRole::Caption, text)))
+}
+
+/// Блокирует новый запрос до окончания уже начатой операции.
+fn pending_key(status: Option<&KeyActionState>) -> bool {
+    matches!(status, Some(KeyActionState::Running(_) | KeyActionState::Waiting(_) | KeyActionState::ReplySent(_)))
+}
+
+/// Подписывает ход обмена ключами для строки запроса или закрытого сообщения.
+fn key_action_explanation(status: Option<&KeyActionState>, locale: Language) -> Option<&'static str> {
+    match status {
         Some(KeyActionState::Running(_)) => Some(locale.tr("message.sending")),
         Some(KeyActionState::Waiting(_)) => {
             Some(locale.tr("desktop.messenger.history.waitingForKeyReply"))
@@ -1478,8 +1477,7 @@ fn key_action_row(
             Some(locale.tr("desktop.messenger.history.keyActionFailed"))
         }
         None => None,
-    };
-    row.children(explanation.map(|text| label(palette, TextRole::Caption, text)))
+    }
 }
 
 /// Подписывает служебную историю и предлагает ответ только на открытые запросы другого устройства.
@@ -1613,6 +1611,13 @@ fn quote_content(
                     .into_any_element(),
             ),
             BodyPart::Text(text) => body = body.child(label(palette, TextRole::Body, text.clone())),
+            BodyPart::Preview(preview) => {
+                body = body.child(label(
+                    palette,
+                    TextRole::Body,
+                    fragments.locale.preview_text(preview),
+                ));
+            }
             BodyPart::Fragment { slot, reference } => {
                 inline.push(fragments.render((id, *slot), reference.as_ref(), palette))
             }
@@ -1702,38 +1707,39 @@ fn forward_card(
         .px_2()
         .py_1()
         .border_l_2()
-        .border_color(palette.accent)
-        .child(label(
-            palette,
-            TextRole::Caption,
-            fragments.locale.tr("message.forwarded"),
-        ));
+        .border_color(palette.accent);
+    let mut header = div().flex().flex_col().min_w_0().gap_1().child(label(
+        palette,
+        TextRole::Caption,
+        fragments.locale.tr("message.forwarded"),
+    ));
     let Some(reference) = reference else {
-        return card;
+        return card.child(header);
     };
     if !reference.author.is_empty() {
-        card = card.child(label(palette, TextRole::Label, reference.author.clone()));
+        header = header.child(label(palette, TextRole::Label, reference.author.clone()));
     }
     if let Some(source) = &reference.source {
-        card = card.child(label(palette, TextRole::Caption, source.clone()));
+        header = header.child(label(palette, TextRole::Caption, source.clone()));
     }
-    if let Some(conversation) = fragments.conversation.cloned() {
+    card = if let Some(conversation) = fragments.conversation.cloned() {
         let target = reference.id;
-        let mut open = Button::new(
-            (gpui::ElementId::from(target), "open-forward-original"),
-            fragments.locale.tr("message.openForwardOriginal"),
-        );
-        open.appearance = crate::gpui_client::ui::ButtonAppearance::Ghost;
-        card = card.child(
-            open.render(palette, None, move |_, cx| {
+        let header = header
+            .id((gpui::ElementId::from(target), "open-forward-original"))
+            .border_1()
+            .border_color(gpui::transparent_black());
+        card.child(
+            activate(header, None, palette, move |_, cx| {
                 cx.stop_propagation();
                 let _ =
                     conversation.update(cx, |view, cx| view.open_forward_original(id, target, cx));
             })
             .occlude()
             .debug_selector(move || format!("forward-original-{id}-{target}")),
-        );
-    }
+        )
+    } else {
+        card.child(header)
+    };
     let mut inline = Vec::new();
     for (position, part) in reference.parts.iter().enumerate() {
         match part {
@@ -1744,6 +1750,15 @@ fn forward_card(
                         .into_any_element(),
                 );
             }
+            BodyPart::Preview(preview) => inline.push(
+                label(
+                    palette,
+                    TextRole::Body,
+                    fragments.locale.preview_text(preview),
+                )
+                .min_w_0()
+                .into_any_element(),
+            ),
             BodyPart::Fragment { slot, reference } => {
                 inline.push(fragments.render((id, *slot), reference.as_ref(), palette));
             }
@@ -1831,12 +1846,7 @@ fn build_rows(
                 own,
                 author: message.metadata.author_id,
                 topic: message.topic_id,
-                date: Some(format!(
-                    "{}.{}.{}",
-                    &stamp[8..10],
-                    &stamp[5..7],
-                    &stamp[0..4]
-                )),
+                date: Some(stamp[..10].to_owned()),
                 body,
                 encrypted,
                 service,

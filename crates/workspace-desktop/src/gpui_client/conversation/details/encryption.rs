@@ -1,59 +1,87 @@
 //! Показывает сведения о локальных ключах и запускает управление точным поколением из панели чата.
 
+mod confirmation;
+mod view;
+
+use std::collections::HashMap;
+
 use futures::{StreamExt, stream};
-use gpui::{Context, Div, div, prelude::*};
+use gpui::{App, Context, FocusHandle, Window};
 use uuid::Uuid;
 use workspace_core::messenger::encryption::{
-    key_exchange::{KeyExchange, KeyRequestCompletion, KeyRequestOutcome, KeyRequestTarget},
-    lifecycle::{KeyLifecycleError, KeyLifecycleIntent, LocalStreamKeys},
+    key_exchange::{
+        KeyExchange, KeyReplyCapabilities, KeyRequestCompletion, KeyRequestOutcome,
+        KeyRequestStatus, KeyRequestTarget,
+    },
+    lifecycle::{KeyLifecycleError, LocalStreamKeys},
 };
 
-use super::{Conversation, State, action};
-use crate::gpui_client::{
-    preferences::Preferences,
-    ui::{Button, Palette, TextRole, label},
-};
+use super::{Conversation, EncryptedScreen, State};
 use workspace_core::storage::KeyRequestHint;
+
+use confirmation::KeyConfirmation;
 
 /// Состояние ключей для текущего открытия панели. Хранит только UUID и разрешённые действия.
 #[derive(Default)]
 pub(super) enum KeyManagement {
     #[default]
     Hidden, // Обычный разговор или сервер ещё не подтвердил режим.
-    Loading(Uuid),      // Чтение списка для этого открытия.
-    Ready(KeyControls), // Есть сведения о ключах для показанного пользователя.
+    Loading(Uuid),           // Чтение списка для этого открытия.
+    Failed,                  // Не удалось прочитать список, можно повторить.
+    Ready(Box<KeyControls>), // Есть сведения о ключах для показанного пользователя.
 }
 
 /// Видимые локальные ключи и действие, которое уже запустили или ожидаем подтвердить.
 pub(super) struct KeyControls {
     data: LocalStreamKeys, // Подтверждённое поколение, право ротации и локальные UUID.
     expanded: bool,        // Развёрнут ли список поколений этого чата.
-    remove: Option<Uuid>,  // Поколение, удаления которого пользователь ещё не подтвердил.
-    rotate: bool,          // Пользователь должен явно подтвердить смену поколения.
+    request_sections: [bool; 3], // Раскрытие входящих, выданных и отклонённых запросов.
+    key_focus: HashMap<Uuid, FocusHandle>, // Фокус каждой строки для возврата после просмотра.
+    rotate_focus: FocusHandle, // Кнопка перевыпуска на текущем экране.
+    remove_focus: FocusHandle, // Кнопка удаления открытого ключа.
     operation: Option<Uuid>, // Активный вызов, к которому относится поздний ответ.
     error: bool,           // Последнее действие не получило подтверждения.
-    request: Option<Uuid>, // Публичный ID ожидающего запроса текущего поколения.
-    rejected: bool,        // Ранее подтверждённый отказ, после которого можно запросить ключ снова.
+    requests: HashMap<Uuid, RequestedKey>, // Состояния своих запросов по UUID поколения.
     bulk: Vec<PendingKeyGrant>, // Известные запросы всех тем и отдельные результаты выдачи.
 }
 
-/// Строка массовой выдачи адресована точному запросу из журнала сообщений.
+/// Состояние запроса ключа с этого устройства.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RequestedKey {
+    Waiting(Uuid), // Публичный UUID запроса до подтверждённого ответа.
+    Rejected,      // После подтверждённого отказа можно отправить новый запрос.
+}
+
+/// Строка списка адресована точному запросу из журнала сообщений.
 #[derive(Clone)]
 struct PendingKeyGrant {
     hint: KeyRequestHint, // Подтверждённое размещение и имя устройства из истории.
+    author_id: Uuid,      // UUID автора, подтверждённый серверным чтением запроса.
+    capabilities: KeyReplyCapabilities, // Какие ответы разрешил Core.
     state: GrantState,    // Решение или состояние доставки для одного запроса.
 }
 
 /// Что происходит с одной строкой доступного набора.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GrantState {
-    Available, // Core подтвердил возможность отправки.
-    Sending,   // Запущена явная операция выдачи.
-    Granted,   // Сервер подтвердил размещение ответа.
-    Failed,    // Выдача не завершилась и может быть повторно проверена.
+    Pending,                      // Можно принять решение по запросу.
+    Sending,                      // Запущена явная операция ответа.
+    Completed(KeyRequestOutcome), // Сервер подтвердил выдачу или отказ.
+    Failed(KeyRequestOutcome),    // Ответ не завершился, можно повторить то же решение.
 }
 
 impl PendingKeyGrant {
+    /// Учитывает проверенные права и позволяет повторить только уже выбранный ответ.
+    fn can_respond(&self, outcome: KeyRequestOutcome) -> bool {
+        if self.state != GrantState::Pending && self.state != GrantState::Failed(outcome) {
+            return false;
+        }
+        match outcome {
+            KeyRequestOutcome::Granted => self.capabilities.can_grant,
+            KeyRequestOutcome::Rejected => self.capabilities.can_reject,
+        }
+    }
+
     /// Использует UUID места запроса, темы и поколения без зависимости от видимого окна.
     fn target(&self) -> KeyRequestTarget {
         KeyRequestTarget {
@@ -75,7 +103,7 @@ impl PendingKeyGrant {
 #[derive(Clone, Copy)]
 enum Change {
     Remove(Uuid), // Удалить один локальный ключ, сохранив серверное поколение.
-    Rotate,       // Выпустить поколение штатным процессом Core.
+    Rotate(Uuid), // Выпустить новое поколение после показанного пользователю.
 }
 
 impl Conversation {
@@ -87,24 +115,19 @@ impl Conversation {
         if !matches!(panel.state, Some(State::Ready)) || !panel.is_present(cx) {
             return;
         }
-        let current = match &panel.keys {
-            KeyManagement::Ready(keys) if keys.operation.is_none() => Some((
-                keys.expanded,
-                keys.data.topic_id,
-                keys.data.current_key_id,
-                keys.request,
-                keys.rejected,
-            )),
-            KeyManagement::Ready(_) => return,
-            KeyManagement::Hidden => None,
-            KeyManagement::Loading(_) => return,
-        };
         let request = Uuid::new_v4();
-        let previous_results = match &panel.keys {
-            KeyManagement::Ready(keys) => keys.bulk.clone(),
-            _ => Vec::new(),
+        match &panel.keys {
+            KeyManagement::Ready(keys) if keys.operation.is_some() => return,
+            KeyManagement::Loading(_) => return,
+            _ => {}
+        }
+        let previous = match std::mem::replace(&mut panel.keys, KeyManagement::Loading(request)) {
+            KeyManagement::Ready(keys) => Some(keys),
+            _ => None,
         };
-        panel.keys = KeyManagement::Loading(request);
+        let previous_results = previous
+            .as_ref()
+            .map_or_else(Vec::new, |keys| keys.bulk.clone());
         let activation = encryption.activation.clone();
         let engine = encryption.engine.clone();
         let runtime = panel.runtime.clone();
@@ -142,32 +165,47 @@ impl Conversation {
                     let exchange = KeyExchange::new(services.messenger, services.sync, engine);
                     let mut bulk = stream::iter(hints)
                         .map(|hint| async {
-                            let row = PendingKeyGrant {
-                                hint,
-                                state: GrantState::Available,
+                            let target = KeyRequestTarget {
+                                stream_id: hint.stream_id,
+                                topic_id: hint.topic_id,
+                                key_id: hint.key_id,
                             };
-                            let permission = exchange
-                                .key_reply_capabilities(
-                                    &activation,
-                                    row.target(),
-                                    row.hint.request_id,
-                                )
+                            let (author_id, capabilities, state) = match exchange
+                                .key_request_status(&activation, target, hint.request_id)
                                 .await
-                                .ok()?;
-                            permission.can_grant.then_some(row)
+                                .ok()??
+                            {
+                                KeyRequestStatus::Pending {
+                                    author_id,
+                                    capabilities,
+                                } => (author_id, capabilities, GrantState::Pending),
+                                KeyRequestStatus::Completed { author_id, outcome } => (
+                                    author_id,
+                                    KeyReplyCapabilities::default(),
+                                    GrantState::Completed(outcome),
+                                ),
+                            };
+                            Some(PendingKeyGrant {
+                                hint,
+                                author_id,
+                                capabilities,
+                                state,
+                            })
                         })
                         .buffered(8)
                         .filter_map(async |row| row)
                         .collect::<Vec<_>>()
                         .await;
                     for previous in previous_results {
-                        if !matches!(previous.state, GrantState::Granted | GrantState::Failed) {
-                            continue;
-                        }
-                        if let Some(row) = bulk.iter_mut().find(|row| row.same_request(&previous)) {
+                        if let Some(row) = bulk.iter_mut().find(|row| row.same_request(&previous))
+                            && row.state == GrantState::Pending
+                            && matches!(
+                                previous.state,
+                                GrantState::Completed(_) | GrantState::Failed(_)
+                            )
+                        {
+                            // POST может получить подтверждение раньше, чем ответ появится в локальном индексе.
                             row.state = previous.state;
-                        } else if previous.state == GrantState::Granted {
-                            bulk.push(previous);
                         }
                     }
                     Ok::<_, KeyLifecycleError>((data, bulk))
@@ -185,28 +223,55 @@ impl Conversation {
                 }
                 panel.keys = match result {
                     Ok(Ok((data, bulk))) => {
-                        let waiting = current
-                            .filter(|(_, topic, key, _, _)| {
-                                *topic == data.topic_id && *key == data.current_key_id
+                        let (
+                            expanded,
+                            request_sections,
+                            mut key_focus,
+                            requests,
+                            rotate_focus,
+                            remove_focus,
+                        ) = previous
+                            .filter(|keys| keys.data.topic_id == data.topic_id)
+                            .map(|keys| {
+                                (
+                                    keys.expanded,
+                                    keys.request_sections,
+                                    keys.key_focus,
+                                    keys.requests,
+                                    keys.rotate_focus,
+                                    keys.remove_focus,
+                                )
                             })
-                            .filter(|_| {
-                                data.keys
-                                    .iter()
-                                    .all(|key| key.key_id != data.current_key_id)
+                            .unwrap_or_else(|| {
+                                (
+                                    false,
+                                    [false; 3],
+                                    HashMap::new(),
+                                    HashMap::new(),
+                                    cx.focus_handle(),
+                                    cx.focus_handle(),
+                                )
                             });
-                        KeyManagement::Ready(KeyControls {
+                        key_focus.retain(|id, _| data.keys.iter().any(|key| key.key_id == *id));
+                        for key in &data.keys {
+                            key_focus
+                                .entry(key.key_id)
+                                .or_insert_with(|| cx.focus_handle());
+                        }
+                        KeyManagement::Ready(Box::new(KeyControls {
                             data,
-                            expanded: current.is_some_and(|(expanded, ..)| expanded),
-                            remove: None,
-                            rotate: false,
+                            expanded,
+                            request_sections,
+                            key_focus,
+                            rotate_focus,
+                            remove_focus,
                             operation: None,
                             error: false,
-                            request: waiting.and_then(|(_, _, _, request, _)| request),
-                            rejected: waiting.is_some_and(|(_, _, _, _, rejected)| rejected),
+                            requests,
                             bulk,
-                        })
+                        }))
                     }
-                    _ => KeyManagement::Hidden,
+                    _ => KeyManagement::Failed,
                 };
                 cx.notify();
             });
@@ -215,8 +280,13 @@ impl Conversation {
         cx.notify();
     }
 
-    /// Выдаёт только прошедшие последнюю проверку запросы, независимо от открытой темы.
-    fn bulk_grant_keys(&mut self, cx: &mut Context<Self>) {
+    /// Отвечает на один запрос или выдаёт ключи по всем доступным запросам в канале.
+    fn respond_to_sidebar_key_requests(
+        &mut self,
+        request_id: Option<Uuid>,
+        outcome: KeyRequestOutcome,
+        cx: &mut Context<Self>,
+    ) {
         let (Some(panel), Some(encryption)) = (&mut self.details, &self.encryption) else {
             return;
         };
@@ -232,11 +302,12 @@ impl Conversation {
         let requests: Vec<_> = keys
             .bulk
             .iter_mut()
-            .filter_map(|row| {
-                matches!(row.state, GrantState::Available | GrantState::Failed).then(|| {
-                    row.state = GrantState::Sending;
-                    row.clone()
-                })
+            .filter(|row| {
+                request_id.is_none_or(|id| id == row.hint.request_id) && row.can_respond(outcome)
+            })
+            .map(|row| {
+                row.state = GrantState::Sending;
+                row.clone()
             })
             .collect();
         if requests.is_empty() {
@@ -244,6 +315,7 @@ impl Conversation {
         }
         let op_id = Uuid::new_v4();
         keys.operation = Some(op_id);
+        keys.error = false;
         let runtime = panel.runtime.clone();
         let address = self.address.clone();
         let activation = encryption.activation.clone();
@@ -254,19 +326,19 @@ impl Conversation {
                     let exchange = KeyExchange::new(services.messenger, services.sync, engine);
                     stream::iter(requests)
                         .map(|mut row| async {
-                            let shared = exchange
+                            let sent = exchange
                                 .respond_to_key_request(
                                     &activation,
                                     row.target(),
                                     row.hint.request_id,
-                                    KeyRequestOutcome::Granted,
+                                    outcome,
                                 )
                                 .await
                                 .is_ok();
-                            row.state = if shared {
-                                GrantState::Granted
+                            row.state = if sent {
+                                GrantState::Completed(outcome)
                             } else {
-                                GrantState::Failed
+                                GrantState::Failed(outcome)
                             };
                             row
                         })
@@ -302,7 +374,7 @@ impl Conversation {
                                 .iter()
                                 .find(|candidate| row.same_request(candidate))
                         })
-                        .map_or(GrantState::Failed, |resolved| resolved.state);
+                        .map_or(GrantState::Failed(outcome), |resolved| resolved.state);
                 }
                 cx.notify();
             });
@@ -337,22 +409,21 @@ impl Conversation {
             return;
         };
         if keys.data.topic_id != target.topic_id
-            || keys.data.current_key_id != target.key_id
-            || keys.request != Some(receipt.request_id)
+            || keys.requests.get(&target.key_id) != Some(&RequestedKey::Waiting(receipt.request_id))
         {
             return;
         }
-        keys.request = None;
         if receipt.outcome == KeyRequestOutcome::Rejected {
-            keys.rejected = true;
+            keys.requests.insert(target.key_id, RequestedKey::Rejected);
         } else {
+            keys.requests.remove(&target.key_id);
             self.refresh_key_management(cx);
         }
         cx.notify();
     }
 
-    /// Просит недостающий текущий ключ для подтверждённой темы даже при пустой истории.
-    fn request_current_key(&mut self, cx: &mut Context<Self>) {
+    /// Запрашивает указанное поколение в подтверждённой теме открытой панели.
+    fn request_sidebar_key(&mut self, id: Uuid, cx: &mut Context<Self>) {
         let (Some(panel), Some(encryption)) = (&mut self.details, &self.encryption) else {
             return;
         };
@@ -363,24 +434,21 @@ impl Conversation {
             return;
         };
         if keys.operation.is_some()
-            || keys.request.is_some()
-            || keys
-                .data
-                .keys
-                .iter()
-                .any(|key| key.key_id == keys.data.current_key_id)
+            || matches!(keys.requests.get(&id), Some(RequestedKey::Waiting(_)))
+            || (keys.data.current_key_id != id
+                && !keys.data.keys.iter().any(|key| key.key_id == id))
         {
             return;
         }
         let target = KeyRequestTarget {
             stream_id: self.address.route.scope.stream_id,
             topic_id: keys.data.topic_id,
-            key_id: keys.data.current_key_id,
+            key_id: id,
         };
         let op_id = Uuid::new_v4();
         keys.operation = Some(op_id);
         keys.error = false;
-        keys.rejected = false;
+        keys.requests.remove(&id);
         let activation = encryption.activation.clone();
         let captured = activation.clone();
         let engine = encryption.engine.clone();
@@ -410,7 +478,8 @@ impl Conversation {
                 keys.operation = None;
                 let completion = match result {
                     Ok(Ok(receipt)) => {
-                        keys.request = Some(receipt.request_id);
+                        keys.requests
+                            .insert(id, RequestedKey::Waiting(receipt.request_id));
                         runtime.key_request_completion(&activation, target, receipt.request_id)
                     }
                     _ => {
@@ -428,27 +497,60 @@ impl Conversation {
         cx.notify();
     }
 
-    /// Проверяет, что команда адресована списку из того же открытия панели.
-    fn apply_key_management(&mut self, change: Change, cx: &mut Context<Self>) {
+    /// Проверяет, что диалог всё ещё относится к открытому экрану и точному ключу.
+    fn key_change_state(
+        &self,
+        change: Change,
+        screen: Option<EncryptedScreen>,
+        app: &App,
+    ) -> Option<&KeyControls> {
+        let panel = self.details.as_ref()?;
+        if self.encryption.is_none()
+            || !self.has_access()
+            || !panel.is_present(app)
+            || panel.gallery.is_some()
+            || panel.encrypted_screen() != screen
+            || !matches!(panel.state, Some(State::Ready))
+        {
+            return None;
+        }
+        let KeyManagement::Ready(keys) = &panel.keys else {
+            return None;
+        };
+        let available = match change {
+            Change::Remove(id) => {
+                screen == Some(EncryptedScreen::LocalKey(id))
+                    && keys.data.keys.iter().any(|key| key.key_id == id)
+            }
+            Change::Rotate(id) => {
+                matches!(screen, None | Some(EncryptedScreen::Keys))
+                    && keys.data.can_rotate
+                    && keys.data.current_key_id == id
+            }
+        };
+        available.then_some(keys.as_ref())
+    }
+
+    /// Проверяет ещё раз состояние перед отправкой подтверждённого действия в Core.
+    fn apply_key_management(
+        &mut self,
+        change: Change,
+        screen: Option<EncryptedScreen>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .key_change_state(change, screen, cx)
+            .is_none_or(|keys| keys.operation.is_some())
+        {
+            return;
+        }
         let (Some(panel), Some(encryption)) = (&mut self.details, &self.encryption) else {
             return;
         };
-        if !panel.is_present(cx) || !matches!(panel.state, Some(State::Ready)) {
-            return;
-        }
         let KeyManagement::Ready(keys) = &mut panel.keys else {
             return;
         };
-        if keys.operation.is_some() {
-            return;
-        }
-        match change {
-            Change::Remove(id)
-                if keys.remove == Some(id) && keys.data.keys.iter().any(|key| key.key_id == id) => {
-            }
-            Change::Rotate if keys.rotate && keys.data.can_rotate => {}
-            _ => return,
-        }
         let op_id = Uuid::new_v4();
         keys.operation = Some(op_id);
         keys.error = false;
@@ -456,7 +558,7 @@ impl Conversation {
         let address = self.address.clone();
         let engine = encryption.engine.clone();
         let activation = encryption.activation.clone();
-        cx.spawn(async move |view, cx| {
+        cx.spawn_in(window, async move |view, cx| {
             let reply = runtime
                 .conversation(address, move |services, address| async move {
                     let scope = address.route.scope;
@@ -477,18 +579,16 @@ impl Conversation {
                             .and_then(Result::ok)
                             .ok_or(KeyLifecycleError::Changed)
                         }
-                        Change::Rotate => {
-                            let pending = services.messenger.pending_key_lifecycle(&services.sync, &activation)?
-                                .into_iter().find(|operation| {
-                                    operation.stream_id == scope.stream_id && matches!(
-                                        operation.intent, KeyLifecycleIntent::Rotate { topic_id, .. }
-                                            if scope.topic_id.is_none_or(|current| current == topic_id)
-                                    )
-                                });
-                            let operation = match pending {
-                                Some(operation) => operation.operation_id,
-                                None => services.messenger.stage_key_rotation(&services.sync, &activation, scope).await?,
-                            };
+                        Change::Rotate(id) => {
+                            let operation = services
+                                .messenger
+                                .stage_confirmed_key_rotation(
+                                    &services.sync,
+                                    &activation,
+                                    scope,
+                                    id,
+                                )
+                                .await?;
                             services
                                 .messenger
                                 .rotate_encrypted_key(&services.sync, &activation, operation)
@@ -498,296 +598,43 @@ impl Conversation {
                     }
                 })
                 .await;
-            let _ = view.update(cx, |view, cx| {
-                let Some(result) = reply.for_current(Some(&view.address)) else {
-                    return;
-                };
-                let Some(panel) = view.details.as_mut().filter(|panel| panel.is_present(cx)) else {
-                    return;
-                };
-                let KeyManagement::Ready(keys) = &mut panel.keys else {
-                    return;
-                };
-                if keys.operation != Some(op_id) {
-                    return;
-                }
-                keys.operation = None;
-                keys.error = !matches!(result, Ok(Ok(())));
-                log::debug!(
-                    "event=gpui_chat_keys_changed op_id={op_id} ok={}",
-                    !keys.error
-                );
-                if !keys.error {
-                    view.load_key_management(cx);
-                }
-                cx.notify();
+            let _ = cx.update(|window, app| {
+                let _ = view.update(app, |view, cx| {
+                    let Some(result) = reply.for_current(Some(&view.address)) else {
+                        return;
+                    };
+                    let Some(panel) = view.details.as_mut().filter(|panel| panel.is_present(cx))
+                    else {
+                        return;
+                    };
+                    let KeyManagement::Ready(keys) = &mut panel.keys else {
+                        return;
+                    };
+                    if keys.operation != Some(op_id) {
+                        return;
+                    }
+                    keys.operation = None;
+                    keys.error = !matches!(result, Ok(Ok(())));
+                    log::debug!(
+                        "event=gpui_chat_keys_changed op_id={op_id} ok={}",
+                        !keys.error
+                    );
+                    if !keys.error {
+                        panel.host.update(cx, |host, cx| {
+                            if host.modal_is::<KeyConfirmation>() {
+                                host.close_modal(window, cx);
+                            }
+                        });
+                        if let Change::Remove(id) = change {
+                            view.return_from_encrypted_local_key(id, cx);
+                        }
+                        view.load_key_management(cx);
+                    }
+                    cx.notify();
+                });
             });
         })
         .detach();
         cx.notify();
     }
-}
-
-impl KeyManagement {
-    /// Рисует список и подтверждения только после проверки нативного защищённого чата.
-    pub(super) fn render(&self, palette: Palette, cx: &Context<Conversation>) -> Option<Div> {
-        let Self::Ready(keys) = self else {
-            return None;
-        };
-        let locale = Preferences::read(cx).language;
-        let text = |ru, en| locale.text(ru, en);
-        let mut group = div()
-            .flex()
-            .flex_none()
-            .flex_col()
-            .items_start()
-            .gap_1()
-            .px_2()
-            .py_2()
-            .child(
-                Button::new("conversation-chat-keys", text("Ключи чата", "Chat keys"))
-                    .render(
-                        palette,
-                        None,
-                        action(cx, |view, _, cx| {
-                            let Some(KeyManagement::Ready(keys)) =
-                                view.details.as_mut().map(|panel| &mut panel.keys)
-                            else {
-                                return;
-                            };
-                            keys.expanded = !keys.expanded;
-                            cx.notify();
-                        }),
-                    )
-                    .debug_selector(|| "conversation-chat-keys".into()),
-            );
-        if !keys.expanded {
-            return Some(group);
-        }
-        group = group.child(label(
-            palette,
-            TextRole::Caption,
-            format!(
-                "{} · {}",
-                text("Текущий ключ", "Current key"),
-                keys.data.current_key_id
-            ),
-        ));
-        if keys.data.keys.is_empty() {
-            group = group.child(label(
-                palette,
-                TextRole::Body,
-                text(
-                    "На этом устройстве пока нет ключей",
-                    "This device has no keys yet",
-                ),
-            ));
-        }
-        let busy = keys.operation.is_some();
-        if !keys
-            .data
-            .keys
-            .iter()
-            .any(|key| key.key_id == keys.data.current_key_id)
-        {
-            let mut request = Button::new(
-                "request-current-chat-key",
-                text("Запросить текущий ключ", "Request current key"),
-            );
-            request.disabled = busy || keys.request.is_some();
-            group = group.child(
-                request
-                    .render(
-                        palette,
-                        None,
-                        action(cx, |view, _, cx| view.request_current_key(cx)),
-                    )
-                    .debug_selector(|| "request-current-chat-key".into()),
-            );
-            if keys.request.is_some() {
-                group = group.child(label(
-                    palette,
-                    TextRole::Caption,
-                    text("Ожидаем ответа на запрос", "Awaiting a key reply"),
-                ));
-            } else if keys.rejected {
-                group = group.child(label(
-                    palette,
-                    TextRole::Caption,
-                    text("В выдаче ключа отказано", "Key request declined"),
-                ));
-            }
-        }
-        let mut held = div()
-            .id("conversation-held-keys")
-            .flex()
-            .flex_col()
-            .w_full()
-            .gap_1()
-            .max_h(gpui::px(160.))
-            .overflow_y_scroll();
-        for key in &keys.data.keys {
-            let id = key.key_id;
-            let confirm = keys.remove == Some(id);
-            let name = if confirm {
-                text("Подтвердить удаление", "Confirm removal")
-            } else {
-                text("Удалить с устройства", "Remove from device")
-            };
-            let mut button = Button::new((gpui::ElementId::from(id), "remove-chat-key"), name);
-            button.disabled = busy;
-            held = held.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_start()
-                    .gap_1()
-                    .child(label(palette, TextRole::Caption, id.to_string()))
-                    .children(key.added_at_unix_ms.map(|added_at| {
-                        label(
-                            palette,
-                            TextRole::Caption,
-                            crate::platform::chat_keys::key_date(added_at),
-                        )
-                    }))
-                    .child(
-                        button
-                            .render(
-                                palette,
-                                None,
-                                action(cx, move |view, _, cx| {
-                                    if confirm {
-                                        view.apply_key_management(Change::Remove(id), cx);
-                                    } else if let Some(KeyManagement::Ready(keys)) =
-                                        view.details.as_mut().map(|panel| &mut panel.keys)
-                                    {
-                                        keys.remove = Some(id);
-                                        keys.rotate = false;
-                                        cx.notify();
-                                    }
-                                }),
-                            )
-                            .debug_selector(move || format!("conversation-remove-key-{id}")),
-                    ),
-            );
-        }
-        group = group.child(held);
-        if keys.data.can_rotate {
-            let name = if keys.rotate {
-                text("Подтвердить смену ключа", "Confirm key rotation")
-            } else {
-                text("Сменить ключ", "Rotate key")
-            };
-            let confirm = keys.rotate;
-            let mut button = Button::new("conversation-rotate-key", name);
-            button.disabled = busy;
-            group = group.child(
-                button
-                    .render(
-                        palette,
-                        None,
-                        action(cx, move |view, _, cx| {
-                            if confirm {
-                                view.apply_key_management(Change::Rotate, cx);
-                            } else if let Some(KeyManagement::Ready(keys)) =
-                                view.details.as_mut().map(|panel| &mut panel.keys)
-                            {
-                                keys.rotate = true;
-                                keys.remove = None;
-                                cx.notify();
-                            }
-                        }),
-                    )
-                    .debug_selector(|| "conversation-rotate-key".into()),
-            );
-        }
-        if keys.error {
-            group = group.child(label(
-                palette,
-                TextRole::Caption,
-                text(
-                    "Не удалось подтвердить действие. Повторите попытку",
-                    "Action could not be confirmed. Try again",
-                ),
-            ));
-        }
-        Some(group.children(bulk_controls(&keys.bulk, busy, palette, cx)))
-    }
-}
-
-/// Показывает доступную массовую выдачу и отдельный результат для каждого устройства.
-fn bulk_controls(
-    rows: &[PendingKeyGrant],
-    busy: bool,
-    palette: Palette,
-    cx: &Context<Conversation>,
-) -> Option<Div> {
-    if rows.is_empty() {
-        return None;
-    }
-    let locale = Preferences::read(cx).language;
-    let t = |ru, en| locale.text(ru, en);
-    let count = rows
-        .iter()
-        .filter(|row| matches!(row.state, GrantState::Available | GrantState::Failed))
-        .count();
-    let mut list = div()
-        .id("conversation-bulk-key-requests")
-        .max_h(gpui::px(160.))
-        .overflow_y_scroll()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(label(
-            palette,
-            TextRole::Label,
-            t("Запросы ключей", "Key requests"),
-        ));
-    if count > 0 {
-        let mut button = Button::new(
-            "bulk-grant-chat-keys",
-            format!(
-                "{} · {count}",
-                t("Выдать доступные ключи", "Share available keys")
-            ),
-        );
-        button.disabled = busy;
-        list = list.child(
-            button
-                .render(
-                    palette,
-                    None,
-                    action(cx, |view, _, cx| view.bulk_grant_keys(cx)),
-                )
-                .debug_selector(|| "bulk-grant-chat-keys".into()),
-        );
-    }
-    for row in rows {
-        let id = row.hint.request_id;
-        let state = row.state;
-        let status = match row.state {
-            GrantState::Sending => t("Отправляем…", "Sending…"),
-            GrantState::Granted => t("Выдан", "Granted"),
-            GrantState::Failed => t("Не удалось выдать", "Could not share"),
-            GrantState::Available => t("Ожидает ответа", "Awaiting a reply"),
-        };
-        list = list.child(
-            div()
-                .flex()
-                .justify_between()
-                .gap_1()
-                .debug_selector(move || format!("bulk-key-result-{id}"))
-                .child(label(palette, TextRole::Body, row.hint.device_name.clone()))
-                .child(
-                    label(palette, TextRole::Caption, status).debug_selector(move || {
-                        if state == GrantState::Granted {
-                            format!("bulk-key-granted-{id}")
-                        } else {
-                            format!("bulk-key-pending-{id}")
-                        }
-                    }),
-                ),
-        );
-    }
-    Some(div().min_w_0().child(list))
 }

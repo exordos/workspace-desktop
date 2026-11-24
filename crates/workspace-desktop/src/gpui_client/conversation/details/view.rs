@@ -4,23 +4,31 @@ mod channel;
 mod gallery;
 mod peer;
 
-use std::rc::Rc;
+use std::{rc::Rc, sync::Arc};
 
-use gpui::{App, Div, FocusHandle, ImageSource, SharedString, Window};
+use gpui::{
+    App, Div, ElementId, FocusHandle, ImageSource, Pixels, Point, SharedString, Window, div,
+    prelude::*, px,
+};
 use uuid::Uuid;
+use workspace_core::{directory::ProfilePresence, messenger::details::TopicSummaryBlock};
 
 use super::{
     Conversation,
     gallery::{Action as GalleryAction, Gallery},
 };
-use crate::gpui_client::ui::{Avatar, AvatarPresence, Icon, Palette};
+use crate::gpui_client::{
+    preferences::Language,
+    ui::{Avatar, AvatarPresence, Icon, Palette, TextRole, ellipsized_label, label},
+};
 
+pub(in crate::gpui_client) use channel::member_counts;
 pub(super) use gallery::title as gallery_title;
 
 /// Данные одного из двух видов панели.
 pub(super) enum PanelContent {
-    Peer(PeerView),       // Карточка собеседника в личном чате.
-    Channel(ChannelView), // Сведения о канале, темы и участники.
+    Peer(PeerView),            // Карточка собеседника в личном чате.
+    Channel(Box<ChannelView>), // Сведения о канале, темы и участники.
 }
 
 /// Видимость и доступность действия в текущем контексте.
@@ -77,9 +85,11 @@ pub(super) struct PeerView {
     pub name: SharedString,                  // Отображаемое имя собеседника.
     pub avatar: AvatarView,                  // Аватар, инициалы и присутствие.
     pub custom_status: Option<SharedString>, // Пользовательский статус, если есть.
-    pub presence: Option<SharedString>,      // Подпись «В сети», «Отошёл» и другие варианты.
+    pub presence: Option<ProfilePresence>,   // Состояние для подписи и её цвета.
     pub fields: Vec<ProfileField>,           // Строки профиля в порядке показа.
+    pub copied_fields: Vec<usize>,           // Номера строк с галочкой после копирования.
     pub actions: PeerActions,                // Доступность карточек действий.
+    pub language: Language,                  // Язык подписей и подсказок.
 }
 
 /// Три уровня уведомлений для всего канала.
@@ -100,6 +110,7 @@ pub(super) struct NotificationsView {
 /// Одна строка списка тем.
 pub(super) struct TopicView {
     pub id: Uuid,            // Идентификатор темы для навигации.
+    pub focus: FocusHandle,  // Возврат на тему из контекстного меню.
     pub title: SharedString, // Отображаемое имя темы.
     pub selected: bool,      // Сейчас открыт этот разговор.
     pub muted: Option<bool>, // Действующий режим темы, если он известен.
@@ -110,9 +121,13 @@ pub(super) struct TopicView {
 
 /// Контекст открытой темы и сведения о завершении.
 pub(super) struct SelectedTopicView {
-    pub title: SharedString,           // Название открытой темы.
-    pub done: bool,                    // Тема завершена.
-    pub summary: Option<SharedString>, // Готовый контекст из данных темы.
+    pub title: SharedString,                       // Название открытой темы.
+    pub done: bool,                                // Тема завершена.
+    pub summary: Option<Arc<[TopicSummaryBlock]>>, // Контекст с нативным начертанием.
+    pub expanded: bool,                            // Содержимое контекста сейчас раскрыто.
+    pub summary_enabled: bool,                     // Контекст продолжает обновляться.
+    pub summary_has_new_messages: bool,            // После сводки появились сообщения.
+    pub summary_settings: Option<FocusHandle>,     // Право открыть настройки и вернуть фокус.
 }
 
 /// Строка участника с действием, разрешённым контроллером.
@@ -129,6 +144,7 @@ pub(super) struct MemberView {
 #[derive(Default)]
 pub(super) struct ChannelView {
     pub name: SharedString,                        // Отображаемое имя канала.
+    pub language: Language,                        // Язык подписей и счётчиков.
     pub avatar: AvatarView,                        // Аватар канала с резервными инициалами.
     pub color: Option<gpui::Hsla>,                 // Цвет подложки аватара, если задан.
     pub description: Option<SharedString>,         // Описание канала.
@@ -138,8 +154,10 @@ pub(super) struct ChannelView {
     pub selected_topic: Option<SelectedTopicView>, // Контекст открытой темы, если он есть.
     pub topics_expanded: bool,                     // Видимость списка тем.
     pub topics: Vec<TopicView>,                    // Темы в порядке показа.
+    pub topic_error: Option<SharedString>,         // Ошибка изменения темы.
     pub members: Vec<MemberView>,                  // Участники в порядке показа.
     pub add_members: Availability,                 // Доступность кнопки добавления участников.
+    pub add_members_focus: Option<FocusHandle>,    // Возврат на кнопку из окна приглашения.
     pub member_error: Option<SharedString>,        // Ошибка изменения состава, если есть.
 }
 
@@ -150,18 +168,27 @@ pub(super) struct ChannelView {
     reason = "Часть действий появится после подключения адаптеров экрана"
 )]
 pub(super) enum PanelAction {
-    MessagePeer,                         // Перейти к разговору профиля.
-    CallPeer,                            // Позвонить собеседнику.
-    SharePeer,                           // Скопировать ссылку профиля.
-    Favorites,                           // Перейти в избранное.
-    EditPeer,                            // Изменить свой профиль.
-    Copy(String),                        // Скопировать видимое значение.
+    MessagePeer, // Перейти к разговору профиля.
+    CallPeer,    // Позвонить собеседнику.
+    SharePeer,   // Скопировать ссылку профиля.
+    Favorites,   // Перейти в избранное.
+    EditPeer,    // Изменить свой профиль.
+    Copy {
+        field: usize,  // Номер строки, на которой показать подтверждение.
+        value: String, // Видимое значение для буфера обмена.
+    },
     SetNotifications(NotificationLevel), // Установить уровень канала.
     ToggleTopics,                        // Развернуть или свернуть темы.
+    ToggleSummary,                       // Развернуть или свернуть контекст темы.
+    OpenSummarySettings,                 // Открыть форму параметров выжимки.
     OpenTopic(Uuid),                     // Открыть тему канала.
-    AddMembers,                          // Показать выбор новых участников.
-    RemoveMember(Uuid),                  // Удалить привязку к каналу.
-    Gallery(GalleryAction),              // Открыть раздел вложений или выполнить его действие.
+    OpenTopicMenu {
+        topic: Uuid,           // UUID темы в переданном снимке канала.
+        anchor: Point<Pixels>, // Точка показа меню рядом с указателем или строкой.
+    },
+    AddMembers,             // Показать выбор новых участников.
+    RemoveMember(Uuid),     // Удалить привязку к каналу.
+    Gallery(GalleryAction), // Открыть раздел вложений или выполнить его действие.
 }
 
 type Dispatch = Rc<dyn Fn(PanelAction, &mut Window, &mut App)>;
@@ -174,11 +201,104 @@ pub(super) fn render(
     dispatch: impl Fn(PanelAction, &mut Window, &mut App) + 'static,
 ) -> Div {
     let dispatch: Dispatch = Rc::new(dispatch);
-    let gallery = gallery_triggers.map(|triggers| gallery::triggers(triggers, palette, &dispatch));
+    let gallery = |language| {
+        gallery_triggers.map(|triggers| gallery::triggers(triggers, palette, language, &dispatch))
+    };
     match content {
-        PanelContent::Peer(peer) => peer::render(peer, gallery, palette, &dispatch),
-        PanelContent::Channel(channel) => channel::render(channel, gallery, palette, &dispatch),
+        PanelContent::Peer(peer) => peer::render(peer, gallery(peer.language), palette, &dispatch),
+        PanelContent::Channel(channel) => {
+            channel::render(channel, gallery(channel.language), palette, &dispatch)
+        }
     }
+}
+
+/// Рисует сведения защищённого чата с ключами, участниками и разделами вложений.
+pub(super) fn render_encrypted(
+    channel: &ChannelView,
+    actions: Div,
+    keys: Div,
+    palette: Palette,
+    gallery_triggers: Option<&[FocusHandle; 4]>,
+    dispatch: impl Fn(PanelAction, &mut Window, &mut App) + 'static,
+) -> Div {
+    let dispatch: Dispatch = Rc::new(dispatch);
+    let language = channel.language;
+    let header = div()
+        .flex()
+        .items_center()
+        .gap_4()
+        .px_2()
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(px(64.))
+                .rounded_full()
+                .bg(channel.color.unwrap_or(palette.card))
+                .child(Icon::ChatLock.element(px(40.), palette.text)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .flex_col()
+                .gap_2()
+                .child(
+                    ellipsized_label(palette, TextRole::ProfileHeading, channel.name.clone())
+                        .h(px(20.)),
+                )
+                .child(
+                    label(palette, TextRole::Label, language.tr("e2ee.protectedChat"))
+                        .text_size(px(16.))
+                        .line_height(px(16.))
+                        .text_color(palette.accent),
+                )
+                .child(ellipsized_label(
+                    Palette {
+                        text: palette.text_muted,
+                        ..palette
+                    },
+                    TextRole::Body,
+                    member_counts(language, channel.member_count, channel.online_count),
+                )),
+        );
+    encrypted_scroll(
+        "encrypted-info-scroll",
+        div()
+            .flex()
+            .flex_col()
+            .gap_5()
+            .debug_selector(|| "conversation-encrypted-info".into())
+            .child(header)
+            .child(actions)
+            .child(keys)
+            .children(
+                gallery_triggers
+                    .map(|triggers| gallery::triggers(triggers, palette, language, &dispatch)),
+            )
+            .child(
+                channel::render_members(channel, palette, &dispatch)
+                    .border_t_1()
+                    .border_color(palette.border)
+                    .pt_5(),
+            ),
+    )
+}
+
+/// Прокручивает содержимое открытого экрана внутри общей рамки панели.
+pub(super) fn encrypted_scroll(id: impl Into<ElementId>, content: Div) -> Div {
+    div().flex().flex_col().min_h_0().flex_1().child(
+        div()
+            .id(id)
+            .min_h_0()
+            .flex_1()
+            .overflow_x_hidden()
+            .overflow_y_scroll()
+            .child(content.py_4()),
+    )
 }
 
 /// Создаёт содержимое вложенного экрана с действиями текущего разговора.
@@ -186,8 +306,9 @@ pub(super) fn render_gallery(
     conversation: &Conversation,
     gallery: &Gallery,
     palette: Palette,
+    language: Language,
     dispatch: impl Fn(PanelAction, &mut Window, &mut App) + 'static,
 ) -> Div {
     let dispatch: Dispatch = Rc::new(dispatch);
-    gallery::render(conversation, gallery, palette, &dispatch)
+    gallery::render(conversation, gallery, palette, language, &dispatch)
 }

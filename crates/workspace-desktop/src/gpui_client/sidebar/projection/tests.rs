@@ -33,6 +33,24 @@ fn titles<'a>(group: &ChatGroup<'a>) -> Vec<&'a str> {
         .collect()
 }
 
+/// Поиск чата с собой следует его локализованной подписи, а не имени из каталога.
+#[test]
+fn search_follows_the_localized_self_chat_title() {
+    let user = Uuid::from_u128(31);
+    let mut favorite = channel(30, "Анастасия", Vec::new());
+    favorite.direct = true;
+    favorite.metadata.direct_peer_id = Some(user);
+    let mut presentation = Presentation::default();
+    presentation.set_titles(Language::En, Some(user));
+    presentation.set_query("Favorites");
+    assert!(presentation.group(&favorite, None).is_some());
+
+    presentation.set_titles(Language::Ru, Some(user));
+    assert!(presentation.group(&favorite, None).is_none());
+    presentation.set_query("Избранное");
+    assert!(presentation.group(&favorite, None).is_some());
+}
+
 /// Кнопка последовательно открывает незавершённые и завершённые темы.
 #[test]
 fn reveals_unfinished_then_completed_and_collapses_to_first_three() {
@@ -53,7 +71,7 @@ fn reveals_unfinished_then_completed_and_collapses_to_first_three() {
     assert!(!group.expanded);
     assert!(group.topics.is_empty());
 
-    presentation.toggle_channel(chat.id);
+    presentation.toggle_chat(chat.id);
     let group = presentation.group(&chat, None).unwrap();
     assert_eq!(titles(&group), ["Первая", "Вторая", "Третья"]);
     assert_eq!(group.toggle, Some(TopicToggleKind::ShowMore(1)));
@@ -124,8 +142,8 @@ fn hides_only_remaining_completed_topics_and_resets_on_channel_close() {
         Some(TopicToggleFocus::Topic(Uuid::from_u128(5))),
     );
 
-    presentation.toggle_channel(chat.id);
-    presentation.toggle_channel(chat.id);
+    presentation.toggle_chat(chat.id);
+    presentation.toggle_chat(chat.id);
     assert_eq!(
         presentation.group(&chat, None).unwrap().toggle,
         Some(TopicToggleKind::ShowCompleted(1)),
@@ -268,28 +286,29 @@ fn highlights_parent_when_active_topic_is_hidden() {
     assert!(presentation.group(&chat, selected).unwrap().selected);
     presentation.apply_toggle(&chat, selected, TopicToggleKind::ShowMore(1));
     assert!(!presentation.group(&chat, selected).unwrap().selected);
-    presentation.toggle_channel(chat.id);
+    presentation.toggle_chat(chat.id);
     assert!(presentation.group(&chat, selected).unwrap().selected);
 }
 
-/// Восстановленные раскрытия принадлежат только существующим каналам.
+/// Новый снимок сохраняет раскрытие личного чата и забывает удалённый разговор.
 #[test]
-fn retains_only_channels_from_current_snapshot() {
-    let existing = channel(1, "Канал", vec![]);
+fn retains_personal_chat_from_current_snapshot() {
+    let mut existing = channel(1, "Коллега", vec![topic(3, "Общая", false)]);
+    existing.direct = true;
     let removed = Uuid::from_u128(2);
     let mut presentation = Presentation::default();
     presentation.set_expanded(HashSet::from([existing.id, removed]));
     let expected = HashSet::from([existing.id]);
-    presentation.retain_channels(&[existing]);
+    presentation.retain_chats(&[existing]);
     assert_eq!(presentation.expanded(), &expected);
 }
 
-/// Внешний переход раскрывает целевую завершённую тему, не меняя соседнюю группу.
+/// Внешний переход раскрывает завершённую тему личного чата, сохраняя соседнюю группу.
 #[test]
-fn opens_external_topic_in_its_channel_only() {
-    let first = channel(
+fn opens_external_topic_in_its_chat_only() {
+    let mut first = channel(
         1,
-        "Канал",
+        "Коллега",
         vec![
             topic(2, "1", false),
             topic(3, "2", false),
@@ -297,6 +316,7 @@ fn opens_external_topic_in_its_channel_only() {
             topic(5, "4", true),
         ],
     );
+    first.direct = true;
     let second = channel(
         6,
         "Другой канал",

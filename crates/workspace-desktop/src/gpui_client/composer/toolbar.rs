@@ -7,7 +7,10 @@ use gpui::{
 };
 
 use super::{COMPOSER_INSET, Composer, ToolbarPreferences, editor::Format};
-use crate::gpui_client::ui::{Button, ButtonAppearance, Icon, Palette, popup};
+use crate::gpui_client::{
+    preferences::Language,
+    ui::{Button, ButtonAppearance, Icon, Palette, popup},
+};
 
 /// Команда ряда с подписью и размерами иконки из референса.
 struct Command {
@@ -15,7 +18,7 @@ struct Command {
     icon: Icon,          // Глиф для кнопки команды.
     glyph: [f32; 2],     // Ширина и высота глифа в логических пикселях.
     id: &'static str,    // Устойчивое имя кнопки для маршрута фокуса и тестов.
-    title: &'static str, // Название действия в подсказке.
+    title_key: &'static str, // Ключ названия действия в подсказке.
 }
 
 impl Command {
@@ -25,14 +28,14 @@ impl Command {
         icon: Icon,
         glyph: [f32; 2],
         id: &'static str,
-        title: &'static str,
+        title_key: &'static str,
     ) -> Self {
         Self {
             format,
             icon,
             glyph,
             id,
-            title,
+            title_key,
         }
     }
 }
@@ -43,70 +46,70 @@ const COMMANDS: [Command; 10] = [
         Icon::ComposerLink,
         [24., 14.769],
         "composer-format-link",
-        "Вставить ссылку",
+        "desktop.messenger.composer.insertLink",
     ),
     Command::new(
         Format::Bold,
         Icon::ComposerBold,
         [10.93, 16.667],
         "composer-format-bold",
-        "Жирный",
+        "composer.bold",
     ),
     Command::new(
         Format::Italic,
         Icon::ComposerItalic,
         [15.448, 16.747],
         "composer-format-italic",
-        "Курсив",
+        "composer.italic",
     ),
     Command::new(
         Format::Strike,
         Icon::ComposerStrike,
         [25.333, 19.79],
         "composer-format-strike",
-        "Зачёркнутый",
+        "composer.strikethrough",
     ),
     Command::new(
         Format::NumberedList,
         Icon::ComposerNumberedList,
         [21.333, 24.],
         "composer-format-numbered",
-        "Нумерованный список",
+        "composer.numberedList",
     ),
     Command::new(
         Format::BulletedList,
         Icon::ComposerBulletedList,
         [21.328, 19.533],
         "composer-format-bulleted",
-        "Маркированный список",
+        "composer.bulletedList",
     ),
     Command::new(
         Format::Quote,
         Icon::ComposerQuote,
         [24., 21.38],
         "composer-format-quote",
-        "Цитата",
+        "composer.quote",
     ),
     Command::new(
         Format::CodeBlock,
         Icon::ComposerCodeBlock,
         [21.333, 21.333],
         "composer-format-block",
-        "Блок кода",
+        "composer.codeBlock",
     ),
     Command::new(
         Format::InlineCode,
         Icon::ComposerInlineCode,
         [22., 18.],
         "composer-format-inline",
-        "Строка кода",
+        "composer.code",
     ),
     Command::new(
         Format::Spoiler,
         Icon::ComposerSpoiler,
         [25.834, 17.333],
         "composer-format-spoiler",
-        "Спойлер",
+        "composer.spoiler",
     ),
 ];
 const STYLE_GROUP_END: usize = 4;
@@ -139,20 +142,18 @@ impl Toolbar {
         &self,
         expanded: bool,
         palette: Palette,
+        language: Language,
         cx: &Context<Composer>,
     ) -> Stateful<Div> {
-        let (title, icon) = if expanded {
-            ("Скрыть инструменты форматирования", Icon::ComposerToolbar)
+        let (key, icon) = if expanded {
+            ("composer.collapseToolbar", Icon::ComposerToolbar)
         } else {
-            (
-                "Показать инструменты форматирования",
-                Icon::ComposerToolbarExpand,
-            )
+            ("composer.expandToolbar", Icon::ComposerToolbarExpand)
         };
         let target = cx.entity().downgrade();
         icon_button(
             "composer-toolbar-toggle",
-            title,
+            language.tr(key),
             (icon, [21.333; 2]),
             palette,
             &self.toggle,
@@ -173,6 +174,7 @@ impl Toolbar {
         &mut self,
         palette: Palette,
         can_format: bool,
+        language: Language,
         window: &Window,
         cx: &Context<Composer>,
     ) -> Stateful<Div> {
@@ -225,7 +227,7 @@ impl Toolbar {
             .pl(COMPOSER_INSET)
             .overflow_x_scroll()
             .track_scroll(&self.scroll)
-            .child(self.toggle(true, palette, cx));
+            .child(self.toggle(true, palette, language, cx));
         for (index, command) in COMMANDS.iter().enumerate() {
             if DIVIDERS.contains(&index) {
                 row = row.child(separator(palette).ml(TOOLBAR_GAP));
@@ -240,7 +242,7 @@ impl Toolbar {
             row = row.child(
                 icon_button(
                     command.id,
-                    command.title,
+                    language.tr(command.title_key),
                     (command.icon, command.glyph),
                     palette,
                     &self.commands[index],

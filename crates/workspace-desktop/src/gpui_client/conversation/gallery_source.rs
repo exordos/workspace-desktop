@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use gpui::{Context, FocusHandle, RenderImage, Task, Window};
+use gpui::{Context, Div, FocusHandle, RenderImage, Task, Window};
 use uuid::Uuid;
 use workspace_core::{
     messenger::{
@@ -22,11 +22,13 @@ use workspace_core::{
 
 use super::{
     Conversation,
-    attachments::{ProtectedAttachment, decode_thumbnail},
+    attachments::{AttachmentKey, ProtectedAttachment, decode_thumbnail},
 };
 use crate::gpui_client::{
     contracts::{ConversationAddress, ConversationReply},
+    preferences::{Language, Preferences},
     runtime::{RuntimeClient, WorkerServices},
+    ui::{Button, ConversationNotice, Palette},
 };
 
 const PAGE_SIZE: usize = 24;
@@ -207,15 +209,15 @@ pub(super) enum GalleryExportStatus {
 
 impl GalleryExportStatus {
     /// Показывает короткий статус без раскрытия пути и ошибок сервера.
-    pub(super) fn message(self) -> &'static str {
-        match self {
-            Self::Choosing => "Выбираем место…",
-            Self::Saving => "Сохраняем…",
-            Self::Done => "Сохранено",
-            Self::TooLarge => "Файл слишком большой для скачивания",
-            Self::Occupied => "Имя занято. Выберите другое",
-            Self::Failed => "Не удалось сохранить файл",
-        }
+    pub(super) fn message(self, language: Language) -> &'static str {
+        language.tr(match self {
+            Self::Choosing => "desktop.conversation.gallery.chooseLocation",
+            Self::Saving => "desktop.conversation.gallery.saving",
+            Self::Done => "desktop.conversation.gallery.saved",
+            Self::TooLarge => "desktop.conversation.gallery.tooLarge",
+            Self::Occupied => "desktop.conversation.gallery.nameOccupied",
+            Self::Failed => "desktop.conversation.gallery.saveFailed",
+        })
     }
 
     /// Отключает повторное сохранение до завершения текущего действия.
@@ -226,17 +228,22 @@ impl GalleryExportStatus {
 
 /// Операция принадлежит открытому экрану. Снятие состояния отменяет публикацию файла.
 pub(super) struct GalleryExport {
-    id: Uuid,                    // Номер попытки для проверки ответа.
-    message: Uuid,               // Исходное сообщение для отзыва ссылки.
-    quoting: Option<Uuid>,       // Цитирующий бабл для отмены после его правки.
-    file: Uuid,                  // UUID файла для строки и событий Core.
-    status: GalleryExportStatus, // Видимый результат или стадия работы.
-    cancelled: Arc<Mutex<bool>>, // Синхронизирует отмену и публикацию готовой записи.
-    _task: Task<()>,             // Владеет ожиданием системного диалога и результата.
+    id: Uuid,                            // Номер попытки для проверки ответа.
+    message: Uuid,                       // Исходное сообщение для отзыва ссылки.
+    quoting: Option<Uuid>,               // Цитирующий бабл для отмены после его правки.
+    file: Uuid,                          // UUID файла для строки и событий Core.
+    history_card: Option<AttachmentKey>, // Обычная карточка, сохранившая статус у истории.
+    status: GalleryExportStatus,         // Видимый результат или стадия работы.
+    cancelled: Arc<Mutex<bool>>,         // Синхронизирует отмену и публикацию готовой записи.
+    _task: Task<()>,                     // Владеет ожиданием системного диалога и результата.
 }
 
-/// Уже выбранная карточка в галерее или в раскрытом защищённом сообщении.
+/// Уже выбранная карточка в истории, галерее или раскрытом защищённом сообщении.
 enum ExportSource {
+    History {
+        key: AttachmentKey, // Точное вложение текущего окна.
+        name: String,       // Имя для подсказки системного диалога.
+    },
     Gallery {
         item: MediaHistoryItem, // Подтверждённая карточка из индекса обычных файлов.
         whole_stream: bool,     // Открыт индекс всего чата, включая другие темы.
@@ -258,6 +265,68 @@ impl Drop for GalleryExport {
 }
 
 impl Conversation {
+    /// Проверяет, что открыт допуск к вложению и исполнитель свободен.
+    pub(super) fn can_save_history_attachment(&self, key: AttachmentKey) -> bool {
+        self.can_copy_attachment(key)
+            && self
+                .gallery_export
+                .as_ref()
+                .is_none_or(|save| !save.status.is_pending())
+    }
+
+    /// Сохраняет оригинал из истории через ту же операцию, что и галерея.
+    pub(super) fn save_history_attachment(
+        &mut self,
+        key: AttachmentKey,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(reference) = self
+            .viewport
+            .attachment(key)
+            .filter(|_| self.can_save_history_attachment(key))
+        else {
+            return;
+        };
+        let name = reference
+            .name
+            .as_deref()
+            .unwrap_or(&reference.label)
+            .to_owned();
+        self.start_file_export(
+            ExportSource::History { key, name },
+            self.history_focus.clone(),
+            window,
+            cx,
+        );
+    }
+
+    /// Показывает ход и результат сохранения оригинала у исходного разговора.
+    pub(super) fn render_history_export(
+        &self,
+        palette: Palette,
+        language: Language,
+        cx: &Context<Self>,
+    ) -> Option<Div> {
+        let save = self.gallery_export.as_ref()?;
+        let key = save.history_card?;
+        if !self.viewport.has_attachment(key) {
+            return None;
+        }
+        let id = save.id;
+        let view = cx.entity().downgrade();
+        Some(
+            ConversationNotice {
+                text: save.status.message(language).into(),
+                action: (!save.status.is_pending())
+                    .then(|| Button::new("history-export-dismiss", language.tr("common.close"))),
+            }
+            .render(palette, move |_, cx| {
+                let _ = view.update(cx, |view, cx| view.finish_gallery_export(id, None, cx));
+            }),
+        )
+    }
+
     /// Возвращает статус только для строки, начавшей сохранение.
     pub(super) fn gallery_export_status(
         &self,
@@ -330,7 +399,7 @@ impl Conversation {
         );
     }
 
-    /// Использует одинаковый выбор пути и защищённую запись файла для обеих поверхностей.
+    /// Использует одинаковый выбор пути и защищённую запись файла для всех источников.
     fn start_file_export(
         &mut self,
         origin: ExportSource,
@@ -354,15 +423,34 @@ impl Conversation {
         let address = self.address.clone();
         let cancelled = Arc::new(Mutex::new(false));
         let cancel_write = Arc::clone(&cancelled);
-        let (message, file, quoting, name) = match &origin {
-            ExportSource::Gallery { item, .. } => {
-                (item.message_id, item.file_id, None, suggested_name(item))
-            }
+        let language = Preferences::read_for(cx, &address.route.owner).language;
+        let (message, file, quoting, history_card, name) = match &origin {
+            ExportSource::History { key, name } => (
+                key.message,
+                key.file,
+                None,
+                Some(*key),
+                suggested_file_name(name, MediaKind::Image, language),
+            ),
+            ExportSource::Gallery { item, .. } => (
+                item.message_id,
+                item.file_id,
+                None,
+                None,
+                suggested_file_name(
+                    item.name.as_deref().unwrap_or_default(),
+                    item.kind,
+                    language,
+                ),
+            ),
             ExportSource::Protected { source, .. } => (
                 source.key.message,
                 source.key.file,
                 Some(source.row_id()),
-                "Вложение".to_owned(),
+                None,
+                language
+                    .tr("desktop.messenger.history.attachment")
+                    .to_owned(),
             ),
         };
         let start = std::env::home_dir().unwrap_or_else(|| PathBuf::from("/"));
@@ -406,6 +494,10 @@ impl Conversation {
                                 );
                                 return false;
                             }
+                            if history_card.is_some_and(|key| !view.viewport.has_attachment(key)) {
+                                view.finish_gallery_export(id, None, cx);
+                                return false;
+                            }
                             window.focus(&source);
                             if path.is_none() {
                                 view.finish_gallery_export(id, None, cx);
@@ -427,6 +519,12 @@ impl Conversation {
             let reply = runtime
                 .conversation(address, move |services, _| async move {
                     let original = match origin {
+                        ExportSource::History { key, .. } => {
+                            services
+                                .messenger
+                                .open_media(&services.sync, &access, key.message, key.file)
+                                .await
+                        }
                         ExportSource::Gallery { item, whole_stream } => {
                             services
                                 .messenger
@@ -464,6 +562,7 @@ impl Conversation {
             message,
             quoting,
             file,
+            history_card,
             status: GalleryExportStatus::Choosing,
             cancelled,
             _task: task,
@@ -492,11 +591,8 @@ impl Conversation {
 }
 
 /// Имя из сообщения остаётся подсказкой в диалоге и не задаёт путь записи.
-fn suggested_name(item: &MediaHistoryItem) -> String {
-    let cleaned: String = item
-        .name
-        .as_deref()
-        .unwrap_or_default()
+fn suggested_file_name(name: &str, kind: MediaKind, language: Language) -> String {
+    let cleaned: String = name
         .chars()
         .filter(|letter| !letter.is_control())
         .map(|letter| {
@@ -510,11 +606,13 @@ fn suggested_name(item: &MediaHistoryItem) -> String {
         .collect();
     let cleaned = cleaned.trim_matches([' ', '.']);
     if cleaned.is_empty() {
-        if item.kind == MediaKind::Video {
-            "Видео".into()
-        } else {
-            "Вложение".into()
-        }
+        language
+            .tr(if kind == MediaKind::Video {
+                "mediaViewer.videoQueued"
+            } else {
+                "desktop.messenger.history.attachment"
+            })
+            .into()
     } else {
         cleaned.into()
     }

@@ -106,15 +106,18 @@ fn forward_dialog_posts_canonical_fragment_and_reveal_uses_origin_key(cx: &mut T
         },
     );
     click(ui, CHAT_ROW);
-    let open = "forward-fragments-10000000-0000-4000-8000-000000000042";
+    let original = "history-message-10000000-0000-4000-8000-000000000042";
     until(
         ui,
-        "действие пересылки у подтверждённого оригинала",
-        |ui| ui.debug_bounds(open).is_some(),
+        "подтверждённый оригинал виден в истории",
+        |ui| ui.debug_bounds(original).is_some(),
     );
-    let point = ui.debug_bounds(open).unwrap().center();
-    ui.simulate_mouse_move(point, None, Modifiers::none());
-    click(ui, open);
+    assert!(
+        ui.debug_bounds("forward-fragments-10000000-0000-4000-8000-000000000042")
+            .is_none()
+    );
+    open_history_context_menu(ui, original);
+    click(ui, "history-forward-message");
     until(ui, "диалог пересылки открыт", |ui| {
         ui.debug_bounds("fragment-forward-dialog").is_some()
     });
@@ -207,12 +210,12 @@ fn forward_dialog_posts_canonical_fragment_and_reveal_uses_origin_key(cx: &mut T
         },
     );
     let route_before = ui.read(|app| client.read(app).shell.conversation().unwrap().clone());
-    let original_button: &'static str =
+    let original_header: &'static str =
         Box::leak(format!("forward-original-{id}-{ORIGINAL}").into_boxed_str());
     fixture.deny_original.store(true, Ordering::SeqCst);
-    let point = ui.debug_bounds(original_button).unwrap().center();
+    let point = ui.debug_bounds(original_header).unwrap().center();
     ui.simulate_mouse_move(point, None, Modifiers::none());
-    click(ui, original_button);
+    click(ui, original_header);
     until(
         ui,
         "сервер проверил и отказал в доступе к оригиналу",
@@ -227,6 +230,7 @@ fn forward_dialog_posts_canonical_fragment_and_reveal_uses_origin_key(cx: &mut T
         keystroke: gpui::Keystroke::parse("enter").unwrap(),
     });
     let original_id = Uuid::parse_str(ORIGINAL).unwrap();
+    let original_topic = Uuid::parse_str(TOPIC).unwrap();
     until(
         ui,
         "клавиша Enter открывает точный оригинал в личке",
@@ -240,7 +244,7 @@ fn forward_dialog_posts_canonical_fragment_and_reveal_uses_origin_key(cx: &mut T
                         address.route.entry
                             == crate::gpui_client::contracts::ChatEntry::Around(original_id)
                             && address.route.scope.stream_id == origin
-                            && address.route.scope.topic_id.is_none()
+                            && address.route.scope.topic_id == Some(original_topic)
                     })
             })
         },

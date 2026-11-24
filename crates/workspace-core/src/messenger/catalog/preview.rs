@@ -22,6 +22,9 @@ use crate::{
 
 use super::{Catalog, CatalogError, Chat};
 
+mod text;
+pub use text::{MessagePreview, PreviewPart};
+
 const BATCH_SIZE: usize = 100;
 const CONCURRENT_BATCHES: usize = 3;
 const TEXT_LIMIT: usize = 240;
@@ -40,7 +43,7 @@ pub struct SidebarPreview {
 /// Содержимое фонового превью. Расшифрованный текст в этой модели не хранится.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SidebarPreviewBody {
-    Summary(String), // Короткая строка из обычного Markdown.
+    Summary(MessagePreview), // Короткие части из обычного Markdown.
     Encrypted {
         key_id: Uuid,        // Точное поколение, указанное в сообщении.
         ciphertext: String,  // Канонический конверт из REST.
@@ -62,30 +65,14 @@ pub enum SidebarKeyServiceKind {
 impl From<&str> for SidebarPreviewBody {
     /// Создаёт подпись обычного сообщения из готовой строки.
     fn from(text: &str) -> Self {
-        Self::Summary(text.to_owned())
+        Self::Summary(text.into())
     }
 }
 
 impl From<String> for SidebarPreviewBody {
     /// Принимает подготовленную подпись обычного сообщения.
     fn from(text: String) -> Self {
-        Self::Summary(text)
-    }
-}
-
-impl SidebarPreviewBody {
-    /// Возвращает подпись до расшифровки или после удаления ключа.
-    pub fn fallback_text(&self) -> &str {
-        match self {
-            Self::Summary(text) => text,
-            Self::Encrypted { .. } => "Нужен ключ",
-            Self::KeyService(kind) => match kind {
-                SidebarKeyServiceKind::Requested => "Запрос ключа",
-                SidebarKeyServiceKind::Granted => "Ключ передан",
-                SidebarKeyServiceKind::Rejected => "Запрос отклонён",
-                SidebarKeyServiceKind::Announced => "Объявлен новый ключ",
-            },
-        }
+        Self::Summary(text.into())
     }
 }
 
@@ -118,7 +105,7 @@ impl SidebarPreview {
         let prepared = encryption.prepare(activation, stream_id, *key_id)?;
         let accepted = encryption.accept(prepared.decrypt(ciphertext))?;
         let text = accepted
-            .with_body(|markdown| Zeroizing::new(preview_text(markdown)))
+            .with_body(|markdown| Zeroizing::new(MessagePreview::short(markdown, TEXT_LIMIT)))
             .ok_or(DecryptionError::Stale)?;
         Ok(Some(ProtectedSidebarSummary {
             permission: accepted.into_permission(),
@@ -130,12 +117,12 @@ impl SidebarPreview {
 /// Временная подпись, доступная, пока действует ключ сообщения.
 pub struct ProtectedSidebarSummary {
     permission: MessageReadPermission, // Не даёт показать старую подпись при отзыве ключа.
-    text: Zeroizing<String>,           // Сокращённая строка для представления.
+    text: Zeroizing<MessagePreview>,   // Отзывные части превью для оформления интерфейсом.
 }
 
 impl ProtectedSidebarSummary {
-    /// Читает одну короткую строку и возвращает `None` после отзыва ключа.
-    pub fn with_text<T>(&self, read: impl FnOnce(&str) -> T) -> Option<T> {
+    /// Читает короткое превью только до отзыва ключа.
+    pub fn with_preview<T>(&self, read: impl FnOnce(&MessagePreview) -> T) -> Option<T> {
         self.permission.with_current(|| read(&self.text))
     }
 }
@@ -220,7 +207,7 @@ fn make_preview(
     let author_id = row.metadata.author_id.unwrap_or(Uuid::nil());
     let text = match &row.body {
         MessageBody::Markdown(text) => {
-            let summary = preview_text(text);
+            let summary = MessagePreview::short(text, TEXT_LIMIT);
             if summary.is_empty() {
                 return None;
             }
@@ -250,63 +237,6 @@ fn make_preview(
         created_at: row.metadata.created_at.clone(),
         text,
     })
-}
-
-/// Собирает одну короткую строку и заменяет адреса подписью ссылки.
-pub(in crate::messenger) fn preview_text(markdown: &str) -> String {
-    let markdown = crate::messenger::encryption::fragments::fragment_preview(markdown);
-    let markdown = crate::messenger::forward::forward_preview(&markdown);
-    let links = inline_link_labels(&markdown);
-    let text: String = links
-        .split_whitespace()
-        .map(|word| {
-            let word = word.trim_matches(['*', '`', '~']);
-            let address = word.trim_matches(['<', '>']);
-            if address.starts_with("https://") || address.starts_with("http://") {
-                "Ссылка"
-            } else {
-                word
-            }
-        })
-        .filter(|word| !word.is_empty())
-        .flat_map(|word| word.chars().chain(std::iter::once(' ')))
-        .filter(|character| !character.is_control())
-        .take(TEXT_LIMIT)
-        .collect();
-    text.trim_end().to_owned()
-}
-
-/// Оставляет подписи встроенных ссылок и вложений без их адресов.
-fn inline_link_labels(mut text: &str) -> String {
-    let mut labels = String::new();
-    while let Some((before, destination)) = text.split_once("](") {
-        let Some((prefix, label)) = before.rsplit_once('[') else {
-            labels.push_str(before);
-            labels.push_str("](");
-            text = destination;
-            continue;
-        };
-        let mut depth = 1;
-        let Some((close, _)) = destination.char_indices().find(|&(_, character)| {
-            match character {
-                '(' => depth += 1,
-                ')' => depth -= 1,
-                _ => {}
-            }
-            depth == 0
-        }) else {
-            break;
-        };
-        labels.push_str(prefix.strip_suffix('!').unwrap_or(prefix));
-        labels.push_str(if label.is_empty() {
-            "Ссылка"
-        } else {
-            label
-        });
-        text = &destination[close + 1..];
-    }
-    labels.push_str(text);
-    labels
 }
 
 /// Подтверждённое сообщение из общей базы или из точного запроса каталога.
@@ -499,11 +429,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            summary.with_text(str::to_owned).as_deref(),
-            Some("карточка файл")
+            summary.with_preview(Clone::clone),
+            Some("карточка файл".into())
         );
         engine.select_session(None);
-        assert_eq!(summary.with_text(str::to_owned), None);
-        assert_eq!(preview.body().fallback_text(), "Нужен ключ");
+        assert_eq!(summary.with_preview(Clone::clone), None);
+        assert!(matches!(preview.body(), SidebarPreviewBody::Encrypted { .. }));
     }
 }

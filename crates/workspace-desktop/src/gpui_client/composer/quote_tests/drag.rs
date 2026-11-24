@@ -58,8 +58,9 @@ fn release(ui: &mut VisualTestContext, at: Point<Pixels>) {
 #[gpui::test]
 fn reply_drag_reorders_both_directions_without_selecting_source(cx: &mut TestAppContext) {
     let (view, ui, requests) = open(cx);
-    for (id, answer) in [(MESSAGE, "Ввод A"), (SECOND, "Ввод Б"), (MESSAGE, "Ввод В")]
-    {
+    choose(ui, MESSAGE, "history-reply-replace");
+    paste(ui, "Ввод A");
+    for (id, answer) in [(SECOND, "Ввод Б"), (MESSAGE, "Ввод В")] {
         choose(ui, id, "history-reply-add");
         paste(ui, answer);
     }
@@ -99,7 +100,7 @@ fn reply_drag_reorders_both_directions_without_selecting_source(cx: &mut TestApp
 #[gpui::test]
 fn reply_drag_cancels_outside_row_and_on_escape(cx: &mut TestAppContext) {
     let (view, ui, requests) = open(cx);
-    choose(ui, MESSAGE, "history-reply-add");
+    choose(ui, MESSAGE, "history-reply-replace");
     paste(ui, "Слева");
     choose(ui, SECOND, "history-reply-add");
     paste(ui, "Справа");
@@ -169,8 +170,9 @@ fn reply_drag_respects_scrolled_viewport_and_keeps_visible_offset(cx: &mut TestA
         })
     });
     ui.run_until_parked();
+    choose(ui, MESSAGE, "history-reply-replace");
+    paste(ui, "Первый");
     for (id, answer) in [
-        (MESSAGE, "Первый"),
         (SECOND, "Второй"),
         (MESSAGE, "Третий"),
         (MESSAGE, "Четвёртый"),
@@ -245,7 +247,7 @@ fn reply_drag_respects_scrolled_viewport_and_keeps_visible_offset(cx: &mut TestA
 #[gpui::test]
 fn reply_drag_and_keyboard_reorder_after_destination_failure(cx: &mut TestAppContext) {
     let (view, ui, requests) = open(cx);
-    choose(ui, MESSAGE, "history-reply-add");
+    choose(ui, MESSAGE, "history-reply-replace");
     paste(ui, "Ответ А");
     choose(ui, SECOND, "history-reply-add");
     paste(ui, "Ответ Б");

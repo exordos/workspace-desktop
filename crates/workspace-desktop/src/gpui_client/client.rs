@@ -10,7 +10,7 @@ mod preference_runtime;
 use std::collections::HashMap;
 
 use gpui::{
-    AnyView, Context, Entity, FocusHandle, SharedString, StyleRefinement, Subscription, Task,
+    AnyView, Context, Entity, FocusHandle, StyleRefinement, Subscription, Task,
     Window, div, prelude::*, px,
 };
 use workspace_core::{
@@ -26,9 +26,10 @@ use super::{
     Options,
     avatars::AvatarImages,
     contracts::{
-        AccountSession, AccountSnapshot, RuntimeEvent, RuntimeExit, ShellAction, SidebarAction,
+        AccountSession, AccountSnapshot, ConversationAddress, NotificationRouteError, RuntimeEvent,
+        RuntimeExit, ShellAction, SidebarAction,
     },
-    conversation::{Conversation, OpenDetailsTopic, OpenForwardOriginal},
+    conversation::{Conversation, DetailsProfileAction, DetailsProfileIntent, OpenDetailsTopic, OpenForwardOriginal},
     next_control,
     platform_window::WindowPlatform,
     previous_control,
@@ -96,12 +97,13 @@ pub(super) struct Client {
     sidebar: Entity<Sidebar>, // Единственный каталог; хранит поиск каждого входа.
     encrypted_channel: Option<super::sidebar::OpenEncryptedChannel>, // Запрошенная форма для текущего входа.
     key_response_scan: Option<Task<()>>, // Чтение сохранённых ответов для текущего выбора входа.
-    sidebar_visible: bool,               // Показывается ли каталог в рабочем разделе.
-    search_return: Option<FocusHandle>,  // Куда вернуться после завершения поиска сочетанием.
+    sidebar_visible: bool,  // Показывается ли каталог в рабочем разделе.
+    search_return: Option<FocusHandle>, // Куда вернуться после завершения поиска сочетанием.
     idle: Option<preference_runtime::IdleSession>, // Таймер автовыхода для выбранного входа.
-    places: preference_runtime::Places,  // Маршруты навигации назад и вперёд выбранного входа.
+    places: preference_runtime::Places, // Маршруты навигации назад и вперёд выбранного входа.
     conversation: Option<Entity<Conversation>>, // Экран актуального адреса, если он открыт.
-    history_positions: HistoryPositions, // Опоры чтения недавних разговоров этого окна.
+    history_positions: HistoryPositions,     // Опоры чтения недавних разговоров этого окна.
+    details_profile_requested: Option<DetailsProfileIntent>, // Переход из карточки своего профиля.
     details_navigation: Option<Subscription>, // Подписка на переход из правой панели текущего экрана.
     right_panel: Entity<RightPanel>,          // Общая история правых панелей рабочего окна.
     sign_in: Option<Entity<SignIn>>,          // Открытая форма первого или дополнительного входа.
@@ -133,13 +135,9 @@ impl Client {
     pub(super) fn new(options: Options, runtime: RuntimeClient, cx: &mut Context<Self>) -> Self {
         let sidebar = cx.new(|cx| Sidebar::with_runtime(runtime.clone(), cx));
         cx.observe(&sidebar, |_, _, cx| cx.notify()).detach();
-        cx.subscribe(
-            &sidebar,
-            |client, _, intent: &super::sidebar::OpenEncryptedChannel, cx| {
-                client.request_encrypted_channel(intent, cx);
-            },
-        )
-        .detach();
+        cx.subscribe(&sidebar, |client, _, intent: &super::sidebar::OpenEncryptedChannel, cx| {
+            client.request_encrypted_channel(intent, cx);
+        }).detach();
         cx.subscribe(&sidebar, |client, _, intent: &FolderIntent, cx| {
             client.handle_folder_intent(intent.clone(), cx);
         })
@@ -165,6 +163,7 @@ impl Client {
         });
         let right_panel = cx.new(|cx| RightPanel::new(initial_focus.clone(), cx));
         cx.observe(&right_panel, |_, _, cx| cx.notify()).detach();
+        sidebar.update(cx, |sidebar, _| sidebar.set_action_panel(&right_panel));
         let selection = cx.subscribe(&top_bar, |client, _, selection: &TopBarSelection, cx| {
             client.open_section(TopBarSection::Chats, cx);
             client.handle_action(ShellAction::SelectAccount(selection.0.clone()), cx);
@@ -182,16 +181,7 @@ impl Client {
                 },
             );
         let subscription = cx.subscribe(&sidebar, |client, _, action: &SidebarAction, cx| {
-            let action = match action {
-                SidebarAction::OpenChat { route, generation } => SidebarAction::OpenChat {
-                    route: route.clone(),
-                    generation: *generation,
-                },
-                SidebarAction::RetryCatalog(session) => {
-                    SidebarAction::RetryCatalog(session.clone())
-                }
-            };
-            client.handle_action(ShellAction::Sidebar(action), cx);
+            client.handle_action(ShellAction::Sidebar(action.clone()), cx);
         });
 
         Self {
@@ -208,6 +198,7 @@ impl Client {
             key_response_scan: None,
             history_positions: HistoryPositions::default(),
             right_panel,
+            details_profile_requested: None,
             details_navigation: None,
             sign_in: None,
             add_account: None,
@@ -421,44 +412,13 @@ impl Client {
     /// Выполняет команду оболочки и обновляет связанные части того же окна.
     fn apply(&mut self, effect: Option<ShellEffect>, cx: &mut Context<Self>) {
         let effect = self.reconcile_sign_in(cx).or(effect);
-        if let Some(activation) = self
-            .runtime
-            .select_encryption_session(self.shell.selected())
-        {
+        if let Some(activation) = self.runtime.select_encryption_session(self.shell.selected()) {
             self.reconcile_key_inbox(activation, cx);
         }
         self.sync_right_panel_context(cx);
         match effect {
             Some(ShellEffect::OpenConversation(address)) => {
-                self.save_history_position(cx);
-                self.release_old_conversation_avatars(cx);
-                self.open_section(TopBarSection::Chats, cx);
-                let runtime = self.runtime.clone();
-                let panel = self.right_panel.clone();
-                let restore = self.history_positions.take(&address);
-                let conversation =
-                    cx.new(|cx| Conversation::open(address, runtime, panel, restore, cx));
-                self.details_navigation = Some(cx.subscribe(
-                    &conversation,
-                    |client, _, target: &OpenDetailsTopic, cx| {
-                        client.open_details_topic(target, cx)
-                    },
-                ));
-                cx.subscribe(
-                    &conversation,
-                    |client, _, target: &OpenForwardOriginal, cx| {
-                        if client.section == TopBarSection::Chats {
-                            let effect = client.shell.open_forward_original(
-                                &target.address,
-                                target.scope,
-                                target.id,
-                            );
-                            client.apply(effect, cx);
-                        }
-                    },
-                )
-                .detach();
-                self.conversation = Some(conversation);
+                self.open_conversation_view(address, cx);
             }
             Some(ShellEffect::CloseConversation) => {
                 self.save_history_position(cx);
@@ -522,6 +482,39 @@ impl Client {
         });
         self.record_place();
         cx.notify();
+    }
+
+    /// Открывает экран истории подтверждённого разговора.
+    fn open_conversation_view(
+        &mut self,
+        address: ConversationAddress,
+        cx: &mut Context<Self>,
+    ) {
+        self.save_history_position(cx);
+        self.release_old_conversation_avatars(cx);
+        self.open_section(TopBarSection::Chats, cx);
+        let runtime = self.runtime.clone();
+        let panel = self.right_panel.clone();
+        let restore = self.history_positions.take(&address);
+        let conversation = cx.new(|cx| Conversation::open(address, runtime, panel, restore, cx));
+        self.details_navigation = Some(
+            cx.subscribe(&conversation, |client, _, target: &OpenDetailsTopic, cx| {
+                client.open_details_topic(target, cx)
+            }),
+        );
+        cx.subscribe(&conversation, |client, _, target: &OpenForwardOriginal, cx| {
+            if client.section == TopBarSection::Chats {
+                let effect = client.shell.open_forward_original(&target.address, target.scope, target.id);
+                client.apply(effect, cx);
+            }
+        })
+        .detach();
+        cx.subscribe(&conversation, |client, _, intent: &DetailsProfileIntent, cx| {
+            client.details_profile_requested = Some(intent.clone());
+            cx.notify();
+        })
+        .detach();
+        self.conversation = Some(conversation);
     }
 
     /// Начинает дополнительный вход через тот же RuntimeClient, сохраняя маршрут мессенджера.
@@ -681,6 +674,55 @@ impl Client {
                 details: self.profile_details.clone(),
             };
             Profile::toggle(&self.right_panel, session, opener, services, window, cx);
+        }
+    }
+
+    /// Передаёт действия собственного профиля существующим маршрутам рабочего окна.
+    fn open_requested_details_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(intent) = self.details_profile_requested.take() else {
+            return;
+        };
+        let Some(session) = self.shell.selected().cloned() else {
+            return;
+        };
+        if self.shell.conversation() != Some(&intent.address)
+            || self.sign_in.is_some()
+            || self.status().is_some()
+            || !self
+                .conversation
+                .as_ref()
+                .is_some_and(|view| view.read(cx).details_active(cx))
+        {
+            return;
+        }
+        match intent.action {
+            DetailsProfileAction::Favorites => {
+                if let Ok(link) = workspace_core::messenger::own_profile::favorites_link(&session.owner) {
+                    cx.open_url(&link);
+                }
+            }
+            DetailsProfileAction::Edit => {
+                let services = ProfileServices {
+                    runtime: self.runtime.clone(),
+                    sidebar: self.sidebar.downgrade(),
+                    client: cx.weak_entity(),
+                    account_label: self
+                        .labels
+                        .get(&session.owner.account_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    details: self.profile_details.clone(),
+                };
+                Profile::open_personal(
+                    &self.right_panel,
+                    intent.address,
+                    session,
+                    intent.opener,
+                    services,
+                    window,
+                    cx,
+                );
+            }
         }
     }
 
@@ -857,7 +899,6 @@ impl Client {
     /// Обновляет подписи и счётчики шапки с учётом выбранного входа и языка.
     fn refresh_top_bar_accounts(&self, cx: &mut Context<Self>) {
         let locale = super::preferences::Preferences::read(cx).language;
-        let t = |ru, en| locale.text(ru, en);
         let accounts = self
             .shell
             .accounts()
@@ -869,19 +910,21 @@ impl Client {
                     .labels
                     .get(&session.owner.account_id)
                     .cloned()
-                    .unwrap_or_else(|| format!("{} {}", t("Аккаунт", "Account"), index + 1));
+                    .unwrap_or_else(|| {
+                        locale.tr_with(
+                            "desktop.profile.numberedAccount",
+                            &[("number", &(index + 1).to_string())],
+                        )
+                    });
                 let label = match account.status {
                     SessionStatus::Active => display_name,
                     SessionStatus::Restoring => {
-                        format!("{display_name} · {}", t("Вход…", "Signing in…"))
+                        format!("{display_name} · {}", locale.tr("auth.loginLoading"))
                     }
                     SessionStatus::TemporarilyUnavailable => {
-                        format!("{display_name} · {}", t("Нет связи", "Offline"))
+                        format!("{display_name} · {}", locale.tr("desktop.auth.offline"))
                     }
-                    _ => format!(
-                        "{display_name} · {}",
-                        t("Требуется вход", "Sign-in required")
-                    ),
+                    _ => format!("{display_name} · {}", locale.tr("desktop.auth.required")),
                 };
                 let server = session.owner.server.trim_start_matches("https://");
                 TopBarAccount {
@@ -897,16 +940,21 @@ impl Client {
             .update(cx, |view, cx| view.set_accounts(accounts, cx));
     }
 
-    /// Сообщает о начальном состоянии или ошибке только безопасным текстом.
-    fn status(&self) -> Option<SharedString> {
+    /// Возвращает ключ подписи начального состояния или безопасной ошибки.
+    fn status(&self) -> Option<&'static str> {
         if let Some(error) = self.startup_error {
-            return Some(error.to_string().into());
+            return Some(match error {
+                StartupError::Profile => "desktop.startup.profileFailed",
+                StartupError::Database => "desktop.startup.databaseFailed",
+                StartupError::Worker => "desktop.startup.workerFailed",
+                StartupError::TestLogin => "desktop.startup.testLoginFailed",
+            });
         }
         if self.stopped {
-            return Some("Фоновая работа остановлена".into());
+            return Some("desktop.startup.stopped");
         }
         if !self.ready || !self.received_accounts {
-            return Some("Загружаем аккаунты…".into());
+            return Some("desktop.startup.loadingAccounts");
         }
         None
     }
@@ -930,6 +978,7 @@ impl Render for Client {
         self.sync_profile_details(cx);
         RightPanel::restore_focus(&self.right_panel, window, cx);
         self.open_requested_profile(window, cx);
+        self.open_requested_details_profile(window, cx);
         self.open_requested_encrypted_channel(window, cx);
         let palette = Palette::for_window(window, cx);
         let locale = super::preferences::Preferences::read(cx).language;
@@ -980,7 +1029,7 @@ impl Render for Client {
                 .items_center()
                 .justify_center()
                 .p_4()
-                .child(label(palette, TextRole::Label, status))
+                .child(label(palette, TextRole::Label, locale.tr(status)))
                 .into_any_element()
         } else if self.section != TopBarSection::Chats {
             let section = self.section;
@@ -1031,7 +1080,7 @@ impl Render for Client {
                 .child(label(
                     palette,
                     TextRole::Body,
-                    locale.text("Выберите разговор", "Select a conversation"),
+                    locale.tr("desktop.conversation.select"),
                 ));
             div()
                 .flex()
@@ -1071,7 +1120,7 @@ impl Render for Client {
                                     .h_full()
                                     .child(conversation.clone()),
                             ),
-                            None => view.child(empty.flex_1().min_w_0()),
+                            None => view.child(empty),
                         })
                         .children(RightPanel::frame(&self.right_panel, palette, window, cx)),
                 )
@@ -1084,8 +1133,15 @@ impl Render for Client {
                 .track_focus(&self.top_zone)
                 .child(self.top_bar.clone()),
         )
-        .children(route_error.map(|message| {
-            label(palette, TextRole::Body, message)
+        .children(route_error.map(|error| {
+            let key = match error {
+                NotificationRouteError::InactiveSession => "desktop.notifications.inactiveAccount",
+                NotificationRouteError::TargetUnavailable => {
+                    "desktop.notifications.unavailableMessage"
+                }
+                NotificationRouteError::LookupFailed => "desktop.notifications.openFailed",
+            };
+            label(palette, TextRole::Body, locale.tr(key))
                 .p_2()
                 .text_color(palette.danger)
         }))

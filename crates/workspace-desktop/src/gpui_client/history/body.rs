@@ -5,11 +5,11 @@ use std::ops::Range;
 use gpui::SharedString;
 use uuid::Uuid;
 use workspace_core::messenger::{
+    catalog::MessagePreview,
     encryption::fragments::{
         FragmentDisplayKind, FragmentDisplaySpan, FragmentReference, fragment_display_spans,
-        fragment_preview,
     },
-    forward::{ForwardReference, ForwardSpan, MAX_FORWARD_DEPTH, forward_preview, forward_spans},
+    forward::{ForwardReference, ForwardSpan, MAX_FORWARD_DEPTH, forward_spans},
     quote::{self, Block},
     references::MediaReference,
 };
@@ -23,7 +23,6 @@ pub(super) struct Body {
     pub parts: Vec<BodyPart>,      // Разобранный текст и ссылки на цитаты.
     excerpt: Option<SharedString>, // Короткий текст, если в исходном сообщении он есть.
     pub caption: Option<MediaCaption>, // Подпись после извлечения карточек, если у строки есть медиа.
-    pub can_forward: bool,             // В подтверждённом теле есть фрагмент для пересылки.
     pub has_fragments: bool, // Нужны спойлеры или скрытие служебного адреса из исходного текста.
 }
 
@@ -38,7 +37,8 @@ pub(super) struct MediaCaption {
 /// Подготовленная часть обычного тела. Источник цитаты проверяется по текущему окну при показе.
 #[derive(Eq, PartialEq)]
 pub(super) enum BodyPart {
-    Text(SharedString), // Отдельный участок текста для GPUI.
+    Text(SharedString),      // Отдельный участок текста для GPUI.
+    Preview(MessagePreview), // Открытый снимок пересылки с переводимыми служебными частями.
     Fragment {
         slot: usize,                          // Порядковое место спойлера среди вложений строки.
         reference: Option<FragmentReference>, // Точная ссылка либо закрытая ошибка формата.
@@ -71,7 +71,6 @@ impl Body {
         let caption = (!media.is_empty()).then(|| MediaCaption::new(text, media));
         let text: SharedString = text.to_owned().into();
         let (parts, has_fragments) = parse(&text, 0, &mut 0);
-        let can_forward = has_protected_part(&parts, MAX_FORWARD_DEPTH - 1);
         let excerpt = parts.iter().find_map(|part| match part {
             BodyPart::Text(line) if !line.trim().is_empty() => Some(short_reply_text(line).into()),
             _ => None,
@@ -81,7 +80,6 @@ impl Body {
             parts,
             excerpt,
             caption,
-            can_forward,
             has_fragments,
         }
     }
@@ -250,10 +248,9 @@ fn parse_placements(
 /// Разбирает подписанный снимок, не перенося его служебный URL в отображаемое тело.
 fn forward_body(reference: &ForwardReference, depth: usize, slot: &mut usize) -> ForwardBody {
     let parts = if reference.plain {
-        let preview = fragment_preview(&reference.snapshot);
-        vec![BodyPart::Text(
-            forward_preview(&preview).into_owned().into(),
-        )]
+        vec![BodyPart::Preview(MessagePreview::plain_forward(
+            &reference.snapshot,
+        ))]
     } else {
         parse(&reference.snapshot.clone().into(), depth + 1, slot).0
     };
@@ -287,22 +284,36 @@ fn fragment_at(parts: &[BodyPart], position: usize) -> Option<&FragmentReference
     })
 }
 
-/// Проверяет, что после добавления новой карточки вложенный фрагмент останется доступен.
-fn has_protected_part(parts: &[BodyPart], depth: usize) -> bool {
-    parts.iter().any(|part| match part {
-        BodyPart::Fragment {
-            reference: Some(_), ..
-        } => true,
-        BodyPart::Forward(Some(reference)) if depth > 0 => {
-            has_protected_part(&reference.parts, depth - 1)
-        }
-        _ => false,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Переводит служебный текст буквальной пересылки на языке получателя.
+    #[test]
+    fn plain_forward_snapshot_retains_translatable_parts() {
+        let body = forward_body(
+            &ForwardReference {
+                id: Uuid::from_u128(1),
+                author: "Автор".into(),
+                snapshot: "Зашифрованный фрагмент [ключ](urn:secret:v9:bad)".into(),
+                plain: true,
+                source: None,
+            },
+            0,
+            &mut 0,
+        );
+        let [BodyPart::Preview(preview)] = body.parts.as_slice() else {
+            panic!("Буквальная пересылка должна использовать готовые части превью");
+        };
+        assert_eq!(
+            Language::En.preview_text(preview),
+            "Зашифрованный фрагмент Encrypted fragment"
+        );
+        assert_eq!(
+            Language::Ru.preview_text(preview),
+            "Зашифрованный фрагмент Зашифрованный фрагмент"
+        );
+    }
 
     /// Использует текущий язык для пустого фрагмента одного и того же сообщения.
     #[test]

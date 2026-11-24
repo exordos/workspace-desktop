@@ -24,7 +24,8 @@ mod latest_tests;
 mod preview;
 pub(crate) use preview::SidebarPreviews;
 pub use preview::{
-    ProtectedSidebarSummary, SidebarKeyServiceKind, SidebarPreview, SidebarPreviewBody,
+    MessagePreview, PreviewPart, ProtectedSidebarSummary, SidebarKeyServiceKind, SidebarPreview,
+    SidebarPreviewBody,
 };
 
 const USERS_PATH: &str = "/api/workspace/v1/users/";

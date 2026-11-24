@@ -3,8 +3,8 @@
 use std::{cell::RefCell, ops::Range, rc::Rc};
 
 use gpui::{
-    Context, Deferred, Div, FocusHandle, HighlightStyle, KeyDownEvent, MouseButton, Pixels, Point,
-    SharedString, Stateful, StyledText, TextLayout, WeakEntity, Window, div, prelude::*, px,
+    Context, Div, FocusHandle, HighlightStyle, KeyDownEvent, MouseButton, Pixels, Point,
+    SharedString, Stateful, StyledText, TextLayout, WeakEntity, Window, div, prelude::*,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
@@ -12,16 +12,16 @@ use workspace_core::messenger::{
     encryption::fragments::{FragmentDisplayKind, fragment_display_spans},
     forward::forward_spans,
     quote::{self, Block},
+    references::external_link_references,
 };
 
-use super::{Conversation, State};
+use super::{Conversation, State, message_menu::MenuHit};
 use crate::gpui_client::{
     composer::{ReplyAction, ReplyQuote, ReplyText, short_reply_text},
-    preferences::{Language, Preferences},
+    preferences::Language,
     ui::{
-        Button, ButtonAppearance, Icon, Palette, QuoteSurface, TextRole, label,
-        popup::{MenuInput, menu_layer, menu_navigation, menu_surface},
-        quote_frame, text_role,
+        Palette, QuoteSurface, TextRole, label, quote_frame,
+        text_role,
     },
 };
 
@@ -49,6 +49,11 @@ pub(super) struct Selection {
 }
 
 impl Selection {
+    /// Возвращает последнюю строку с клавиатурным фокусом истории.
+    pub(super) fn focused(&self, focus: &FocusHandle, window: &Window) -> Option<Uuid> {
+        self.focused.filter(|_| focus.is_focused(window))
+    }
+
     /// Сбрасывает указатели на исчезнувшие строки и выделение старой версии тела.
     pub(super) fn retain_current<'a>(&mut self, body: impl Fn(Uuid) -> Option<&'a str>) {
         if let Some(fragment) = &self.fragment
@@ -74,7 +79,7 @@ impl Selection {
     }
 
     /// Берёт только текст, выделенный в совпадающей версии строки.
-    fn fragment(&self, id: Uuid, text: &str) -> Option<String> {
+    pub(super) fn fragment(&self, id: Uuid, text: &str) -> Option<String> {
         let selected = self.fragment.as_ref()?;
         if selected.id != id || selected.body.as_ref() != text {
             return None;
@@ -150,6 +155,9 @@ impl ReplyControls {
         let layout = styled.layout().clone();
         let drag_layout = layout.clone();
         let mouse_layout = layout.clone();
+        let menu = self.conversation.clone();
+        let link_layout = layout.clone();
+        let link_body = body.clone();
         let controls = self.clone();
         let drag = self.selection.clone();
         let drag_visible = visible.clone();
@@ -173,6 +181,23 @@ impl ReplyControls {
                 window.refresh();
                 cx.stop_propagation();
             })
+            .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                let Some(link) = link_layout
+                    .index_for_position(event.position)
+                    .ok()
+                    .and_then(|byte| {
+                        external_link_references(&link_body)
+                            .into_iter()
+                            .find(|link| link.range.contains(&(start + byte)))
+                    })
+                else {
+                    return;
+                };
+                let _ = menu.update(cx, |view, cx| {
+                    view.open_message_menu(id, event.position, MenuHit::Link(link.href), window, cx)
+                });
+                cx.stop_propagation();
+            })
             .on_mouse_move(move |event, window, _| {
                 if event.dragging()
                     && let Some(selection) = drag.borrow_mut().fragment.as_mut()
@@ -190,26 +215,15 @@ impl ReplyControls {
         (element, layout)
     }
 
-    /// Добавляет быстрый ответ и открывает меню по правому клику той же строки.
-    pub(super) fn row(
-        &self,
-        id: Uuid,
-        inner: Div,
-        palette: Palette,
-        language: Language,
-    ) -> Stateful<Div> {
-        let target = self.conversation.clone();
+    /// Сохраняет выделение и передаёт правый клик в меню сообщения.
+    pub(super) fn row(&self, id: Uuid, inner: Div) -> Stateful<Div> {
         let menu = self.conversation.clone();
         let select = self.selection.clone();
         let focus = self.focus.clone();
         let focus_select = self.selection.clone();
-        let mut button = Button::new((gpui::ElementId::Uuid(id), "history-reply"), "");
-        button.appearance = ButtonAppearance::Ghost;
-        button.icon = Some(Icon::Reply);
         inner
             .relative()
             .id(SharedString::from(format!("history-reply-row-{id}")))
-            .group("history-reply-row")
             .on_hover(move |hovered, _, _| {
                 let mut selection = select.borrow_mut();
                 if *hovered {
@@ -235,35 +249,11 @@ impl ReplyControls {
             })
             .on_mouse_down(MouseButton::Right, move |event, window, cx| {
                 let _ = menu.update(cx, |view, cx| {
-                    view.open_reply_menu(id, event.position, window, cx)
+                    view.open_message_menu(id, event.position, MenuHit::Bubble, window, cx)
                 });
                 cx.stop_propagation();
             })
-            .child(
-                div().absolute().right_1().top(px(-14.)).child(
-                    button
-                        .render(palette, None, move |window, cx| {
-                            let _ = target.update(cx, |view, cx| {
-                                view.reply_to(id, ReplyAction::Replace, window, cx)
-                            });
-                        })
-                        .bg(palette.surface)
-                        .opacity(0.)
-                        .tab_stop(false)
-                        .group_hover("history-reply-row", |style| style.opacity(1.))
-                        .when(palette.keyboard_focus_visible(), |button| {
-                            button.focus(|style| style.opacity(1.).border_color(palette.focus))
-                        })
-                        .tooltip(move |_, app| {
-                            crate::gpui_client::ui::popup::tooltip(
-                                palette,
-                                language.tr("message.reply").into(),
-                                app,
-                            )
-                        })
-                        .debug_selector(move || format!("history-reply-{id}")),
-                ),
-            )
+
     }
 }
 
@@ -295,36 +285,6 @@ fn byte_at(layout: &TextLayout, text: &str, position: Point<Pixels>) -> usize {
     index
 }
 
-/// Строка, чья версия ещё должна совпасть при выборе действия.
-struct MenuTarget {
-    id: Uuid,              // Публичный UUID в проверенном окне.
-    anchor: Point<Pixels>, // Координаты меню у указателя.
-    body: String,          // Тело строки на момент открытия, минимум для проверки свежести.
-}
-
-/// Меню отвечает или добавляет вкладку для выбранной серверной строки.
-pub(super) struct ReplyMenu {
-    pub focus: FocusHandle,   // Клавиатурный фокус открытого меню.
-    selected: bool,           // Выбран «Добавить ответ», если true.
-    item: Option<MenuTarget>, // Исходная версия строки и якорь меню в окне.
-}
-
-impl ReplyMenu {
-    /// Теряет прежнюю цель при сбросе подтверждённого окна истории.
-    pub(super) fn clear(&mut self) {
-        self.item = None;
-    }
-
-    /// Готовит закрытое меню одного разговора.
-    pub(super) fn new(focus: FocusHandle) -> Self {
-        Self {
-            focus,
-            selected: false,
-            item: None,
-        }
-    }
-}
-
 impl Conversation {
     /// Выполняет быстрый ответ над выделением, строкой с фокусом или под указателем.
     pub(super) fn reply_hotkey(
@@ -335,7 +295,7 @@ impl Conversation {
     ) {
         use crate::gpui_client::preferences::{Preferences, shortcuts::matching};
         if event.is_held
-            || self.reply_menu.item.is_some()
+            || self.message_menu.is_open()
             || matching(
                 &event.keystroke,
                 Preferences::read_for(cx, &self.address.route.owner),
@@ -355,6 +315,11 @@ impl Conversation {
         }
     }
 
+    /// Открывает ответ на сообщение или его выделенный фрагмент из быстрой панели.
+    pub(super) fn quick_reply(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.reply_to(id, ReplyAction::Replace, window, cx);
+    }
+
     /// Передаёт проверенное серверное сообщение только редактору текущего разговора.
     fn reply_to(
         &mut self,
@@ -366,6 +331,32 @@ impl Conversation {
         let Some(quote) = self.reply_quote(id) else {
             return false;
         };
+        self.apply_reply(action, quote, window, cx)
+    }
+
+    /// Отвечает на выделение, которое было видно при открытии меню.
+    pub(super) fn reply_to_selection(
+        &mut self,
+        id: Uuid,
+        action: ReplyAction,
+        fragment: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(quote) = self.quote_for_fragment(id, fragment) {
+            self.apply_reply(action, quote, window, cx);
+        }
+    }
+
+    /// Проверяет готовность редактора и показывает проверенную цитату.
+    fn apply_reply(
+        &mut self,
+        action: ReplyAction,
+        quote: ReplyQuote,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let id = quote.id;
         let Some(sending) = &self.sending else {
             return false;
         };
@@ -399,11 +390,17 @@ impl Conversation {
     /// Получает автора и фрагмент только из актуального окна подтверждённой истории.
     fn reply_quote(&self, id: Uuid) -> Option<ReplyQuote> {
         let text = self.reply_text(id)?;
+        let fragment = self.viewport.selection().borrow().fragment(id, text);
+        self.quote_for_fragment(id, fragment)
+    }
+
+    /// Собирает цитату из подтверждённого источника и уже найденного выделения.
+    fn quote_for_fragment(&self, id: Uuid, fragment: Option<String>) -> Option<ReplyQuote> {
+        let text = self.reply_text(id)?;
         let author = self
             .viewport
             .source_author(id, self.reply_peer())
             .unwrap_or(ReplyText::Label("desktop.messenger.participant"));
-        let fragment = self.viewport.selection().borrow().fragment(id, text);
         let preview = fragment.as_deref().map_or_else(
             || reply_preview(text, true),
             |text| reply_preview(text, false),
@@ -440,126 +437,6 @@ impl Conversation {
             .direct
             .then_some(self.heading.chat.as_deref())
             .flatten()
-    }
-
-    /// Открывает меню только пока исходное сообщение и редактор доступны.
-    fn open_reply_menu(
-        &mut self,
-        id: Uuid,
-        anchor: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(text) = self.reply_text(id) else {
-            return;
-        };
-        if !self
-            .sending
-            .as_ref()
-            .is_some_and(|sending| sending.view.read(cx).reply_action_enabled(cx))
-        {
-            return;
-        }
-        self.reply_menu.item = Some(MenuTarget {
-            id,
-            anchor,
-            body: text.to_owned(),
-        });
-        self.reply_menu.selected = false;
-        window.focus(&self.reply_menu.focus);
-        cx.notify();
-    }
-
-    /// Убирает меню при Esc или щелчке снаружи и возвращает фокус истории.
-    fn close_reply_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.reply_menu.item.take().is_some() {
-            window.focus(&self.history_focus);
-            cx.notify();
-        }
-    }
-
-    /// Выбирает операцию из меню и закрывает его до передачи управления полю ввода.
-    fn run_reply_menu(&mut self, action: ReplyAction, window: &mut Window, cx: &mut Context<Self>) {
-        let id = self.current_menu_reply().map(|target| target.id);
-        self.close_reply_menu(window, cx);
-        if let Some(id) = id {
-            self.reply_to(id, action, window, cx);
-        }
-    }
-
-    /// Перемещает клавиатурный выбор в двухстрочном меню.
-    fn reply_menu_input(&mut self, input: MenuInput, window: &mut Window, cx: &mut Context<Self>) {
-        match input {
-            MenuInput::Close => self.close_reply_menu(window, cx),
-            MenuInput::Select => self.run_reply_menu(
-                if self.reply_menu.selected {
-                    ReplyAction::Add
-                } else {
-                    ReplyAction::Replace
-                },
-                window,
-                cx,
-            ),
-            MenuInput::Next | MenuInput::Last => self.reply_menu.selected = true,
-            MenuInput::Previous | MenuInput::First => self.reply_menu.selected = false,
-        }
-        cx.notify();
-    }
-
-    /// Принимает пункт меню только для исходной, по-прежнему доступной версии строки.
-    fn current_menu_reply(&self) -> Option<&MenuTarget> {
-        let target = self.reply_menu.item.as_ref()?;
-        let current = self.reply_text(target.id)?;
-        (current == target.body).then_some(target)
-    }
-
-    /// Показывает меню через общий слой GPUI, без второго меню на каждую строку.
-    pub(super) fn render_reply_menu(
-        &mut self,
-        window: &mut Window,
-        palette: Palette,
-        cx: &mut Context<Self>,
-    ) -> Option<[Deferred; 2]> {
-        self.reply_menu.item.as_ref()?;
-        let Some(anchor) = self.current_menu_reply().map(|target| target.anchor) else {
-            self.close_reply_menu(window, cx);
-            return None;
-        };
-        let viewport = window.viewport_size();
-        let language = Preferences::read_for(cx, &self.address.route.owner).language;
-        let surface = menu_surface("history-reply-menu", palette, viewport, px(190.), px(100.))
-            .on_mouse_down_out(cx.listener(|view, _, window, cx| view.close_reply_menu(window, cx)))
-            .children(
-                [
-                    (
-                        "history-reply-replace",
-                        "message.reply",
-                        ReplyAction::Replace,
-                    ),
-                    ("history-reply-add", "message.addReply", ReplyAction::Add),
-                ]
-                .into_iter()
-                .enumerate()
-                .map(|(index, (id, key, action))| {
-                    let mut button = Button::new(id, language.tr(key));
-                    button.appearance = ButtonAppearance::Ghost;
-                    let target = cx.entity().downgrade();
-                    button
-                        .render(palette, None, move |window, app| {
-                            let _ = target
-                                .update(app, |view, cx| view.run_reply_menu(action, window, cx));
-                        })
-                        .when(self.reply_menu.selected == (index == 1), |row| {
-                            row.bg(palette.card_selected)
-                        })
-                        .debug_selector(move || id.into())
-                }),
-            );
-        Some(menu_layer(
-            viewport,
-            anchor,
-            menu_navigation(surface, &self.reply_menu.focus, cx, Self::reply_menu_input),
-        ))
     }
 }
 

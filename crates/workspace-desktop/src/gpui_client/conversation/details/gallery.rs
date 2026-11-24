@@ -161,9 +161,10 @@ impl Conversation {
                 && panel.snapshot.is_some()
                 && panel.picker.is_none()
                 && panel.gallery.is_none()
+                && panel.encrypted_screen().is_none()
             {
                 let has_topic = self.address.route.scope.topic_id.is_some();
-                panel.refocus_gallery = None;
+                panel.refocus_details = None;
                 panel.gallery = Some(Gallery::new(category, has_topic));
                 panel.host.read(cx).focus_close(&panel.key, window);
                 panel.refresh_frame(cx);

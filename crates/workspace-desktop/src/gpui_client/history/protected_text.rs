@@ -16,6 +16,9 @@ use workspace_core::messenger::{
     catalog::ProtectedSidebarSummary,
     encryption::{AcceptedDecryption, ProtectedMessage},
 };
+use zeroize::Zeroizing;
+
+use crate::gpui_client::preferences::Language;
 
 /// Отзывный материал сообщения для постановки в layout текущего кадра.
 pub(in crate::gpui_client) struct ProtectedText(pub Arc<ProtectedMessage>); // Core проверяет сессию и версию ключа.
@@ -30,7 +33,11 @@ pub(in crate::gpui_client) struct GuardedText {
 enum TextSource {
     Body(Arc<ProtectedMessage>, Option<Range<usize>>), // Тело или проверяемый поддиапазон.
     Fragment(Arc<AcceptedDecryption>),                 // Отдельно принятый защищённый фрагмент.
-    Sidebar(Arc<ProtectedSidebarSummary>, Rc<Cell<bool>>), // Ключ и срок жизни подписи в каталоге.
+    Sidebar {
+        access: Arc<ProtectedSidebarSummary>, // Ключ, который разрешает читать подпись.
+        mounted: Rc<Cell<bool>>, // Текущее место подписи в каталоге.
+        locale: Language, // Язык служебных вставок видимого аккаунта.
+    },
     Quote {
         access: QuoteText, // Исходный и цитирующий ключи с проверенными связью и сроком жизни.
         placeholder: &'static str, // Подпись на языке окна, если фрагмент состоит из ссылки.
@@ -46,9 +53,12 @@ impl TextSource {
                 .with_body(|text| text.get(range.clone()).map(read))
                 .flatten(),
             Self::Fragment(access) => access.with_text(read),
-            Self::Sidebar(access, mounted) => {
-                mounted.get().then(|| access.with_text(read)).flatten()
-            }
+            Self::Sidebar { access, mounted, locale } => mounted.get().then(|| {
+                access.with_preview(|preview| {
+                    let text = Zeroizing::new(locale.preview_text(preview));
+                    read(&text)
+                })
+            }).flatten(),
             Self::Quote {
                 access,
                 placeholder,
@@ -60,6 +70,7 @@ impl TextSource {
     fn with_current<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
         match self {
             Self::Quote { access, .. } => access.with_current(action),
+            Self::Sidebar { access, mounted, .. } => mounted.get().then(|| access.with_preview(|_| action())).flatten(),
             _ => self.with_text(|_| action()),
         }
     }
@@ -96,9 +107,10 @@ impl GuardedText {
     pub(in crate::gpui_client) fn summary(
         access: Arc<ProtectedSidebarSummary>,
         mounted: Rc<Cell<bool>>,
+        locale: Language,
     ) -> Self {
         Self {
-            source: TextSource::Sidebar(access, mounted),
+            source: TextSource::Sidebar { access, mounted, locale },
         }
     }
 }
@@ -153,7 +165,7 @@ impl Element for GuardedText {
         _: &mut App,
     ) -> (LayoutId, FrameText) {
         let mut style = window.text_style();
-        if matches!(self.source, TextSource::Sidebar(..)) {
+        if matches!(self.source, TextSource::Sidebar { .. }) {
             style.line_clamp = Some(1);
         }
         let font_size = style.font_size.to_pixels(window.rem_size());

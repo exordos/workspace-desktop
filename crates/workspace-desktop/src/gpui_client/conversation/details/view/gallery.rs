@@ -12,6 +12,7 @@ use crate::gpui_client::{
         details::gallery::{Action, CATEGORIES, Entry, Gallery, State},
         gallery_source::{GalleryCategory, GalleryItem},
     },
+    preferences::Language,
     ui::{
         Button, ButtonAppearance, Icon, Palette, TextRole, activate, ellipsized_label, label,
         popup::tooltip,
@@ -24,13 +25,14 @@ const COLUMNS: usize = 3;
 /// Заголовок раздела в общей рамке правой панели.
 pub(in crate::gpui_client::conversation::details) fn title(
     category: GalleryCategory,
+    language: Language,
 ) -> &'static str {
-    match category {
-        GalleryCategory::Photos => "Фотографии",
-        GalleryCategory::Videos => "Видео",
-        GalleryCategory::Links => "Ссылки",
-        GalleryCategory::Files => "Файлы",
-    }
+    language.tr(match category {
+        GalleryCategory::Photos => "desktop.conversation.gallery.photos",
+        GalleryCategory::Videos => "desktop.conversation.gallery.videos",
+        GalleryCategory::Links => "desktop.conversation.gallery.links",
+        GalleryCategory::Files => "desktop.conversation.gallery.files",
+    })
 }
 
 /// Возвращает стабильный идентификатор входа в раздел.
@@ -44,12 +46,25 @@ fn trigger_id(category: GalleryCategory) -> &'static str {
 }
 
 /// Добавляет четыре доступных раздела в прокручиваемые сведения разговора.
-pub(super) fn triggers(focus: &[FocusHandle; 4], palette: Palette, dispatch: &Dispatch) -> Div {
+pub(super) fn triggers(
+    focus: &[FocusHandle; 4],
+    palette: Palette,
+    language: Language,
+    dispatch: &Dispatch,
+) -> Div {
     div()
         .flex()
         .flex_col()
         .gap_1()
-        .child(label(palette, TextRole::Label, "Вложения").px_2().mb_1())
+        .child(
+            label(
+                palette,
+                TextRole::Label,
+                language.tr("desktop.conversation.gallery.title"),
+            )
+            .px_2()
+            .mb_1(),
+        )
         .children(CATEGORIES.into_iter().zip(focus).map(|(category, focus)| {
             let id = trigger_id(category);
             let trigger = div()
@@ -65,7 +80,7 @@ pub(super) fn triggers(focus: &[FocusHandle; 4], palette: Palette, dispatch: &Di
                 .border_color(gpui::transparent_black())
                 .bg(palette.card)
                 .hover(|style| style.bg(palette.card_hover))
-                .child(label(palette, TextRole::Body, title(category)))
+                .child(label(palette, TextRole::Body, title(category, language)))
                 .child(Icon::ChevronRight.element(px(16.), palette.icon));
             let dispatch = dispatch.clone();
             activate(trigger, Some(focus), palette, move |window, app| {
@@ -79,6 +94,7 @@ pub(super) fn render(
     conversation: &Conversation,
     gallery: &Gallery,
     palette: Palette,
+    language: Language,
     dispatch: &Dispatch,
 ) -> Div {
     div()
@@ -90,13 +106,13 @@ pub(super) fn render(
         .min_w_0()
         .gap_2()
         .when(gallery.has_topic, |panel| {
-            panel.child(scope(gallery, palette, dispatch))
+            panel.child(scope(gallery, palette, language, dispatch))
         })
         .child(
             label(
                 palette,
                 TextRole::Caption,
-                "Из загруженной истории. Список может быть неполным.",
+                language.tr("desktop.conversation.gallery.coverage"),
             )
             .px_2()
             .text_color(palette.text_muted)
@@ -116,24 +132,32 @@ pub(super) fn render(
                         .flex_col()
                         .gap(px(20.))
                         .pb_2()
-                        .children(months(conversation, gallery, palette, dispatch))
-                        .children(footer(gallery, palette, dispatch)),
+                        .children(months(conversation, gallery, palette, language, dispatch))
+                        .children(footer(gallery, palette, language, dispatch)),
                 ),
         )
 }
 
 /// Даёт выбрать текущую тему или все известные темы того же канала.
-fn scope(gallery: &Gallery, palette: Palette, dispatch: &Dispatch) -> Div {
+fn scope(gallery: &Gallery, palette: Palette, language: Language, dispatch: &Dispatch) -> Div {
     let buttons = [
-        (false, "conversation-gallery-scope-topic", "Эта тема"),
-        (true, "conversation-gallery-scope-stream", "Весь канал"),
+        (
+            false,
+            "conversation-gallery-scope-topic",
+            "desktop.conversation.gallery.thisTopic",
+        ),
+        (
+            true,
+            "conversation-gallery-scope-stream",
+            "desktop.conversation.gallery.wholeChannel",
+        ),
     ];
     div()
         .flex()
         .gap_1()
         .px_2()
-        .children(buttons.map(|(whole, id, caption)| {
-            let mut button = Button::new(id, caption);
+        .children(buttons.map(|(whole, id, key)| {
+            let mut button = Button::new(id, language.tr(key));
             if gallery.whole_stream != whole {
                 button.appearance = ButtonAppearance::Ghost;
             }
@@ -147,40 +171,51 @@ fn scope(gallery: &Gallery, palette: Palette, dispatch: &Dispatch) -> Div {
 }
 
 /// Показывает текущую операцию, пустой результат или команду следующей страницы.
-fn footer(gallery: &Gallery, palette: Palette, dispatch: &Dispatch) -> Option<Div> {
+fn footer(
+    gallery: &Gallery,
+    palette: Palette,
+    language: Language,
+    dispatch: &Dispatch,
+) -> Option<Div> {
     let content = div().flex().flex_col().items_start().gap_2().px_2();
     let content = match gallery.state {
-        State::Loading { .. } => content.child(label(palette, TextRole::Body, "Загружаем…")),
+        State::Loading { .. } => content.child(label(
+            palette,
+            TextRole::Body,
+            language.tr("desktop.conversation.gallery.loading"),
+        )),
         State::Failed { .. } => content
             .child(label(
                 palette,
                 TextRole::Body,
-                "Не удалось загрузить вложения",
+                language.tr("desktop.conversation.gallery.loadFailed"),
             ))
             .child(command(
                 "conversation-gallery-retry",
-                "Повторить",
+                language.tr("common.retry"),
                 Action::Retry,
                 palette,
                 dispatch,
             )),
         State::Ready if gallery.has_next() => content.child(command(
             "conversation-gallery-more",
-            "Показать ещё",
+            language.tr("desktop.conversation.gallery.more"),
             Action::More,
             palette,
             dispatch,
         )),
-        State::Ready if gallery.entries.is_empty() => {
-            content.child(label(palette, TextRole::Body, "Здесь пока пусто"))
-        }
+        State::Ready if gallery.entries.is_empty() => content.child(label(
+            palette,
+            TextRole::Body,
+            language.tr("desktop.conversation.gallery.empty"),
+        )),
         State::Ready if gallery.needs_refresh => content,
         State::Ready => return None,
     };
     Some(content.when(gallery.needs_refresh, |content| {
         content.child(command(
             "conversation-gallery-refresh",
-            "Обновить список",
+            language.tr("desktop.conversation.gallery.refresh"),
             Action::Refresh,
             palette,
             dispatch,
@@ -209,6 +244,7 @@ fn months(
     conversation: &Conversation,
     gallery: &Gallery,
     palette: Palette,
+    language: Language,
     dispatch: &Dispatch,
 ) -> Vec<Div> {
     let first_year = gallery
@@ -224,17 +260,7 @@ fn months(
         .entries
         .chunk_by(|left, right| month_key(left) == month_key(right))
         .map(|entries| {
-            let heading = month_key(&entries[0]).map_or_else(
-                || "Дата неизвестна".to_owned(),
-                |(year, month)| {
-                    let name = MONTHS[usize::from(month - 1)].0;
-                    if show_year {
-                        format!("{name} {year}")
-                    } else {
-                        name.to_owned()
-                    }
-                },
-            );
+            let heading = month_label(month_key(&entries[0]), show_year, language);
             let grid = matches!(
                 gallery.category,
                 GalleryCategory::Photos | GalleryCategory::Videos
@@ -249,7 +275,14 @@ fn months(
                             .flex()
                             .gap_2()
                             .children(row.iter().map(|entry| {
-                                tile(conversation, entry, gallery.category, palette, dispatch)
+                                tile(
+                                    conversation,
+                                    entry,
+                                    gallery.category,
+                                    palette,
+                                    language,
+                                    dispatch,
+                                )
                             }))
                             .children((row.len()..COLUMNS).map(|_| {
                                 div()
@@ -263,7 +296,7 @@ fn months(
                 div().flex().flex_col().gap_1().children(
                     entries
                         .iter()
-                        .map(|entry| row(conversation, entry, palette, dispatch)),
+                        .map(|entry| row(conversation, entry, palette, language, dispatch)),
                 )
             };
             div()
@@ -282,6 +315,7 @@ fn tile(
     entry: &Entry,
     category: GalleryCategory,
     palette: Palette,
+    language: Language,
     dispatch: &Dispatch,
 ) -> Stateful<Div> {
     let mut tile = entry_control(entry, palette)
@@ -312,7 +346,7 @@ fn tile(
         }
         if let Some(status) = conversation.gallery_export_status(item) {
             tile = tile.child(
-                label(palette, TextRole::Caption, status.message())
+                label(palette, TextRole::Caption, status.message(language))
                     .absolute()
                     .bottom_0()
                     .left_0()
@@ -322,7 +356,11 @@ fn tile(
             );
         } else if category == GalleryCategory::Videos {
             tile = tile.child(
-                label(palette, TextRole::Caption, "Сохранить…")
+                label(
+                    palette,
+                    TextRole::Caption,
+                    language.tr("desktop.conversation.gallery.save"),
+                )
                     .absolute()
                     .bottom_2()
                     .left_2()
@@ -330,15 +368,22 @@ fn tile(
                     .truncate(),
             );
         }
-        let action = if category == GalleryCategory::Photos {
-            "Открыть фотографию"
+        let action = language.tr(if category == GalleryCategory::Photos {
+            "desktop.conversation.gallery.openPhoto"
         } else {
-            "Сохранить видео…"
-        };
-        let description: SharedString = item
-            .name
-            .as_deref()
-            .map_or_else(|| action.into(), |name| format!("{action} · {name}").into());
+            "desktop.conversation.gallery.saveVideo"
+        });
+        let description: SharedString = item.name.as_deref().map_or_else(
+            || action.into(),
+            |name| {
+                language
+                    .tr_with(
+                        "desktop.conversation.gallery.namedAction",
+                        &[("action", action), ("name", name)],
+                    )
+                    .into()
+            },
+        );
         tile = tile.tooltip(move |_, app| tooltip(palette, description.clone(), app));
     }
     activate_entry(tile, entry, palette, dispatch)
@@ -349,6 +394,7 @@ fn row(
     conversation: &Conversation,
     entry: &Entry,
     palette: Palette,
+    language: Language,
     dispatch: &Dispatch,
 ) -> Stateful<Div> {
     let mut details = div()
@@ -360,22 +406,33 @@ fn row(
         .pr_2();
     let (icon, action) = match &entry.item {
         GalleryItem::Media { item, .. } => {
-            let name = item.name.as_deref().unwrap_or("Файл").to_owned();
+            let name = item
+                .name
+                .as_deref()
+                .unwrap_or_else(|| language.tr("attachmentCard.unnamedFile"))
+                .to_owned();
             details = details.child(ellipsized_label(palette, TextRole::Body, name));
             if let Some(status) = conversation.gallery_export_status(item) {
-                details = details.child(label(palette, TextRole::Caption, status.message()));
+                details =
+                    details.child(label(palette, TextRole::Caption, status.message(language)));
             } else if let Some(size) = item.size {
-                details = details.child(label(palette, TextRole::Caption, size_label(size)));
-            }
-            if let Some(date) = date(entry) {
-                let month = MONTHS[usize::from(date.month - 1)].1;
                 details = details.child(label(
                     palette,
                     TextRole::Caption,
-                    format!("{} {month}", date.day),
+                    size_label(size, language),
                 ));
             }
-            (Icon::Attach, "Сохранить файл…")
+            if let Some(date) = date(entry) {
+                details = details.child(label(
+                    palette,
+                    TextRole::Caption,
+                    day_label(&date, language),
+                ));
+            }
+            (
+                Icon::Attach,
+                language.tr("desktop.conversation.gallery.saveFile"),
+            )
         }
         GalleryItem::Link(link) => {
             details = details
@@ -393,7 +450,10 @@ fn row(
                     ellipsized_label(palette, TextRole::Caption, link.url.clone())
                         .text_color(palette.accent),
                 );
-            (Icon::Links, "Открыть в браузере")
+            (
+                Icon::Links,
+                language.tr("desktop.conversation.gallery.openBrowser"),
+            )
         }
     };
     let row = entry_control(entry, palette)
@@ -459,21 +519,86 @@ struct Date {
     day: u8,   // День месяца для подписи файла.
 }
 
-/// Две формы названия месяца для заголовка и даты строки.
+/// Ключи двух форм названия месяца для заголовка и даты строки.
 const MONTHS: [(&str, &str); 12] = [
-    ("Январь", "января"),
-    ("Февраль", "февраля"),
-    ("Март", "марта"),
-    ("Апрель", "апреля"),
-    ("Май", "мая"),
-    ("Июнь", "июня"),
-    ("Июль", "июля"),
-    ("Август", "августа"),
-    ("Сентябрь", "сентября"),
-    ("Октябрь", "октября"),
-    ("Ноябрь", "ноября"),
-    ("Декабрь", "декабря"),
+    (
+        "desktop.conversation.gallery.month.jan",
+        "desktop.conversation.gallery.dayMonth.jan",
+    ),
+    (
+        "desktop.conversation.gallery.month.feb",
+        "desktop.conversation.gallery.dayMonth.feb",
+    ),
+    (
+        "desktop.conversation.gallery.month.mar",
+        "desktop.conversation.gallery.dayMonth.mar",
+    ),
+    (
+        "desktop.conversation.gallery.month.apr",
+        "desktop.conversation.gallery.dayMonth.apr",
+    ),
+    (
+        "desktop.conversation.gallery.month.may",
+        "desktop.conversation.gallery.dayMonth.may",
+    ),
+    (
+        "desktop.conversation.gallery.month.jun",
+        "desktop.conversation.gallery.dayMonth.jun",
+    ),
+    (
+        "desktop.conversation.gallery.month.jul",
+        "desktop.conversation.gallery.dayMonth.jul",
+    ),
+    (
+        "desktop.conversation.gallery.month.aug",
+        "desktop.conversation.gallery.dayMonth.aug",
+    ),
+    (
+        "desktop.conversation.gallery.month.sep",
+        "desktop.conversation.gallery.dayMonth.sep",
+    ),
+    (
+        "desktop.conversation.gallery.month.oct",
+        "desktop.conversation.gallery.dayMonth.oct",
+    ),
+    (
+        "desktop.conversation.gallery.month.nov",
+        "desktop.conversation.gallery.dayMonth.nov",
+    ),
+    (
+        "desktop.conversation.gallery.month.dec",
+        "desktop.conversation.gallery.dayMonth.dec",
+    ),
 ];
+
+/// Формирует заголовок группы, добавляя год только для многолетней истории.
+fn month_label(date: Option<(u16, u8)>, show_year: bool, language: Language) -> String {
+    let Some((year, month)) = date else {
+        return language
+            .tr("desktop.conversation.gallery.unknownDate")
+            .to_owned();
+    };
+    let name = language.tr(MONTHS[usize::from(month - 1)].0);
+    if show_year {
+        language.tr_with(
+            "desktop.conversation.gallery.monthYear",
+            &[("month", name), ("year", &year.to_string())],
+        )
+    } else {
+        name.to_owned()
+    }
+}
+
+/// Формирует подпись даты файла, оставляя порядок частей каталогу.
+fn day_label(date: &Date, language: Language) -> String {
+    language.tr_with(
+        "desktop.conversation.gallery.day",
+        &[
+            ("month", language.tr(MONTHS[usize::from(date.month - 1)].1)),
+            ("day", &date.day.to_string()),
+        ],
+    )
+}
 
 /// Берёт год и месяц записи для группировки списка.
 fn month_key(entry: &Entry) -> Option<(u16, u8)> {
@@ -493,13 +618,48 @@ fn date(entry: &Entry) -> Option<Date> {
     ((1..=12).contains(&month) && (1..=31).contains(&day)).then_some(Date { year, month, day })
 }
 
-/// Показывает реальный известный размер с русской десятичной запятой.
-fn size_label(size: u64) -> String {
-    const UNITS: [(u64, &str); 3] = [(1 << 30, "ГиБ"), (1 << 20, "МиБ"), (1 << 10, "КиБ")];
-    for (unit, label) in UNITS {
+/// Подставляет размер в шаблон локальной единицы и использует десятичный разделитель языка.
+fn size_label(size: u64, language: Language) -> String {
+    const UNITS: [(u64, &str); 3] = [
+        (1 << 30, "desktop.conversation.gallery.size.gib"),
+        (1 << 20, "desktop.conversation.gallery.size.mib"),
+        (1 << 10, "desktop.conversation.gallery.size.kib"),
+    ];
+    for (unit, key) in UNITS {
         if size >= unit {
-            return format!("{:.1} {label}", size as f64 / unit as f64).replace('.', ",");
+            let value = format!("{:.1}", size as f64 / unit as f64).replace(
+                '.',
+                language.tr("desktop.conversation.gallery.size.decimalSeparator"),
+            );
+            return language.tr_with(key, &[("size", &value)]);
         }
     }
-    format!("{size} Б")
+    language.tr_with(
+        "desktop.conversation.gallery.size.bytes",
+        &[("size", &size.to_string())],
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Использует каталог для названия месяца, порядка даты и единицы размера.
+    #[test]
+    fn gallery_metadata_uses_the_conversation_locale() {
+        let date = Date {
+            year: 2026,
+            month: 3,
+            day: 22,
+        };
+        assert_eq!(title(GalleryCategory::Photos, Language::En), "Photos");
+        assert_eq!(
+            month_label(Some((2026, 3)), true, Language::En),
+            "March 2026"
+        );
+        assert_eq!(day_label(&date, Language::Ru), "22 марта");
+        assert_eq!(day_label(&date, Language::En), "March 22");
+        assert_eq!(size_label(1536, Language::Ru), "1,5 КиБ");
+        assert_eq!(size_label(1536, Language::En), "1.5 KiB");
+    }
 }

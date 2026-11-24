@@ -86,7 +86,7 @@ impl Client {
     ) {
         let effect =
             self.shell
-                .open_created_encrypted_channel(session, created.stream_id, created.topic_id);
+                .open_created_topic(session, created.stream_id, created.topic_id);
         if effect.is_some() {
             let runtime = self.runtime.clone();
             let session = session.clone();
@@ -129,11 +129,11 @@ impl CreateEncryptedChannel {
         runtime: RuntimeClient,
         cx: &mut Context<Self>,
     ) -> Self {
-        let locale = Preferences::read(cx).language;
+        let locale = Preferences::read_for(cx, &session.owner).language;
         let name = cx.new(|cx| {
             TextInput::new(
                 "e2ee-channel-name",
-                locale.text("Название канала", "Channel name"),
+                locale.tr("channel.channelName"),
                 false,
                 cx,
             )
@@ -141,7 +141,7 @@ impl CreateEncryptedChannel {
         let description = cx.new(|cx| {
             TextInput::new(
                 "e2ee-channel-description",
-                locale.text("Описание", "Description"),
+                locale.tr("chatInfo.description"),
                 false,
                 cx,
             )
@@ -149,7 +149,7 @@ impl CreateEncryptedChannel {
         let search = cx.new(|cx| {
             TextInput::new(
                 "e2ee-channel-members-search",
-                locale.text("Найти участника", "Find a member"),
+                locale.tr("desktop.conversation.members.findAMember"),
                 false,
                 cx,
             )
@@ -322,8 +322,15 @@ impl Render for CreateEncryptedChannel {
     /// Показывает название, описание, выбор людей и состояние фоновой операции.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::for_window(window, cx);
-        let locale = Preferences::read(cx).language;
-        let t = |ru, en| locale.text(ru, en);
+        let locale = Preferences::read_for(cx, &self.session.owner).language;
+        let t = |key| locale.tr(key);
+        for (input, key) in [
+            (&self.name, "channel.channelName"),
+            (&self.description, "chatInfo.description"),
+            (&self.search, "desktop.conversation.members.findAMember"),
+        ] {
+            input.update(cx, |input, cx| input.set_placeholder(t(key), cx));
+        }
         if self.loaded && std::mem::take(&mut self.first_frame) && self.resume.is_none() {
             self.name.read(cx).focus(window);
         }
@@ -332,15 +339,15 @@ impl Render for CreateEncryptedChannel {
         let mut submit = Button::new(
             "e2ee-channel-submit",
             if self.resume.is_some() {
-                t("Продолжить создание", "Resume creation")
+                t("desktop.conversation.encryptedChannel.resumeCreation")
             } else {
-                t("Создать канал", "Create channel")
+                t("channel.createChannel")
             },
         );
         submit.appearance = ButtonAppearance::Primary;
         submit.disabled =
             self.saving.is_some() || !self.loaded || self.name.read(cx).text().trim().is_empty();
-        let mut cancel = Button::new("e2ee-channel-cancel", t("Закрыть", "Close"));
+        let mut cancel = Button::new("e2ee-channel-cancel", t("common.close"));
         cancel.disabled = self.saving.is_some();
         let host = self.host.clone();
         let retry = cx.entity().downgrade();
@@ -400,7 +407,7 @@ impl Render for CreateEncryptedChannel {
             .child(label(
                 palette,
                 TextRole::Heading,
-                t("Защищённый канал", "Encrypted channel"),
+                t("desktop.conversation.encryptedChannel.encryptedChannel"),
             ))
             .child(field(&self.name))
             .child(field(&self.description))
@@ -409,7 +416,7 @@ impl Render for CreateEncryptedChannel {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .child(label(palette, TextRole::Caption, t("Участники", "Members")))
+                    .child(label(palette, TextRole::Caption, t("channel.members")))
                     .child(field(&self.search))
                     .child(people)
             }))
@@ -417,15 +424,11 @@ impl Render for CreateEncryptedChannel {
                 label(
                     palette,
                     TextRole::Caption,
-                    t(
-                        "Не удалось подтвердить создание",
-                        "Could not confirm channel creation",
-                    ),
-                )
-                .debug_selector(|| "e2ee-channel-failure".into())
+                    t("desktop.conversation.encryptedChannel.couldNotConfirmChannelCreation"),
+                ).debug_selector(|| "e2ee-channel-failure".into())
             }))
             .children((self.failed && !self.loaded).then(|| {
-                Button::new("e2ee-channel-reload", t("Повторить", "Retry")).render(
+                Button::new("e2ee-channel-reload", t("common.retry")).render(
                     palette,
                     None,
                     move |_, app| {

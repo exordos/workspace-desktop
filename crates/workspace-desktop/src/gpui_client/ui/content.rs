@@ -1,8 +1,8 @@
 //! Компоненты чатов: аватары, счётчики, строки каталога и пузыри сообщений.
 
 use gpui::{
-    AnyElement, App, Div, ElementId, FocusHandle, Hsla, ImageSource, ObjectFit, SharedString,
-    Stateful, Window, div, img, prelude::*, px,
+    AnyElement, App, Div, ElementId, FocusHandle, Hsla, ImageSource, ObjectFit, SharedString, Stateful, Window,
+    div, img, prelude::*, px,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -84,6 +84,7 @@ pub enum AvatarPresence {
     Hidden, // Индикатор не нужен.
     Online, // Пользователь в сети.
     Away,   // Пользователь отошёл.
+    Offline, // Пользователь вне сети.
 }
 
 /// Аватар из готового изображения, инициалов или заглушки.
@@ -151,6 +152,7 @@ impl Avatar {
             AvatarPresence::Hidden => None,
             AvatarPresence::Online => Some(palette.presence_online),
             AvatarPresence::Away => Some(palette.presence_away),
+            AvatarPresence::Offline => Some(palette.text_muted),
         };
         let initials: String = self.initials.graphemes(true).take(2).collect();
         let avatar = div()
@@ -351,12 +353,7 @@ impl ChatRow {
                     .items_start()
                     .child(self.avatar.render(palette)),
             )
-            .child(Self::text_with_caption(
-                palette,
-                self.title,
-                self.preview,
-                caption,
-            ))
+            .child(Self::text_with_caption(palette, self.title, self.preview, caption))
             .children(Self::metadata(
                 palette,
                 self.time,
@@ -384,9 +381,7 @@ impl ChatRow {
 
     /// Объединяет название с готовой подписью или стандартной строкой.
     fn text_with_caption(
-        palette: Palette,
-        title: SharedString,
-        preview: Option<ChatRowPreview>,
+        palette: Palette, title: SharedString, preview: Option<ChatRowPreview>,
         caption: Option<AnyElement>,
     ) -> Div {
         div()
@@ -399,17 +394,15 @@ impl ChatRow {
                 ellipsized_label(palette, TextRole::Label, one_line(&title))
                     .debug_selector(|| "chat-row-title".into()),
             )
-            .children(caption.or_else(|| {
-                preview.map(|preview| {
-                    let text = match preview.sender {
-                        Some(sender) => format!("{sender}: {}", preview.text),
-                        None => preview.text.to_string(),
-                    };
-                    ellipsized_label(palette, TextRole::Caption, one_line(&text))
-                        .debug_selector(|| "chat-row-preview".into())
-                        .into_any_element()
-                })
-            }))
+            .children(caption.or_else(|| preview.map(|preview| {
+                let text = match preview.sender {
+                    Some(sender) => format!("{sender}: {}", preview.text),
+                    None => preview.text.to_string(),
+                };
+                ellipsized_label(palette, TextRole::Caption, one_line(&text))
+                    .debug_selector(|| "chat-row-preview".into())
+                    .into_any_element()
+            })))
     }
 
     /// Размещает индикаторы над временем; ширина колонки защищена от длинных имён.
@@ -511,6 +504,19 @@ impl MessageBubble {
         self.render_body(palette, content, ends_group, Some(accessory))
     }
 
+    /// Привязывает наложение к границам самого пузыря и сохраняет разметку строки.
+    pub(in crate::gpui_client) fn render_with_overlay(
+        self,
+        palette: Palette,
+        content: Option<AnyElement>,
+        ends_group: bool,
+        accessory: Option<AnyElement>,
+        overlay: impl IntoElement,
+    ) -> Div {
+        let content = content.unwrap_or_else(|| self.plain_body(palette).into_any_element());
+        self.render_body_with_overlay(palette, content, ends_group, accessory, Some(overlay.into_any_element()))
+    }
+
     /// Готовит одинаковый текстовый элемент для обычного и раскрытого пузыря.
     fn plain_body(&self, palette: Palette) -> Div {
         label(palette, TextRole::Body, self.body.clone())
@@ -525,6 +531,18 @@ impl MessageBubble {
         content: impl gpui::IntoElement,
         ends_group: bool,
         accessory: Option<gpui::AnyElement>,
+    ) -> Div {
+        self.render_body_with_overlay(palette, content, ends_group, accessory, None)
+    }
+
+    /// Размещает внутренние блоки в потоке, а панель действий поверх границ пузыря.
+    fn render_body_with_overlay(
+        self,
+        palette: Palette,
+        content: impl IntoElement,
+        ends_group: bool,
+        accessory: Option<AnyElement>,
+        overlay: Option<AnyElement>,
     ) -> Div {
         let status = self.delivery.filter(|_| self.own).map(|state| match state {
             DeliveryMark::Pending | DeliveryMark::Unknown => {
@@ -557,6 +575,7 @@ impl MessageBubble {
                 )
             });
         let bubble = message_bubble_surface(self.own, ends_group)
+            .relative()
             .max_w(px(680.))
             .min_w_0()
             .px(px(12.))
@@ -573,7 +592,8 @@ impl MessageBubble {
                     .overflow_hidden()
             }))
             .child(body)
-            .children(accessory);
+            .children(accessory)
+            .children(overlay);
         div()
             .w_full()
             .min_w_0()

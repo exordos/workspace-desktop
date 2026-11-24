@@ -7,8 +7,14 @@ use super::*;
 
 pub(super) const FIRST: Uuid = Uuid::from_u128(161);
 pub(super) const SECOND: Uuid = Uuid::from_u128(162);
-const FIRST_ROW: &str = "history-message-00000000-0000-0000-0000-0000000000a1";
-const TOPIC_SOURCE: &str = "history-message-00000000-0000-0000-0000-000000000054";
+const FIRST_REPLY: (&str, &str) = (
+    "history-quick-bubble-00000000-0000-0000-0000-0000000000a1",
+    "history-reply-00000000-0000-0000-0000-0000000000a1",
+);
+const TOPIC_REPLY: (&str, &str) = (
+    "history-quick-bubble-00000000-0000-0000-0000-000000000054",
+    "history-reply-00000000-0000-0000-0000-000000000054",
+);
 const SECOND_ROW: &str = "history-message-00000000-0000-0000-0000-0000000000a2";
 
 /// Фиксирует источник и при необходимости откладывает первую проверку перед очередью.
@@ -112,7 +118,20 @@ fn enter(ui: &mut VisualTestContext, text: &str) {
     ui.run_until_parked();
 }
 
-/// Выбирает «Добавить ответ» из меню точно выбранного сообщения.
+/// Начинает первый ответ через кнопку, которая появляется у сообщения при наведении.
+fn reply(ui: &mut VisualTestContext, (bubble, action): (&'static str, &'static str)) {
+    let bounds = ui.debug_bounds(bubble).unwrap();
+    ui.simulate_mouse_move(bounds.center(), None, Modifiers::none());
+    until(
+        ui,
+        "появилась кнопка быстрого ответа",
+        |ui| ui.debug_bounds(action).is_some(),
+    );
+    click(ui, action);
+    ui.run_until_parked();
+}
+
+/// Выбирает «Добавить ответ» из меню, пока в редакторе уже есть вкладка.
 fn add(ui: &mut VisualTestContext, row: &'static str) {
     let bounds = ui.debug_bounds(row).unwrap();
     let point = gpui::point(bounds.center().x, bounds.bottom() - px(5.));
@@ -183,7 +202,7 @@ fn reply_draft_survives_navigation_and_restart_without_reviving_queued_input(
     ready_text(&client, ui, topic, "", "личка открылась с чистым полем");
 
     for (newer, expected) in [(None, ""), (Some(" новый"), "Отвечаю 🦊 новый")] {
-        add(ui, FIRST_ROW);
+        reply(ui, FIRST_REPLY);
         enter(ui, "Отвечаю 🦊");
         let release = fixture.hold();
         press_enter(ui);
@@ -345,7 +364,7 @@ fn rechecking_keeps_answer_until_explicit_topic_revocation(cx: &mut TestAppConte
     click(ui, CHAT_ROW);
     let topic = TOPIC.parse().unwrap();
     ready_text(&client, ui, topic, "", "готова исходная личка");
-    add(ui, FIRST_ROW);
+    reply(ui, FIRST_REPLY);
     enter(ui, "Ответ до перепроверки");
 
     // Отказ сохраняет ответ и предлагает ручную перепроверку под историей.
@@ -472,7 +491,7 @@ fn closed_topic_keeps_reply_draft_scoped_to_its_owner(cx: &mut TestAppContext) {
     attach(&client, events, ui);
     switch_topic(ui);
     topic_ready(&client, ui, "открыта тема автора черновика");
-    add(ui, TOPIC_SOURCE);
+    reply(ui, TOPIC_REPLY);
     enter(ui, "Ответ автора в теме");
     click_account(&client, ui, &peer);
     expand_channel(ui);
@@ -485,7 +504,7 @@ fn closed_topic_keeps_reply_draft_scoped_to_its_owner(cx: &mut TestAppContext) {
         "",
         "тот же UUID темы не раскрыл чужой ответ",
     );
-    add(ui, TOPIC_SOURCE);
+    reply(ui, TOPIC_REPLY);
     enter(ui, "Ответ второго владельца");
 
     click_account(&client, ui, &owner);
