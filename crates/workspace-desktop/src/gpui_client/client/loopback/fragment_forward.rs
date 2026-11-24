@@ -194,6 +194,8 @@ fn forward_dialog_posts_canonical_fragment_and_reveal_uses_origin_key(cx: &mut T
         "фрагмент готов под исходным ключом",
         |ui| ui.debug_bounds(ready).is_some(),
     );
+    let point = ui.debug_bounds(ready).unwrap().center();
+    ui.simulate_mouse_move(point, None, Modifiers::none());
     click(ui, ready);
     until(
         ui,
