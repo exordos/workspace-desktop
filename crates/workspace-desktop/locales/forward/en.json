@@ -1,0 +1,10 @@
+{
+  "channel.name": "Channel",
+  "channel.selectChannel": "Select channel",
+  "chat.selectTopic": "Select a topic to send messages to the channel",
+  "message.channel": "Channel",
+  "message.directMessage": "DM",
+  "message.forwardSending": "Forwarding…",
+  "message.forwardToChannel": "Forward to channel",
+  "message.searchUsers": "Search users…"
+}

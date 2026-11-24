@@ -35,13 +35,10 @@ impl Render for About {
         let client = self.client.clone();
         let version = format!(
             "{} {}",
-            language.text("Текущая версия:", "Current version:"),
+            language.tr("desktop.about.currentVersion"),
             env!("CARGO_PKG_VERSION")
         );
-        let mut check = Button::new(
-            "profile-update-check",
-            language.text("Проверить обновления", "Check for updates"),
-        );
+        let mut check = Button::new("profile-update-check", language.tr("update.check"));
         check.appearance = ButtonAppearance::Primary;
         let about = cx.weak_entity();
         let check = check
@@ -66,8 +63,8 @@ impl Render for About {
                 summary(
                     palette,
                     Icon::NewWindow,
-                    language.text("Open Source лицензии", "Open Source licenses"),
-                    language.text("Открыть", "Open"),
+                    language.tr("licenses.title"),
+                    language.tr("common.open"),
                     false,
                 )
                 .min_w_0(),
@@ -89,7 +86,7 @@ impl Render for About {
                     .child(card(palette).child(summary(
                         palette,
                         Icon::Info,
-                        language.text("Версия приложения", "App version"),
+                        language.tr("settings.appVersion"),
                         &version,
                         false,
                     )))
@@ -99,17 +96,11 @@ impl Render for About {
                             .child(summary(
                                 palette,
                                 Icon::Download,
-                                language.text("Обновление приложения", "App update"),
+                                language.tr("update.title"),
                                 if self.checked {
-                                    language.text(
-                                        "Проверка обновлений недоступна в этой сборке",
-                                        "Update checks are unavailable in this build",
-                                    )
+                                    language.tr("desktop.about.updatesUnavailable")
                                 } else {
-                                    language.text(
-                                        "Проверьте, доступна ли новая версия",
-                                        "Check if a new version is available",
-                                    )
+                                    language.tr("update.idle")
                                 },
                                 true,
                             ))
@@ -189,7 +180,7 @@ impl Licenses {
         let search = cx.new(|cx| {
             TextInput::new(
                 "licenses-search",
-                language.text("Поиск пакетов…", "Search packages…"),
+                language.tr("licenses.searchPlaceholder"),
                 false,
                 cx,
             )
@@ -426,23 +417,17 @@ impl Render for Licenses {
                             .min_w_0()
                             .flex_1()
                             .child(
-                                label(
-                                    palette,
-                                    TextRole::Heading,
-                                    language.text("Open Source лицензии", "Open Source licenses"),
-                                )
-                                .text_size(px(20.))
-                                .line_height(px(28.)),
+                                label(palette, TextRole::Heading, language.tr("licenses.title"))
+                                    .text_size(px(20.))
+                                    .line_height(px(28.)),
                             )
                             .child(
                                 label(
                                     palette,
                                     TextRole::Body,
-                                    format!(
-                                        "Workspace {} {total} {}",
-                                        language.text("использует", "uses"),
-                                        language
-                                            .text("open source пакетов", "open source packages")
+                                    language.tr_with(
+                                        "licenses.subtitle",
+                                        &[("count", &total.to_string())],
                                     ),
                                 )
                                 .mt_1()
@@ -460,7 +445,7 @@ impl Render for Licenses {
                         self.chip(Some(kind), format!("{kind} ({count})"), palette, cx)
                     }))
                     .children(self.filter.map(|_| {
-                        self.chip(None, language.text("Сбросить", "Reset").into(), palette, cx)
+                        self.chip(None, language.tr("licenses.reset").into(), palette, cx)
                     })),
             )
             .child(
@@ -487,11 +472,12 @@ impl Render for Licenses {
                         label(
                             palette,
                             TextRole::Caption,
-                            format!(
-                                "{} {} {total} {}",
-                                filtered.len(),
-                                language.text("из", "of"),
-                                language.text("пакетов", "packages")
+                            language.tr_with(
+                                "licenses.packagesOf",
+                                &[
+                                    ("filtered", &filtered.len().to_string()),
+                                    ("total", &total.to_string()),
+                                ],
                             ),
                         )
                         .text_color(palette.text_muted),
@@ -499,10 +485,10 @@ impl Render for Licenses {
                     .child(Self::row(
                         palette,
                         [
-                            language.text("Пакет", "Package"),
-                            language.text("Версия", "Version"),
-                            language.text("Лицензия", "License"),
-                            language.text("Автор", "Author"),
+                            language.tr("licenses.package"),
+                            language.tr("licenses.version"),
+                            language.tr("licenses.license"),
+                            language.tr("licenses.author"),
                         ],
                         true,
                     ))

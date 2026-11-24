@@ -1,0 +1,358 @@
+{
+  "a11y": {
+    "away": "Away",
+    "online": "Online"
+  },
+  "app": {
+    "invalidResponse": "Invalid server response"
+  },
+  "auth": {
+    "currentServer": "Current server",
+    "emailOrLogin": "Email or login",
+    "invalidLogin": "Invalid login or password",
+    "invalidOtp": "The authentication code is invalid. Try again.",
+    "invalidServerUrl": "Server address must be a valid HTTPS URL",
+    "login": "Login",
+    "loginLoading": "Logging in…",
+    "logout": "Logout",
+    "logoutFromOrgConfirm": "Log out from %{server}?",
+    "noProjectsAvailable": "Your account does not have access to any projects in this organization.",
+    "organizationStepHint": "Enter your organization address first.",
+    "password": "Password",
+    "projectStepHint": "Choose the project you want to open.",
+    "register": "Register",
+    "selectProject": "Project",
+    "selectServer": "Select account"
+  },
+  "common": {
+    "add": "Add",
+    "all": "All",
+    "back": "Back",
+    "cancel": "Cancel",
+    "close": "Close",
+    "create": "Create",
+    "delete": "Delete",
+    "email": "Email",
+    "favorites": "Favorites",
+    "loadMore": "Load more",
+    "next": "Next",
+    "open": "Open",
+    "prev": "Prev",
+    "rename": "Rename",
+    "retry": "Retry",
+    "save": "Save",
+    "skip": "Skip",
+    "you": "You"
+  },
+  "desktop": {
+    "about": {
+      "currentVersion": "Current version:",
+      "updatesUnavailable": "Update checks are unavailable in this build"
+    },
+    "appearance": {
+      "paletteBlueCold": "Blue Cold",
+      "paletteBlueMist": "Blue Mist",
+      "paletteEmerald": "Emerald Chat",
+      "paletteOrangeWarm": "Orange Warm",
+      "saveFailed": "Could not save the setting.",
+      "title": "Chat background"
+    },
+    "auth": {
+      "addAccount": "Add account",
+      "attemptUnavailable": "The sign-in attempt expired. Enter your password again.",
+      "busy": "Sign-in is temporarily unavailable. Try again.",
+      "confirm": "Confirm",
+      "connecting": "Connecting to the workspace…",
+      "credentialsHint": "Enter your credentials to sign in.",
+      "loginPlaceholder": "Your email or login",
+      "offline": "Offline",
+      "otpHint": "Enter your six-digit one-time code.",
+      "otpLabel": "One-time code",
+      "otpRequired": "A one-time code is required to sign in.",
+      "passwordPlaceholder": "Your password",
+      "required": "Sign-in required",
+      "stopped": "Background services have stopped. Restart Workspace.",
+      "storageError": "Could not open or save sign-in data. Try again.",
+      "temporarilyUnavailable": "The Workspace server is unavailable. Try again.",
+      "title": "Sign in to Workspace",
+      "unknownProject": "This project is unavailable. Choose a different project.",
+      "workspaceAddress": "Workspace address"
+    },
+    "avatar": {
+      "chooseFailed": "Could not choose an image",
+      "fileTooLarge": "The file is too large. Maximum size is 25 MB",
+      "invalidFormat": "Choose a PNG, JPEG, GIF, or WebP image"
+    },
+    "background": {
+      "addCustom": "Add your own",
+      "allChats": "For all chats",
+      "apply": "Apply background",
+      "applyHint": "For all chats or only the chat currently open?",
+      "chooseFile": "Choose a background image file",
+      "customImage": "Your image",
+      "defaultImage": "Default background",
+      "fileRequirements": "JPEG, PNG, WebP — up to 8 MB. Backgrounds stay on this device.",
+      "forest": "Forest",
+      "invalidFormat": "Choose a JPEG, PNG or WebP image.",
+      "invalidSize": "The image is too large or empty. Choose a file up to 8 MB and 24 megapixels.",
+      "mountains": "Mountains",
+      "onlyThisChat": "Only this chat",
+      "openChat": "Open a chat to apply a background only to that chat.",
+      "openFailed": "Could not open the image. Try another file.",
+      "processing": "Processing image…",
+      "resetHint": "The default background will be restored.",
+      "saveFailed": "Could not save the background. Your previous background was kept.",
+      "sea": "Sea"
+    },
+    "conversation": {
+      "select": "Select a conversation"
+    },
+    "general": {
+      "saveFailed": "Could not save settings",
+      "separateCallWindow": "Open calls in a separate window"
+    },
+    "nav": {
+      "chats": "Chats",
+      "contacts": "Contacts"
+    },
+    "notifications": {
+      "accountLabel": "Account %{account}",
+      "collapse": "Collapse the banner",
+      "disabledTitle": "System notifications are off",
+      "expand": "Show the notifications banner",
+      "inactiveAccount": "The account from the notification is unavailable",
+      "openFailed": "Could not open the notification",
+      "openSettings": "Open notification settings",
+      "permissionBody": "Workspace will alert you to new messages while you are working elsewhere.",
+      "settingsHint": "Enable Workspace Desktop banners in macOS settings.",
+      "settingsPath": "System Settings → Notifications → Workspace Desktop",
+      "unavailableMessage": "The message from the notification is unavailable",
+      "waitingForSystem": "Waiting for macOS…"
+    },
+    "personal": {
+      "favoriteUnavailable": "Temporarily unavailable",
+      "invalidIdentity": "Check the name and phone number",
+      "loadFailed": "Could not load personal information. Click Edit to retry.",
+      "loading": "Loading personal information…",
+      "saveFailed": "Could not save personal information"
+    },
+    "profile": {
+      "appearanceSubtitle": "Theme settings, Folder layout, Chat list density",
+      "clearCacheSubtitle": "Message cache, local settings, then reload",
+      "closeAll": "Close all",
+      "generalSubtitle": "Notification sounds, Language, Auto sign-out",
+      "joinedDate": "%{month} %{day}, %{year}",
+      "joinedMonths": {
+        "apr": "Apr",
+        "aug": "Aug",
+        "dec": "Dec",
+        "feb": "Feb",
+        "jan": "Jan",
+        "jul": "Jul",
+        "jun": "Jun",
+        "mar": "Mar",
+        "may": "May",
+        "nov": "Nov",
+        "oct": "Oct",
+        "sep": "Sep"
+      },
+      "logoutFailed": "Could not sign out of the organization",
+      "numberedAccount": "Account %{number}",
+      "resetFailed": "Could not reset local settings",
+      "restartFailed": "Could not restart the app"
+    },
+    "startup": {
+      "databaseFailed": "Could not open the Workspace database",
+      "loadingAccounts": "Loading accounts…",
+      "profileFailed": "Could not open the Workspace profile",
+      "stopped": "Background services have stopped",
+      "testLoginFailed": "Could not sign in to the test Workspace. See the startup log for details.",
+      "workerFailed": "Could not start Workspace background services"
+    },
+    "status": {
+      "emoji": {
+        "activities": "Activities",
+        "animals": "Animals & Nature",
+        "flags": "Flags",
+        "food": "Food & Drink",
+        "mood": "What's Your Mood?",
+        "objects": "Objects",
+        "recent": "Frequently Used",
+        "results": "Search Results",
+        "smileys": "Smileys & People",
+        "symbols": "Symbols",
+        "travel": "Travel & Places"
+      },
+      "emojiSearch": "Search emoji",
+      "loadFailed": "Could not load status",
+      "loading": "Loading status…"
+    }
+  },
+  "hotkeys": {
+    "actions": {
+      "composer": {
+        "bold": "Bold",
+        "code": "Code",
+        "editLastMessage": "Edit last message",
+        "italic": "Italic",
+        "strike": "Strikethrough"
+      },
+      "interface": {
+        "help": "Help",
+        "infoPanel": "Chat information",
+        "quoteMessage": "Quote message",
+        "sidebar": "Toggle sidebar",
+        "theme": "Change theme"
+      },
+      "navigation": {
+        "activity": "Activity",
+        "back": "Back",
+        "calendar": "Calendar",
+        "calls": "Calls",
+        "chatSearch": "Search chats",
+        "folderList": "Folder list",
+        "forward": "Forward",
+        "mail": "Mail",
+        "messenger": "Messenger"
+      }
+    },
+    "composer": "Composer",
+    "conflict": "This shortcut is already in use",
+    "disable": "Disable",
+    "disabled": "Disabled",
+    "edit": "Edit",
+    "editLastMessageHint": "When the composer is empty and not editing a message",
+    "empty": "No shortcuts found",
+    "enabled": "Enable keyboard shortcuts",
+    "fixed": {
+      "cancel": "Close or cancel",
+      "editing": "Standard editing shortcuts, such as copy",
+      "focus": "Move focus (Shift+Tab moves backward)",
+      "focusZones": "Move between focus areas",
+      "send": "Send or insert a line, depending on send settings"
+    },
+    "fixedTitle": "Fixed shortcuts",
+    "interface": "Interface",
+    "invalid": "Invalid shortcut",
+    "localDescription": "Settings are stored on this device. Composer shortcuts apply while editing a message.",
+    "navigation": "Navigation",
+    "quoteHint": "Select text, focus a message with Tab, or point to it.",
+    "record": "Press a key combination. Escape cancels.",
+    "recordInput": "Press a shortcut",
+    "reserved": "This shortcut is reserved",
+    "reset": "Reset",
+    "resetAll": "Reset all",
+    "search": "Search shortcuts",
+    "storageError": "Could not save settings",
+    "title": "Keyboard shortcuts"
+  },
+  "info": {
+    "accountStatus": "Account status",
+    "accountType": "Account type",
+    "birthday": "Birthday",
+    "edit": "Edit",
+    "jobTitle": "Team > Job title",
+    "joined": "Joined",
+    "localTime": "Local time",
+    "manager": "Manager",
+    "phone": "Phone",
+    "role": "Role",
+    "saveChanges": "Save changes",
+    "share": "Share",
+    "timezone": "Timezone",
+    "userId": "User ID",
+    "username": "Username"
+  },
+  "licenses": {
+    "author": "Author",
+    "license": "License",
+    "package": "Package",
+    "packagesOf": "%{filtered} of %{total} packages",
+    "reset": "Reset",
+    "searchPlaceholder": "Search packages…",
+    "subtitle": "Workspace uses %{count} open source packages",
+    "title": "Open Source Licenses",
+    "version": "Version"
+  },
+  "message": {
+    "copied": "Copied"
+  },
+  "nav": {
+    "account": "Account",
+    "calendar": "Calendar",
+    "calls": "Calls",
+    "mail": "Mail"
+  },
+  "notifications": {
+    "newMessage": "New message",
+    "permissionBannerDismiss": "Not now",
+    "permissionBannerEnable": "Enable notifications",
+    "permissionBannerTitle": "Enable desktop notifications?"
+  },
+  "presence": {
+    "doNotDisturb": "do not disturb",
+    "offline": "offline"
+  },
+  "settings": {
+    "appVersion": "App version",
+    "appearance": "Appearance",
+    "authIdleTimeout": "Auto sign-out",
+    "authIdleTimeout12h": "12 hours",
+    "authIdleTimeout24h": "24 hours",
+    "authIdleTimeout3d": "3 days",
+    "authIdleTimeout6h": "6 hours",
+    "authIdleTimeout7d": "7 days",
+    "authIdleTimeoutHint": "After inactivity",
+    "authIdleTimeoutNever": "Never",
+    "chatClickAction": "Chat click",
+    "chatClickActionAvatarHint": "Click the avatar to open the general chat",
+    "chatClickActionGeneral": "General chat and topics",
+    "chatClickActionHint": "What to open when clicking a chat",
+    "chatClickActionLatestTopic": "Latest topic",
+    "chatListDensity": "Chat list density",
+    "chatListDensityCompact": "Compact",
+    "chatListDensityStandard": "Standard",
+    "chooseFromGallery": "Choose from gallery",
+    "clearCache": "Clear cache",
+    "clearCacheConfirm": "Clear message cache and all local settings? Your sign-in and saved organizations will be kept. The app will reload.",
+    "dockBounce": "Bounce Dock icon",
+    "folderLayout": "Folder layout",
+    "folderLayoutHorizontal": "Horizontal tabs",
+    "folderLayoutVertical": "Vertical rail",
+    "messengerSidebarSortMode": "Stream and topic order",
+    "messengerSidebarSortModeAlphabetical": "By name",
+    "messengerSidebarSortModeLastMessage": "Last message",
+    "messengerSidebarSortModeUnreadFirst": "Unread first",
+    "notificationSound": "Notification sound",
+    "personalInfo": "Personal info",
+    "profileDescription": "About me",
+    "profileDisplayName": "Display name",
+    "profileFirstName": "First name",
+    "profileLastName": "Last name",
+    "removeCurrentPhoto": "Delete current photo",
+    "sectionDescription": "Description",
+    "settings": "Settings",
+    "soundDefault": "Default",
+    "soundDigital": "Digital",
+    "soundGlass": "Glass",
+    "soundNone": "Off",
+    "soundPulse": "Pulse",
+    "soundSubtle": "Subtle",
+    "status": "Status",
+    "statusAwayToggle": "Mark me as away",
+    "statusChooseEmoji": "Choose emoji",
+    "statusClear": "Clear status",
+    "statusDialogHint": "Add an emoji and text to show your current availability.",
+    "statusPlaceholder": "Set your status",
+    "statusUpdateError": "Failed to update status",
+    "themeDark": "Dark",
+    "themeLight": "Light",
+    "themeSettings": "Theme settings",
+    "themeSystem": "System"
+  },
+  "update": {
+    "check": "Check for updates",
+    "idle": "Check whether a new version is available",
+    "title": "Application update"
+  }
+}

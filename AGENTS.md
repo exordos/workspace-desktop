@@ -35,6 +35,7 @@
 ## Работа с UI
 
 - Новые экраны и компоненты реализуй на **GPUI**. Выбирай срез по [плану UI-паритета](docs/plans/roadmap/gpui-ui-parity.md). Границы рабочего клиента описаны в [архитектуре](docs/plans/workspace-desktop-architecture.md).
+- Подписи, подсказки и ошибки интерфейса переводи через `rust-i18n`. Храни строки по ключам в [JSON-каталогах](crates/workspace-desktop/locales/README.md) и явно передавай язык аккаунта, к которому относится текст.
 - Для проектирования, реализации или ревью компонентов и экранов используй [Workspace Desktop UI](skills/workspace-desktop-ui/SKILL.md).
 - Когда для задачи нужен актуальный макет, используй [Workspace Desktop Figma Bridge](skills/workspace-desktop-figma-bridge/SKILL.md), даже если Figma не упомянута.
 

@@ -6,6 +6,8 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::gpui_client::preferences::Language;
+
 use super::{
     Icon, Palette, TextRole,
     controls::activate,
@@ -14,6 +16,58 @@ use super::{
         CONTROL_BORDER, MESSAGE_BUBBLE_RADIUS, PANEL_RADIUS, SURFACE_RADIUS, ellipsized_label,
     },
 };
+
+/// Показывает календарную дату из ISO-строки Workspace на языке профиля.
+pub(in crate::gpui_client) fn profile_joined_date(value: &str, language: Language) -> Option<String> {
+    let date = value.get(..10)?;
+    let mut parts = date.split('-');
+    let year = parts.next()?;
+    let month = parts.next()?.parse::<usize>().ok()?.checked_sub(1)?;
+    let day = parts.next()?.parse::<u8>().ok()?;
+    let month_key = [
+        "desktop.profile.joinedMonths.jan",
+        "desktop.profile.joinedMonths.feb",
+        "desktop.profile.joinedMonths.mar",
+        "desktop.profile.joinedMonths.apr",
+        "desktop.profile.joinedMonths.may",
+        "desktop.profile.joinedMonths.jun",
+        "desktop.profile.joinedMonths.jul",
+        "desktop.profile.joinedMonths.aug",
+        "desktop.profile.joinedMonths.sep",
+        "desktop.profile.joinedMonths.oct",
+        "desktop.profile.joinedMonths.nov",
+        "desktop.profile.joinedMonths.dec",
+    ]
+    .get(month)?;
+    Some(language.tr_with(
+        "desktop.profile.joinedDate",
+        &[
+            ("year", year),
+            ("month", language.tr(month_key)),
+            ("day", &day.to_string()),
+        ],
+    ))
+}
+
+#[cfg(test)]
+mod date_tests {
+    use super::*;
+
+    /// Использует подпись месяца и порядок частей даты из выбранного каталога.
+    #[test]
+    fn profile_joined_date_uses_locale_template() {
+        let date = "2025-05-01T04:05:06Z";
+        assert_eq!(
+            profile_joined_date(date, Language::Ru).as_deref(),
+            Some("1 мая 2025 г.")
+        );
+        assert_eq!(
+            profile_joined_date(date, Language::En).as_deref(),
+            Some("May 1, 2025")
+        );
+        assert_eq!(profile_joined_date("2025-13-01", Language::En), None);
+    }
+}
 
 /// Размер аватара в пределах рабочего среза.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

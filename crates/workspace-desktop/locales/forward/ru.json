@@ -1,0 +1,10 @@
+{
+  "channel.name": "Канал",
+  "channel.selectChannel": "Выберите канал",
+  "chat.selectTopic": "Выберите тему для отправки сообщений в канал",
+  "message.channel": "Канал",
+  "message.directMessage": "ЛС",
+  "message.forwardSending": "Пересылаем…",
+  "message.forwardToChannel": "Переслать в канал",
+  "message.searchUsers": "Поиск пользователей…"
+}

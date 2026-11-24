@@ -82,9 +82,9 @@ impl Appearance {
             let focus = self.background.choices[index].clone();
             let id = format!("settings-background-{}", preset.id());
             let title = match preset {
-                BackgroundPreset::Mountains => language.text("Горы", "Mountains"),
-                BackgroundPreset::Sea => language.text("Море", "Sea"),
-                BackgroundPreset::Forest => language.text("Лес", "Forest"),
+                BackgroundPreset::Mountains => language.tr("desktop.background.mountains"),
+                BackgroundPreset::Sea => language.tr("desktop.background.sea"),
+                BackgroundPreset::Forest => language.tr("desktop.background.forest"),
             };
             let value = Background::Preset(preset);
             let active = current == Some(&value);
@@ -100,9 +100,9 @@ impl Appearance {
         let upload = preset_card(
             "settings-background-upload".into(),
             if working {
-                language.text("Обработка…", "Processing image…")
+                language.tr("desktop.background.processing")
             } else {
-                language.text("Добавить своё", "Add your own")
+                language.tr("desktop.background.addCustom")
             },
             None,
             false,
@@ -136,7 +136,7 @@ impl Appearance {
                 label(
                     palette,
                     TextRole::Caption,
-                    language.text("Стандартный фон", "Default background"),
+                    language.tr("desktop.background.defaultImage"),
                 )
                 .text_color(palette.text)
                 .font_weight(FontWeight::MEDIUM),
@@ -162,10 +162,7 @@ impl Appearance {
                 label(
                     palette,
                     TextRole::Caption,
-                    language.text(
-                        "JPEG, PNG, WebP — до 8 МБ. Фон хранится на этом устройстве.",
-                        "JPEG, PNG, WebP — up to 8 MB. Backgrounds stay on this device.",
-                    ),
+                    language.tr("desktop.background.fileRequirements"),
                 )
                 .line_height(px(20.)),
             )
@@ -200,7 +197,7 @@ impl Appearance {
                                 label(
                                     palette,
                                     TextRole::Caption,
-                                    language.text("Своё изображение", "Your image"),
+                                    language.tr("desktop.background.customImage"),
                                 )
                                 .text_color(palette.text),
                             ),
@@ -247,11 +244,7 @@ impl Appearance {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some(
-                language
-                    .text("Выбрать файл для фона", "Choose a background image file")
-                    .into(),
-            ),
+            prompt: Some(language.tr("desktop.background.chooseFile").into()),
         });
         let opener = self.background.upload.clone();
         let address = self.background_address(cx);
@@ -434,20 +427,17 @@ impl Render for BackgroundDialog {
             .rounded(px(6.))
             .hover(|style| style.bg(palette.card_hover))
             .child(Icon::Close.element(px(18.), palette.text_secondary));
-        let mut cancel = Button::new(
-            "settings-background-cancel",
-            language.text("Отмена", "Cancel"),
-        );
+        let mut cancel = Button::new("settings-background-cancel", language.tr("common.cancel"));
         cancel.appearance = ButtonAppearance::Ghost;
         let mut chat = Button::new(
             "settings-background-apply-chat",
-            language.text("Только этот чат", "Only this chat"),
+            language.tr("desktop.background.onlyThisChat"),
         );
         chat.appearance = ButtonAppearance::Ghost;
         chat.disabled = self.address.is_none();
         let mut all = Button::new(
             "settings-background-apply-all",
-            language.text("Все чаты", "For all chats"),
+            language.tr("desktop.background.allChats"),
         );
         all.appearance = ButtonAppearance::Primary;
         div()
@@ -473,7 +463,7 @@ impl Render for BackgroundDialog {
                     .child(label(
                         palette,
                         TextRole::Heading,
-                        language.text("Применить фон", "Apply background"),
+                        language.tr("desktop.background.apply"),
                     ))
                     .child(activate(close, None, palette, {
                         let view = view.clone();
@@ -486,10 +476,7 @@ impl Render for BackgroundDialog {
                 label(
                     palette,
                     TextRole::Body,
-                    language.text(
-                        "Для всех чатов или только для чата, который сейчас открыт?",
-                        "For all chats or only the chat currently open?",
-                    ),
+                    language.tr("desktop.background.applyHint"),
                 )
                 .text_color(palette.text_secondary),
             )
@@ -513,10 +500,7 @@ impl Render for BackgroundDialog {
                     label(
                         palette,
                         TextRole::Body,
-                        language.text(
-                            "Будет восстановлен стандартный фон.",
-                            "The default background will be restored.",
-                        ),
+                        language.tr("desktop.background.resetHint"),
                     )
                     .text_color(palette.text_secondary),
                 ),
@@ -526,10 +510,7 @@ impl Render for BackgroundDialog {
                     label(
                         palette,
                         TextRole::Body,
-                        language.text(
-                            "Открой нужный чат, чтобы применить фон только к нему.",
-                            "Open a chat to apply a background only to that chat.",
-                        ),
+                        language.tr("desktop.background.openChat"),
                     )
                     .text_color(palette.text_secondary),
                 )
@@ -539,10 +520,7 @@ impl Render for BackgroundDialog {
                     label(
                         palette,
                         TextRole::Body,
-                        language.text(
-                            "Не удалось сохранить фон. Предыдущий фон оставлен.",
-                            "Could not save the background. Your previous background was kept.",
-                        ),
+                        language.tr("desktop.background.saveFailed"),
                     )
                     .text_color(palette.danger),
                 )
@@ -629,18 +607,9 @@ impl UploadError {
     /// Возвращает локализованный текст ошибки выбора изображения.
     fn label(self, language: Language) -> &'static str {
         match self {
-            Self::Format => language.text(
-                "Выбери изображение JPEG, PNG или WebP.",
-                "Choose a JPEG, PNG or WebP image.",
-            ),
-            Self::Size => language.text(
-                "Изображение слишком большое или пустое. Выбери файл до 8 МБ и до 24 мегапикселей.",
-                "The image is too large or empty. Choose a file up to 8 MB and 24 megapixels.",
-            ),
-            Self::Decode => language.text(
-                "Не удалось открыть изображение. Попробуй другой файл.",
-                "Could not open the image. Try another file.",
-            ),
+            Self::Format => language.tr("desktop.background.invalidFormat"),
+            Self::Size => language.tr("desktop.background.invalidSize"),
+            Self::Decode => language.tr("desktop.background.openFailed"),
         }
     }
 }

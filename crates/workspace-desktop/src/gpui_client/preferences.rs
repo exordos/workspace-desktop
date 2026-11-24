@@ -12,35 +12,13 @@ use gpui::{App, BorrowAppContext, Global};
 use serde::{Deserialize, Serialize};
 use workspace_core::context::OwnerContext;
 
+pub(super) use super::i18n::Language;
+
 pub(super) mod appearance;
 pub(super) mod shortcuts;
 
 const FILE: &str = "preferences.json";
 static DEFAULTS: LazyLock<PreferenceValues> = LazyLock::new(PreferenceValues::default);
-
-/// Выбранный язык интерфейса.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(super) enum Language {
-    #[default]
-    Ru, // Русский, основной язык Desktop.
-    En, // Английский.
-}
-
-impl Language {
-    /// Возвращает подпись на текущем языке.
-    pub fn text(self, ru: &'static str, en: &'static str) -> &'static str {
-        match self {
-            Self::Ru => ru,
-            Self::En => en,
-        }
-    }
-
-    /// Показывает название языка его собственным названием.
-    pub fn name(self) -> &'static str {
-        self.text("Русский", "English")
-    }
-}
 
 /// Действие основной области строки канала в каталоге.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -269,7 +247,24 @@ mod tests {
         values.hotkeys.insert("navigation.chatSearch".into(), None);
         persist(&path, &records).unwrap();
         let restored = read_file(&path).remove(&None).unwrap();
+        assert_eq!(restored.language, Language::En);
         assert_eq!(restored.chat_click, ChatClick::LatestTopic);
         assert_eq!(restored.hotkeys, records[&None].hotkeys);
+    }
+
+    /// Недоступный язык не мешает загрузить остальные настройки со старого профиля.
+    #[test]
+    fn restores_other_preferences_when_catalog_is_unavailable() {
+        let profile = tempfile::tempdir().unwrap();
+        let path = profile.path().join(FILE);
+        fs::write(
+            &path,
+            br#"[[null,{"language":"xx-x-missing","dockBounce":false}]]"#,
+        )
+        .unwrap();
+
+        let restored = read_file(&path).remove(&None).unwrap();
+        assert_eq!(restored.language, Language::Ru);
+        assert!(!restored.dock_bounce);
     }
 }

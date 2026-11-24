@@ -21,6 +21,7 @@ fn server_and_credentials_keep_their_own_fields_and_focus(cx: &mut TestAppContex
     cx.update(|app| {
         TextInput::bind_keys(app);
         SignIn::bind_keys(app);
+        Preferences::update(app, |settings| settings.language = Language::En).unwrap();
     });
     let (form, ui) = cx.add_window_view(|_, cx| SignIn::new(runtime.clone(), None, cx));
     ui.simulate_resize(size(px(250.), px(370.)));
@@ -37,6 +38,12 @@ fn server_and_credentials_keep_their_own_fields_and_focus(cx: &mut TestAppContex
         let view = form.read(app);
         assert!(matches!(view.step, Step::Server));
         assert_eq!(view.issue, Some(LoginError::InvalidServer));
+        let language = Preferences::read(app).language;
+        assert_eq!(view.copy(language).1, "Next");
+        assert_eq!(
+            error_message(LoginError::InvalidServer, language),
+            "Server address must be a valid HTTPS URL"
+        );
     });
 
     ui.simulate_keystrokes("cmd-a");

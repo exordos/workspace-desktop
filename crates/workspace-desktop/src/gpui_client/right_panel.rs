@@ -10,7 +10,7 @@ use gpui::{
 use super::{
     NextControl, PreviousControl,
     contracts::{AccountSession, ConversationAddress},
-    preferences::{Language, Preferences},
+    preferences::Preferences,
     ui::{Button, ButtonAppearance, Icon, PANEL_RADIUS, Palette, TextRole, label, popup::tooltip},
 };
 
@@ -88,7 +88,7 @@ struct ConversationChrome {
 struct Entry {
     key: PanelKey,       // Ключ для повторного открытия и проверки владельца.
     title: SharedString, // Заголовок общей рамки.
-    english_title: Option<&'static str>, // Перевод заголовка страницы аккаунта.
+    translation_key: Option<&'static str>, // Ключ заголовка страницы аккаунта.
     conversation_chrome: Option<ConversationChrome>, // Внутренний шаг сведений разговора.
     body: AnyView,       // Живой GPUI-вид со своим состоянием.
     opener: FocusHandle, // Элемент вне стека, к которому можно вернуться при закрытии.
@@ -250,7 +250,7 @@ impl RightPanel {
             self.entries.push(Entry {
                 key,
                 title: title.into(),
-                english_title: None,
+                translation_key: None,
                 conversation_chrome: None,
                 body,
                 opener,
@@ -273,10 +273,10 @@ impl RightPanel {
         }
     }
 
-    /// Запоминает английскую подпись для смены языка на уже открытом экране.
-    pub fn set_account_translation(&mut self, title: &'static str) {
+    /// Запоминает ключ заголовка для смены языка на уже открытом экране.
+    pub fn set_translation_key(&mut self, title: &'static str) {
         if let Some(entry) = self.entries.last_mut() {
-            entry.english_title = Some(title);
+            entry.translation_key = Some(title);
         }
     }
 
@@ -657,8 +657,8 @@ impl RightPanel {
                 .nth(1)
                 .is_some_and(|previous| entry.key.scope == previous.key.scope);
         let language = Preferences::read(app).language;
-        let close_label = language.text("Закрыть", "Close");
-        let back_label = language.text("Назад", "Back");
+        let close_label = language.tr("common.close");
+        let back_label = language.tr("common.back");
         let close_id = if account_page {
             "profile-close"
         } else {
@@ -681,19 +681,16 @@ impl RightPanel {
         back.appearance = ButtonAppearance::Ghost;
         let title = entry.conversation_chrome.as_ref().map_or_else(
             || {
-                if language == Language::En
-                    && let Some(title) = entry.english_title
-                {
-                    title.into()
-                } else {
-                    entry.title.clone()
-                }
+                entry.translation_key.map_or_else(
+                    || entry.title.clone(),
+                    |key| SharedString::from(language.tr(key)),
+                )
             },
             |chrome| SharedString::from((chrome.title)(app)),
         );
         let clear = Button::new(
             "right-panel-close-all",
-            language.text("Закрыть все", "Close all"),
+            language.tr("desktop.profile.closeAll"),
         );
         let clear_focus = (!account_page && !conversation_back && stack.entries.len() > 1)
             .then_some(&entry.clear);

@@ -42,29 +42,25 @@ impl Section {
     /// Возвращает стабильный ключ секции, подпись и значок.
     fn metadata(self, language: Language) -> (&'static str, &'static str, Icon) {
         match self {
-            Self::Theme => (
-                "theme",
-                language.text("Настройки темы", "Theme settings"),
-                Icon::Draw,
-            ),
+            Self::Theme => ("theme", language.tr("settings.themeSettings"), Icon::Draw),
             Self::Sorting => (
                 "sorting",
-                language.text("Порядок стримов и топиков", "Stream and topic order"),
+                language.tr("settings.messengerSidebarSortMode"),
                 Icon::StreamOrder,
             ),
             Self::Folders => (
                 "folder",
-                language.text("Отображение папок", "Folder layout"),
+                language.tr("settings.folderLayout"),
                 Icon::FolderLayout,
             ),
             Self::Density => (
                 "density",
-                language.text("Плотность списка чатов", "Chat list density"),
+                language.tr("settings.chatListDensity"),
                 Icon::Topic,
             ),
             Self::Background => (
                 "background",
-                language.text("Задний фон чата", "Chat background"),
+                language.tr("desktop.appearance.title"),
                 Icon::Background,
             ),
         }
@@ -252,7 +248,7 @@ impl Appearance {
             .border_color(palette.border)
             .bg(palette.surface.opacity(0.6))
             .overflow_hidden();
-        let selections: &[(&str, &str, &str, bool, Change)] = match section {
+        let selections: &[(&str, &str, bool, Change)] = match section {
             Section::Theme => {
                 return panel.child(theme_options(
                     preferences.theme,
@@ -268,22 +264,19 @@ impl Appearance {
             Section::Sorting => &[
                 (
                     "last-message",
-                    "По последнему сообщению",
-                    "Last message",
+                    "settings.messengerSidebarSortModeLastMessage",
                     preferences.sort == SidebarSort::LastMessage,
                     Change::Sort(SidebarSort::LastMessage),
                 ),
                 (
                     "unread-first",
-                    "Сначала непрочитанные",
-                    "Unread first",
+                    "settings.messengerSidebarSortModeUnreadFirst",
                     preferences.sort == SidebarSort::UnreadFirst,
                     Change::Sort(SidebarSort::UnreadFirst),
                 ),
                 (
                     "alphabetical",
-                    "По имени",
-                    "By name",
+                    "settings.messengerSidebarSortModeAlphabetical",
                     preferences.sort == SidebarSort::Alphabetical,
                     Change::Sort(SidebarSort::Alphabetical),
                 ),
@@ -297,15 +290,13 @@ impl Appearance {
                 &[
                     (
                         "vertical",
-                        "Вертикальная панель",
-                        "Vertical rail",
+                        "settings.folderLayoutVertical",
                         vertical,
                         Change::Vertical(true),
                     ),
                     (
                         "horizontal",
-                        "Горизонтальные вкладки",
-                        "Horizontal tabs",
+                        "settings.folderLayoutHorizontal",
                         !vertical,
                         Change::Vertical(false),
                     ),
@@ -314,32 +305,33 @@ impl Appearance {
             Section::Density => &[
                 (
                     "standard",
-                    "Стандартная",
-                    "Standard",
+                    "settings.chatListDensityStandard",
                     preferences.density == ChatDensity::Standard,
                     Change::Density(ChatDensity::Standard),
                 ),
                 (
                     "compact",
-                    "Компактная",
-                    "Compact",
+                    "settings.chatListDensityCompact",
                     preferences.density == ChatDensity::Compact,
                     Change::Density(ChatDensity::Compact),
                 ),
             ],
         };
-        panel.children(selections.iter().enumerate().map(
-            |(index, (id, ru, en, active, change))| {
-                option_row(
-                    format!("settings-{id}"),
-                    language.text(ru, en),
-                    *active,
-                    index != 0,
-                    palette,
-                    Self::select(cx, *change),
-                )
-            },
-        ))
+        panel.children(
+            selections
+                .iter()
+                .enumerate()
+                .map(|(index, (id, key, active, change))| {
+                    option_row(
+                        format!("settings-{id}"),
+                        language.tr(key),
+                        *active,
+                        index != 0,
+                        palette,
+                        Self::select(cx, *change),
+                    )
+                }),
+        )
     }
 }
 
@@ -380,10 +372,7 @@ impl Render for Appearance {
                             label(
                                 palette,
                                 TextRole::Caption,
-                                language.text(
-                                    "Не удалось сохранить настройку.",
-                                    "Could not save the setting.",
-                                ),
+                                language.tr("desktop.appearance.saveFailed"),
                             )
                             .m_2()
                             .text_color(palette.danger),
@@ -452,7 +441,7 @@ fn theme_options(
             Icon::DayTheme,
             18.,
             0xffd633,
-            language.text("Светлая", "Light"),
+            language.tr("settings.themeLight"),
         ),
         (
             ThemeChoice::Dark,
@@ -460,7 +449,7 @@ fn theme_options(
             Icon::NightTheme,
             16.,
             0xf7fdff,
-            language.text("Тёмная", "Dark"),
+            language.tr("settings.themeDark"),
         ),
         (
             ThemeChoice::System,
@@ -468,22 +457,32 @@ fn theme_options(
             Icon::DesktopWindows,
             17.,
             0x707070,
-            language.text("Системная", "System"),
+            language.tr("settings.themeSystem"),
         ),
     ];
     let themes = [
         (
             ThemePalette::OrangeWarm,
             "orange-warm",
-            "Orange Warm",
+            language.tr("desktop.appearance.paletteOrangeWarm"),
             0xff8438,
         ),
-        (ThemePalette::BlueCold, "blue-cold", "Blue Cold", 0x7087ff),
-        (ThemePalette::BlueMist, "blue-mist", "Blue Mist", 0x7d9ddf),
+        (
+            ThemePalette::BlueCold,
+            "blue-cold",
+            language.tr("desktop.appearance.paletteBlueCold"),
+            0x7087ff,
+        ),
+        (
+            ThemePalette::BlueMist,
+            "blue-mist",
+            language.tr("desktop.appearance.paletteBlueMist"),
+            0x7d9ddf,
+        ),
         (
             ThemePalette::EmeraldChat,
             "emerald-chat",
-            "Emerald Chat",
+            language.tr("desktop.appearance.paletteEmerald"),
             0x2ecf72,
         ),
     ];

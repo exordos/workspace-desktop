@@ -9,7 +9,10 @@ use gpui::{
 };
 
 use crate::{
-    gpui_client::ui::{Button, ButtonAppearance, Palette, TextRole, label, popup::tooltip},
+    gpui_client::{
+        preferences::Preferences,
+        ui::{Button, ButtonAppearance, Palette, TextRole, label, popup::tooltip},
+    },
     platform::notifications::NotificationPermission,
 };
 
@@ -143,32 +146,36 @@ impl NotificationBanner {
     ) -> Div {
         let open = self.mode != BannerMode::Collapsed;
         let needs_settings = permission == NotificationPermission::NeedsSettings;
+        let language = Preferences::read(cx).language;
         let (title, description, action) = if needs_settings {
             (
-                "Системные уведомления выключены",
+                "desktop.notifications.disabledTitle",
                 if self.settings_failed {
-                    "Системные настройки → Уведомления → Workspace Desktop"
+                    "desktop.notifications.settingsPath"
                 } else {
-                    "Включите баннеры Workspace Desktop в настройках macOS."
+                    "desktop.notifications.settingsHint"
                 },
-                "Открыть настройки уведомлений",
+                "desktop.notifications.openSettings",
             )
         } else {
             (
-                "Включить уведомления?",
-                "Workspace сообщит о новых сообщениях, когда вы заняты другим.",
+                "notifications.permissionBannerTitle",
+                "desktop.notifications.permissionBody",
                 if requesting {
-                    "Ожидаем ответа macOS…"
+                    "desktop.notifications.waitingForSystem"
                 } else {
-                    "Включить уведомления"
+                    "notifications.permissionBannerEnable"
                 },
             )
         };
 
-        let mut primary = Button::new("notification-permission-primary", action);
+        let mut primary = Button::new("notification-permission-primary", language.tr(action));
         primary.appearance = ButtonAppearance::Primary;
         primary.disabled = requesting || !open;
-        let mut later = Button::new("notification-permission-later", "Не сейчас");
+        let mut later = Button::new(
+            "notification-permission-later",
+            language.tr("notifications.permissionBannerDismiss"),
+        );
         later.disabled = !open;
         let mut collapse = Button::new("notification-permission-collapse", "⌃");
         collapse.appearance = ButtonAppearance::Ghost;
@@ -199,9 +206,9 @@ impl NotificationBanner {
                 div()
                     .flex()
                     .flex_col()
-                    .child(label(palette, TextRole::Heading, title))
+                    .child(label(palette, TextRole::Heading, language.tr(title)))
                     .child(
-                        label(palette, TextRole::Body, description)
+                        label(palette, TextRole::Body, language.tr(description))
                             .text_color(palette.text_secondary),
                     ),
             )
@@ -233,7 +240,16 @@ impl NotificationBanner {
                     .child(
                         collapse
                             .render(palette, Some(&self.collapse), dismiss)
-                            .tooltip(move |_, app| tooltip(palette, "Свернуть планку".into(), app)),
+                            .tooltip(move |_, app| {
+                                tooltip(
+                                    palette,
+                                    Preferences::read(app)
+                                        .language
+                                        .tr("desktop.notifications.collapse")
+                                        .into(),
+                                    app,
+                                )
+                            }),
                     ),
             )
     }
@@ -286,7 +302,14 @@ impl NotificationBanner {
                         });
                     })
                     .tooltip(move |_, app| {
-                        tooltip(palette, "Показать планку уведомлений".into(), app)
+                        tooltip(
+                            palette,
+                            Preferences::read(app)
+                                .language
+                                .tr("desktop.notifications.expand")
+                                .into(),
+                            app,
+                        )
                     })
             });
 

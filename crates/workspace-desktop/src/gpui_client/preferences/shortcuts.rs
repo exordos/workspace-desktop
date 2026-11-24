@@ -9,9 +9,9 @@ actions!(workspace_hotkeys, [CancelRecording]);
 /// Действие, которое можно назначить на собственное сочетание клавиш.
 #[derive(Clone, Copy)]
 pub(in crate::gpui_client) struct Shortcut {
-    pub id: &'static str,                    // Ключ этой команды в профиле.
-    pub title: (&'static str, &'static str), // Русская и английская подписи.
-    pub binding: Option<&'static str>,       // Стандартное сочетание в синтаксисе GPUI.
+    pub id: &'static str,              // Ключ этой команды в профиле.
+    pub title: &'static str,           // Ключ подписи команды.
+    pub binding: Option<&'static str>, // Стандартное сочетание в синтаксисе GPUI.
 }
 
 /// Пункты в порядке Electron, разделённые на три группы.
@@ -19,101 +19,101 @@ pub(in crate::gpui_client) const SHORTCUT_GROUPS: [&[Shortcut]; 3] = [
     &[
         Shortcut {
             id: "navigation.back",
-            title: ("Назад", "Back"),
+            title: "hotkeys.actions.navigation.back",
             binding: Some("alt-left"),
         },
         Shortcut {
             id: "navigation.forward",
-            title: ("Вперёд", "Forward"),
+            title: "hotkeys.actions.navigation.forward",
             binding: Some("alt-right"),
         },
         Shortcut {
             id: "navigation.messenger",
-            title: ("Мессенджер", "Messenger"),
+            title: "hotkeys.actions.navigation.messenger",
             binding: None,
         },
         Shortcut {
             id: "navigation.calendar",
-            title: ("Календарь", "Calendar"),
+            title: "hotkeys.actions.navigation.calendar",
             binding: None,
         },
         Shortcut {
             id: "navigation.mail",
-            title: ("Почта", "Mail"),
+            title: "hotkeys.actions.navigation.mail",
             binding: None,
         },
         Shortcut {
             id: "navigation.calls",
-            title: ("Звонки", "Calls"),
+            title: "hotkeys.actions.navigation.calls",
             binding: None,
         },
         Shortcut {
             id: "navigation.activity",
-            title: ("Активность", "Activity"),
+            title: "hotkeys.actions.navigation.activity",
             binding: None,
         },
         Shortcut {
             id: "navigation.chatSearch",
-            title: ("Поиск чатов", "Search chats"),
+            title: "hotkeys.actions.navigation.chatSearch",
             binding: Some("cmd-k"),
         },
         Shortcut {
             id: "navigation.folderList",
-            title: ("Список папок", "Folder list"),
+            title: "hotkeys.actions.navigation.folderList",
             binding: None,
         },
     ],
     &[
         Shortcut {
             id: "interface.theme",
-            title: ("Сменить тему", "Change theme"),
+            title: "hotkeys.actions.interface.theme",
             binding: None,
         },
         Shortcut {
             id: "interface.help",
-            title: ("Справка", "Help"),
+            title: "hotkeys.actions.interface.help",
             binding: Some("cmd-/"),
         },
         Shortcut {
             id: "interface.sidebar",
-            title: ("Боковая панель", "Toggle sidebar"),
+            title: "hotkeys.actions.interface.sidebar",
             binding: Some("cmd-\\"),
         },
         Shortcut {
             id: "interface.infoPanel",
-            title: ("Информация о чате", "Chat information"),
+            title: "hotkeys.actions.interface.infoPanel",
             binding: Some("cmd-."),
         },
         Shortcut {
             id: "interface.quoteMessage",
-            title: ("Цитировать сообщение", "Quote message"),
+            title: "hotkeys.actions.interface.quoteMessage",
             binding: Some("ctrl-l"),
         },
     ],
     &[
         Shortcut {
             id: "composer.editLastMessage",
-            title: ("Редактировать последнее сообщение", "Edit last message"),
+            title: "hotkeys.actions.composer.editLastMessage",
             binding: Some("up"),
         },
         Shortcut {
             id: "composer.bold",
-            title: ("Жирный", "Bold"),
+            title: "hotkeys.actions.composer.bold",
             binding: Some("cmd-b"),
         },
         Shortcut {
             id: "composer.italic",
-            title: ("Курсив", "Italic"),
+            title: "hotkeys.actions.composer.italic",
             binding: Some("cmd-i"),
         },
         Shortcut {
             id: "composer.strike",
-            title: ("Зачёркнутый", "Strikethrough"),
+            title: "hotkeys.actions.composer.strike",
             binding: Some("shift-cmd-x"),
         },
         Shortcut {
             id: "composer.code",
-            title: ("Код", "Code"),
+            title: "hotkeys.actions.composer.code",
             binding: Some("cmd-e"),
         },
     ],
@@ -123,36 +123,27 @@ pub(in crate::gpui_client) const SHORTCUT_GROUPS: [&[Shortcut]; 3] = [
 pub(in crate::gpui_client) const FIXED: [Shortcut; 5] = [
     Shortcut {
         id: "fixed.cancel",
-        title: ("Закрыть или отменить", "Close or cancel"),
+        title: "hotkeys.fixed.cancel",
         binding: Some("escape"),
     },
     Shortcut {
         id: "fixed.focus",
-        title: (
-            "Переход по элементам (Shift+Tab — назад)",
-            "Move focus (Shift+Tab moves backward)",
-        ),
+        title: "hotkeys.fixed.focus",
         binding: Some("tab"),
     },
     Shortcut {
         id: "fixed.send",
-        title: (
-            "Отправка или перенос строки согласно настройке отправки",
-            "Send or insert a line, depending on send settings",
-        ),
+        title: "hotkeys.fixed.send",
         binding: Some("enter"),
     },
     Shortcut {
         id: "fixed.editing",
-        title: (
-            "Стандартные операции редактирования, например копирование",
-            "Standard editing shortcuts, such as copy",
-        ),
+        title: "hotkeys.fixed.editing",
         binding: Some("cmd-c"),
     },
     Shortcut {
         id: "fixed.focusZones",
-        title: ("Переход между областями фокуса", "Move between focus areas"),
+        title: "hotkeys.fixed.focusZones",
         binding: Some("f6"),
     },
 ];
@@ -160,20 +151,14 @@ pub(in crate::gpui_client) const FIXED: [Shortcut; 5] = [
 impl Shortcut {
     /// Возвращает название действия в выбранной локали.
     pub fn title(self, language: Language) -> &'static str {
-        language.text(self.title.0, self.title.1)
+        language.tr(self.title)
     }
 
     /// Показывает пояснение двух команд, которые зависят от фокуса и контекста.
     pub fn hint(self, language: Language) -> Option<&'static str> {
         match self.id {
-            "interface.quoteMessage" => Some(language.text(
-                "Выделите текст, перейдите к сообщению клавишей Tab или наведите на него курсор.",
-                "Select text, focus a message with Tab, or point to it.",
-            )),
-            "composer.editLastMessage" => Some(language.text(
-                "Когда поле пустое и редактирование сообщения не активно",
-                "When the composer is empty and not editing a message",
-            )),
+            "interface.quoteMessage" => Some(language.tr("hotkeys.quoteHint")),
+            "composer.editLastMessage" => Some(language.tr("hotkeys.editLastMessageHint")),
             _ => None,
         }
     }
@@ -199,14 +184,9 @@ impl BindingError {
     /// Показывает причину рядом с полем записи.
     pub fn message(self, language: Language) -> &'static str {
         match self {
-            Self::Invalid => language.text("Недопустимое сочетание", "Invalid shortcut"),
-            Self::Reserved => {
-                language.text("Это сочетание зарезервировано", "This shortcut is reserved")
-            }
-            Self::Conflict => language.text(
-                "Это сочетание уже используется",
-                "This shortcut is already in use",
-            ),
+            Self::Invalid => language.tr("hotkeys.invalid"),
+            Self::Reserved => language.tr("hotkeys.reserved"),
+            Self::Conflict => language.tr("hotkeys.conflict"),
         }
     }
 }

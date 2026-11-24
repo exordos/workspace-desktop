@@ -1,0 +1,358 @@
+{
+  "a11y": {
+    "away": "Отошёл",
+    "online": "В сети"
+  },
+  "app": {
+    "invalidResponse": "Неверный ответ сервера"
+  },
+  "auth": {
+    "currentServer": "Текущий сервер",
+    "emailOrLogin": "Email или логин",
+    "invalidLogin": "Неверный логин или пароль",
+    "invalidOtp": "Код подтверждения неверный. Попробуйте ещё раз.",
+    "invalidServerUrl": "Адрес сервера должен быть валидным HTTPS URL",
+    "login": "Войти",
+    "loginLoading": "Вход…",
+    "logout": "Выйти",
+    "logoutFromOrgConfirm": "Выйти из организации %{server}?",
+    "noProjectsAvailable": "У вашего аккаунта нет доступа к проектам этой организации.",
+    "organizationStepHint": "Сначала укажите адрес вашей организации.",
+    "password": "Пароль",
+    "projectStepHint": "Выберите проект, который хотите открыть.",
+    "register": "Зарегистрироваться",
+    "selectProject": "Проект",
+    "selectServer": "Выбрать аккаунт"
+  },
+  "common": {
+    "add": "Добавить",
+    "all": "Все",
+    "back": "Назад",
+    "cancel": "Отмена",
+    "close": "Закрыть",
+    "create": "Создать",
+    "delete": "Удалить",
+    "email": "Email",
+    "favorites": "Избранное",
+    "loadMore": "Загрузить ещё",
+    "next": "Далее",
+    "open": "Открыть",
+    "prev": "Назад",
+    "rename": "Переименовать",
+    "retry": "Повторить",
+    "save": "Сохранить",
+    "skip": "Пропустить",
+    "you": "Вы"
+  },
+  "desktop": {
+    "about": {
+      "currentVersion": "Текущая версия:",
+      "updatesUnavailable": "Проверка обновлений недоступна в этой сборке"
+    },
+    "appearance": {
+      "paletteBlueCold": "Холодный синий",
+      "paletteBlueMist": "Дымчатый синий",
+      "paletteEmerald": "Изумрудный",
+      "paletteOrangeWarm": "Тёплый оранжевый",
+      "saveFailed": "Не удалось сохранить настройку.",
+      "title": "Задний фон чата"
+    },
+    "auth": {
+      "addAccount": "Добавить аккаунт",
+      "attemptUnavailable": "Время входа истекло. Введите пароль ещё раз.",
+      "busy": "Вход временно недоступен. Повторите попытку.",
+      "confirm": "Подтвердить",
+      "connecting": "Подключаем рабочее пространство…",
+      "credentialsHint": "Введите учётные данные для входа.",
+      "loginPlaceholder": "Ваш логин или почта",
+      "offline": "Нет связи",
+      "otpHint": "Введите шестизначный одноразовый код.",
+      "otpLabel": "Одноразовый код",
+      "otpRequired": "Для входа требуется одноразовый код.",
+      "passwordPlaceholder": "Ваш пароль",
+      "required": "Требуется вход",
+      "stopped": "Фоновая работа остановлена. Перезапустите Workspace.",
+      "storageError": "Не удалось открыть или сохранить данные входа. Повторите попытку.",
+      "temporarilyUnavailable": "Сервер Workspace недоступен. Повторите попытку.",
+      "title": "Вход в Workspace",
+      "unknownProject": "Проект недоступен. Выберите другой проект.",
+      "workspaceAddress": "Адрес Workspace"
+    },
+    "avatar": {
+      "chooseFailed": "Не удалось выбрать изображение",
+      "fileTooLarge": "Файл слишком большой. Максимум 25 МБ",
+      "invalidFormat": "Выберите изображение PNG, JPEG, GIF или WebP"
+    },
+    "background": {
+      "addCustom": "Добавить своё",
+      "allChats": "Все чаты",
+      "apply": "Применить фон",
+      "applyHint": "Для всех чатов или только для чата, который сейчас открыт?",
+      "chooseFile": "Выбрать файл для фона",
+      "customImage": "Своё изображение",
+      "defaultImage": "Стандартный фон",
+      "fileRequirements": "JPEG, PNG, WebP — до 8 МБ. Фон хранится на этом устройстве.",
+      "forest": "Лес",
+      "invalidFormat": "Выбери изображение JPEG, PNG или WebP.",
+      "invalidSize": "Изображение слишком большое или пустое. Выбери файл до 8 МБ и до 24 мегапикселей.",
+      "mountains": "Горы",
+      "onlyThisChat": "Только этот чат",
+      "openChat": "Открой нужный чат, чтобы применить фон только к нему.",
+      "openFailed": "Не удалось открыть изображение. Попробуй другой файл.",
+      "processing": "Обработка…",
+      "resetHint": "Будет восстановлен стандартный фон.",
+      "saveFailed": "Не удалось сохранить фон. Предыдущий фон оставлен.",
+      "sea": "Море"
+    },
+    "conversation": {
+      "select": "Выберите разговор"
+    },
+    "general": {
+      "saveFailed": "Не удалось сохранить настройки",
+      "separateCallWindow": "Открывать звонки в отдельном окне"
+    },
+    "nav": {
+      "chats": "Чаты",
+      "contacts": "Контакты"
+    },
+    "notifications": {
+      "accountLabel": "Аккаунт %{account}",
+      "collapse": "Свернуть планку",
+      "disabledTitle": "Системные уведомления выключены",
+      "expand": "Показать планку уведомлений",
+      "inactiveAccount": "Аккаунт из уведомления недоступен",
+      "openFailed": "Не удалось открыть уведомление",
+      "openSettings": "Открыть настройки уведомлений",
+      "permissionBody": "Workspace сообщит о новых сообщениях, когда вы заняты другим.",
+      "settingsHint": "Включите баннеры Workspace Desktop в настройках macOS.",
+      "settingsPath": "Системные настройки → Уведомления → Workspace Desktop",
+      "unavailableMessage": "Сообщение из уведомления недоступно",
+      "waitingForSystem": "Ожидаем ответа macOS…"
+    },
+    "personal": {
+      "favoriteUnavailable": "Временно не подключено",
+      "invalidIdentity": "Проверьте имя и телефон",
+      "loadFailed": "Не удалось загрузить личную информацию. Нажмите «Редактировать», чтобы повторить.",
+      "loading": "Загружаем личную информацию…",
+      "saveFailed": "Не удалось сохранить личную информацию"
+    },
+    "profile": {
+      "appearanceSubtitle": "Настройки темы, Отображение папок, Плотность списка чатов",
+      "clearCacheSubtitle": "Кэш сообщений, локальные настройки, перезагрузка",
+      "closeAll": "Закрыть все",
+      "generalSubtitle": "Звуки уведомлений, Язык, Автовыход",
+      "joinedDate": "%{day} %{month} %{year} г.",
+      "joinedMonths": {
+        "apr": "апр.",
+        "aug": "авг.",
+        "dec": "дек.",
+        "feb": "февр.",
+        "jan": "янв.",
+        "jul": "июл.",
+        "jun": "июн.",
+        "mar": "мар.",
+        "may": "мая",
+        "nov": "нояб.",
+        "oct": "окт.",
+        "sep": "сент."
+      },
+      "logoutFailed": "Не удалось выйти из организации",
+      "numberedAccount": "Аккаунт %{number}",
+      "resetFailed": "Не удалось сбросить локальные настройки",
+      "restartFailed": "Не удалось перезапустить приложение"
+    },
+    "startup": {
+      "databaseFailed": "Не удалось открыть базу Workspace",
+      "loadingAccounts": "Загружаем аккаунты…",
+      "profileFailed": "Не удалось открыть профиль Workspace",
+      "stopped": "Фоновая работа остановлена",
+      "testLoginFailed": "Не удалось войти в тестовый Workspace. Причина указана в журнале запуска.",
+      "workerFailed": "Не удалось запустить фоновую работу Workspace"
+    },
+    "status": {
+      "emoji": {
+        "activities": "Занятия",
+        "animals": "Животные и природа",
+        "flags": "Флаги",
+        "food": "Еда и напитки",
+        "mood": "Какое у вас настроение?",
+        "objects": "Предметы",
+        "recent": "Часто используемые",
+        "results": "Результаты поиска",
+        "smileys": "Смайлики и люди",
+        "symbols": "Символы",
+        "travel": "Путешествия и места"
+      },
+      "emojiSearch": "Поиск эмодзи",
+      "loadFailed": "Не удалось загрузить статус",
+      "loading": "Загружаем статус…"
+    }
+  },
+  "hotkeys": {
+    "actions": {
+      "composer": {
+        "bold": "Жирный",
+        "code": "Код",
+        "editLastMessage": "Редактировать последнее сообщение",
+        "italic": "Курсив",
+        "strike": "Зачёркнутый"
+      },
+      "interface": {
+        "help": "Справка",
+        "infoPanel": "Информация о чате",
+        "quoteMessage": "Цитировать сообщение",
+        "sidebar": "Боковая панель",
+        "theme": "Сменить тему"
+      },
+      "navigation": {
+        "activity": "Активность",
+        "back": "Назад",
+        "calendar": "Календарь",
+        "calls": "Звонки",
+        "chatSearch": "Поиск чатов",
+        "folderList": "Список папок",
+        "forward": "Вперёд",
+        "mail": "Почта",
+        "messenger": "Мессенджер"
+      }
+    },
+    "composer": "Редактор",
+    "conflict": "Это сочетание уже используется",
+    "disable": "Отключить",
+    "disabled": "Отключено",
+    "edit": "Изменить",
+    "editLastMessageHint": "Когда поле пустое и редактирование сообщения не активно",
+    "empty": "Сочетания не найдены",
+    "enabled": "Включить горячие клавиши",
+    "fixed": {
+      "cancel": "Закрыть или отменить",
+      "editing": "Стандартные операции редактирования, например копирование",
+      "focus": "Переход по элементам (Shift+Tab — назад)",
+      "focusZones": "Переход между областями фокуса",
+      "send": "Отправка или перенос строки согласно настройке отправки"
+    },
+    "fixedTitle": "Фиксированные сочетания",
+    "interface": "Интерфейс",
+    "invalid": "Недопустимое сочетание",
+    "localDescription": "Настройки сохраняются на этом устройстве. Сочетания редактора действуют при вводе сообщения.",
+    "navigation": "Навигация",
+    "quoteHint": "Выделите текст, перейдите к сообщению клавишей Tab или наведите на него курсор.",
+    "record": "Нажмите сочетание клавиш. Escape отменяет запись.",
+    "recordInput": "Нажмите сочетание",
+    "reserved": "Это сочетание зарезервировано",
+    "reset": "Сбросить",
+    "resetAll": "Сбросить все",
+    "search": "Поиск сочетаний",
+    "storageError": "Не удалось сохранить настройки",
+    "title": "Горячие клавиши"
+  },
+  "info": {
+    "accountStatus": "Статус аккаунта",
+    "accountType": "Тип аккаунта",
+    "birthday": "День рождения",
+    "edit": "Редактировать",
+    "jobTitle": "Команда > Должность",
+    "joined": "Дата регистрации",
+    "localTime": "Местное время",
+    "manager": "Руководитель",
+    "phone": "Телефон",
+    "role": "Роль",
+    "saveChanges": "Сохранить изменения",
+    "share": "Поделиться",
+    "timezone": "Часовой пояс",
+    "userId": "ID пользователя",
+    "username": "Имя пользователя"
+  },
+  "licenses": {
+    "author": "Автор",
+    "license": "Лицензия",
+    "package": "Пакет",
+    "packagesOf": "%{filtered} из %{total} пакетов",
+    "reset": "Сбросить",
+    "searchPlaceholder": "Поиск пакетов…",
+    "subtitle": "Workspace использует %{count} open source пакетов",
+    "title": "Open Source лицензии",
+    "version": "Версия"
+  },
+  "message": {
+    "copied": "Скопировано"
+  },
+  "nav": {
+    "account": "Аккаунт",
+    "calendar": "Календарь",
+    "calls": "Звонки",
+    "mail": "Почта"
+  },
+  "notifications": {
+    "newMessage": "Новое сообщение",
+    "permissionBannerDismiss": "Не сейчас",
+    "permissionBannerEnable": "Включить уведомления",
+    "permissionBannerTitle": "Включить уведомления на рабочем столе?"
+  },
+  "presence": {
+    "doNotDisturb": "Не беспокоить",
+    "offline": "Не в сети"
+  },
+  "settings": {
+    "appVersion": "Версия приложения",
+    "appearance": "Внешний вид",
+    "authIdleTimeout": "Автовыход",
+    "authIdleTimeout12h": "12 часов",
+    "authIdleTimeout24h": "24 часа",
+    "authIdleTimeout3d": "3 дня",
+    "authIdleTimeout6h": "6 часов",
+    "authIdleTimeout7d": "7 дней",
+    "authIdleTimeoutHint": "После неактивности",
+    "authIdleTimeoutNever": "Никогда",
+    "chatClickAction": "Клик по чату",
+    "chatClickActionAvatarHint": "Клик по аватару откроет общий чат",
+    "chatClickActionGeneral": "Общий чат и топики",
+    "chatClickActionHint": "Что открывать при клике на чат",
+    "chatClickActionLatestTopic": "Последний топик",
+    "chatListDensity": "Плотность списка чатов",
+    "chatListDensityCompact": "Компактная",
+    "chatListDensityStandard": "Стандартная",
+    "chooseFromGallery": "Выбрать из галереи",
+    "clearCache": "Очистить кэш",
+    "clearCacheConfirm": "Очистить кэш сообщений и все локальные настройки? Вход и сохранённые организации останутся. Приложение перезагрузится.",
+    "dockBounce": "Прыжок значка в Dock",
+    "folderLayout": "Отображение папок",
+    "folderLayoutHorizontal": "Горизонтальные вкладки",
+    "folderLayoutVertical": "Вертикальная панель",
+    "messengerSidebarSortMode": "Порядок стримов и топиков",
+    "messengerSidebarSortModeAlphabetical": "По имени",
+    "messengerSidebarSortModeLastMessage": "По последнему сообщению",
+    "messengerSidebarSortModeUnreadFirst": "Сначала непрочитанные",
+    "notificationSound": "Звуки уведомлений",
+    "personalInfo": "Личная информация",
+    "profileDescription": "О себе",
+    "profileDisplayName": "Отображаемое имя",
+    "profileFirstName": "Имя",
+    "profileLastName": "Фамилия",
+    "removeCurrentPhoto": "Удалить текущее фото",
+    "sectionDescription": "Описание",
+    "settings": "Настройки",
+    "soundDefault": "По умолчанию",
+    "soundDigital": "Цифровой",
+    "soundGlass": "Стекло",
+    "soundNone": "Без звука",
+    "soundPulse": "Пульс",
+    "soundSubtle": "Тихий",
+    "status": "Статус",
+    "statusAwayToggle": "Отметить меня как отсутствующего",
+    "statusChooseEmoji": "Выбрать эмодзи",
+    "statusClear": "Очистить статус",
+    "statusDialogHint": "Добавьте эмодзи и текст, чтобы показать текущую занятость.",
+    "statusPlaceholder": "Укажите статус",
+    "statusUpdateError": "Не удалось обновить статус",
+    "themeDark": "Тёмная",
+    "themeLight": "Светлая",
+    "themeSettings": "Настройки темы",
+    "themeSystem": "Системная"
+  },
+  "update": {
+    "check": "Проверить обновления",
+    "idle": "Проверьте, доступна ли новая версия",
+    "title": "Обновление приложения"
+  }
+}

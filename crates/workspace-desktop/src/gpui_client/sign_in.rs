@@ -9,6 +9,7 @@ use uuid::Uuid;
 use workspace_core::context::OwnerContext;
 
 use super::{
+    preferences::{Language, Preferences},
     runtime::{LoginAttempt, LoginError, RuntimeClient},
     ui::{
         Button, ButtonAppearance, Icon, Palette, TextInput, TextInputChanged, TextInputSubmitted,
@@ -81,8 +82,23 @@ impl SignIn {
         if let Some(value) = server_hint {
             server.update(cx, |input, cx| input.set_text(value, cx));
         }
-        let login = cx.new(|cx| TextInput::new("sign-in-login", "Ваш логин или почта", false, cx));
-        let password = cx.new(|cx| TextInput::new("sign-in-password", "Ваш пароль", true, cx));
+        let language = Preferences::read(cx).language;
+        let login = cx.new(|cx| {
+            TextInput::new(
+                "sign-in-login",
+                language.tr("desktop.auth.loginPlaceholder"),
+                false,
+                cx,
+            )
+        });
+        let password = cx.new(|cx| {
+            TextInput::new(
+                "sign-in-password",
+                language.tr("desktop.auth.passwordPlaceholder"),
+                true,
+                cx,
+            )
+        });
         let otp = cx.new(|cx| TextInput::new("sign-in-otp", "000000", true, cx));
 
         let mut subscriptions = Vec::new();
@@ -429,29 +445,33 @@ impl SignIn {
     }
 
     /// Возвращает подсказку и текст кнопки независимо от геометрии формы.
-    fn copy(&self) -> (&'static str, &'static str) {
+    fn copy(&self, language: Language) -> (&'static str, &'static str) {
         let (hint, button) = match self.step {
-            Step::Server => ("Укажите адрес вашей организации.", "Далее"),
-            Step::Credentials => ("Введите учётные данные для входа.", "Далее"),
-            Step::Otp => ("Введите шестизначный одноразовый код.", "Подтвердить"),
-            Step::Project { .. } => ("Выберите проект, в который хотите войти.", "Войти"),
-            Step::Finished => ("Подключаем рабочее пространство…", ""),
+            Step::Server => ("auth.organizationStepHint", "common.next"),
+            Step::Credentials => ("desktop.auth.credentialsHint", "common.next"),
+            Step::Otp => ("desktop.auth.otpHint", "desktop.auth.confirm"),
+            Step::Project { .. } => ("auth.projectStepHint", "auth.login"),
+            Step::Finished => return (language.tr("desktop.auth.connecting"), ""),
         };
         (
-            hint,
-            if self.request.is_some() {
-                "Входим…"
+            language.tr(hint),
+            language.tr(if self.request.is_some() {
+                "auth.loginLoading"
             } else {
                 button
-            },
+            }),
         )
     }
 
     /// Рисует только поля видимого шага, чтобы Tab не попадал в скрытые поля.
-    fn fields(&self, palette: Palette, cx: &Context<Self>) -> Div {
+    fn fields(&self, palette: Palette, language: Language, cx: &Context<Self>) -> Div {
         let body = div().flex().flex_col().gap_4();
         match &self.step {
-            Step::Server => body.child(form_field(palette, "Адрес Workspace", self.server.clone())),
+            Step::Server => body.child(form_field(
+                palette,
+                language.tr("desktop.auth.workspaceAddress"),
+                self.server.clone(),
+            )),
             Step::Credentials => body
                 .child(
                     label(
@@ -463,9 +483,21 @@ impl SignIn {
                     .min_w_0()
                     .overflow_hidden(),
                 )
-                .child(form_field(palette, "Почта или логин", self.login.clone()))
-                .child(form_field(palette, "Пароль", self.password.clone())),
-            Step::Otp => body.child(form_field(palette, "Одноразовый код", self.otp.clone())),
+                .child(form_field(
+                    palette,
+                    language.tr("auth.emailOrLogin"),
+                    self.login.clone(),
+                ))
+                .child(form_field(
+                    palette,
+                    language.tr("auth.password"),
+                    self.password.clone(),
+                )),
+            Step::Otp => body.child(form_field(
+                palette,
+                language.tr("desktop.auth.otpLabel"),
+                self.otp.clone(),
+            )),
             Step::Project {
                 attempt,
                 selected,
@@ -474,7 +506,7 @@ impl SignIn {
                 ..
             } => body.child(form_field(
                 palette,
-                "Проект",
+                language.tr("auth.selectProject"),
                 self.projects(attempt, *selected, focus, scroll, palette, cx),
             )),
             Step::Finished => body,
@@ -533,13 +565,18 @@ impl SignIn {
     }
 
     /// Предлагает перейти к регистрации, если сервер сообщил адрес страницы.
-    fn registration_action(&self, palette: Palette, cx: &Context<Self>) -> Option<Stateful<Div>> {
+    fn registration_action(
+        &self,
+        palette: Palette,
+        language: Language,
+        cx: &Context<Self>,
+    ) -> Option<Stateful<Div>> {
         if let (Step::Credentials, Registration::Available(url)) = (&self.step, &self.registration)
         {
             let target = cx.weak_entity();
             let url = url.clone();
             return Some(
-                Button::new("sign-in-register", "Зарегистрироваться")
+                Button::new("sign-in-register", language.tr("auth.register"))
                     .render(palette, None, move |_, app| {
                         let _ = target.update(app, |view, cx| {
                             if matches!(
@@ -557,13 +594,19 @@ impl SignIn {
     }
 
     /// Рисует подтверждение и возврат с общей механикой клавиатуры GPUI.
-    fn actions(&self, caption: &'static str, palette: Palette, cx: &Context<Self>) -> Div {
+    fn actions(
+        &self,
+        caption: &'static str,
+        palette: Palette,
+        language: Language,
+        cx: &Context<Self>,
+    ) -> Div {
         let target = cx.weak_entity();
         let back_target = target.clone();
         let mut submit = Button::new("sign-in-submit", caption);
         submit.appearance = ButtonAppearance::Primary;
         submit.disabled = !self.can_submit(cx);
-        let mut back = Button::new("sign-in-back", "Назад");
+        let mut back = Button::new("sign-in-back", language.tr("common.back"));
         back.appearance = ButtonAppearance::Ghost;
         back.disabled = matches!(self.step, Step::Project { .. }) && self.request.is_some();
         div()
@@ -577,7 +620,7 @@ impl SignIn {
                     })
                     .debug_selector(|| "sign-in-submit".into()),
             )
-            .children(self.registration_action(palette, cx))
+            .children(self.registration_action(palette, language, cx))
             .when(
                 self.adding_account || !matches!(self.step, Step::Server),
                 |actions| {
@@ -598,12 +641,19 @@ impl Render for SignIn {
         self.focus_current_step(window, cx);
         self.keep_project_in_view(window);
         let palette = Palette::for_window(window, cx);
-        let (hint, submit) = self.copy();
-        let title = if self.adding_account {
-            "Добавить аккаунт"
+        let language = Preferences::read(cx).language;
+        self.login.update(cx, |input, cx| {
+            input.set_placeholder(language.tr("desktop.auth.loginPlaceholder"), cx);
+        });
+        self.password.update(cx, |input, cx| {
+            input.set_placeholder(language.tr("desktop.auth.passwordPlaceholder"), cx);
+        });
+        let (hint, submit) = self.copy(language);
+        let title = language.tr(if self.adding_account {
+            "desktop.auth.addAccount"
         } else {
-            "Вход в Workspace"
-        };
+            "desktop.auth.title"
+        });
         div()
             .id("workspace-sign-in")
             .debug_selector(|| "workspace-sign-in".into())
@@ -647,18 +697,22 @@ impl Render for SignIn {
                                     ),
                             )
                             .when(!matches!(self.step, Step::Finished), |form| {
-                                form.child(self.fields(palette, cx))
+                                form.child(self.fields(palette, language, cx))
                                     .children(self.issue.map(|issue| {
-                                        label(palette, TextRole::Body, error_message(issue))
-                                            .id("sign-in-error")
-                                            .debug_selector(|| "sign-in-error".into())
-                                            .p_2()
-                                            .rounded(px(8.))
-                                            .border_1()
-                                            .border_color(palette.danger)
-                                            .text_color(palette.danger)
+                                        label(
+                                            palette,
+                                            TextRole::Body,
+                                            error_message(issue, language),
+                                        )
+                                        .id("sign-in-error")
+                                        .debug_selector(|| "sign-in-error".into())
+                                        .p_2()
+                                        .rounded(px(8.))
+                                        .border_1()
+                                        .border_color(palette.danger)
+                                        .text_color(palette.danger)
                                     }))
-                                    .child(self.actions(submit, palette, cx))
+                                    .child(self.actions(submit, palette, language, cx))
                             }),
                     ),
             )
@@ -676,21 +730,21 @@ fn form_field(palette: Palette, caption: &'static str, control: impl IntoElement
 }
 
 /// Переводит категории ошибок в локальные подсказки без подробностей ответа IAM.
-fn error_message(error: LoginError) -> &'static str {
-    match error {
-        LoginError::InvalidServer => "Введите действительный HTTPS-адрес Workspace.",
-        LoginError::OtpRequired => "Для входа требуется одноразовый код.",
-        LoginError::InvalidOtp => "Код не подошёл. Введите новый код.",
-        LoginError::InvalidCredentials => "Проверьте логин и пароль.",
-        LoginError::TemporarilyUnavailable => "Сервер Workspace недоступен. Повторите попытку.",
-        LoginError::AttemptUnavailable => "Время входа истекло. Введите пароль ещё раз.",
-        LoginError::UnknownProject => "Проект недоступен. Выберите другой проект.",
-        LoginError::NoProjects => "У этого аккаунта нет доступных проектов.",
-        LoginError::InvalidResponse => "Не удалось обработать ответ сервера Workspace.",
-        LoginError::Storage => "Не удалось открыть или сохранить данные входа. Повторите попытку.",
-        LoginError::Busy => "Вход временно недоступен. Повторите попытку.",
-        LoginError::Stopped => "Фоновая работа остановлена. Перезапустите Workspace.",
-    }
+fn error_message(error: LoginError, language: Language) -> &'static str {
+    language.tr(match error {
+        LoginError::InvalidServer => "auth.invalidServerUrl",
+        LoginError::OtpRequired => "desktop.auth.otpRequired",
+        LoginError::InvalidOtp => "auth.invalidOtp",
+        LoginError::InvalidCredentials => "auth.invalidLogin",
+        LoginError::TemporarilyUnavailable => "desktop.auth.temporarilyUnavailable",
+        LoginError::AttemptUnavailable => "desktop.auth.attemptUnavailable",
+        LoginError::UnknownProject => "desktop.auth.unknownProject",
+        LoginError::NoProjects => "auth.noProjectsAvailable",
+        LoginError::InvalidResponse => "app.invalidResponse",
+        LoginError::Storage => "desktop.auth.storageError",
+        LoginError::Busy => "desktop.auth.busy",
+        LoginError::Stopped => "desktop.auth.stopped",
+    })
 }
 
 #[cfg(all(test, feature = "gpui-test"))]

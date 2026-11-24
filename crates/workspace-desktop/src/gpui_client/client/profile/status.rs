@@ -24,14 +24,14 @@ use crate::gpui_client::{
 const PRESETS: [&str; 6] = ["💬", "🏠", "🌴", "🍽️", "⛑️", "🗓️"];
 const EMOJIS: &str = include_str!("../../../../assets/status-emojis.tsv");
 const CATEGORIES: [(&str, &str); 8] = [
-    ("smileys_people", "Smileys & People"),
-    ("animals_nature", "Animals & Nature"),
-    ("food_drink", "Food & Drink"),
-    ("travel_places", "Travel & Places"),
-    ("activities", "Activities"),
-    ("objects", "Objects"),
-    ("symbols", "Symbols"),
-    ("flags", "Flags"),
+    ("smileys_people", "desktop.status.emoji.smileys"),
+    ("animals_nature", "desktop.status.emoji.animals"),
+    ("food_drink", "desktop.status.emoji.food"),
+    ("travel_places", "desktop.status.emoji.travel"),
+    ("activities", "desktop.status.emoji.activities"),
+    ("objects", "desktop.status.emoji.objects"),
+    ("symbols", "desktop.status.emoji.symbols"),
+    ("flags", "desktop.status.emoji.flags"),
 ];
 
 /// До чтения прежнего статуса сохранять обнулённые поля нельзя.
@@ -76,7 +76,7 @@ impl Status {
         let text = cx.new(|cx| {
             let mut input = TextInput::new(
                 "profile-status-text",
-                language.text("Укажите статус", "Set a status"),
+                language.tr("settings.statusPlaceholder"),
                 false,
                 cx,
             )
@@ -90,8 +90,14 @@ impl Status {
             );
             input
         });
-        let search =
-            cx.new(|cx| TextInput::new("profile-status-emoji-search", "Search", false, cx));
+        let search = cx.new(|cx| {
+            TextInput::new(
+                "profile-status-emoji-search",
+                language.tr("desktop.status.emojiSearch"),
+                false,
+                cx,
+            )
+        });
         cx.subscribe(&search, |_, _, _: &TextInputChanged, cx| cx.notify())
             .detach();
         let needs_load = initial.is_none();
@@ -311,11 +317,12 @@ impl Status {
 
     /// Рисует поиск, категории и прокручиваемые результаты в открытом наборе.
     fn picker(&self, palette: Palette, cx: &Context<Self>) -> Div {
+        let language = Preferences::read(cx).language;
         let query = self.search.read(cx).text().trim().to_lowercase();
         let (category, title) = CATEGORIES
             .get(self.category)
             .copied()
-            .unwrap_or(("suggested", "Frequently Used"));
+            .unwrap_or(("suggested", "desktop.status.emoji.recent"));
         let found = EMOJIS.lines().filter_map(|line| {
             let (group, value) = line.split_once('\t')?;
             let (emoji, name) = value.split_once('\t')?;
@@ -382,11 +389,11 @@ impl Status {
                         label(
                             palette,
                             TextRole::Heading,
-                            if query.is_empty() {
+                            language.tr(if query.is_empty() {
                                 title
                             } else {
-                                "Search Results"
-                            },
+                                "desktop.status.emoji.results"
+                            }),
                         )
                         .text_color(palette.text_muted)
                         .pb_1(),
@@ -425,8 +432,12 @@ impl Status {
                             .line_height(px(48.)),
                     )
                     .child(
-                        label(palette, TextRole::Body, "What's Your Mood?")
-                            .text_color(palette.text_muted),
+                        label(
+                            palette,
+                            TextRole::Body,
+                            language.tr("desktop.status.emoji.mood"),
+                        )
+                        .text_color(palette.text_muted),
                     ),
             )
     }
@@ -455,23 +466,26 @@ impl Render for Status {
         }
         let palette = Palette::for_window(window, cx);
         let language = Preferences::read(cx).language;
+        self.text.update(cx, |input, cx| {
+            input.set_placeholder(language.tr("settings.statusPlaceholder"), cx);
+        });
+        self.search.update(cx, |input, cx| {
+            input.set_placeholder(language.tr("desktop.status.emojiSearch"), cx);
+        });
         let busy = !self.can_edit();
         let ready = self.loaded == InitialStatus::Ready;
         let mut picker = Button::new(
             "profile-status-emoji-picker",
-            language.text("Выбрать эмодзи", "Choose emoji"),
+            language.tr("settings.statusChooseEmoji"),
         );
         picker.disabled = busy;
-        let mut clear = Button::new(
-            "profile-status-clear",
-            language.text("Очистить статус", "Clear status"),
-        );
+        let mut clear = Button::new("profile-status-clear", language.tr("settings.statusClear"));
         clear.appearance = ButtonAppearance::Ghost;
         clear.disabled = busy;
-        let mut cancel = Button::new("profile-status-cancel", language.text("Отмена", "Cancel"));
+        let mut cancel = Button::new("profile-status-cancel", language.tr("common.cancel"));
         cancel.appearance = ButtonAppearance::Ghost;
         cancel.disabled = !self.can_dismiss();
-        let mut save = Button::new("profile-status-save", language.text("Сохранить", "Save"));
+        let mut save = Button::new("profile-status-save", language.tr("common.save"));
         save.appearance = ButtonAppearance::Primary;
         save.disabled = busy;
         let selected = if self.emoji.is_empty() {
@@ -508,7 +522,7 @@ impl Render for Status {
             .child(label(
                 palette,
                 TextRole::Body,
-                language.text("Отметить меня как отсутствующего", "Mark me as away"),
+                language.tr("settings.statusAwayToggle"),
             ));
         let checkbox = if busy {
             checkbox
@@ -546,16 +560,13 @@ impl Render for Status {
                     .child(label(
                         palette,
                         TextRole::Heading,
-                        language.text("Статус", "Status"),
+                        language.tr("settings.status"),
                     ))
                     .child(
                         label(
                             palette,
                             TextRole::Body,
-                            language.text(
-                                "Добавьте эмодзи и текст, чтобы показать текущую занятость.",
-                                "Add an emoji and text to show your current availability.",
-                            ),
+                            language.tr("settings.statusDialogHint"),
                         )
                         .mt_1()
                         .text_color(palette.text_muted),
@@ -575,7 +586,7 @@ impl Render for Status {
                             label(
                                 palette,
                                 TextRole::Body,
-                                language.text("Загружаем статус…", "Loading status…"),
+                                language.tr("desktop.status.loading"),
                             )
                             .into_any_element(),
                         ),
@@ -588,17 +599,14 @@ impl Render for Status {
                                     label(
                                         palette,
                                         TextRole::Body,
-                                        language.text(
-                                            "Не удалось загрузить статус",
-                                            "Could not load status",
-                                        ),
+                                        language.tr("desktop.status.loadFailed"),
                                     )
                                     .text_color(palette.danger),
                                 )
                                 .child(
                                     Button::new(
                                         "profile-status-retry",
-                                        language.text("Повторить", "Retry"),
+                                        language.tr("common.retry"),
                                     )
                                     .render(
                                         palette,
@@ -656,7 +664,7 @@ impl Render for Status {
                             .flex_col()
                             .gap(px(6.))
                             .child(
-                                label(palette, TextRole::Body, language.text("Статус", "Status"))
+                                label(palette, TextRole::Body, language.tr("settings.status"))
                                     .text_color(palette.text_muted),
                             )
                             .child(
@@ -680,8 +688,7 @@ impl Render for Status {
                             label(
                                 palette,
                                 TextRole::Body,
-                                language
-                                    .text("Не удалось обновить статус", "Could not update status"),
+                                language.tr("settings.statusUpdateError"),
                             )
                             .text_color(palette.danger),
                         )

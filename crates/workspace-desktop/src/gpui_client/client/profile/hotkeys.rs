@@ -54,7 +54,7 @@ impl Hotkeys {
         let search = cx.new(|cx| {
             TextInput::new(
                 "profile-hotkeys-search",
-                language.text("Поиск сочетаний", "Search shortcuts"),
+                language.tr("hotkeys.search"),
                 false,
                 cx,
             )
@@ -269,7 +269,7 @@ impl Hotkeys {
         };
         let value = selection
             .map(format)
-            .unwrap_or_else(|| language.text("Отключено", "Disabled").into());
+            .unwrap_or_else(|| language.tr("hotkeys.disabled").into());
         let id = shortcut.id;
         let row = div()
             .id(id)
@@ -417,7 +417,7 @@ impl Hotkeys {
                             element.child(Icon::Check.element(px(11.), rgb(0xffffff).into()))
                         }),
                 )
-                .child(language.text("Включить горячие клавиши", "Enable keyboard shortcuts")),
+                .child(language.tr("hotkeys.enabled")),
             interactive.then_some(&toggle),
             palette,
             move |_, app| {
@@ -428,10 +428,7 @@ impl Hotkeys {
                 });
             },
         );
-        let mut button = Button::new(
-            "profile-hotkeys-reset-all",
-            language.text("Сбросить все", "Reset all"),
-        );
+        let mut button = Button::new("profile-hotkeys-reset-all", language.tr("hotkeys.resetAll"));
         button.appearance = ButtonAppearance::Ghost;
         div()
             .flex()
@@ -465,7 +462,7 @@ impl Hotkeys {
         let selected = self.recording.as_ref()?;
         let title = format!(
             "{}: {}",
-            language.text("Изменить", "Edit"),
+            language.tr("hotkeys.edit"),
             selected.shortcut.title(language)
         );
         let entered = selected.candidate.is_some();
@@ -473,37 +470,32 @@ impl Hotkeys {
             .candidate
             .as_deref()
             .map(format)
-            .unwrap_or_else(|| {
-                language
-                    .text("Нажмите сочетание", "Press a shortcut")
-                    .into()
-            });
+            .unwrap_or_else(|| language.tr("hotkeys.recordInput").into());
         let error = selected
             .error
             .map(|error| error.message(language))
             .or_else(|| {
-                self.storage_error.then(|| {
-                    language.text("Не удалось сохранить настройки", "Could not save settings")
-                })
+                self.storage_error
+                    .then(|| language.tr("hotkeys.storageError"))
             });
         let close = self.close_button(palette, true, cx);
         let actions = [
             (
                 Edit::Save,
                 "profile-hotkey-save",
-                language.text("Сохранить", "Save"),
+                language.tr("common.save"),
                 ButtonAppearance::Primary,
             ),
             (
                 Edit::Disable,
                 "profile-hotkey-disable",
-                language.text("Отключить", "Disable"),
+                language.tr("hotkeys.disable"),
                 ButtonAppearance::Ghost,
             ),
             (
                 Edit::Reset,
                 "profile-hotkey-reset",
-                language.text("Сбросить", "Reset"),
+                language.tr("hotkeys.reset"),
                 ButtonAppearance::Ghost,
             ),
         ];
@@ -575,10 +567,7 @@ impl Hotkeys {
                     .text_size(px(14.))
                     .line_height(px(20.))
                     .text_color(palette.text_secondary)
-                    .child(language.text(
-                        "Нажмите сочетание клавиш. Escape отменяет запись.",
-                        "Press a key combination. Escape cancels.",
-                    )),
+                    .child(language.tr("hotkeys.record")),
             )
             .child(
                 div()
@@ -646,16 +635,13 @@ impl Render for Hotkeys {
         let viewport = window.viewport_size();
         let palette = Palette::for_window(window, cx);
         let language = Preferences::read(cx).language;
-        let t = |ru, en| language.text(ru, en);
+        let t = |key| language.tr(key);
         let query = self.search.read(cx).text().trim().to_lowercase();
         let groups = [
-            (t("Навигация", "Navigation"), SHORTCUT_GROUPS[0]),
-            (t("Интерфейс", "Interface"), SHORTCUT_GROUPS[1]),
-            (t("Редактор", "Composer"), SHORTCUT_GROUPS[2]),
-            (
-                t("Фиксированные сочетания", "Fixed shortcuts"),
-                FIXED.as_slice(),
-            ),
+            (t("hotkeys.navigation"), SHORTCUT_GROUPS[0]),
+            (t("hotkeys.interface"), SHORTCUT_GROUPS[1]),
+            (t("hotkeys.composer"), SHORTCUT_GROUPS[2]),
+            (t("hotkeys.fixedTitle"), FIXED.as_slice()),
         ];
         let mut sections: Vec<_> = groups
             .into_iter()
@@ -665,7 +651,7 @@ impl Render for Hotkeys {
             .collect();
         let mut grid = div().w_full().flex_none().flex().flex_col().gap(px(16.));
         if sections.is_empty() {
-            grid = grid.child(t("Сочетания не найдены", "No shortcuts found"));
+            grid = grid.child(t("hotkeys.empty"));
         } else if viewport.width >= px(768.) {
             let mut rows = sections.drain(..);
             while let Some(left) = rows.next() {
@@ -694,26 +680,70 @@ impl Render for Hotkeys {
                 .top(px(7.))
                 .child(Icon::Search.element(px(18.), palette.text_muted)),
         );
-        let dialog = div().id("profile-hotkeys-dialog").debug_selector(|| "profile-hotkeys-dialog".into())
-            .w(viewport.width.min(px(768.))).max_h(viewport.height * 0.92)
-            .rounded(px(12.)).overflow_hidden().border_1().border_color(palette.border)
-            .bg(palette.surface).shadow_lg().flex().flex_col().text_color(palette.text)
-            .child(div().flex_none().pt(px(24.)).px(px(24.)).pb(px(16.))
-                .flex().justify_between().items_start().gap(px(12.))
-                .child(div().text_size(px(16.)).line_height(px(24.)).font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(t("Горячие клавиши", "Keyboard shortcuts")))
-                .child(self.close_button(palette, false, cx)))
-            .child(div().id("profile-hotkeys-scroll").flex_1().min_h_0().overflow_y_scroll().track_scroll(&self.scroll)
-                .px(px(40.)).pt(px(16.)).pb(px(40.)).flex().flex_col().gap(px(12.))
-                .child(div().text_size(px(14.)).line_height(px(20.)).text_color(palette.text_secondary).child(
-                    t("Настройки сохраняются на этом устройстве. Сочетания редактора действуют при вводе сообщения.",
-                      "Settings are stored on this device. Composer shortcuts apply while editing a message.")))
-                .child(search)
-                .child(self.controls(language, palette, cx))
-                .when(self.storage_error && self.recording.is_none(), |body| {
-                    body.child(div().text_color(palette.danger).child(t("Не удалось сохранить настройки", "Could not save settings")))
-                })
-                .child(grid));
+        let dialog = div()
+            .id("profile-hotkeys-dialog")
+            .debug_selector(|| "profile-hotkeys-dialog".into())
+            .w(viewport.width.min(px(768.)))
+            .max_h(viewport.height * 0.92)
+            .rounded(px(12.))
+            .overflow_hidden()
+            .border_1()
+            .border_color(palette.border)
+            .bg(palette.surface)
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .text_color(palette.text)
+            .child(
+                div()
+                    .flex_none()
+                    .pt(px(24.))
+                    .px(px(24.))
+                    .pb(px(16.))
+                    .flex()
+                    .justify_between()
+                    .items_start()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .text_size(px(16.))
+                            .line_height(px(24.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(t("hotkeys.title")),
+                    )
+                    .child(self.close_button(palette, false, cx)),
+            )
+            .child(
+                div()
+                    .id("profile-hotkeys-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .px(px(40.))
+                    .pt(px(16.))
+                    .pb(px(40.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .line_height(px(20.))
+                            .text_color(palette.text_secondary)
+                            .child(t("hotkeys.localDescription")),
+                    )
+                    .child(search)
+                    .child(self.controls(language, palette, cx))
+                    .when(self.storage_error && self.recording.is_none(), |body| {
+                        body.child(
+                            div()
+                                .text_color(palette.danger)
+                                .child(t("hotkeys.storageError")),
+                        )
+                    })
+                    .child(grid),
+            );
         div()
             .relative()
             .flex()

@@ -19,6 +19,7 @@ pub use content::{
     Avatar, AvatarPresence, AvatarSize, BadgeTone, ChatRow, ChatRowPreview, DeliveryMark,
     MessageBubble, mention_badge, unread_badge,
 };
+pub(in crate::gpui_client) use content::profile_joined_date;
 pub(in crate::gpui_client) use controls::activate;
 pub use controls::{Button, ButtonAppearance, FieldAppearance, field};
 pub use conversation_notice::ConversationNotice;

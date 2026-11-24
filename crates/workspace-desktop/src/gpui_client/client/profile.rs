@@ -45,34 +45,11 @@ pub(super) fn open_hotkey_dialog(
 /// Действие корневого меню и подписи для панели.
 #[derive(Clone, Copy)]
 struct Row {
-    id: &'static str,       // Идентификатор действия и открываемого экрана.
-    title: &'static str,    // Подпись пункта и заголовок его страницы.
-    subtitle: &'static str, // Строка под подписью. Пустая строка её скрывает.
-    icon: Icon,             // Значок слева.
-    action: Action,         // Экран или модальное действие, которое откроется.
-}
-
-impl Row {
-    /// Переводит видимые подписи, оставляя идентификатор действия прежним.
-    fn localized(self, language: Language) -> Self {
-        let (title, subtitle) = match self.action {
-            Action::Personal => ("Personal info", ""),
-            Action::Status => ("Status", "Set a status"),
-            Action::General => ("Settings", "Notification sounds, Language, Auto sign-out"),
-            Action::Appearance => (
-                "Appearance",
-                "Theme settings, Folder layout, Chat list density",
-            ),
-            Action::About => ("App version", ""),
-            Action::ClearCache => ("Clear cache", "Message cache, local settings, then reload"),
-            Action::Logout => ("Log out", ""),
-        };
-        Self {
-            title: language.text(self.title, title),
-            subtitle: language.text(self.subtitle, subtitle),
-            ..self
-        }
-    }
+    id: &'static str,               // Идентификатор действия и открываемого экрана.
+    title: &'static str,            // Ключ подписи пункта и заголовка страницы.
+    subtitle: Option<&'static str>, // Ключ подписи под названием, если она есть.
+    icon: Icon,                     // Значок слева.
+    action: Action,                 // Экран или модальное действие, которое откроется.
 }
 
 /// Определяет поверхность, которая открывается из строки меню.
@@ -88,52 +65,53 @@ enum Action {
 }
 
 const ROOT_ID: &str = "profile-root";
+const ROOT_TITLE: &str = "nav.account";
 const PERSONAL: Row = Row {
     id: "profile-personal-info",
-    title: "Личная информация",
-    subtitle: "",
+    title: "settings.personalInfo",
+    subtitle: None,
     icon: Icon::Account,
     action: Action::Personal,
 };
 const STATUS: Row = Row {
     id: "profile-status",
-    title: "Статус",
-    subtitle: "Укажите статус",
+    title: "settings.status",
+    subtitle: Some("settings.statusPlaceholder"),
     icon: Icon::StatusSmile,
     action: Action::Status,
 };
 const GENERAL: Row = Row {
     id: "profile-settings",
-    title: "Настройки",
-    subtitle: "Звуки уведомлений, Язык, Автовыход",
+    title: "settings.settings",
+    subtitle: Some("desktop.profile.generalSubtitle"),
     icon: Icon::Settings,
     action: Action::General,
 };
 const APPEARANCE: Row = Row {
     id: "profile-appearance",
-    title: "Внешний вид",
-    subtitle: "Настройки темы, Отображение папок, Плотность списка чатов",
+    title: "settings.appearance",
+    subtitle: Some("desktop.profile.appearanceSubtitle"),
     icon: Icon::Draw,
     action: Action::Appearance,
 };
 const ABOUT: Row = Row {
     id: "profile-about",
-    title: "Версия приложения",
-    subtitle: "",
+    title: "settings.appVersion",
+    subtitle: None,
     icon: Icon::Info,
     action: Action::About,
 };
 const CLEAR_CACHE: Row = Row {
     id: "profile-clear-cache",
-    title: "Очистить кэш",
-    subtitle: "Кэш сообщений, локальные настройки, перезагрузка",
+    title: "settings.clearCache",
+    subtitle: Some("desktop.profile.clearCacheSubtitle"),
     icon: Icon::Delete,
     action: Action::ClearCache,
 };
 const LOGOUT: Row = Row {
     id: "profile-logout",
-    title: "Выйти",
-    subtitle: "",
+    title: "auth.logout",
+    subtitle: None,
     icon: Icon::Logout,
     action: Action::Logout,
 };
@@ -149,7 +127,7 @@ pub(super) struct Profile {
     account_label: String,        // Подпись текущего входа.
     client: WeakEntity<Client>,   // Рабочее окно для перехода к лицензиям.
     public_profile: Option<UserProfile>, // Статус и имя из подтверждённого ответа.
-    action_error: Option<&'static str>, // Безопасная подпись сбоя локальной команды.
+    action_error: Option<&'static str>, // Ключ безопасной подписи сбоя локальной команды.
 }
 
 /// Живые части окна, которые использует панель аккаунта.
@@ -177,9 +155,10 @@ impl Profile {
                 return;
             }
             let key = Self::key(ROOT_ID, &session);
+            let title = Preferences::read(cx).language.tr(ROOT_TITLE);
             host.open(
                 key,
-                "Аккаунт",
+                title,
                 opener.clone(),
                 |cx| {
                     cx.new(|cx| {
@@ -202,7 +181,7 @@ impl Profile {
                 window,
                 cx,
             );
-            host.set_account_translation("Account");
+            host.set_translation_key(ROOT_TITLE);
         });
     }
 
@@ -277,14 +256,16 @@ impl Profile {
         let client = self.client.clone();
         let root = cx.weak_entity();
         let public_profile = self.public_profile.clone();
-        let away = Preferences::read(cx).manual_away;
+        let preferences = Preferences::read(cx);
+        let away = preferences.manual_away;
+        let title = preferences.language.tr(row.title);
         log::debug!("event=workspace_profile_action_opened action={}", row.id);
         let _ = self.host.update(cx, |host, cx| {
             let key = Self::key(row.id, &session);
             match row.action {
                 Action::General => host.open(
                     key,
-                    row.title,
+                    title,
                     opener,
                     |cx| cx.new(|cx| General::new(weak, session, runtime, cx)),
                     window,
@@ -292,7 +273,7 @@ impl Profile {
                 ),
                 Action::Appearance => host.open(
                     key,
-                    row.title,
+                    title,
                     opener,
                     |cx| cx.new(|cx| Appearance::new(weak, session, sidebar, cx)),
                     window,
@@ -300,7 +281,7 @@ impl Profile {
                 ),
                 Action::Personal => host.open(
                     key,
-                    row.title,
+                    title,
                     opener,
                     |cx| {
                         cx.new(|cx| {
@@ -312,7 +293,7 @@ impl Profile {
                 ),
                 Action::About => host.open(
                     key,
-                    row.title,
+                    title,
                     opener,
                     |cx| cx.new(|_| About::new(client)),
                     window,
@@ -339,7 +320,7 @@ impl Profile {
                 Action::ClearCache | Action::Logout => return,
             }
             host.set_parent_opener(focus);
-            host.set_account_translation(row.localized(Language::En).title);
+            host.set_translation_key(row.title);
         });
     }
 
@@ -348,15 +329,11 @@ impl Profile {
         let language = Preferences::read(cx).language;
         let cache = matches!(row.action, Action::ClearCache);
         let question = if cache {
-            language.text(
-                "Очистить кэш сообщений и все локальные настройки? Вход и сохранённые организации останутся. Приложение перезагрузится.",
-                "Clear the message cache and all local settings? Saved organizations and sign-ins will be kept. The app will restart.",
-            ).to_owned()
+            language.tr("settings.clearCacheConfirm").to_owned()
         } else {
-            format!(
-                "{} {}?",
-                language.text("Выйти из организации", "Log out from"),
-                self.server_host()
+            language.tr_with(
+                "auth.logoutFromOrgConfirm",
+                &[("server", self.server_host())],
             )
         };
         let prompt = window.prompt(
@@ -364,8 +341,8 @@ impl Profile {
             &question,
             None,
             &[
-                PromptButton::ok(row.localized(language).title),
-                PromptButton::cancel(language.text("Отмена", "Cancel")),
+                PromptButton::ok(language.tr(row.title)),
+                PromptButton::cancel(language.tr("common.cancel")),
             ],
             cx,
         );
@@ -382,7 +359,7 @@ impl Profile {
                             if Preferences::reset(cx).is_ok() {
                                 true
                             } else {
-                                view.action_error = Some("Не удалось сбросить локальные настройки");
+                                view.action_error = Some("desktop.profile.resetFailed");
                                 cx.notify();
                                 false
                             }
@@ -396,10 +373,7 @@ impl Profile {
                     let _ = cx.update(|window, app| {
                         if let Err(error) = restart_after_reset(app) {
                             log::warn!("event=workspace_cache_restart result=failed error={error}");
-                            let title = language.text(
-                                "Не удалось перезапустить приложение",
-                                "Could not restart the app",
-                            );
+                            let title = language.tr("desktop.profile.restartFailed");
                             let _prompt = window.prompt(
                                 PromptLevel::Critical,
                                 title,
@@ -416,7 +390,7 @@ impl Profile {
                 if result.is_err() {
                     let _ = cx.update(|_, app| {
                         let _ = view.update(app, |view, cx| {
-                            view.action_error = Some("Не удалось выйти из организации");
+                            view.action_error = Some("desktop.profile.logoutFailed");
                             cx.notify();
                         });
                     });
@@ -447,8 +421,8 @@ impl Profile {
         };
         let has_chevron = !matches!(row.action, Action::Logout | Action::Status);
         let language = Preferences::read(cx).language;
-        let shown = row.localized(language);
-        let subtitle = self.row_subtitle(shown, language);
+        let title = language.tr(row.title);
+        let subtitle = self.row_subtitle(row, language);
         activate(
             div()
                 .id(row.id)
@@ -475,8 +449,7 @@ impl Profile {
                             div()
                                 .min_w_0()
                                 .child(
-                                    label(palette, TextRole::Label, shown.title)
-                                        .text_color(title_color),
+                                    label(palette, TextRole::Label, title).text_color(title_color),
                                 )
                                 .when(!subtitle.is_empty(), |text| {
                                     text.child(
@@ -530,7 +503,7 @@ impl Profile {
                     .child(label(
                         palette,
                         TextRole::Label,
-                        language.text("Текущий сервер", "Current server"),
+                        language.tr("auth.currentServer"),
                     ))
                     .child(
                         label(palette, TextRole::Body, server)
@@ -569,16 +542,16 @@ impl Profile {
             }
             if let Some(presence) = profile.presence {
                 return match presence {
-                    ProfilePresence::Active => language.text("В сети", "Online"),
+                    ProfilePresence::Active => language.tr("a11y.online"),
                     ProfilePresence::Idle | ProfilePresence::DoNotDisturb => {
-                        language.text("Отошёл", "Away")
+                        language.tr("a11y.away")
                     }
-                    ProfilePresence::Offline => language.text("Не в сети", "Offline"),
+                    ProfilePresence::Offline => language.tr("presence.offline"),
                 }
                 .into();
             }
         }
-        row.subtitle.into()
+        row.subtitle.map_or("", |key| language.tr(key)).into()
     }
 }
 
@@ -614,7 +587,7 @@ impl Render for Profile {
                     .gap_5()
                     .py_5()
                     .child(group(
-                        language.text("Описание", "Description"),
+                        language.tr("settings.sectionDescription"),
                         palette,
                         div()
                             .flex()
@@ -624,7 +597,7 @@ impl Render for Profile {
                             .child(self.row(STATUS, 1, true, palette, cx)),
                     ))
                     .child(group(
-                        language.text("Настройки", "Settings"),
+                        language.tr("settings.settings"),
                         palette,
                         div()
                             .flex()
@@ -633,7 +606,7 @@ impl Render for Profile {
                             .child(self.row(APPEARANCE, 3, true, palette, cx)),
                     ))
                     .child(group(
-                        language.text("Версия приложения", "App version"),
+                        language.tr("settings.appVersion"),
                         palette,
                         div()
                             .flex()
@@ -642,7 +615,7 @@ impl Render for Profile {
                             .child(self.row(CLEAR_CACHE, 5, true, palette, cx))
                             .child(self.row(LOGOUT, 6, true, palette, cx))
                             .children(self.action_error.map(|error| {
-                                label(palette, TextRole::Caption, error)
+                                label(palette, TextRole::Caption, language.tr(error))
                                     .text_color(palette.danger)
                                     .p_4()
                             })),

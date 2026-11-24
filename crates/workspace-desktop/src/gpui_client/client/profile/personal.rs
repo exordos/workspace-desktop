@@ -26,7 +26,7 @@ use crate::gpui_client::{
     runtime::RuntimeClient,
     ui::{
         Avatar, AvatarPresence, Button, ButtonAppearance, Icon, Palette, TextInput,
-        TextInputChanged, TextRole, activate, ellipsized_label, label,
+        TextInputChanged, TextRole, activate, ellipsized_label, label, profile_joined_date,
     },
 };
 
@@ -52,7 +52,7 @@ pub(super) struct Personal {
     waiting: Option<Task<()>>,          // Запрос сохранения, допускается только один.
     photo: Option<AvatarChoice>,        // Локальное изменение аватара до подтверждения.
     photo_focus: FocusHandle,           // Кнопка открытия диалога аватара.
-    notice: Option<&'static str>,       // Отображаемая ошибка или предупреждение.
+    notice: Option<&'static str>,       // Ключ ошибки или предупреждения на экране.
     share_feedback: Option<Task<()>>,   // Возвращает исходную плитку после краткой подсказки.
     share_copied: bool,                 // После копирования ссылка ожидает вставки.
 }
@@ -136,11 +136,7 @@ impl Personal {
                     if page.identity.is_some() {
                         page.edit(cx);
                     } else {
-                        let language = Preferences::read(cx).language;
-                        page.notice = Some(language.text(
-                            "Не удалось загрузить личную информацию. Нажмите «Редактировать», чтобы повторить.",
-                            "Could not load personal information. Click Edit to retry.",
-                        ));
+                        page.notice = Some("desktop.personal.loadFailed");
                     }
                 }
                 cx.notify();
@@ -152,11 +148,7 @@ impl Personal {
     /// Открывает текущую версию значений в полях редактирования.
     fn edit(&mut self, cx: &mut Context<Self>) {
         let Some(identity) = &self.identity else {
-            let language = Preferences::read(cx).language;
-            self.notice = Some(language.text(
-                "Загружаем личную информацию…",
-                "Loading personal information…",
-            ));
+            self.notice = Some("desktop.personal.loading");
             self.edit_requested = true;
             self.load(cx);
             cx.notify();
@@ -238,7 +230,7 @@ impl Personal {
             self.description.read(cx).text(),
         );
         if !edit.is_valid() {
-            self.notice = Some("Проверьте имя и телефон");
+            self.notice = Some("desktop.personal.invalidIdentity");
             cx.notify();
             return;
         }
@@ -303,7 +295,7 @@ impl Personal {
                         match identity {
                             Ok(identity) => page.identity = Some(identity),
                             Err(_) => {
-                                page.notice = Some("Не удалось сохранить личную информацию");
+                                page.notice = Some("desktop.personal.saveFailed");
                                 cx.notify();
                                 return;
                             }
@@ -315,7 +307,7 @@ impl Personal {
                         client.set_profile_name(&page.session, name, page.profile.as_ref(), cx)
                     });
                 } else {
-                    page.notice = Some("Не удалось сохранить личную информацию");
+                    page.notice = Some("desktop.personal.saveFailed");
                 }
                 cx.notify();
             });
@@ -430,7 +422,7 @@ impl Personal {
                     .child(label(
                         palette,
                         TextRole::Caption,
-                        language.text("Отображаемое имя", "Display name"),
+                        language.tr("settings.profileDisplayName"),
                     ))
                     .child(
                         label(palette, TextRole::Caption, name)
@@ -463,17 +455,16 @@ impl Personal {
                             .map(|presence| {
                                 let (text, color) = match presence {
                                     ProfilePresence::Active => {
-                                        (language.text("В сети", "Online"), palette.presence_online)
+                                        (language.tr("a11y.online"), palette.presence_online)
                                     }
                                     ProfilePresence::Idle => {
-                                        (language.text("Отошёл", "Away"), palette.presence_away)
+                                        (language.tr("a11y.away"), palette.presence_away)
                                     }
-                                    ProfilePresence::DoNotDisturb => (
-                                        language.text("Не беспокоить", "Do not disturb"),
-                                        palette.danger,
-                                    ),
+                                    ProfilePresence::DoNotDisturb => {
+                                        (language.tr("presence.doNotDisturb"), palette.danger)
+                                    }
                                     ProfilePresence::Offline => {
-                                        (language.text("Не в сети", "Offline"), palette.text_muted)
+                                        (language.tr("presence.offline"), palette.text_muted)
                                     }
                                 };
                                 label(palette, TextRole::Caption, text)
@@ -509,7 +500,7 @@ impl Personal {
             .gap_2()
             .child(action_tile(
                 "profile-favorites",
-                language.text("Избранное", "Favorites"),
+                language.tr("common.favorites"),
                 (Icon::Home, 26.),
                 palette,
                 move |_, app| {
@@ -520,7 +511,7 @@ impl Personal {
             ))
             .child(action_tile(
                 "profile-edit",
-                language.text("Редактировать", "Edit"),
+                language.tr("info.edit"),
                 (Icon::Stylus, 30.),
                 palette,
                 self.handler(cx, |view, _, cx| view.edit(cx)),
@@ -528,9 +519,9 @@ impl Personal {
             .child(action_tile(
                 "profile-share",
                 if self.share_copied {
-                    language.text("Скопировано", "Copied")
+                    language.tr("message.copied")
                 } else {
-                    language.text("Поделиться", "Share")
+                    language.tr("info.share")
                 },
                 if self.share_copied {
                     (Icon::Check, 28.)
@@ -574,24 +565,24 @@ impl Personal {
         });
         let created = profile
             .and_then(|user| user.created_at.as_deref())
-            .and_then(|date| joined_date(date, language));
+            .and_then(|date| profile_joined_date(date, language));
         let mut details = div().flex().flex_col().gap_3();
         if self.editing {
             details = details
                 .child(edit_field(
-                    language.text("Имя", "First name"),
+                    language.tr("settings.profileFirstName"),
                     Icon::Account,
                     &self.fields[0],
                     palette,
                 ))
                 .child(edit_field(
-                    language.text("Фамилия", "Last name"),
+                    language.tr("settings.profileLastName"),
                     Icon::Account,
                     &self.fields[1],
                     palette,
                 ))
                 .child(detail(
-                    language.text("Имя пользователя", "Username"),
+                    language.tr("info.username"),
                     Icon::At,
                     identity.map(|user| user.username.as_str()),
                     true,
@@ -600,23 +591,29 @@ impl Personal {
         }
         details = details
             .child(detail(
-                language.text("ID пользователя", "User ID"),
+                language.tr("info.userId"),
                 Icon::At,
                 Some(&self.session.owner.user_id),
                 true,
                 palette,
             ))
-            .child(detail("Email", Icon::Mail, email, true, palette));
+            .child(detail(
+                language.tr("common.email"),
+                Icon::Mail,
+                email,
+                true,
+                palette,
+            ));
         details = if self.editing {
             details.child(edit_field(
-                language.text("Телефон", "Phone"),
+                language.tr("info.phone"),
                 Icon::Phone,
                 &self.fields[2],
                 palette,
             ))
         } else {
             details.child(detail(
-                language.text("Телефон", "Phone"),
+                language.tr("info.phone"),
                 Icon::Phone,
                 phone,
                 false,
@@ -624,47 +621,19 @@ impl Personal {
             ))
         };
         for (title, icon, value) in [
+            (language.tr("info.jobTitle"), Icon::BusinessCenter, None),
+            (language.tr("info.manager"), Icon::Handshake, None),
+            (language.tr("info.role"), Icon::Account, None),
+            (language.tr("info.accountType"), Icon::Group, None),
+            (language.tr("info.accountStatus"), Icon::Info, None),
+            (language.tr("info.timezone"), Icon::GlobeLocation, None),
+            (language.tr("info.localTime"), Icon::Calendar, None),
             (
-                language.text("Команда > Должность", "Team > Job title"),
-                Icon::BusinessCenter,
-                None,
-            ),
-            (
-                language.text("Руководитель", "Manager"),
-                Icon::Handshake,
-                None,
-            ),
-            (language.text("Роль", "Role"), Icon::Account, None),
-            (
-                language.text("Тип аккаунта", "Account type"),
-                Icon::Group,
-                None,
-            ),
-            (
-                language.text("Статус аккаунта", "Account status"),
-                Icon::Info,
-                None,
-            ),
-            (
-                language.text("Часовой пояс", "Time zone"),
-                Icon::GlobeLocation,
-                None,
-            ),
-            (
-                language.text("Местное время", "Local time"),
-                Icon::Calendar,
-                None,
-            ),
-            (
-                language.text("Дата регистрации", "Joined"),
+                language.tr("info.joined"),
                 Icon::Calendar,
                 created.as_deref(),
             ),
-            (
-                language.text("День рождения", "Birthday"),
-                Icon::Celebration,
-                None,
-            ),
+            (language.tr("info.birthday"), Icon::Celebration, None),
         ] {
             details = details.child(detail(title, icon, value, false, palette));
         }
@@ -677,7 +646,7 @@ impl Personal {
                     .child(label(
                         palette,
                         TextRole::Caption,
-                        language.text("О себе", "About me"),
+                        language.tr("settings.profileDescription"),
                     ))
                     .child(
                         div()
@@ -707,7 +676,7 @@ impl Personal {
                     .filter(|value| !value.is_empty())
                     .map(|value| {
                         detail(
-                            language.text("О себе", "About me"),
+                            language.tr("settings.profileDescription"),
                             Icon::Info,
                             Some(value),
                             false,
@@ -721,11 +690,8 @@ impl Personal {
     /// Размещает отмену и сохранение внизу формы.
     fn footer(&self, palette: Palette, cx: &Context<Self>) -> Div {
         let language = Preferences::read(cx).language;
-        let mut cancel = Button::new("profile-edit-cancel", language.text("Отмена", "Cancel"));
-        let mut save = Button::new(
-            "profile-edit-save",
-            language.text("Сохранить изменения", "Save changes"),
-        );
+        let mut cancel = Button::new("profile-edit-cancel", language.tr("common.cancel"));
+        let mut save = Button::new("profile-edit-save", language.tr("info.saveChanges"));
         save.appearance = ButtonAppearance::Primary;
         save.disabled = self.waiting.is_some();
         cancel.disabled = save.disabled;
@@ -756,6 +722,7 @@ impl Render for Personal {
     /// В режиме просмотра показывает карточку, в режиме правки — те же данные и поля.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::for_window(window, cx);
+        let language = Preferences::read(cx).language;
         div()
             .id("profile-personal-info-page")
             .debug_selector(|| "profile-personal-info-page".into())
@@ -771,14 +738,14 @@ impl Render for Personal {
                     .child(self.header(palette, cx))
                     .when(!self.editing, |body| body.child(self.actions(palette, cx)))
                     .children(self.notice.map(|notice| {
-                        label(palette, TextRole::Body, notice)
+                        label(palette, TextRole::Body, language.tr(notice))
                             .px_2()
                             .text_color(palette.danger)
                     }))
                     .when(self.editing, |body| {
                         body.child(div().h(px(1.)).bg(palette.border))
                     })
-                    .child(self.details(palette, Preferences::read(cx).language, cx))
+                    .child(self.details(palette, language, cx))
                     .when(self.editing, |body| body.child(self.footer(palette, cx))),
             )
     }
@@ -855,7 +822,7 @@ fn detail(
                     None => label(
                         palette,
                         TextRole::Body,
-                        language.text("Временно не подключено", "Temporarily unavailable"),
+                        language.tr("desktop.personal.favoriteUnavailable"),
                     )
                     .italic()
                     .text_color(palette.text_muted)
@@ -890,36 +857,4 @@ fn edit_field(title: &str, icon: Icon, field: &Entity<TextInput>, palette: Palet
                 .child(label(palette, TextRole::Caption, title.to_owned()).mb_1())
                 .child(field.clone()),
         )
-}
-
-/// Показывает календарную дату из ISO-строки Workspace.
-fn joined_date(value: &str, language: Language) -> Option<String> {
-    let date = value.get(..10)?;
-    let mut parts = date.split('-');
-    let year = parts.next()?;
-    let month = parts.next()?.parse::<usize>().ok()?.checked_sub(1)?;
-    let day = parts.next()?.parse::<u8>().ok()?;
-    if language == Language::En {
-        let month = [
-            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-        ]
-        .get(month)?;
-        return Some(format!("{month} {day}, {year}"));
-    }
-    let month = [
-        "янв.",
-        "февр.",
-        "мар.",
-        "апр.",
-        "мая",
-        "июн.",
-        "июл.",
-        "авг.",
-        "сент.",
-        "окт.",
-        "нояб.",
-        "дек.",
-    ]
-    .get(month)?;
-    Some(format!("{day} {month} {year} г."))
 }

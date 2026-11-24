@@ -75,11 +75,7 @@ impl AvatarDialog {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some(
-                language
-                    .text("Выбрать из галереи", "Choose from gallery")
-                    .into(),
-            ),
+            prompt: Some(language.tr("settings.chooseFromGallery").into()),
         });
         let background = cx.background_executor().clone();
         cx.spawn_in(window, async move |view, cx| {
@@ -92,7 +88,7 @@ impl AvatarDialog {
                     None => Ok(None),
                 },
                 Ok(Ok(None)) => Ok(None),
-                _ => Err("Не удалось выбрать изображение"),
+                _ => Err("desktop.avatar.chooseFailed"),
             };
             let _ = cx.update(|window, app| {
                 let _ = view.update(app, |view, cx| {
@@ -142,7 +138,7 @@ impl Render for AvatarDialog {
             .child(label(
                 palette,
                 TextRole::Body,
-                language.text("Выбрать из галереи", "Choose from gallery"),
+                language.tr("settings.chooseFromGallery"),
             ));
         let choose = if self.choosing {
             choose
@@ -163,7 +159,7 @@ impl Render for AvatarDialog {
                 label(
                     palette,
                     TextRole::Body,
-                    language.text("Удалить текущее фото", "Remove current photo"),
+                    language.tr("settings.removeCurrentPhoto"),
                 )
                 .text_color(palette.danger),
             );
@@ -179,7 +175,7 @@ impl Render for AvatarDialog {
         } else {
             remove.opacity(0.55)
         };
-        let mut cancel = Button::new("profile-avatar-cancel", language.text("Отмена", "Cancel"));
+        let mut cancel = Button::new("profile-avatar-cancel", language.tr("common.cancel"));
         cancel.appearance = ButtonAppearance::Neutral;
         cancel.disabled = self.choosing;
         div()
@@ -197,11 +193,9 @@ impl Render for AvatarDialog {
             .shadow_md()
             .child(choose)
             .child(remove)
-            .children(
-                self.error.map(|error| {
-                    label(palette, TextRole::Caption, error).text_color(palette.danger)
-                }),
-            )
+            .children(self.error.map(|error| {
+                label(palette, TextRole::Caption, language.tr(error)).text_color(palette.danger)
+            }))
             .child(
                 cancel
                     .render(
@@ -219,7 +213,7 @@ impl Render for AvatarDialog {
 
 /// Читает только допустимый объём байтов и использует декодер общего кэша аватаров.
 fn load_preview(path: PathBuf) -> Result<AvatarChoice, &'static str> {
-    let invalid = "Выберите изображение PNG, JPEG, GIF или WebP";
+    let invalid = "desktop.avatar.invalidFormat";
     let mut bytes = Vec::new();
     File::open(path)
         .map_err(|_| invalid)?
@@ -227,7 +221,7 @@ fn load_preview(path: PathBuf) -> Result<AvatarChoice, &'static str> {
         .read_to_end(&mut bytes)
         .map_err(|_| invalid)?;
     if bytes.len() > MAX_OWN_AVATAR_BYTES {
-        return Err("Файл слишком большой. Максимум 25 МБ");
+        return Err("desktop.avatar.fileTooLarge");
     }
     let format = AvatarFormat::sniff(&bytes).ok_or(invalid)?;
     let image = AvatarImage { bytes, format };
