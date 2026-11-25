@@ -2,18 +2,24 @@
 
 use std::sync::Arc;
 
-use gpui::{AnyElement, Context, FocusHandle, IntoElement, Window, div, prelude::*, px};
+use gpui::{AnyElement, Context, Div, FocusHandle, IntoElement, Stateful, div, prelude::*};
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 use workspace_core::{
-    messenger::encryption::{
-        EncryptionActivation, MessageEncryption,
-        fragments::{FragmentEdit, has_protected_draft},
+    messenger::{
+        encryption::{
+            EncryptionActivation, MessageEncryption,
+            fragments::{FragmentEdit, has_protected_draft},
+        },
+        history::MediaAccess,
     },
     storage::{HistoryMessage, PlaintextDraft},
 };
 
-use super::{Composer, Destination, EditAccess, ProtectedEdit, WriteFailure, editor::Format};
+use super::{
+    Composer, Destination, EditAccess, ProtectedEdit, WriteFailure, editor::Format,
+    toolbar::icon_button,
+};
 use crate::gpui_client::{
     preferences::Language,
     ui::{Button, ButtonAppearance, Icon, Palette},
@@ -58,6 +64,7 @@ impl Composer {
         access: FragmentEdit,
         engine: Arc<MessageEncryption>,
         activation: EncryptionActivation,
+        media_access: Option<MediaAccess>,
         cx: &mut Context<Self>,
     ) {
         if self.fragment_edit_topic() != Some(expected.topic_id) {
@@ -68,6 +75,7 @@ impl Composer {
         else {
             return;
         };
+        self.discard_attachments(cx);
         let access = Arc::new(access);
         let expected_id = expected.id;
         let watching = access.clone();
@@ -95,9 +103,13 @@ impl Composer {
             draft_replies: Some(std::mem::take(&mut self.replies)),
             _watch: Some(watch),
         });
+        let text = zeroize::Zeroizing::new(self.open_attachment_edit(&text, cx));
         self.editor.update(cx, |editor, cx| {
             editor.show_fragment_edit(&text, access, cx)
         });
+        if let Some(access) = media_access {
+            self.load_attachment_edit_previews(access, cx);
+        }
         cx.notify();
     }
 
@@ -128,7 +140,7 @@ impl Composer {
         can_format: bool,
         focus: &FocusHandle,
         cx: &Context<Self>,
-    ) -> Option<AnyElement> {
+    ) -> Option<Stateful<Div>> {
         if self
             .plain_target
             .as_ref()
@@ -144,35 +156,23 @@ impl Composer {
             return None;
         }
         let target = cx.entity().downgrade();
-        let mut button = Button::new("composer-format-encrypted-spoiler", "");
-        button.icon = Some(Icon::EncryptedSpoiler);
-        button.disabled = !can_format;
-        Some(
-            button
-                .render(palette, Some(focus), move |window: &mut Window, cx| {
-                    let _ = target.update(cx, |composer, cx| {
-                        composer.editor.update(cx, |editor, cx| {
-                            editor.apply_format(Format::EncryptedSpoiler, cx)
-                        });
-                        composer.persist_draft(cx);
-                        composer.focus_editor(window, cx);
+        Some(icon_button(
+            "composer-format-encrypted-spoiler",
+            locale.tr("desktop.messenger.composer.protectBeforeTyping"),
+            (Icon::EncryptedSpoiler, [32.; 2]),
+            palette,
+            focus,
+            !can_format,
+            move |window, cx| {
+                let _ = target.update(cx, |composer, cx| {
+                    composer.editor.update(cx, |editor, cx| {
+                        editor.apply_format(Format::EncryptedSpoiler, cx)
                     });
-                })
-                .size(px(32.))
-                .p_0()
-                .flex_none()
-                .tooltip(move |_, cx| {
-                    cx.new(|_| super::SendTooltip {
-                        palette,
-                        text: locale
-                            .tr("desktop.messenger.composer.protectBeforeTyping")
-                            .into(),
-                    })
-                    .into()
-                })
-                .debug_selector(|| "composer-format-encrypted-spoiler".into())
-                .into_any_element(),
-        )
+                    composer.persist_draft(cx);
+                    composer.focus_editor(window, cx);
+                });
+            },
+        ))
     }
 
     /// Предлагает новый ключ только для сообщения с защищённым вводом.

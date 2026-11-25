@@ -181,6 +181,25 @@ impl Replies {
         }
     }
 
+    /// Убирает ссылки временных файлов из вводов, которые сейчас не показаны в поле.
+    pub(super) fn rewrite_attachment_text(
+        &mut self,
+        mut rewrite: impl FnMut(&str) -> Option<String>,
+    ) {
+        let mut changed = false;
+        for text in
+            std::iter::once(&mut self.plain).chain(self.tabs.iter_mut().map(|tab| &mut tab.answer))
+        {
+            if let Some(updated) = rewrite(text) {
+                *text = updated;
+                changed = true;
+            }
+        }
+        if changed {
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
     /// Увеличивает версию снимка и возвращает текст, который следует показать.
     fn change(&mut self) -> String {
         self.revision = self.revision.wrapping_add(1);

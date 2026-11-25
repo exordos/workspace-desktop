@@ -77,6 +77,72 @@ impl Fixture {
     }
 }
 
+/// Сверяет всю панель редактора в подтверждённой нативной личке.
+#[gpui::test]
+fn native_direct_composer_orders_attachments_time_and_spoilers(cx: &mut TestAppContext) {
+    cx.update(bind_keys);
+    let server = Server::serve(Received {
+        fragment_forward: Some(Fixture::default()),
+        topic: Some(TopicAcceptance::default()),
+        ..Received::default()
+    });
+    let profile = tempfile::tempdir().unwrap();
+    let (runtime, events) =
+        start_runtime(profile.path(), saved_account(&server, USER, Uuid::nil()));
+    let (client, ui) =
+        cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
+    ui.update(|_, app| {
+        let subscription = events.attach(&client, app, Client::handle_runtime);
+        client.update(app, |client, cx| client.attach(subscription, cx));
+    });
+    ui.simulate_resize(size(px(1400.), px(900.)));
+    until(
+        ui,
+        "обычная личка и канал доступны в каталоге",
+        |ui| {
+            server.state.ready.load(Ordering::SeqCst) != 0
+                && ui.debug_bounds(CHAT_ROW).is_some()
+                && ui.debug_bounds(CHANNEL_CHEVRON).is_some()
+        },
+    );
+    click(ui, CHAT_ROW);
+
+    // В подтверждённой нативной личке раскрытая панель показывает обе условные команды.
+    until(ui, "композер подтвердил цель отправки", |ui| {
+        ui.debug_bounds("composer-toolbar-toggle").is_some()
+            && ui.debug_bounds("composer-attach-file").is_some()
+    });
+    click(ui, "composer-toolbar-toggle");
+    until(
+        ui,
+        "доступны вложения и защищённый спойлер",
+        |ui| {
+            ui.debug_bounds("composer-attach-file").is_some()
+                && ui
+                    .debug_bounds("composer-format-encrypted-spoiler")
+                    .is_some()
+        },
+    );
+    let toolbar = ui.debug_bounds("composer-toolbar").unwrap();
+    let toggle = ui.debug_bounds("composer-toolbar-toggle").unwrap();
+    let attach = ui.debug_bounds("composer-attach-file").unwrap();
+    let time = ui.debug_bounds("composer-insert-time").unwrap();
+    let link = ui.debug_bounds("composer-format-link").unwrap();
+    let spoiler = ui.debug_bounds("composer-format-spoiler").unwrap();
+    let protected = ui
+        .debug_bounds("composer-format-encrypted-spoiler")
+        .unwrap();
+    assert_eq!(attach.left() - toggle.right(), px(8.));
+    assert_eq!(time.left() - attach.right(), px(17.));
+    assert_eq!(link.left() - time.right(), px(17.));
+    assert_eq!(protected.left() - spoiler.right(), px(8.));
+    for action in [attach, time, protected] {
+        assert_eq!(action.size, size(px(32.), px(32.)));
+        assert_eq!(action.top(), toolbar.top());
+        assert!(action.right() <= toolbar.right());
+    }
+}
+
 /// Отправляет через диалог в другую тему и раскрывает фрагмент только по ключу лички.
 #[gpui::test]
 fn forward_dialog_posts_canonical_fragment_and_reveal_uses_origin_key(cx: &mut TestAppContext) {
@@ -170,9 +236,11 @@ fn forward_dialog_posts_canonical_fragment_and_reveal_uses_origin_key(cx: &mut T
     let chevron = ui.debug_bounds(CHANNEL_CHEVRON).unwrap().center();
     ui.simulate_mouse_move(chevron, None, Modifiers::none());
     click(ui, CHANNEL_CHEVRON);
-    until(ui, "тема назначения появилась в каталоге", |ui| {
-        ui.debug_bounds(CHANNEL_TOPIC_ROW).is_some()
-    });
+    until(
+        ui,
+        "тема назначения появилась в каталоге",
+        |ui| ui.debug_bounds(CHANNEL_TOPIC_ROW).is_some(),
+    );
     click(ui, CHANNEL_TOPIC_ROW);
     let id = sent["uuid"].as_str().unwrap();
     // GPUI принимает только статический селектор. UUID здесь выдала реальная очередь.
@@ -234,9 +302,11 @@ fn forward_dialog_posts_canonical_fragment_and_reveal_uses_origin_key(cx: &mut T
         .unwrap();
     // Готовая строка остаётся свёрнутой, поэтому первый успешный клик должен раскрыть её.
     let ready: &'static str = Box::leak(format!("{spoiler}-ready").into_boxed_str());
-    until(ui, "фрагмент готов под исходным ключом", |ui| {
-        ui.debug_bounds(ready).is_some()
-    });
+    until(
+        ui,
+        "фрагмент готов под исходным ключом",
+        |ui| ui.debug_bounds(ready).is_some(),
+    );
     let point = ui.debug_bounds(ready).unwrap().center();
     ui.simulate_mouse_move(point, None, Modifiers::none());
     click(ui, ready);

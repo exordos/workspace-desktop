@@ -265,10 +265,10 @@ fn reply_drag_and_keyboard_reorder_after_destination_failure(cx: &mut TestAppCon
     );
     ui.run_until_parked();
     assert!(ui.debug_bounds("conversation-send-retry").is_some());
-    assert!(ui.update(|window, app| {
+    assert!(ui.read(|app| {
         let view = view.read(app);
-        let (history, editor) = view.history_and_editor_focus(app);
-        editor.is_none() && history.is_focused(window)
+        let (_, editor) = view.history_and_editor_focus(app);
+        editor.is_some()
     }));
 
     click(ui, "conversation-send-retry");

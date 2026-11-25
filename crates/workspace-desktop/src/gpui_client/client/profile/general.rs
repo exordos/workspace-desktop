@@ -13,6 +13,7 @@ use crate::gpui_client::{
     notification_audio,
     preferences::{
         ChatClick, IdleTimeout, Language, NotificationSound, PreferenceValues, Preferences,
+        workspace_direct,
     },
     right_panel::RightPanel,
     runtime::RuntimeClient,
@@ -315,6 +316,32 @@ impl General {
         )
     }
 
+    /// Показывает общий переключатель маршрута и сохраняет выбор для следующего запуска.
+    fn workspace_direct_row(
+        &mut self,
+        lang: Language,
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let checked = workspace_direct::enabled(cx);
+        self.row(
+            Row {
+                id: "profile-workspace-direct",
+                label: lang.tr("desktop.general.workspaceDirect"),
+                subtitle: Some(lang.tr("desktop.general.workspaceDirectHint")),
+                icon: Icon::Links,
+                tail: switch_indicator(palette, checked).into_any_element(),
+            },
+            palette,
+            cx,
+            |view, window, cx| {
+                view.storage_error = workspace_direct::toggle(cx).is_err();
+                cx.notify();
+                window.refresh();
+            },
+        )
+    }
+
     /// Открывает диалог над всем окном и возвращает фокус в эту строку при закрытии.
     fn open_hotkeys(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let opener = self.focus("profile-hotkeys", cx);
@@ -449,6 +476,7 @@ impl Render for General {
                 )
                 .gap(px(4.)),
             )
+            .child(self.workspace_direct_row(lang, palette, cx))
             .child(self.section(
                 Section::Language,
                 "profile-language",

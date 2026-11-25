@@ -20,6 +20,7 @@ use uuid::Uuid;
 use workspace_core::{
     messenger::{
         encryption::{ProtectedMessage, fragments::FragmentEdit},
+        history::MediaAccess,
         quote::{Source as QuoteSource, SourceCheckError},
         send::PlainSendTarget,
     },
@@ -33,9 +34,9 @@ pub(super) use self::source::{
     DestinationError, QueueWriteOutcome, ResolvedDestination, SendSource,
 };
 use self::{
-    attachment_upload::AttachmentState,
+    attachment_upload::{AttachmentDrag, AttachmentState},
     draft::{DraftSend, DraftSession},
-    editor::{EditPreviousRequested, PasteImageRequested, SubmitRequested},
+    editor::{EditPreviousRequested, PasteFilesRequested, PasteImageRequested, SubmitRequested},
     reference_source::ReferenceDirectory,
     replies::Replies,
     time_insert::TimeInsert,
@@ -50,7 +51,7 @@ use super::{
     },
 };
 
-use toolbar::Toolbar;
+use toolbar::{Toolbar, ToolbarExtras};
 use toolbar_preferences::ToolbarPreferences;
 
 /// Загружает выбор панели для штатного приложения до построения редактора.
@@ -171,6 +172,9 @@ pub(super) struct Composer {
     replies: Replies,             // Отдельные ответы и цитаты текущего разговора.
     draft_runtime: Option<RuntimeClient>, // Рабочая запись есть у редактора штатного окна.
     draft_session: Option<DraftSession>, // Точная локальная версия открытого поля.
+    early_draft_id: Option<Uuid>, // Явный UUID раннего открытия, если он задан.
+    early_claim: Option<Uuid>,    // Владелец временного снимка этого маршрута.
+    local_draft_id: Option<(Uuid, u64)>, // UUID и версия локально показанного черновика.
     draft_topic: Option<Uuid>,    // Последняя точная тема, к которой относился показанный ввод.
     plain_target: Option<PlainSendTarget>, // Проверенный тип провайдера открытого Markdown.
     destination: Destination,     // Состояние проверки возможности отправки.
@@ -179,7 +183,7 @@ pub(super) struct Composer {
     toolbar: Toolbar,       // Кнопка раскрытия, команды и их клавиатурный фокус.
     reference_directory: ReferenceDirectory, // Состояние запроса справочника для @.
     time_insert: Option<TimeInsert>, // Открытая форма выбора местной даты и времени.
-    attachment_upload: AttachmentState, // Файл на выборе или в передаче для этого черновика.
+    attachment_upload: AttachmentState, // Карточки, передачи и права на очистку вложений.
     writing: Option<Attempt>, // Текущая запись; None позволяет начать следующую.
     write_failure: Option<(u64, u64, WriteFailure)>, // Версии ввода и вкладок при отказе записи.
     _editor_observer: Subscription, // Обновляет доступность кнопки после редактирования.
@@ -188,6 +192,7 @@ pub(super) struct Composer {
     _editor_submit: Subscription, // Связывает Enter с тем же действием, что и кнопку отправки.
     _editor_edit: Subscription, // Запрашивает правку со стрелки вверх в пустом редакторе.
     _editor_paste_image: Subscription, // Передаёт картинку из буфера в обычный upload.
+    _editor_paste_files: Subscription, // Передаёт файлы, скопированные в системный буфер.
 }
 
 impl Composer {
@@ -240,12 +245,27 @@ impl Composer {
         let paste = cx.subscribe(&editor, |composer, _, image: &PasteImageRequested, cx| {
             composer.paste_attachment(image.0.clone(), cx);
         });
+        let paste_files = cx.subscribe(
+            &editor,
+            |composer, editor, files: &PasteFilesRequested, cx| {
+                if composer.can_drop_attachments(cx) {
+                    composer.drop_attachments(&files.paths, cx);
+                } else if let Some(text) = &files.text {
+                    editor.update(cx, |editor, cx| editor.paste_clipboard_text(text, cx));
+                }
+            },
+        );
+        cx.on_release(|composer, app| composer.release_attachments(app))
+            .detach();
         Self {
             address,
             editor,
             replies: Replies::default(),
             draft_runtime: None,
             draft_session: None,
+            early_draft_id: None,
+            early_claim: None,
+            local_draft_id: None,
             draft_topic: None,
             plain_target: None,
             destination: Destination::Unchecked,
@@ -261,6 +281,7 @@ impl Composer {
             _editor_submit: submit,
             _editor_edit: edit,
             _editor_paste_image: paste,
+            _editor_paste_files: paste_files,
             #[cfg(all(test, feature = "gpui-test"))]
             renders: 0,
         }
@@ -369,6 +390,7 @@ impl Composer {
         &mut self,
         expected: HistoryMessage,
         access: std::sync::Arc<ProtectedMessage>,
+        media_access: Option<MediaAccess>,
         cx: &mut Context<Self>,
     ) {
         if !self.can_edit_protected() || self.edit.is_some() {
@@ -377,6 +399,7 @@ impl Composer {
         let Some(text) = access.with_body(|text| zeroize::Zeroizing::new(text.to_owned())) else {
             return;
         };
+        self.discard_attachments(cx);
         let draft = zeroize::Zeroizing::new(self.editor.read(cx).text().to_owned());
         self.edit = Some(ProtectedEdit {
             expected,
@@ -385,8 +408,12 @@ impl Composer {
             draft_replies: None,
             _watch: None,
         });
+        let text = zeroize::Zeroizing::new(self.open_attachment_edit(&text, cx));
         self.editor
             .update(cx, |editor, cx| editor.show_reply(&text, cx));
+        if let Some(access) = media_access {
+            self.load_attachment_edit_previews(access, cx);
+        }
         cx.notify();
     }
 
@@ -394,6 +421,9 @@ impl Composer {
     pub(super) fn cancel_protected_edit(&mut self, message: Option<Uuid>, cx: &mut Context<Self>) {
         if message.is_some_and(|id| self.edit.as_ref().is_none_or(|edit| edit.expected.id != id)) {
             return;
+        }
+        if self.edit.is_some() {
+            self.discard_attachments(cx);
         }
         if let Some(edit) = self.edit.take() {
             if let Some(replies) = edit.draft_replies {
@@ -438,11 +468,11 @@ impl Composer {
     pub fn invalidate_destination(&mut self, cx: &mut Context<Self>) {
         // Сохраняем текущий снимок, чтобы вернуть ввод после подтверждения области.
         self.persist_draft(cx);
+        self.discard_new_attachments(cx);
         self.plain_target = None;
         self.destination = Destination::Unchecked;
         self.editor
             .update(cx, |editor, cx| editor.set_reference_suggestions(false, cx));
-        self.attachment_upload.cancel();
         self.time_insert = None;
         cx.emit(ComposerEvent::DestinationChanged);
         cx.notify();
@@ -574,8 +604,8 @@ impl Composer {
             && self.writing.is_none()
             && !self.attachment_upload.pending()
             && !editor.composing()
-            && self.replies.has_answer(editor.text())
-            && !over_limit(&markdown)
+            && (self.replies.has_answer(editor.text()) || self.has_ready_attachments())
+            && !over_limit(&self.attachment_markdown(&markdown))
     }
 
     /// Блокирует повторное нажатие и передаёт экрану прежний текст и адрес.
@@ -604,7 +634,7 @@ impl Composer {
             self.prepare_draft_send(attempt.op_id, cx)
         };
         let editor = self.editor.read(cx);
-        let markdown = self.replies.markdown(editor.text()).into_owned();
+        let markdown = self.attachment_markdown(&self.replies.markdown(editor.text()));
         let submission = Submission {
             draft,
             address: self.address.clone(),
@@ -626,6 +656,7 @@ impl Composer {
             protected_sources: self.replies.protected_sources(),
         };
         self.writing = Some(attempt);
+        self.begin_attachment_submission(attempt.op_id, cx);
         self.editor
             .update(cx, |editor, cx| editor.set_text_menu_busy(true, cx));
         self.write_failure = None;
@@ -664,10 +695,19 @@ impl Composer {
             && self.replies.revision == attempt.replies_version
             && !editor.composing();
         let saved = matches!(outcome, QueueWriteOutcome::Saved(_));
+        self.finish_attachment_submission(
+            attempt.op_id,
+            saved || matches!(outcome, QueueWriteOutcome::Edited),
+            matches!(
+                outcome,
+                QueueWriteOutcome::EditFailed { uncertain: true } | QueueWriteOutcome::StaleEdit
+            ),
+            cx,
+        );
         match outcome {
             QueueWriteOutcome::Edited => self.cancel_protected_edit(None, cx),
             QueueWriteOutcome::StaleEdit => self.cancel_protected_edit(None, cx),
-            QueueWriteOutcome::EditFailed if same_version => {
+            QueueWriteOutcome::EditFailed { .. } if same_version => {
                 self.write_failure =
                     Some((attempt.version, attempt.replies_version, WriteFailure::Edit));
             }
@@ -734,7 +774,19 @@ impl Render for Composer {
         let editor = self.editor.read(cx);
         let expanded = ToolbarPreferences::expanded(cx);
         let can_format = editor.can_format();
-        let too_long = over_limit(&self.replies.markdown(editor.text()));
+        if let Some(picker) = &self.time_insert
+            && (!expanded
+                || !can_format
+                || !self.is_available()
+                || picker.editor_version != editor.version())
+        {
+            let picker_focused = picker.region.contains_focused(window, cx);
+            self.time_insert = None;
+            if picker_focused {
+                self.focus_editor(window, cx);
+            }
+        }
+        let too_long = over_limit(&self.attachment_markdown(&self.replies.markdown(editor.text())));
         let write_failure = self.current_write_failure(cx);
         let explanation = if too_long {
             Some(locale.tr("composer.messageTooLong"))
@@ -764,20 +816,53 @@ impl Render for Composer {
         };
         let target = cx.entity().downgrade();
         let edit_target = target.clone();
+        let [file, time, fragment] = self.toolbar.extra_focus();
         let toolbar = expanded.then(|| {
-            let [time, file, fragment] = self.toolbar.extra_focus();
-            let extras = [
-                Some(
-                    self.time_button(palette, locale, can_format, &time, cx)
-                        .into_any_element(),
-                ),
-                self.attachment_button(palette, locale, &file, cx)
-                    .map(|button| button.into_any_element()),
-                self.fragment_toolbar(palette, locale, can_format, &fragment, cx),
-            ];
+            let extras = ToolbarExtras {
+                file: self.attachment_button(palette, locale, &file, false, cx),
+                time: self.time_button(palette, locale, can_format, &time, cx),
+                fragment: self.fragment_toolbar(palette, locale, can_format, &fragment, cx),
+            };
             self.toolbar
                 .row(palette, can_format, locale, extras, window, cx)
         });
+        let compact_attachment = (!expanded)
+            .then(|| self.attachment_button(palette, locale, &file, true, cx))
+            .flatten();
+        let drop_zone = div()
+            .id("composer-inline-attachment-drop-zone")
+            .min_w_0()
+            .flex_1()
+            .on_drop(cx.listener(|composer, drag: &AttachmentDrag, window, cx| {
+                if drag.composer == cx.entity_id() {
+                    composer.insert_inline_attachment(drag.id, window.mouse_position(), cx);
+                    composer.focus_editor(window, cx);
+                }
+            }))
+            .child(self.editor.clone());
+        let input = div()
+            .flex()
+            .items_end()
+            .w_full()
+            .min_w_0()
+            .gap(px(8.))
+            .child(
+                div()
+                    .flex()
+                    .items_end()
+                    .min_w_0()
+                    .flex_1()
+                    .gap(px(8.))
+                    // Переключатель слева, а Tab из истории сразу входит в поле.
+                    .flex_row_reverse()
+                    .child(drop_zone)
+                    .children((!expanded).then(|| {
+                        self.toolbar
+                            .toggle(false, palette, locale, cx)
+                            .mb(px(4.) - CONTROL_BORDER)
+                    })),
+            )
+            .children(compact_attachment.map(|button| button.mb(px(4.) - CONTROL_BORDER)));
         // Сетка сначала задаёт общую ширину поля и пояснения. От неё зависит высота переносов.
         // Явная ширина нужна и при отдельной раскладке композера из кэша GPUI.
         div()
@@ -821,14 +906,9 @@ impl Render for Composer {
                             .debug_selector(|| "cancel-protected-edit".into()),
                     )
             }))
-            .children(self.render_replies(palette, window, cx))
             .children(self.fragment_key_option(palette, locale, cx))
-            .children(
-                self.time_insert
-                    .as_ref()
-                    .map(|picker| picker.render(palette, locale, cx)),
-            )
-            .children(self.attachments_panel(palette, locale, cx))
+            .children(self.attachments_panel(palette, locale, window, cx))
+            .children(self.render_replies(palette, window, cx))
             .child(
                 div()
                     .flex()
@@ -836,30 +916,13 @@ impl Render for Composer {
                     .items_end()
                     .gap(FIELD_SEND_GAP)
                     .child(
-                        field(
-                            palette,
-                            appearance,
-                            div()
-                                .flex()
-                                .items_end()
-                                .w_full()
-                                .min_w_0()
-                                .gap(px(8.))
-                                // Кнопка слева от поля, но Tab из истории сначала возвращает в текст.
-                                .flex_row_reverse()
-                                .child(div().min_w_0().flex_1().child(self.editor.clone()))
-                                .children((!expanded).then(|| {
-                                    self.toolbar
-                                        .toggle(false, palette, locale, cx)
-                                        .mb(px(4.) - CONTROL_BORDER)
-                                })),
-                        )
-                        // Рамка входит в отступ. Переключатель начинается на одной оси с панелью.
-                        .px(if expanded { px(20.) } else { COMPOSER_INSET } - CONTROL_BORDER)
-                        .min_h(SEND_SIZE)
-                        .flex_1()
-                        .debug_selector(|| "conversation-composer-field".into())
-                        .rounded(SURFACE_RADIUS),
+                        field(palette, appearance, input)
+                            // Рамка входит в отступ. Переключатель начинается на одной оси с панелью.
+                            .px(if expanded { px(20.) } else { COMPOSER_INSET } - CONTROL_BORDER)
+                            .min_h(SEND_SIZE)
+                            .flex_1()
+                            .debug_selector(|| "conversation-composer-field".into())
+                            .rounded(SURFACE_RADIUS),
                     )
                     .child(
                         send.render(palette, None, move |window, app| {
@@ -891,6 +954,11 @@ impl Render for Composer {
             )
             // Панель прокручивается в пределах поля, оставляя справа место под отправку.
             .children(toolbar.map(|row| div().min_w_0().pr(SEND_SIZE + FIELD_SEND_GAP).child(row)))
+            .children(
+                self.render_time_picker(palette, locale, window, cx)
+                    .into_iter()
+                    .flatten(),
+            )
             .when_some(explanation, |view, text| {
                 view.child(
                     label(palette, TextRole::Caption, text)

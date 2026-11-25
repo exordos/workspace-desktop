@@ -1,9 +1,16 @@
-//! Выполняет один multipart POST файла в Workspace и сверяет квитанцию с проверенным запросом.
+//! Передаёт файл через multipart, сверяет квитанцию и отправляет отдельный запрос очистки.
 
-use reqwest::multipart::{Form, Part};
+use std::convert::Infallible;
+
+use futures::stream;
+use reqwest::{
+    Body,
+    multipart::{Form, Part},
+};
+use tokio::sync::watch;
 
 use crate::messenger::files::{
-    UploadAttachmentError, UploadedAttachment,
+    AttachmentUploadProgress, DiscardAttachmentError, UploadAttachmentError,
     upload::{ExpectedAttachment, PreparedAttachment},
 };
 
@@ -11,6 +18,7 @@ use super::*;
 
 const FILES_PATH: &str = "/api/workspace/v1/messenger/files/";
 const RESPONSE_LIMIT: usize = 64 * 1024;
+const FILE_CHUNK_BYTES: usize = 64 * 1024;
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Подтверждение записи от файлового API в контексте загружавшего пользователя.
@@ -53,11 +61,12 @@ impl RestClient {
         token: &str,
         stream: Uuid,
         prepared: PreparedAttachment,
-    ) -> Result<UploadedAttachment, UploadAttachmentError> {
+        progress: Option<watch::Sender<AttachmentUploadProgress>>,
+    ) -> Result<(Uuid, String), UploadAttachmentError> {
         let mut url = workspace_origin(owner).map_err(|_| UploadAttachmentError::InvalidInput)?;
         url.set_path(FILES_PATH);
         let PreparedAttachment { bytes, receipt } = prepared;
-        let file = Part::bytes(bytes)
+        let file = attachment_part(bytes, progress)
             .file_name(receipt.name.clone())
             .mime_str(&receipt.mime)
             .map_err(|_| UploadAttachmentError::InvalidInput)?;
@@ -105,6 +114,60 @@ impl RestClient {
         let id = reply
             .verified_id(owner, stream, &receipt)
             .ok_or(UploadAttachmentError::Unknown)?;
-        Ok(receipt.reference(id))
+        Ok((id, receipt.markdown(id)))
     }
+
+    /// Запрашивает удаление проверенной записи; успех подтверждают ответы 200 и 204.
+    pub(in crate::messenger) async fn delete_attachment(
+        &self,
+        owner: &OwnerContext,
+        token: &str,
+        file_id: Uuid,
+    ) -> Result<(), DiscardAttachmentError> {
+        let mut url = workspace_origin(owner).map_err(|_| DiscardAttachmentError::Unknown)?;
+        url.set_path(&format!("{FILES_PATH}{file_id}"));
+        let response = self
+            .send
+            .delete(url)
+            .header(ACCEPT, "application/json")
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|_| DiscardAttachmentError::Unknown)?;
+        match response.status() {
+            StatusCode::OK | StatusCode::NO_CONTENT => Ok(()),
+            status => Err(DiscardAttachmentError::Rejected(status.as_u16())),
+        }
+    }
+}
+
+/// Считает байты файла по мере чтения HTTP-клиентом, сохраняя известную длину multipart.
+fn attachment_part(
+    bytes: Vec<u8>,
+    progress: Option<watch::Sender<AttachmentUploadProgress>>,
+) -> Part {
+    let Some(progress) = progress else {
+        return Part::bytes(bytes);
+    };
+    let total_bytes = bytes.len() as u64;
+    progress.send_replace(AttachmentUploadProgress {
+        loaded_bytes: 0,
+        total_bytes,
+    });
+    let chunks = stream::unfold(
+        (bytes, 0, progress),
+        move |(bytes, start, progress)| async move {
+            if start == bytes.len() {
+                return None;
+            }
+            let end = (start + FILE_CHUNK_BYTES).min(bytes.len());
+            let chunk = bytes[start..end].to_vec();
+            progress.send_replace(AttachmentUploadProgress {
+                loaded_bytes: end as u64,
+                total_bytes,
+            });
+            Some((Ok::<_, Infallible>(chunk), (bytes, end, progress)))
+        },
+    );
+    Part::stream_with_length(Body::wrap_stream(chunks), total_bytes)
 }

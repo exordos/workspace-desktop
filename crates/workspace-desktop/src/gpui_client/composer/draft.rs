@@ -29,6 +29,36 @@ struct Key {
     topic: Uuid,                   // Явная тема, проверенная сервером.
 }
 
+/// Адрес ввода, пока точная тема или право записи ещё не подтверждены.
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct EarlyKey {
+    owner: OwnerContext,           // Аккаунт и организация исходного поля.
+    generation: SessionGeneration, // Живое поколение входа.
+    stream: Uuid,                  // Стрим исходного маршрута.
+    topic: Option<Uuid>,           // Явная тема либо личка без определённой темы.
+    draft: Option<Uuid>,           // Точный выбранный черновик либо обычное открытие.
+}
+
+impl EarlyKey {
+    /// Создаёт ключ без привязки к положению истории.
+    fn new(address: &ConversationAddress, draft: Option<Uuid>) -> Self {
+        Self {
+            owner: address.route.owner.clone(),
+            generation: address.generation,
+            stream: address.route.scope.stream_id,
+            topic: address.route.scope.topic_id,
+            draft,
+        }
+    }
+}
+
+/// Временный снимок с владельцем последнего открытого редактора.
+struct EarlySlot {
+    claim: Uuid, // Текущий редактор, поздние обновления которого принимаются.
+    value: Option<PlaintextDraft>, // Завершённый ввод только в памяти процесса.
+    origin: Option<(Uuid, u64)>, // Локальная версия, с которой пользователь начал ввод.
+}
+
 impl Key {
     /// Связывает адрес окна с подтверждённой темой.
     fn new(address: &ConversationAddress, scope: DraftScope) -> Self {
@@ -60,26 +90,67 @@ struct PendingPurge {
 /// Операции одной темы, которые переживают экран.
 #[derive(Default)]
 struct Slot {
-    pending: Option<Pending>,   // Последний снимок, включая явную очистку.
+    pending: Option<Pending>, // Последний снимок, включая явную очистку.
+    queued: std::collections::VecDeque<Pending>, // Другие UUID той же темы, ожидающие записи.
     protected: Option<Pending>, // Закрытый снимок только для восстановления поля в памяти.
+    protected_others: Vec<Pending>, // Другие защищённые UUID той же темы остаются в памяти.
     purges: std::collections::VecDeque<PendingPurge>, // Адреса до фиксации удаления в Core.
-    writer: bool,               // Уже поставлен запрос, который сможет записать этот слот.
-    send: Option<Uuid>,         // Идентификатор операции передачи редактора очереди.
+    writer: bool,             // Уже поставлен запрос, который сможет записать этот слот.
+    send: Option<Uuid>,       // Идентификатор операции передачи редактора очереди.
 }
 
 /// Состояние таймера и очереди записи, общее для окон одного профиля.
 #[derive(Default)]
 pub(in crate::gpui_client) struct DraftBuffer {
     slots: Mutex<HashMap<Key, Slot>>, // Сохраняем по подтверждённым адресам и поколениям.
+    early: Mutex<HashMap<EarlyKey, EarlySlot>>, // Неподтверждённый ввод никогда не пишет на диск.
     settled: Notify, // Пробуждает повторное открытие после завершения записи очереди.
 }
 
 impl DraftBuffer {
+    /// Убирает защищённую копию после осознанного снятия защиты с этого UUID.
+    fn forget_protected(&self, key: &Key, id: Uuid) {
+        if let Some(slot) = self.slots.lock().unwrap().get_mut(key) {
+            if slot
+                .protected
+                .as_ref()
+                .is_some_and(|pending| pending.value.id == id)
+            {
+                slot.protected = None;
+            }
+            slot.protected_others
+                .retain(|pending| pending.value.id != id);
+        }
+    }
+
     /// Сразу принимает новый ввод. Фоновый запрос для этой темы может быть только один.
     fn stage(&self, key: Key, pending: Pending) -> bool {
         let mut slots = self.slots.lock().unwrap();
         let slot = slots.entry(key).or_default();
-        slot.protected = None;
+        if slot
+            .protected
+            .as_ref()
+            .is_some_and(|old| old.value.id != pending.value.id)
+            && let Some(old) = slot.protected.take()
+        {
+            slot.protected_others
+                .retain(|item| item.value.id != old.value.id);
+            slot.protected_others.push(old);
+        } else {
+            slot.protected = None;
+        }
+        slot.protected_others
+            .retain(|item| item.value.id != pending.value.id);
+        if slot
+            .pending
+            .as_ref()
+            .is_some_and(|old| old.value.id != pending.value.id)
+            && let Some(old) = slot.pending.take()
+        {
+            slot.queued.retain(|item| item.value.id != old.value.id);
+            slot.queued.push_back(old);
+        }
+        slot.queued.retain(|item| item.value.id != pending.value.id);
         slot.pending = Some(pending);
         !std::mem::replace(&mut slot.writer, true)
     }
@@ -103,13 +174,40 @@ impl DraftBuffer {
                 },
             });
         }
-        slot.pending = None;
+        if slot
+            .pending
+            .as_ref()
+            .is_some_and(|old| old.value.id != pending.value.id)
+            && let Some(old) = slot.pending.take()
+        {
+            slot.queued.retain(|item| item.value.id != old.value.id);
+            slot.queued.push_back(old);
+        } else {
+            slot.pending = None;
+        }
+        slot.queued.retain(|item| item.value.id != pending.value.id);
+        if slot
+            .protected
+            .as_ref()
+            .is_some_and(|old| old.value.id != pending.value.id)
+            && let Some(old) = slot.protected.take()
+        {
+            slot.protected_others
+                .retain(|item| item.value.id != old.value.id);
+            slot.protected_others.push(old);
+        }
+        slot.protected_others
+            .retain(|item| item.value.id != pending.value.id);
         slot.protected = Some(pending);
         !slot.purges.is_empty() && !std::mem::replace(&mut slot.writer, true)
     }
 
     /// Даёт черновику закончить передачу в очередь перед повторным открытием.
-    pub(super) async fn wait_for_send(&self, address: &ConversationAddress, scope: DraftScope) {
+    pub(in crate::gpui_client) async fn wait_for_send(
+        &self,
+        address: &ConversationAddress,
+        scope: DraftScope,
+    ) {
         let key = Key::new(address, scope);
         loop {
             let changed = self.settled.notified();
@@ -130,25 +228,68 @@ impl DraftBuffer {
 
     /// Снимает последний ввод до чтения SQLite. Если запись успеет завершиться
     /// между этими шагами, вызывающий всё равно увидит самую свежую из двух версий.
-    pub(super) fn current(
+    pub(in crate::gpui_client) fn current(
         &self,
         address: &ConversationAddress,
         scope: DraftScope,
+        draft_id: Option<Uuid>,
     ) -> Option<(DraftAccess, PlaintextDraft, bool)> {
         let key = Key::new(address, scope);
         self.slots.lock().unwrap().get(&key).and_then(|slot| {
-            let pending = slot.protected.as_ref().or(slot.pending.as_ref())?;
-            Some((
-                pending.access.clone(),
-                pending.value.clone(),
-                slot.protected.is_some(),
-            ))
+            let (pending, protected) = if let Some(id) = draft_id {
+                slot.protected
+                    .iter()
+                    .chain(slot.protected_others.iter())
+                    .filter(|pending| pending.value.id == id)
+                    .map(|pending| (pending, true))
+                    .chain(
+                        slot.pending
+                            .iter()
+                            .chain(slot.queued.iter())
+                            .filter(|pending| pending.value.id == id)
+                            .map(|pending| (pending, false)),
+                    )
+                    .max_by_key(|(pending, _)| pending.value.version)?
+            } else {
+                slot.protected
+                    .as_ref()
+                    .map(|pending| (pending, true))
+                    .or_else(|| slot.pending.as_ref().map(|pending| (pending, false)))?
+            };
+            Some((pending.access.clone(), pending.value.clone(), protected))
         })
     }
 
     /// Записывает последний ввод темы. Буфер удерживает его при временной ошибке.
     fn write(&self, key: &Key, sync: &Sync) -> bool {
         loop {
+            let queued = self
+                .slots
+                .lock()
+                .unwrap()
+                .get(key)
+                .and_then(|slot| slot.queued.front().cloned());
+            if let Some(pending) = queued {
+                let result = if let Some(target) = &pending.literal_target {
+                    sync.save_external_draft(target, &pending.access, &pending.value)
+                } else {
+                    sync.save_draft(&key.owner, key.generation, &pending.access, &pending.value)
+                };
+                if matches!(result, Err(SyncError::Storage(error)) if !matches!(error, workspace_core::storage::StorageError::StaleDraftAccess))
+                {
+                    return false;
+                }
+                let mut slots = self.slots.lock().unwrap();
+                if let Some(slot) = slots.get_mut(key)
+                    && slot.queued.front().is_some_and(|current| {
+                        current.value.id == pending.value.id
+                            && current.value.version == pending.value.version
+                    })
+                {
+                    slot.queued.pop_front();
+                }
+                continue;
+            }
             let (purge, pending) = self
                 .slots
                 .lock()
@@ -198,12 +339,12 @@ impl DraftBuffer {
                 (None, None) => true,
                 _ => false,
             };
-            if !same || !slot.purges.is_empty() {
+            if !same || !slot.purges.is_empty() || !slot.queued.is_empty() {
                 continue;
             }
             slot.pending = None;
             slot.writer = false;
-            if slot.send.is_none() && slot.protected.is_none() {
+            if slot.send.is_none() && slot.protected.is_none() && slot.protected_others.is_empty() {
                 slots.remove(key);
             }
             return true;
@@ -269,6 +410,9 @@ impl DraftBuffer {
         let slots = self.slots.lock().unwrap();
         if slots.get(&key).is_some_and(|slot| {
             slot.send.is_some()
+                || slot.queued.iter().any(|pending| {
+                    pending.value.id == version.id && pending.value.version > version.version
+                })
                 || slot.pending.as_ref().is_some_and(|pending| {
                     pending.value.id == version.id && pending.value.version > version.version
                 })
@@ -315,6 +459,12 @@ impl DraftBuffer {
                 || key.stream != stream
                 || topic.is_some_and(|topic| key.topic != topic)
         });
+        self.early.lock().unwrap().retain(|key, _| {
+            key.owner != *owner
+                || key.generation != generation
+                || key.stream != stream
+                || topic.is_some_and(|topic| key.topic.is_some_and(|current| current != topic))
+        });
         self.settled.notify_waiters();
     }
 
@@ -327,9 +477,17 @@ impl DraftBuffer {
             .lock()
             .unwrap()
             .retain(|key, _| keep(&key.owner, key.generation));
+        self.early
+            .lock()
+            .unwrap()
+            .retain(|key, _| keep(&key.owner, key.generation));
         self.settled.notify_waiters();
     }
 }
+
+#[cfg(test)]
+#[path = "draft_queue_tests.rs"]
+mod queue_tests;
 
 /// Неизменная локальная версия, которую передаём очереди отправки.
 pub(super) struct DraftSend {
@@ -352,6 +510,16 @@ impl DraftSend {
         if let Some(slot) = slots.get_mut(&self.key)
             && slot.send == Some(self.op_id)
         {
+            if saved {
+                slot.queued.retain(|pending| {
+                    pending.value.id != self.version.id
+                        || pending.value.version > self.version.version
+                });
+                slot.protected_others.retain(|pending| {
+                    pending.value.id != self.version.id
+                        || pending.value.version > self.version.version
+                });
+            }
             if saved
                 && slot.pending.as_ref().is_some_and(|pending| {
                     pending.value.id == self.version.id
@@ -371,6 +539,8 @@ impl DraftSend {
             slot.send = None;
             if slot.pending.is_none()
                 && slot.protected.is_none()
+                && slot.protected_others.is_empty()
+                && slot.queued.is_empty()
                 && slot.purges.is_empty()
                 && !slot.writer
             {
@@ -399,6 +569,103 @@ pub(super) struct DraftSession {
 }
 
 impl Composer {
+    /// Показывает локальный черновик только если поле не изменилось с начала чтения.
+    pub(in crate::gpui_client) fn show_local_draft(
+        &mut self,
+        saved: Option<PlaintextDraft>,
+        stamp: (u64, u64),
+        cx: &mut Context<Self>,
+    ) {
+        let editor = self.editor.read(cx);
+        if self.draft_session.is_some()
+            || (editor.version(), self.replies.revision) != stamp
+            || editor.composing()
+            || !editor.text().is_empty()
+            || !self.replies.sources().is_empty()
+        {
+            return;
+        }
+        if let Some(saved) = saved {
+            self.local_draft_id = Some((saved.id, saved.version));
+            let text = self.replies.restore_draft(saved, cx);
+            self.editor
+                .update(cx, |editor, cx| editor.show_reply(&text, cx));
+            cx.emit(super::ComposerEvent::DraftRestored);
+        }
+    }
+
+    /// Снимает версии поля и вкладок до запуска асинхронного чтения.
+    pub(in crate::gpui_client) fn draft_stamp(&self, app: &gpui::App) -> (u64, u64) {
+        (self.editor.read(app).version(), self.replies.revision)
+    }
+
+    /// Подключает временный ввод маршрута и возвращает его при быстром открытии.
+    pub(in crate::gpui_client) fn attach_early_draft(
+        &mut self,
+        draft_id: Option<Uuid>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(runtime) = &self.draft_runtime else {
+            return;
+        };
+        let key = EarlyKey::new(&self.address, draft_id);
+        let claim = Uuid::new_v4();
+        let saved = {
+            let mut slots = runtime.drafts.early.lock().unwrap();
+            let slot = slots.entry(key).or_insert(EarlySlot {
+                claim,
+                value: None,
+                origin: None,
+            });
+            slot.claim = claim;
+            (slot.value.clone(), slot.origin)
+        };
+        self.early_draft_id = draft_id;
+        self.early_claim = Some(claim);
+        self.local_draft_id = saved.1;
+        if let Some(saved) = saved.0 {
+            let text = self.replies.restore_draft(saved, cx);
+            self.editor
+                .update(cx, |editor, cx| editor.show_reply(&text, cx));
+        }
+    }
+
+    /// Запоминает только законченный ввод и отклоняет старые экземпляры экрана.
+    fn stage_early_draft(&self, cx: &Context<Self>) {
+        let (Some(runtime), Some(claim)) = (&self.draft_runtime, self.early_claim) else {
+            return;
+        };
+        let editor = self.editor.read(cx);
+        if editor.composing() {
+            return;
+        }
+        let (markdown, replies) = self.replies.draft_snapshot(editor.text());
+        let key = EarlyKey::new(&self.address, self.early_draft_id);
+        let mut slots = runtime.drafts.early.lock().unwrap();
+        if let Some(slot) = slots.get_mut(&key).filter(|slot| slot.claim == claim) {
+            slot.value = (!markdown.is_empty() || replies.is_some()).then(|| PlaintextDraft {
+                id: Uuid::new_v4(),
+                version: 0,
+                markdown,
+                replies,
+            });
+            slot.origin = self.local_draft_id;
+        }
+    }
+
+    /// Удаляет временную копию после передачи в подтверждённый буфер.
+    fn clear_early_draft(&self) {
+        let (Some(runtime), Some(claim)) = (&self.draft_runtime, self.early_claim) else {
+            return;
+        };
+        let key = EarlyKey::new(&self.address, self.early_draft_id);
+        let mut slots = runtime.drafts.early.lock().unwrap();
+        if let Some(slot) = slots.get_mut(&key).filter(|slot| slot.claim == claim) {
+            slot.value = None;
+            slot.origin = None;
+        }
+    }
+
     /// Восстанавливает ввод только если с начала чтения его не редактировали.
     pub(super) fn hydrate_draft(
         &mut self,
@@ -408,19 +675,31 @@ impl Composer {
         stamp_at_start: (u64, u64),
         cx: &mut Context<Self>,
     ) {
+        let editor = self.editor.read(cx);
+        let can_restore = (editor.version(), self.replies.revision) == stamp_at_start
+            && !editor.composing()
+            && editor.text().is_empty()
+            && self.replies.sources().is_empty();
+        // Набранный до чтения текст получает новую запись и не перезаписывает старую.
+        let use_saved = can_restore
+            || saved.is_none()
+            || saved
+                .as_ref()
+                .is_some_and(|draft| Some((draft.id, draft.version)) == self.local_draft_id);
         let mut session = DraftSession {
             access,
-            id: saved.as_ref().map_or_else(Uuid::new_v4, |value| value.id),
-            version: saved.as_ref().map_or(0, |value| value.version),
+            id: saved
+                .as_ref()
+                .filter(|_| use_saved)
+                .map_or_else(Uuid::new_v4, |value| value.id),
+            version: saved
+                .as_ref()
+                .filter(|_| use_saved)
+                .map_or(0, |value| value.version),
             stamp: None,
             protected: restored_protected,
         };
-        let editor = self.editor.read(cx);
-        if (editor.version(), self.replies.revision) == stamp_at_start
-            && !editor.composing()
-            && editor.text().is_empty()
-            && self.replies.sources().is_empty()
-        {
+        if can_restore {
             let newly_protected = !restored_protected
                 && self
                     .plain_target
@@ -440,6 +719,7 @@ impl Composer {
             }
         }
         self.draft_session = Some(session);
+        self.local_draft_id = None;
         self.persist_draft(cx);
     }
 
@@ -451,7 +731,8 @@ impl Composer {
         let Some(runtime) = &self.draft_runtime else {
             return;
         };
-        let Some(session) = &mut self.draft_session else {
+        let Some(session) = &self.draft_session else {
+            self.stage_early_draft(cx);
             return;
         };
         let editor = self.editor.read(cx);
@@ -460,7 +741,21 @@ impl Composer {
             return;
         }
         let key = Key::new(&self.address, session.access.scope());
-        let (markdown, replies) = self.replies.draft_snapshot(editor.text());
+        let (mut markdown, mut replies) = self.replies.draft_snapshot(editor.text());
+        // Пока контроллер вложений может удалить новый файл, черновик не должен хранить его ссылку.
+        if let std::borrow::Cow::Owned(text) = self.persistent_attachment_markdown(&markdown) {
+            markdown = text;
+        }
+        if let Some(replies) = &mut replies {
+            for tab in &mut replies.tabs {
+                if let std::borrow::Cow::Owned(text) =
+                    self.persistent_attachment_markdown(&tab.answer)
+                {
+                    tab.answer = text;
+                }
+            }
+        }
+        let session = self.draft_session.as_mut().expect("черновик проверен выше");
         let mut value = PlaintextDraft {
             id: session.id,
             version: session.version + 1,
@@ -482,7 +777,8 @@ impl Composer {
         let protected = marked && (session.protected || native.is_some());
         session.version = value.version;
         session.stamp = Some(stamp);
-        if session.protected && !protected {
+        let removed_protected = (session.protected && !protected).then_some(session.id);
+        if removed_protected.is_some() {
             // Снятие защиты открывает новый черновик, не оживляя очищенный UUID.
             session.id = Uuid::new_v4();
             session.version = 1;
@@ -497,6 +793,9 @@ impl Composer {
             value.version
         );
         let buffer = runtime.drafts.clone();
+        if let Some(id) = removed_protected {
+            buffer.forget_protected(&key, id);
+        }
         let pending = Pending {
             access: session.access.clone(),
             value,
@@ -511,6 +810,7 @@ impl Composer {
         } else {
             buffer.stage(key.clone(), pending)
         };
+        self.clear_early_draft();
         if !should_write {
             return;
         }
@@ -581,7 +881,9 @@ impl Composer {
 
     /// Убирает ввод и подтверждение сохранения при явном отзыве доступа.
     pub(in crate::gpui_client) fn revoke_draft(&mut self, cx: &mut Context<Self>) {
+        self.clear_early_draft();
         self.draft_session = None;
+        self.local_draft_id = None;
         self.draft_topic = None;
         self.replies.clear();
         self.editor.update(cx, Editor::clear);

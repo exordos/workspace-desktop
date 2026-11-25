@@ -3,6 +3,7 @@
 use std::{cell::RefCell, ptr::NonNull};
 
 use block2::RcBlock;
+use chrono::{DateTime, Datelike, NaiveDateTime, SecondsFormat, TimeDelta, Timelike, Utc};
 use objc2::rc::Retained;
 use objc2_foundation::{
     MainThreadMarker, NSDate, NSDateFormatter, NSLocale, NSNotification, NSNotificationCenter,
@@ -114,6 +115,28 @@ impl LocalTime {
             format.stringFromDate(&date)
         };
         Some(format!("{calendar} {clock}"))
+    }
+
+    /// Вычисляет местные календарные поля для абсолютного момента с его точностью.
+    fn datetime(&self, utc: DateTime<Utc>) -> Option<NaiveDateTime> {
+        let zone = unsafe { self.fields.timeZone() };
+        utc.naive_utc()
+            .checked_add_signed(TimeDelta::seconds(zone_offset(&zone, utc)))
+    }
+
+    /// Переводит местные поля в UTC с учётом переходов часового пояса.
+    fn to_utc(&self, local: NaiveDateTime) -> Option<DateTime<Utc>> {
+        let zone = unsafe { self.fields.timeZone() };
+        let wall_time = local.and_utc();
+        // Берём смещения по обе стороны от выбора. При повторе часа выбираем ранний момент,
+        // как в Electron. Пропущенному часу не соответствует ни один момент.
+        [-1, 0, 1]
+            .into_iter()
+            .filter_map(|days| wall_time.checked_add_signed(TimeDelta::days(days)))
+            .map(|instant| zone_offset(&zone, instant))
+            .filter_map(|offset| wall_time.checked_sub_signed(TimeDelta::seconds(offset)))
+            .filter(|&instant| self.datetime(instant) == Some(local))
+            .min()
     }
 
     /// Преобразует дату создания профиля. Дата без часов уже обозначает календарный день.
@@ -243,58 +266,61 @@ pub(crate) fn format_unix_millis(unix_ms: u64, locale: &str) -> String {
     }
 }
 
-/// Возвращает текущую местную дату и время по отдельности для двух полей формы.
-pub(crate) fn local_time_fields() -> (String, String) {
-    let value = unsafe {
-        formatter(INPUT_LOCALE, EDIT_FIELDS, false)
-            .stringFromDate(&NSDate::date())
-            .to_string()
-    };
-    let (date, time) = value.split_once(' ').unwrap_or_default();
-    (date.to_owned(), time.to_owned())
+/// Возвращает текущее местное время для открытия редактора, с точностью до секунды.
+pub(crate) fn current_local_datetime() -> NaiveDateTime {
+    let seconds = unsafe { NSDate::date().timeIntervalSince1970().floor() as i64 };
+    let utc = DateTime::from_timestamp_secs(seconds).expect("системное время");
+    LocalTime::system().datetime(utc).unwrap_or(utc.naive_utc())
 }
 
-/// Переводит введённые местные дату и время в UTC при полном совпадении после разбора.
-pub(crate) fn parse_local_time(date: &str, time: &str) -> Option<HistoryTime> {
-    let date = date.trim();
-    let time = time.trim();
-    let value = if time.len() == 5 {
-        format!("{date} {time}:00")
-    } else {
-        format!("{date} {time}")
-    };
-    if value.len() != 19 {
+/// Переводит выбранные календарные поля в абсолютное время для ссылки Core.
+pub(crate) fn local_datetime_to_utc(local: NaiveDateTime) -> Option<HistoryTime> {
+    let instant = LocalTime::system().to_utc(local)?;
+    if !(1..=9999).contains(&instant.year()) {
         return None;
     }
-    let local = formatter(INPUT_LOCALE, EDIT_FIELDS, false);
-    // Обратная проверка отсекает неполные даты и моменты между переводом часов.
+    HistoryTime::parse(&instant.to_rfc3339_opts(SecondsFormat::Micros, true))
+}
+
+/// Возвращает местные поля сохранённого момента для календаря истории.
+pub(crate) fn local_datetime_for_time(utc: &HistoryTime) -> Option<NaiveDateTime> {
+    LocalTime::system().datetime(chrono_instant(utc)?)
+}
+
+/// Читает нормализованный момент Core, сохраняя дробь секунды.
+fn chrono_instant(utc: &HistoryTime) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(utc.as_str())
+        .ok()
+        .map(|instant| instant.to_utc())
+}
+
+/// Возвращает действовавшее в заданный момент смещение пояса в секундах.
+fn zone_offset(zone: &NSTimeZone, instant: DateTime<Utc>) -> i64 {
     unsafe {
-        let date = local.dateFromString(&NSString::from_str(&value))?;
-        if local.stringFromDate(&date).to_string() != value {
-            return None;
-        }
-        HistoryTime::parse(
-            &formatter(INPUT_LOCALE, WIRE, true)
-                .stringFromDate(&date)
-                .to_string(),
-        )
+        let date = NSDate::dateWithTimeIntervalSince1970(instant.timestamp() as f64);
+        zone.secondsFromGMTForDate(&date) as i64
     }
 }
 
 /// Показывает момент в часовом поясе системы и языке аккаунта.
 pub(crate) fn format_local_time(utc: &HistoryTime, locale: &str) -> String {
-    let Some(date) = date_from_utc(utc) else {
+    let Some(instant) = chrono_instant(utc) else {
         return utc.as_str().to_owned();
     };
-    let pattern = if utc.as_str().get(17..19) == Some("00") {
-        "EEE, d MMM yyyy, HH:mm"
-    } else {
-        "EEE, d MMM yyyy, HH:mm:ss"
-    };
+    let local = LocalTime::system();
+    let show_seconds = local
+        .datetime(instant)
+        .is_some_and(|time| time.second() != 0);
+    let clock = if show_seconds { "jjmmss" } else { "jjmm" };
     unsafe {
-        formatter(locale, pattern, false)
-            .stringFromDate(&date)
-            .to_string()
+        let zone = local.fields.timeZone();
+        let date = NSDate::dateWithTimeIntervalSince1970(instant.timestamp() as f64);
+        let format = formatter_in_zone(locale, "", &zone);
+        format.setLocalizedDateFormatFromTemplate(&NSString::from_str("EEEdMMMy"));
+        let calendar = format.stringFromDate(&date);
+        format.setLocalizedDateFormatFromTemplate(&NSString::from_str(clock));
+        let clock = format.stringFromDate(&date);
+        format!("{calendar}, {clock}")
     }
 }
 
@@ -406,12 +432,19 @@ mod tests {
         assert_eq!(local.profile_date("2026-12-31T23:15:00.badZ"), None);
     }
 
-    /// Принимает полные местные дату и время и отсекает несуществующий день.
+    /// Пропускает несуществующий час, а при повторе выбирает первый момент.
     #[test]
-    fn validates_edit_fields() {
-        assert!(parse_local_time("2026-02-28", "13:45:22").is_some());
-        assert!(parse_local_time("2026-02-28", "13:45").is_some());
-        assert!(parse_local_time("2026-02-29", "13:45:22").is_none());
-        assert!(parse_local_time("2026-02-28", "25:45:22").is_none());
+    fn resolves_local_time_around_daylight_saving_changes() {
+        let zone = LocalTime::for_test("America/New_York");
+        let parse = |value| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f").unwrap();
+        assert_eq!(zone.to_utc(parse("2026-03-08 02:30:00")), None);
+        let repeated = parse("2026-11-01 01:30:00.123");
+        let earliest = DateTime::parse_from_rfc3339("2026-11-01T05:30:00.123Z")
+            .unwrap()
+            .to_utc();
+        assert_eq!(zone.to_utc(repeated), Some(earliest));
+        let later = earliest + TimeDelta::hours(1);
+        assert_eq!(zone.datetime(earliest), Some(repeated));
+        assert_eq!(zone.datetime(later), Some(repeated));
     }
 }

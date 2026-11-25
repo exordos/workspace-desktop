@@ -9,6 +9,7 @@ use workspace_core::storage::{
 pub(super) fn fixture_rows(scope: HistoryScope, start: u128, end: u128) -> Vec<HistoryMessage> {
     (start..=end)
         .map(|number| HistoryMessage {
+            read: None,
             id: Uuid::from_u128(number),
             stream_id: scope.stream_id,
             topic_id: Uuid::from_u128(2002),
@@ -17,6 +18,7 @@ pub(super) fn fixture_rows(scope: HistoryScope, start: u128, end: u128) -> Vec<H
                 "Синтетическая строка для переноса. ".repeat(1 + (number % 5) as usize),
             ),
             metadata: HistoryMetadata {
+                native_source: None,
                 author_id: Some(Uuid::from_u128(if number % 4 < 2 { 900 } else { 901 })),
                 created_at: HistoryTime::parse(if number < 271 {
                     "2026-11-16T07:10:30Z"

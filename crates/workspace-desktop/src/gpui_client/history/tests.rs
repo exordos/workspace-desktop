@@ -207,6 +207,7 @@ fn window(
                 stream_id: scope.stream_id,
                 topic_id: Uuid::from_u128(1001),
                 reactions: Vec::new(),
+                read: None,
                 body: MessageBody::Markdown(format!(
                     "Сообщение {id}{}",
                     "\nСинтетическая строка".repeat((id % 3) as usize)
@@ -215,6 +216,7 @@ fn window(
                     author_id: Some(Uuid::from_u128(910)),
                     created_at: HistoryTime::parse("2026-11-17T07:10:30Z").unwrap(),
                     updated_at: None,
+                    native_source: Some(true),
                 },
             })
             .collect(),
@@ -277,11 +279,158 @@ fn request(requests: &mpsc::Receiver<Request>, expected: Load) -> Request {
 /// Возвращает успешный ответ и даёт GPUI отрисовать принятый снимок.
 fn answer(request: Request, window: HistoryWindow, ui: &mut VisualTestContext) {
     request.finish(Ok(Some(Snapshot {
+        first_unread: None,
+        unread_checked: false,
         media_access: None,
         window,
         outbox: Some(Vec::new()),
     })));
     ui.run_until_parked();
+}
+
+/// Показывает разделитель при обычном входе и сохраняет положение строки после подтверждения.
+#[gpui::test]
+fn confirmed_read_separator_moves_without_scrolling_the_message(cx: &mut TestAppContext) {
+    const MARKER: &str = "history-unread-00000000-0000-0000-0000-00000000001e";
+    const NEXT_MARKER: &str = "history-unread-00000000-0000-0000-0000-00000000001f";
+    let address = address(ChatEntry::Latest);
+    let (view, ui, requests) = scenario(cx, &address);
+    let mut snapshot = window(
+        address.route.scope,
+        1..95,
+        HistoryEdge::End,
+        HistoryEdge::End,
+    );
+    let first = Uuid::from_u128(30);
+    for row in &mut snapshot.messages {
+        row.read = Some(row.id < first);
+    }
+    let id = snapshot.id;
+    request(&requests, Load::Open(ChatEntry::Latest)).finish(Ok(Some(Snapshot {
+        first_unread: Some(first),
+        unread_checked: true,
+        media_access: None,
+        window: snapshot.clone(),
+        outbox: None,
+    })));
+    ui.run_until_parked();
+
+    let marker_y = ui.debug_bounds(MARKER).expect("Виден разделитель").top();
+    let y = ui.read(|app| {
+        view.read(app)
+            .tested_message_window_y(first)
+            .expect("Видно первое непрочитанное")
+    });
+    assert!(marker_y < y);
+    assert!(ui.read(|app| !view.read(app).viewport.at_tail()));
+
+    ui.update(|_, app| view.update(app, |view, cx| view.refresh_outbox(cx)));
+    ui.run_until_parked();
+    snapshot
+        .messages
+        .iter_mut()
+        .find(|row| row.id == first)
+        .unwrap()
+        .read = Some(true);
+    answer(request(&requests, Load::Read(id)), snapshot, ui);
+
+    let settled_y = ui.read(|app| view.read(app).tested_message_window_y(first).unwrap());
+    assert!((settled_y - y).abs() <= px(1.));
+    // GPUI хранит координаты старых отладочных селекторов после удаления элемента.
+    assert_eq!(
+        ui.read(|app| view.read(app).viewport.tested_unread_markers()),
+        [Uuid::from_u128(31)],
+    );
+    let next_marker_y = ui
+        .debug_bounds(NEXT_MARKER)
+        .expect("Виден новый разделитель")
+        .top();
+    assert!(next_marker_y > settled_y);
+}
+
+/// Удерживает запрос отметок после сетевого сбоя и повторяет его после готовности Sync.
+#[gpui::test]
+fn temporary_read_revalidation_waits_for_a_new_sync_signal(cx: &mut TestAppContext) {
+    let address = address(ChatEntry::Latest);
+    let (view, ui, requests) = scenario(cx, &address);
+    let snapshot = window(
+        address.route.scope,
+        1..8,
+        HistoryEdge::End,
+        HistoryEdge::End,
+    );
+    let expected = Load::RevalidateRead(snapshot.id, Some(snapshot.scope));
+    answer(
+        request(&requests, Load::Open(ChatEntry::Latest)),
+        snapshot.clone(),
+        ui,
+    );
+
+    sync(
+        &view,
+        ui,
+        &address,
+        SyncChange::HistoryReadRevalidate {
+            scope: Some(address.route.scope),
+        },
+    );
+    request(&requests, expected).finish(Err(Failure::Unavailable));
+    ui.run_until_parked();
+    assert!(requests.try_recv().is_err(), "Сверка не повторяется сама");
+    assert!(ui.read(|app| view.read(app).has_access()));
+
+    sync(&view, ui, &address, SyncChange::ActivityChanged);
+    assert!(
+        requests.try_recv().is_err(),
+        "Активность не означает готовность связи"
+    );
+    sync(&view, ui, &address, SyncChange::MessengerSourceReady);
+    answer(request(&requests, expected), snapshot, ui);
+}
+
+/// По явному переходу загружает хвост, хотя обычный вход показал далёкое непрочитанное.
+#[gpui::test]
+fn latest_button_opens_tail_after_first_unread(cx: &mut TestAppContext) {
+    let address = address(ChatEntry::Latest);
+    let (view, ui, requests) = scenario(cx, &address);
+    let mut snapshot = window(
+        address.route.scope,
+        1..95,
+        HistoryEdge::End,
+        HistoryEdge::More("newer".into()),
+    );
+    let first = Uuid::from_u128(30);
+    for row in &mut snapshot.messages {
+        row.read = Some(row.id < first);
+    }
+    request(&requests, Load::Open(ChatEntry::Latest)).finish(Ok(Some(Snapshot {
+        first_unread: Some(first),
+        unread_checked: true,
+        media_access: None,
+        window: snapshot,
+        outbox: None,
+    })));
+    ui.run_until_parked();
+    assert_eq!(
+        ui.read(|app| view.read(app).opening_load()),
+        Load::OpenUnread
+    );
+    let last = Uuid::from_u128(199);
+    click(ui, "history-latest");
+    answer(
+        request(&requests, Load::Open(ChatEntry::Latest)),
+        window(
+            address.route.scope,
+            106..200,
+            HistoryEdge::End,
+            HistoryEdge::End,
+        ),
+        ui,
+    );
+    assert!(ui.read(|app| {
+        let view = view.read(app);
+        view.viewport.at_tail() && view.viewport.has_visible_message(last)
+    }));
 }
 
 /// Нажимает видимую кнопку истории.
@@ -294,39 +443,177 @@ fn click(ui: &mut VisualTestContext, selector: &'static str) {
     ui.run_until_parked();
 }
 
-/// Нажатие по видимому моменту открывает панель времени, а клик вне её закрывает панель.
+/// Нажатие по моменту открывает локальный календарь и часы в режиме просмотра.
 #[gpui::test]
 fn references_open_shared_time_from_the_visible_history(cx: &mut TestAppContext) {
     let address = address(ChatEntry::Latest);
     let (view, ui, requests) = scenario(cx, &address);
     let mut snapshot = window(
         address.route.scope,
-        10..11,
+        10..12,
         HistoryEdge::End,
         HistoryEdge::End,
     );
-    let id = snapshot.messages[0].id;
-    snapshot.messages[0].body =
-        MessageBody::Markdown("До urn:time:2026-10-13T10:02:00Z после".into());
+    let rows = [snapshot.messages[0].id, snapshot.messages[1].id];
+    let value = "2026-10-13T10:02:00Z";
+    snapshot.messages[0].body = MessageBody::Markdown(format!("До urn:time:{value} после"));
+    snapshot.messages[1].body =
+        MessageBody::Markdown("До urn:time:2026-10-13T10:02:00.123Z после".into());
     answer(
         request(&requests, Load::Open(ChatEntry::Latest)),
         snapshot,
         ui,
     );
+    let local =
+        crate::platform::message_time::local_datetime_for_time(&HistoryTime::parse(value).unwrap())
+            .expect("Момент доступен в локальном поясе");
+    let local_day = match chrono::Datelike::day(&local) {
+        12 => "date-picker-day-2026-10-12",
+        13 => "date-picker-day-2026-10-13",
+        14 => "date-picker-day-2026-10-14",
+        _ => panic!("Неожиданная локальная дата {local}"),
+    };
+    for (id, seconds) in rows.into_iter().zip([false, true]) {
+        let position = ui.read(|cx| {
+            view.read(cx)
+                .viewport
+                .tested_text_layout(id)
+                .expect("Отрисована строка ссылки")
+                .position_for_index("До ".len())
+                .expect("Отображена локальная подпись времени")
+        }) + gpui::point(if seconds { px(25.) } else { px(4.) }, px(4.));
+        ui.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position,
+            ..Default::default()
+        });
+        ui.run_until_parked();
+        ui.simulate_event(gpui::MouseUpEvent {
+            button: gpui::MouseButton::Left,
+            position,
+            ..Default::default()
+        });
+        ui.run_until_parked();
+
+        let panel = ui
+            .debug_bounds("history-reference-time-panel")
+            .expect("Открылась панель времени");
+        assert!(ui.debug_bounds("date-picker-grid").is_some());
+        assert!(ui.debug_bounds("date-picker-previous").is_some());
+        assert!(ui.debug_bounds("time-picker-clock").is_some());
+        assert_eq!(ui.debug_bounds("time-picker-second").is_some(), seconds);
+        let selected = ui.debug_bounds("date-picker-selected-day").unwrap();
+        assert!(
+            ui.debug_bounds(local_day)
+                .unwrap()
+                .contains(&selected.center())
+        );
+        let focus = ui.update(|window, cx| window.focused(cx));
+        click(ui, "date-picker-day-2026-10-10");
+        assert_eq!(ui.debug_bounds("date-picker-selected-day"), Some(selected));
+        assert_eq!(ui.update(|window, cx| window.focused(cx)), focus);
+        click(ui, "date-picker-next");
+        ui.run_until_parked();
+        assert!(ui.debug_bounds("date-picker-day-2026-11-15").is_some());
+        click(ui, "date-picker-previous");
+        ui.run_until_parked();
+        assert!(ui.debug_bounds(local_day).is_some());
+        assert!(ui.debug_bounds("date-picker-selected-day").is_some());
+        let dismissal = if seconds {
+            ui.simulate_keystrokes("escape");
+            "Escape"
+        } else {
+            let width = ui.update(|window, _| window.viewport_size().width);
+            let x = if panel.left() > px(1.) {
+                px(1.)
+            } else {
+                width - px(1.)
+            };
+            ui.simulate_click(gpui::point(x, panel.center().y), Modifiers::none());
+            "Клик вне панели"
+        };
+        ui.run_until_parked();
+        assert!(
+            ui.read(|cx| view.read(cx).time_reference.is_none()),
+            "{dismissal} должен закрыть календарь"
+        );
+        ui.update(|window, app| {
+            window.draw(app).clear();
+            assert!(view.read(app).history_focus.is_focused(window));
+        });
+    }
+}
+
+/// Открывает календарь из отправленного текста, пока сервер ещё не подтвердил сообщение.
+#[gpui::test]
+fn queued_time_opens_the_shared_calendar(cx: &mut TestAppContext) {
+    let address = address(ChatEntry::Latest);
+    let (view, ui, requests) = scenario(cx, &address);
+    let id = Uuid::from_u128(600);
+    let outgoing = OutboxEntry {
+        snapshot: PreparedSend {
+            canonical_id: Uuid::from_u128(601),
+            public_id: id,
+            stream_id: address.route.scope.stream_id,
+            topic_id: Uuid::from_u128(1001),
+            body: workspace_core::storage::PreparedSendBody::Markdown(
+                "urn:time:2026-10-13T10:02:00Z".into(),
+            ),
+        },
+        status: DeliveryStatus::Waiting,
+    };
+    request(&requests, Load::Open(ChatEntry::Latest)).finish(Ok(Some(Snapshot {
+        first_unread: None,
+        unread_checked: false,
+        media_access: None,
+        window: window(
+            address.route.scope,
+            10..12,
+            HistoryEdge::End,
+            HistoryEdge::End,
+        ),
+        outbox: Some(vec![outgoing]),
+    })));
+    ui.run_until_parked();
     let position = ui.read(|cx| {
         view.read(cx)
             .viewport
             .tested_text_layout(id)
-            .expect("отрисована строка ссылки")
-            .position_for_index("До ".len() + 2)
-            .expect("локальная подпись времени")
-    }) + gpui::point(px(1.), px(4.));
+            .unwrap()
+            .position_for_index(0)
+            .unwrap()
+    }) + gpui::point(px(25.), px(4.));
     ui.simulate_click(position, Modifiers::none());
     ui.run_until_parked();
     assert!(ui.debug_bounds("history-reference-time-panel").is_some());
-    ui.simulate_click(gpui::point(px(3.), px(3.)), Modifiers::none());
+    assert!(ui.debug_bounds("date-time-picker").is_some());
+    let date = crate::platform::message_time::local_datetime_for_time(
+        &HistoryTime::parse("2026-10-13T10:02:00Z").unwrap(),
+    )
+    .unwrap()
+    .date();
+    let local_day = match chrono::Datelike::day(&date) {
+        12 => "date-picker-day-2026-10-12",
+        13 => "date-picker-day-2026-10-13",
+        14 => "date-picker-day-2026-10-14",
+        _ => panic!("Неожиданная локальная дата {date}"),
+    };
+    let selected = ui.debug_bounds("date-picker-selected-day").unwrap();
+    assert!(
+        ui.debug_bounds(local_day)
+            .unwrap()
+            .contains(&selected.center())
+    );
+    assert!(ui.debug_bounds("time-picker-clock").is_some());
+    click(ui, "date-picker-next");
     ui.run_until_parked();
-    assert!(ui.debug_bounds("history-reference-time-panel").is_none());
+    assert!(ui.debug_bounds("date-picker-day-2026-11-15").is_some());
+    click(ui, "date-picker-previous");
+    ui.run_until_parked();
+    assert!(
+        ui.debug_bounds(local_day)
+            .is_some()
+    );
 }
 
 /// Прокручивает сам список, чтобы его рабочий обработчик мог запросить страницу.
@@ -584,6 +871,155 @@ fn encrypted_history_keeps_tail_and_plain_render_in_the_first_frame(cx: &mut Tes
     // GPUI переносит уже подготовленную строку в новые экранные координаты.
     assert_ne!(before.5, after.5);
     assert!(after.4 > before.4);
+}
+
+/// Показывает загруженную цель в первом кадре и восстанавливает прежнее место без загрузки.
+#[gpui::test]
+fn loaded_message_reveal_centers_and_restores_reading(cx: &mut TestAppContext) {
+    const MARK: &str = "history-message-mark-00000000-0000-0000-0000-000000000028";
+    let address = address(ChatEntry::Latest);
+    let (view, ui, requests) = scenario(cx, &address);
+    let ids = 1..160;
+    answer(
+        request(&requests, Load::Open(ChatEntry::Latest)),
+        window(address.route.scope, ids, HistoryEdge::End, HistoryEdge::End),
+        ui,
+    );
+    let target = Uuid::from_u128(40);
+    let saved = ui.update(|window, app| {
+        view.update(app, |view, cx| {
+            view.viewport.list().scroll_to(gpui::ListOffset {
+                item_ix: 91,
+                offset_in_item: px(11.),
+            });
+            cx.notify();
+        });
+        window.refresh();
+        window.draw(app).clear();
+        view.read(app).reading_position().unwrap()
+    });
+    ui.update(|window, app| {
+        view.update(app, |view, cx| {
+            assert!(view.can_reveal_message(target));
+            assert!(view.viewport.tested_bounds(target).is_none());
+            view.reveal_message(target, cx);
+        });
+        window.refresh();
+        window.draw(app).clear();
+        let viewport = &view.read(app).viewport;
+        let row = viewport.tested_bounds(target).unwrap();
+        let screen = viewport.list().viewport_bounds();
+        assert!((row.center().y - screen.center().y + px(6.)).abs() <= px(1.));
+    });
+    assert!(ui.debug_bounds(MARK).is_some());
+
+    ui.update(|window, app| {
+        view.update(app, |view, cx| {
+            assert!(view.restore_reading_position(Some(saved), cx))
+        });
+        window.refresh();
+        window.draw(app).clear();
+        let restored = view.read(app).reading_position().unwrap();
+        assert_eq!(restored.id, saved.id);
+        assert!((restored.y - saved.y).abs() <= px(1.));
+    });
+    assert!(ui.debug_bounds(MARK).is_none());
+    assert!(requests.try_recv().is_err());
+}
+
+/// Меняет окно в существующем разговоре и сразу показывает отмеченную цель.
+#[gpui::test]
+fn prepared_message_reveal_centers_the_first_frame(cx: &mut TestAppContext) {
+    const MARK: &str = "history-message-mark-00000000-0000-0000-0000-000000000028";
+    let address = address(ChatEntry::Latest);
+    let (view, ui, requests) = scenario(cx, &address);
+    answer(
+        request(&requests, Load::Open(ChatEntry::Latest)),
+        window(
+            address.route.scope,
+            90..160,
+            HistoryEdge::End,
+            HistoryEdge::End,
+        ),
+        ui,
+    );
+    let target = Uuid::from_u128(40);
+    let mut target_address = address.clone();
+    target_address.route.entry = ChatEntry::Around(target);
+    let prepared = super::PreparedMessageHistory {
+        address: target_address,
+        snapshot: Snapshot {
+            first_unread: None,
+            unread_checked: false,
+            window: window(
+                address.route.scope,
+                1..85,
+                HistoryEdge::End,
+                HistoryEdge::End,
+            ),
+            outbox: None,
+            media_access: None,
+        },
+        checked: Vec::new(),
+        encryption_revision: None,
+        key_changes: None,
+        flight: super::Flight {
+            id: Uuid::new_v4(),
+            load: Load::Open(ChatEntry::Around(target)),
+        },
+    };
+    ui.update(|window, app| {
+        view.update(app, |view, cx| {
+            assert!(!view.can_reveal_message(target));
+            assert!(view.apply_prepared_message(prepared, cx));
+        });
+        window.refresh();
+        window.draw(app).clear();
+        let chat = view.read(app);
+        assert_eq!(chat.address(), &address);
+        let row = chat.viewport.tested_bounds(target).unwrap();
+        let screen = chat.viewport.list().viewport_bounds();
+        assert!((row.center().y - screen.center().y + px(6.)).abs() <= px(1.));
+    });
+    assert!(ui.debug_bounds(MARK).is_some());
+    assert!(requests.try_recv().is_err());
+
+    ui.update(|_, app| {
+        view.update(app, |view, cx| {
+            assert!(view.restore_reading_position(None, cx))
+        });
+    });
+    ui.run_until_parked();
+    sync(
+        &view,
+        ui,
+        &address,
+        SyncChange::HistoryMessageCreated {
+            scope: address.route.scope,
+            message_id: Uuid::from_u128(85),
+        },
+    );
+    answer(
+        request(&requests, Load::Read(41)),
+        window(
+            address.route.scope,
+            1..85,
+            HistoryEdge::End,
+            HistoryEdge::Unchecked,
+        ),
+        ui,
+    );
+    answer(
+        request(&requests, Load::Open(ChatEntry::Latest)),
+        window(
+            address.route.scope,
+            1..86,
+            HistoryEdge::End,
+            HistoryEdge::End,
+        ),
+        ui,
+    );
+    assert!(ui.read(|app| view.read(app).viewport.y(Uuid::from_u128(85)).is_some()));
 }
 
 /// Проверяет открытие у цели, ввод пользователя и неизменность координаты после страницы и события.
@@ -906,7 +1342,10 @@ fn shows_date_separator_at_local_midnight(cx: &mut TestAppContext) {
         ("2027-01-01", "00:00"),
         ("2027-01-01", "00:01"),
     ]) {
-        message.metadata.created_at = crate::platform::message_time::parse_local_time(date, time)
+        let local =
+            chrono::NaiveDateTime::parse_from_str(&format!("{date} {time}"), "%Y-%m-%d %H:%M")
+                .unwrap();
+        message.metadata.created_at = crate::platform::message_time::local_datetime_to_utc(local)
             .expect("Дата стенда должна существовать в системном часовом поясе");
     }
     answer(request(&requests, Load::Open(ChatEntry::Latest)), page, ui);
@@ -966,6 +1405,8 @@ fn empty_cache_keeps_skeleton_until_server_confirms_empty_history(cx: &mut TestA
     pending
         .cache
         .send(Snapshot {
+            first_unread: None,
+            unread_checked: false,
             media_access: None,
             window: empty.clone(),
             outbox: Some(Vec::new()),
@@ -982,6 +1423,8 @@ fn empty_cache_keeps_skeleton_until_server_confirms_empty_history(cx: &mut TestA
         .send(ConversationReply {
             address: pending.address,
             value: Ok(Some(Snapshot {
+                first_unread: None,
+                unread_checked: false,
                 media_access: None,
                 window: empty,
                 outbox: Some(Vec::new()),
@@ -1138,6 +1581,8 @@ fn cached_tail_refreshes_and_deduplicates_outbox(cx: &mut TestAppContext) {
     pending
         .cache
         .send(Snapshot {
+            first_unread: None,
+            unread_checked: false,
             media_access: None,
             window: window(
                 address.route.scope,
@@ -1188,6 +1633,8 @@ fn cached_tail_refreshes_and_deduplicates_outbox(cx: &mut TestAppContext) {
         .send(ConversationReply {
             address: pending.address,
             value: Ok(Some(Snapshot {
+                first_unread: None,
+                unread_checked: false,
                 media_access: None,
                 window: window(
                     address.route.scope,
@@ -1259,6 +1706,8 @@ fn cached_refresh_keeps_the_anchor_after_leaving_the_tail(cx: &mut TestAppContex
     pending
         .cache
         .send(Snapshot {
+            first_unread: None,
+            unread_checked: false,
             window: fresh_cache,
             media_access: None,
             outbox: Some(Vec::new()),

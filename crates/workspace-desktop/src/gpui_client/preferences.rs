@@ -16,6 +16,7 @@ pub(super) use super::i18n::Language;
 
 pub(super) mod appearance;
 pub(super) mod shortcuts;
+pub(super) mod workspace_direct;
 
 const FILE: &str = "preferences.json";
 static DEFAULTS: LazyLock<PreferenceValues> = LazyLock::new(PreferenceValues::default);
@@ -87,6 +88,8 @@ pub(super) struct PreferenceValues {
     pub(super) activity_expanded: bool,   // Показывать подписи вместо компактного ряда значков.
     #[serde(skip_serializing_if = "Option::is_none")]
     animations_enabled: Option<bool>, // Читается из общей записи профиля. None — включено.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_direct: Option<bool>, // Прямой маршрут для всего профиля. None — выключен.
 }
 
 impl Default for PreferenceValues {
@@ -105,6 +108,7 @@ impl Default for PreferenceValues {
             manual_away: None,
             activity_expanded: false,
             animations_enabled: None,
+            workspace_direct: None,
         }
     }
 }

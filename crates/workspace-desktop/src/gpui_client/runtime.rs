@@ -54,6 +54,7 @@ use super::contracts::{
     AccountSession, AccountSnapshot, ChatEntry, ChatRoute, ConversationAddress, ConversationReply,
     NotificationReply, NotificationRequest, NotificationRouteError, RuntimeEvent, RuntimeExit,
 };
+use super::preferences::workspace_direct;
 use super::test_profile::{MemorySecrets, TestLogin};
 use crate::platform::chat_keys::{ProfileChatKeys, device_id};
 use crate::platform::{JsonAccountStore, MacKeychain, state_directory};
@@ -664,6 +665,7 @@ impl WorkerParts {
         directory: PathBuf,
         test_login: Option<TestLogin>,
     ) -> Result<(Self, oneshot::Receiver<()>), StartupError> {
+        let route = workspace_direct::load_route(&directory);
         let (accounts, released) =
             ProfileAccounts::open(&directory).map_err(|_| StartupError::Profile)?;
         let isolated = test_login.is_some();
@@ -673,7 +675,7 @@ impl WorkerParts {
             Arc::new(MacKeychain)
         };
         let auth = Auth::new(
-            Arc::new(WorkspaceIamHttp::new()),
+            Arc::new(WorkspaceIamHttp::with_route(route.clone())),
             Arc::new(accounts),
             secrets,
         );
@@ -697,7 +699,7 @@ impl WorkerParts {
                 }
             }
         };
-        let messenger = MessengerSource::new().map_err(|_| StartupError::Worker)?;
+        let messenger = MessengerSource::with_route(route).map_err(|_| StartupError::Worker)?;
         let messenger = match &encryption {
             Some(profile) => {
                 messenger.with_chat_encryption(profile.engine.clone(), profile.device_id)

@@ -158,9 +158,52 @@ fn read_events_invalidate_collections_in_their_owner() {
             "payload": {"kind": kind, "project_id": owner.project_id}
         });
         let (parsed, _) = super::super::wire_event(event.clone(), &owner, "epoch").unwrap();
-        assert!(matches!(parsed, Event::ActivityRead(cursor) if cursor.epoch_version == 10));
+        assert!(
+            matches!(parsed, Event::HistoryRead { cursor, flags, revalidate: true, .. }
+            if cursor.epoch_version == 10 && flags.is_empty())
+        );
         let mut other = event;
         other["payload"]["project_id"] = json!(Uuid::from_u128(99));
         assert!(super::super::wire_event(other, &owner, "epoch").is_err());
     }
+}
+
+/// Различает точный флаг поставщика и границу серверной отметки.
+#[test]
+fn read_events_keep_exact_flags_and_topic() {
+    let owner = owner();
+    let id = Uuid::from_u128(10);
+    let other = Uuid::from_u128(11);
+    let stream = Uuid::from_u128(20);
+    let topic = Uuid::from_u128(30);
+    let event = |payload| {
+        json!({
+            "schema_version": 1,
+            "uuid": Uuid::from_u128(80),
+            "epoch_version": 10,
+            "project_id": owner.project_id,
+            "user_uuid": owner.user_id,
+            "object_type": "message",
+            "action": "read",
+            "payload": payload
+        })
+    };
+    for read in [true, false] {
+        let event = event(json!({
+            "kind": "message.read", "uuid": id, "read": read,
+            "stream_uuid": stream, "topic_uuid": topic,
+        }));
+        let (parsed, _) = super::super::wire_event(event, &owner, "epoch").unwrap();
+        assert!(
+            matches!(parsed, Event::HistoryRead { flags, scope: Some(scope), revalidate, .. }
+            if flags == [(id, read)]
+            && scope.stream_id == stream && scope.topic_id == Some(topic) && revalidate == read)
+        );
+    }
+    let event = event(json!({"kind": "messages.read", "message_uuids": [id, other]}));
+    let (parsed, _) = super::super::wire_event(event, &owner, "epoch").unwrap();
+    assert!(
+        matches!(parsed, Event::HistoryRead { flags, revalidate: false, .. }
+        if flags == [(id, true), (other, true)])
+    );
 }

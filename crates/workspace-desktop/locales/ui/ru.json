@@ -4,7 +4,6 @@
     "previous": "Предыдущий месяц",
     "next": "Следующий месяц",
     "monthYear": "%{month} %{year}",
-    "selected": "%{day} · %{monthYear}",
     "january": "Январь",
     "february": "Февраль",
     "march": "Март",

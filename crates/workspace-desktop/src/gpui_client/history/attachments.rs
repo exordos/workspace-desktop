@@ -1064,14 +1064,12 @@ fn decode_original(file: &mut MediaFile) -> Result<DynamicImage, PictureError> {
     if bytes.len() as u64 > MAX_ENCODED_BYTES {
         return Err(PictureError::TooLarge);
     }
-    if matches!(
-        bytes.get(4..12),
-        Some(b"ftypheic" | b"ftypheix" | b"ftypmif1" | b"ftypmsf1" | b"ftypavif" | b"ftypavis")
-    ) {
-        let png = crate::platform::media::heif_preview(&bytes, MAX_VIEW_SIDE)
+    if crate::platform::media::heif_mime_type(&bytes).is_some() {
+        let preview = crate::platform::media::heif_preview(&bytes, MAX_VIEW_SIDE)
             .ok_or(PictureError::Unsupported)?;
-        return image::load_from_memory_with_format(&png, ImageFormat::Png)
-            .map_err(|_| PictureError::Unsupported);
+        return RgbaImage::from_raw(preview.width, preview.height, preview.pixels)
+            .map(DynamicImage::ImageRgba8)
+            .ok_or(PictureError::Unsupported);
     }
     let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()

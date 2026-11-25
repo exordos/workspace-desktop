@@ -1,5 +1,7 @@
 //! Показывает месяц по неделям и обрабатывает выбор календарного дня мышью или клавиатурой.
 
+use std::{cell::Cell, rc::Rc};
+
 use chrono::{Datelike, Months, NaiveDate, TimeDelta};
 use gpui::{
     Context, Div, FocusHandle, KeyDownEvent, Stateful, Transformation, Window, div, prelude::*, px,
@@ -51,6 +53,7 @@ pub struct DatePicker {
     previous: FocusHandle,    // Фокус стрелки предыдущего месяца.
     next: FocusHandle,        // Фокус стрелки следующего месяца.
     embedded: bool,           // Фон и отступы уже заданы общей карточкой.
+    month_offset: Option<Rc<Cell<i32>>>, // Смещение месяца при пересоздании панели просмотра.
 }
 
 impl gpui::EventEmitter<DatePickerChanged> for DatePicker {}
@@ -73,6 +76,7 @@ impl DatePicker {
             previous: cx.focus_handle(),
             next: cx.focus_handle(),
             embedded: false,
+            month_offset: None,
         }
     }
 
@@ -82,9 +86,24 @@ impl DatePicker {
         self
     }
 
+    /// Восстанавливает месяц просмотра и сохраняет его при переключении.
+    pub(super) fn with_month_offset(&mut self, offset: Rc<Cell<i32>>) {
+        if let Some(day) = shift_month(self.cursor, offset.get()) {
+            self.cursor = day;
+        }
+        self.month_offset = Some(offset);
+    }
+
     /// Возвращает календарный день для вызывающей формы.
     pub fn value(&self) -> Option<NaiveDate> {
         self.value
+    }
+
+    /// Переносит клавиатурный фокус в сетку на выбранный день.
+    pub(super) fn focus(&self, window: &mut Window) {
+        if self.selectable(self.cursor) {
+            window.focus(&self.grid_focus);
+        }
     }
 
     /// Отображает переданный формой день без отправки события обратно.
@@ -141,7 +160,7 @@ impl DatePicker {
 
     /// Возвращает доступный день в соседнем месяце.
     fn adjacent_month(&self, direction: i32) -> Option<NaiveDate> {
-        if self.options.mode != PickerMode::Editable || self.min > self.max {
+        if self.options.mode == PickerMode::Disabled || self.min > self.max {
             return None;
         }
         let target = shift_month(self.cursor, direction)?;
@@ -235,8 +254,29 @@ impl DatePicker {
         let Some(target) = target else {
             return button;
         };
-        let picker = cx.weak_entity();
         let title = self.options.language.tr(key);
+        if let Some(offset) = self.month_offset.clone() {
+            let keys = offset.clone();
+            return button
+                .track_focus(&focus.clone().tab_stop(true))
+                .tab_stop(true)
+                .cursor_pointer()
+                .hover(move |style| style.bg(palette.card_hover))
+                .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                    offset.set(offset.get().saturating_add(direction));
+                    cx.stop_propagation();
+                    window.refresh();
+                })
+                .on_key_down(move |event, window, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        keys.set(keys.get().saturating_add(direction));
+                        cx.stop_propagation();
+                        window.refresh();
+                    }
+                })
+                .tooltip(move |_, cx| popup::tooltip(palette, title.into(), cx));
+        }
+        let picker = cx.weak_entity();
         activate(
             button.hover(move |style| style.bg(palette.card_hover)),
             Some(focus),
@@ -273,12 +313,14 @@ impl DatePicker {
         let selected = Some(day) == self.value;
         let enabled = self.selectable(day);
         let muted = day.month() != self.cursor.month() || day.weekday().num_days_from_monday() >= 5;
-        let color = match (selected, enabled && !muted) {
+        let visible = enabled || self.options.mode == PickerMode::ReadOnly;
+        let color = match (selected, visible && !muted) {
             (true, _) => palette.on_accent,
             (false, true) => palette.text,
             (false, false) => palette.text_muted,
         };
         let marker = div()
+            .id("date-picker-marker")
             .w_full()
             .max_w(px(25.))
             .h(px(25.))
@@ -298,7 +340,11 @@ impl DatePicker {
                     gpui::transparent_black()
                 },
             )
-            .when(selected, |marker| marker.bg(palette.accent))
+            .when(selected, |marker| {
+                marker
+                    .bg(palette.accent)
+                    .debug_selector(|| "date-picker-selected-day".into())
+            })
             .child(label(palette, TextRole::Body, day.day().to_string()).text_color(color));
         let element = cell
             .id(("day", day.num_days_from_ce() as u64))
@@ -345,6 +391,7 @@ impl DatePicker {
             }));
         div()
             .id("date-picker-grid")
+            .debug_selector(|| "date-picker-grid".into())
             .when(self.selectable(self.cursor), |grid| {
                 grid.track_focus(&self.grid_focus)
                     .tab_stop(true)
@@ -373,24 +420,6 @@ impl Render for DatePicker {
         let palette = self.options.palette(window, cx);
         let language = self.options.language;
         let surface = if self.embedded { div() } else { card(palette) };
-        if self.options.mode == PickerMode::ReadOnly {
-            return surface.child(label(
-                palette,
-                TextRole::Heading,
-                self.value.map_or_else(
-                    || "—".into(),
-                    |day| {
-                        language.tr_with(
-                            "datePicker.selected",
-                            &[
-                                ("day", &day.day().to_string()),
-                                ("monthYear", &month_title(day, language)),
-                            ],
-                        )
-                    },
-                ),
-            ));
-        }
         surface.child(
             div()
                 .flex()

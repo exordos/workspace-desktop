@@ -76,6 +76,14 @@ pub(super) struct PasteImageRequested(pub(super) Arc<gpui::Image>); // Байт�
 
 impl EventEmitter<PasteImageRequested> for Editor {}
 
+/// Передаёт композеру файлы из буфера и текст для вставки при недоступной загрузке.
+pub(super) struct PasteFilesRequested {
+    pub(super) paths: Vec<std::path::PathBuf>, // Локальные пути из записей file URL.
+    pub(super) text: Option<String>,           // Текстовое представление того же содержимого.
+}
+
+impl EventEmitter<PasteFilesRequested> for Editor {}
+
 /// Черновик разговора и локальное состояние выделения. Индексы считаются в байтах UTF-8.
 pub struct Editor {
     version: u64,        // Меняется при каждом изменении текста, даже если его восстановили.
@@ -253,11 +261,12 @@ impl Editor {
             .references
             .markdown_range(&self.text, selection.clone());
         let (text, relative_selection) = format.edit(&selected, language);
-        let (visible, spans) = References::display_markup(&text, language);
+        let (visible, spans) = self.references.display_markup(&text, language);
+        let anchor = References::display_offset(&spans, relative_selection.start);
+        let caret = References::display_offset(&spans, relative_selection.end);
         let inserted = self.replace_with_spans(selection, &visible, spans, cx);
-        // Команды выбирают курсор или адрес после содержимого, а подписи меняют только его длину.
-        self.anchor = inserted.end - (text.len() - relative_selection.start);
-        self.caret = inserted.end - (text.len() - relative_selection.end);
+        self.anchor = inserted.start + anchor;
+        self.caret = inserted.start + caret;
     }
 
     /// Применяет выбранную комбинацию только в рабочем поле без активной композиции IME.
@@ -412,7 +421,7 @@ impl Editor {
             let copied = self.with_current_text(|| {
                 cx.write_to_clipboard(ClipboardItem::new_string(
                     self.references
-                        .markdown_range(&self.text, selection.clone()),
+                        .clipboard_range(&self.text, selection.clone()),
                 ))
             });
             if cut && copied.is_some() {
@@ -423,11 +432,20 @@ impl Editor {
 
     /// Вставляет обычный текст, приводя переводы строк из буфера к LF.
     fn paste(&mut self, cx: &mut Context<Self>) {
-        let Some(item) = cx.read_from_clipboard() else {
-            return;
-        };
+        let item = cx.read_from_clipboard();
+        if self.send_on_enter && !self.composing() {
+            let paths = crate::platform::clipboard::file_paths();
+            if !paths.is_empty() {
+                cx.emit(PasteFilesRequested {
+                    paths,
+                    text: item.and_then(|item| item.text()),
+                });
+                return;
+            }
+        }
+        let Some(item) = item else { return };
         if let Some(text) = item.text() {
-            self.paste_markup(&normalize_lines(&text), cx);
+            self.paste_clipboard_text(&text, cx);
         } else if self.send_on_enter
             && !self.composing()
             && let Some(image) = item.into_entries().find_map(|entry| match entry {
@@ -437,6 +455,11 @@ impl Editor {
         {
             cx.emit(PasteImageRequested(Arc::new(image)));
         }
+    }
+
+    /// Вставляет текстовую часть буфера штатной заменой ссылок и переводов строк.
+    pub(super) fn paste_clipboard_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.paste_markup(&normalize_lines(text), cx);
     }
 
     /// Ставится в позицию клика и начинает выделение перетаскиванием.

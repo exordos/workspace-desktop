@@ -7,6 +7,7 @@ mod creation;
 mod drafts;
 mod folders;
 mod fragments;
+mod history_read;
 mod key_lifecycle;
 mod key_service;
 mod message_actions;
@@ -14,6 +15,7 @@ pub(super) mod mutations;
 mod own_profile;
 mod protected_drafts;
 mod reactions;
+mod read_boundary;
 mod self_chat;
 pub(super) mod sidebar;
 mod sidebar_actions;
@@ -39,12 +41,12 @@ use crate::{
         PreparedSendBody,
     },
     sync::{AvatarUpdate, Event},
+    workspace_direct::WorkspaceRoute,
 };
 
 use super::catalog::CatalogCounts;
 use super::details::{DetailsError, SidebarChange, StreamNotificationMode, TopicNotificationMode};
 use super::history::OpenHistoryError;
-use super::read::ReadError;
 use super::send::{DirectSendError, MarkdownOrigin, SendError};
 use crate::storage::PreparedSend;
 
@@ -67,46 +69,6 @@ pub(super) struct RestClient {
 }
 
 impl RestClient {
-    /// Однократно отправляет отметку и проверяет адрес возвращённого сообщения.
-    pub(super) async fn read_up_to(
-        &self,
-        owner: &OwnerContext,
-        token: &str,
-        scope: HistoryScope,
-        message_id: Uuid,
-    ) -> Result<(), ReadError> {
-        let mut url = workspace_origin(owner).map_err(|_| ReadError::InvalidInput)?;
-        url.set_path(&format!(
-            "{MESSAGES_PATH}{message_id}/actions/read_up_to/invoke"
-        ));
-        let response = self
-            .send
-            .post(url)
-            .header(ACCEPT, "application/json")
-            .bearer_auth(token)
-            .send()
-            .await
-            .map_err(|_| ReadError::Unknown)?;
-        if response.status() != StatusCode::OK {
-            return Err(ReadError::Http(response.status().as_u16()));
-        }
-        let row: WireHistoryMessage = response.json().await.map_err(|_| ReadError::Unknown)?;
-        if row.uuid != message_id
-            || row.stream_uuid != scope.stream_id
-            || scope.topic_id.is_some_and(|topic| topic != row.topic_uuid)
-            || !matches_owner(owner, row.project_id.as_deref(), row.user_uuid.as_deref())
-            || HistoryTime::parse(&row.created_at).is_none()
-            || row
-                .updated_at
-                .as_deref()
-                .is_some_and(|time| HistoryTime::parse(time).is_none())
-            || row.payload.kind.is_empty()
-        {
-            return Err(ReadError::Unknown);
-        }
-        Ok(())
-    }
-
     /// Читает одно сообщение и принимает его только при совпадении владельца и маршрута.
     pub(super) async fn lookup_prepared(
         &self,
@@ -247,14 +209,26 @@ impl RestClient {
 
     /// Создаёт HTTPS-клиент с тайм-аутами и запретом перенаправлений.
     pub(super) fn new(private_ca: Option<&[u8]>) -> Result<Self, SourceError> {
+        Self::with_route(private_ca, &WorkspaceRoute::default())
+    }
+
+    /// Использует заданный маршрут для чтения и отправки по HTTPS.
+    pub(super) fn with_route(
+        private_ca: Option<&[u8]>,
+        route: &WorkspaceRoute,
+    ) -> Result<Self, SourceError> {
         Ok(Self {
-            read: Self::client(private_ca, false)?,
-            send: Self::client(private_ca, true)?,
+            read: Self::client(private_ca, false, route)?,
+            send: Self::client(private_ca, true, route)?,
         })
     }
 
     /// Настраивает TLS и при необходимости запрещает даже внутренние повторы транспорта.
-    fn client(private_ca: Option<&[u8]>, no_retry: bool) -> Result<Client, SourceError> {
+    fn client(
+        private_ca: Option<&[u8]>,
+        no_retry: bool,
+        route: &WorkspaceRoute,
+    ) -> Result<Client, SourceError> {
         let mut builder = Client::builder()
             .https_only(true)
             .redirect(Policy::none())
@@ -270,7 +244,10 @@ impl RestClient {
                 .tls_built_in_root_certs(false)
                 .add_root_certificate(certificate);
         }
-        let client = builder.build().map_err(|_| SourceError::Temporary)?;
+        let client = route
+            .messenger_https(builder)
+            .build()
+            .map_err(|_| SourceError::Temporary)?;
         Ok(client)
     }
 
@@ -1167,9 +1144,10 @@ pub(super) struct WireHistoryMessage {
     created_at: String,                     // Серверное время создания.
     updated_at: Option<String>,             // Серверное время последней правки.
     source_name: Option<String>,            // Серверный носитель сообщения, если он известен.
-    payload: WireMessageBody,               // Формат и содержимое сообщения.
-    reactions: Option<Value>,               // Число участников по ключу эмодзи.
-    reaction_users: Option<Value>,          // Полные списки участников небольших групп.
+    pub(super) read: Option<bool>, // Флаг чтения владельца. Старый снимок может его опускать.
+    payload: WireMessageBody,      // Формат и содержимое сообщения.
+    reactions: Option<Value>,      // Число участников по ключу эмодзи.
+    reaction_users: Option<Value>, // Полные списки участников небольших групп.
 }
 
 impl WireHistoryMessage {
@@ -1237,6 +1215,7 @@ impl WireHistoryMessage {
                 author_id: Some(self.author_uuid),
                 created_at,
                 updated_at,
+                native_source: self.source_name.as_deref().map(|name| name == "native"),
             },
             reactions: self
                 .reactions
@@ -1245,6 +1224,7 @@ impl WireHistoryMessage {
                     reactions::aggregate(counts, self.reaction_users.as_ref(), owner)
                 })
                 .unwrap_or_default(),
+            read: self.read,
         }))
     }
 }
@@ -1361,6 +1341,7 @@ impl WirePayload {
             author_id: self.author_uuid.as_deref().and_then(parse_uuid),
             created_at: HistoryTime::parse(self.created_at.as_deref()?)?,
             updated_at: self.updated_at.as_deref().and_then(HistoryTime::parse),
+            native_source: self.source_name.as_deref().map(|name| name == "native"),
         })
     }
 
@@ -1369,6 +1350,16 @@ impl WirePayload {
         Some(MessagePlacement {
             stream_id: parse_uuid(self.stream_uuid.as_deref()?)?.to_string(),
             topic_id: parse_uuid(self.topic_uuid.as_deref()?)?.to_string(),
+        })
+    }
+
+    /// Возвращает точный адрес чтения, если сервер передал его в событии сообщения.
+    fn read_scope(&self) -> Option<HistoryScope> {
+        let stream_id = self.stream_uuid.as_deref().and_then(parse_uuid)?;
+        let topic_id = self.topic_uuid.as_deref().and_then(parse_uuid)?;
+        (!stream_id.is_nil() && !topic_id.is_nil()).then_some(HistoryScope {
+            stream_id,
+            topic_id: Some(topic_id),
         })
     }
 }
@@ -1629,7 +1620,46 @@ pub(super) fn wire_event(
         ) {
             return Err(SourceError::InvalidResponse);
         }
-        return Ok((Event::ActivityRead(cursor), None));
+        let payload = &wire.payload;
+        let scope = payload.read_scope();
+        let (flags, revalidate) = if payload.kind == "message.read" {
+            let id = payload
+                .uuid
+                .as_deref()
+                .and_then(parse_uuid)
+                .filter(|id| !id.is_nil());
+            // Одинаковый формат у одиночной отметки и ответа на чтение до границы.
+            let revalidate = id.is_none() || payload.read.is_none() || payload.read == Some(true);
+            (id.zip(payload.read).into_iter().collect(), revalidate)
+        } else {
+            match value["payload"]["message_uuids"].as_array() {
+                Some(ids) => {
+                    let parsed = ids
+                        .iter()
+                        .map(|id| {
+                            id.as_str()
+                                .and_then(parse_uuid)
+                                .filter(|id| !id.is_nil())
+                                .map(|id| (id, true))
+                        })
+                        .collect::<Option<Vec<_>>>();
+                    match parsed {
+                        Some(parsed) => (parsed, false),
+                        None => (Vec::new(), true),
+                    }
+                }
+                None => (Vec::new(), true),
+            }
+        };
+        return Ok((
+            Event::HistoryRead {
+                cursor,
+                flags,
+                scope,
+                revalidate,
+            },
+            None,
+        ));
     }
     if wire.object_type == "message_reaction" {
         return Ok((
@@ -1737,24 +1767,36 @@ pub(super) fn wire_event(
         && matches!(wire.action.as_str(), "created" | "updated" | "read")
     {
         let payload = &wire.payload;
-        let (Some(total), Some(active), Some(passive)) = (
-            payload.unread_count,
-            payload.active_unread_count,
-            payload.passive_unread_count,
-        ) else {
-            return Ok((fallback_event(), None));
-        };
-        let Some(id) = payload.uuid.as_deref().and_then(parse_uuid) else {
+        let Some(id) = payload
+            .uuid
+            .as_deref()
+            .and_then(parse_uuid)
+            .filter(|id| !id.is_nil())
+        else {
             return Ok((fallback_event(), None));
         };
         let (stream_id, topic_id) = if wire.object_type == "topic" {
-            let Some(stream_id) = payload.stream_uuid.as_deref().and_then(parse_uuid) else {
+            let Some(stream_id) = payload
+                .stream_uuid
+                .as_deref()
+                .and_then(parse_uuid)
+                .filter(|id| !id.is_nil())
+            else {
                 return Ok((fallback_event(), None));
             };
             (stream_id, Some(id))
         } else {
             (id, None)
         };
+        let read_event = wire.action == "read";
+        let counts = payload.unread_count.zip(
+            payload
+                .active_unread_count
+                .zip(payload.passive_unread_count),
+        );
+        if !read_event && counts.is_none() {
+            return Ok((fallback_event(), None));
+        }
         if payload.kind.split_once('.') != Some((wire.object_type.as_str(), wire.action.as_str()))
             || !matches_owner(
                 owner,
@@ -1764,6 +1806,20 @@ pub(super) fn wire_event(
         {
             return Err(SourceError::InvalidResponse);
         }
+        let Some((total, (active, passive))) = counts else {
+            return Ok((
+                Event::HistoryRead {
+                    cursor,
+                    flags: Vec::new(),
+                    scope: Some(HistoryScope {
+                        stream_id,
+                        topic_id,
+                    }),
+                    revalidate: true,
+                },
+                None,
+            ));
+        };
         return Ok((
             Event::CatalogCountsChanged {
                 cursor,
@@ -1776,6 +1832,7 @@ pub(super) fn wire_event(
                 },
                 folder,
                 sidebar: sidebar_change.map(Box::new),
+                revalidate_read: read_event,
             },
             None,
         ));
@@ -1907,6 +1964,7 @@ pub(super) fn wire_event(
             message,
             placement,
             metadata,
+            read: payload.read,
         },
         incoming,
     ))
@@ -2176,6 +2234,7 @@ mod tests {
             decode_page(vec![message(20), update], &owner, &cursor(3)).unwrap(),
             [
                 Event::MessageCreated {
+                    read: None,
                     cursor: cursor(20),
                     message: Message {
                         id: "message-uuid".to_owned(),
@@ -2240,6 +2299,7 @@ mod tests {
             events,
             [
                 Event::MessageCreated {
+                    read: None,
                     cursor: cursor(1),
                     message: message.clone(),
                     placement: None,

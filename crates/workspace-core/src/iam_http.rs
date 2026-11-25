@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 use crate::{
     auth::{IamClient, IamError, IamProject, IamToken},
     context::OwnerContext,
+    workspace_direct::WorkspaceRoute,
 };
 
 const TOKEN_PATH: &str = "/api/core/v1/iam/clients/default/actions/get_token/invoke";
@@ -35,6 +36,7 @@ const BASE_SCOPE: &str = "openid email profile";
 #[derive(Default)]
 pub struct WorkspaceIamHttp {
     client: OnceLock<Client>, // Общий HTTP-клиент, который создаётся при первом запросе.
+    route: WorkspaceRoute,    // Маршрут HTTPS к серверу входа и обновления токена.
 }
 
 impl WorkspaceIamHttp {
@@ -43,16 +45,27 @@ impl WorkspaceIamHttp {
         Self::default()
     }
 
+    /// Использует тот же сетевой маршрут, что и мессенджер.
+    pub fn with_route(route: WorkspaceRoute) -> Self {
+        Self {
+            route,
+            ..Self::default()
+        }
+    }
+
     /// Создаёт или возвращает общий HTTPS-клиент с тайм-аутами и запретом перенаправлений.
     fn client(&self) -> Result<&Client, IamError> {
         if let Some(client) = self.client.get() {
             return Ok(client);
         }
-        let client = Client::builder()
+        let builder = Client::builder()
             .https_only(true)
             .redirect(Policy::none())
             .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(15));
+        let client = self
+            .route
+            .iam_https(builder)
             .build()
             .map_err(|_| IamError::Temporary)?;
         Ok(self.client.get_or_init(|| client))

@@ -110,6 +110,18 @@ pub fn has_protected_draft(markdown: &str) -> bool {
     markdown.contains(MARKER)
 }
 
+/// Возвращает диапазоны защищённого ввода, включая открытый фрагмент до конца черновика.
+pub fn protected_draft_spans(markdown: &str) -> impl Iterator<Item = Range<usize>> + '_ {
+    let mut markers = markdown.match_indices(MARKER);
+    std::iter::from_fn(move || {
+        let (start, _) = markers.next()?;
+        let end = markers
+            .next()
+            .map_or(markdown.len(), |(close, _)| close + MARKER.len());
+        Some(start..end)
+    })
+}
+
 /// Определяет зарезервированный адрес фрагмента, включая неверную или неизвестную версию.
 pub fn is_fragment_link(url: &str) -> bool {
     url.trim()
@@ -331,17 +343,16 @@ pub(super) fn seal_fragments(
 
 /// Разбирает парные маркеры слева направо и возвращает только занятые диапазоны.
 fn protected_ranges(markdown: &str) -> Result<Vec<(Range<usize>, &str)>, FragmentError> {
-    let mut markers = markdown.match_indices(MARKER);
-    let mut ranges = Vec::new();
-    while let Some((start, _)) = markers.next() {
-        let (close, _) = markers.next().ok_or(FragmentError::InvalidFragment)?;
-        let text = &markdown[start + MARKER.len()..close];
-        if text.trim().is_empty() {
-            return Err(FragmentError::InvalidFragment);
-        }
-        ranges.push((start..close + MARKER.len(), text));
-    }
-    Ok(ranges)
+    protected_draft_spans(markdown)
+        .map(|range| {
+            let text = markdown[range.clone()]
+                .strip_prefix(MARKER)
+                .and_then(|text| text.strip_suffix(MARKER))
+                .filter(|text| !text.trim().is_empty())
+                .ok_or(FragmentError::InvalidFragment)?;
+            Ok((range, text))
+        })
+        .collect()
 }
 
 /// Принимает только UUID с дефисами, как в ссылках Electron.
@@ -537,6 +548,24 @@ fn relocate_fenced_links(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Метки разбираются попарно, а открытый хвост считается чувствительным до отправки.
+    #[test]
+    fn protected_draft_spans_include_unclosed_tail() {
+        let draft = "Публично :::скрыто::: и :::не закончено";
+        let spans = protected_draft_spans(draft)
+            .map(|range| &draft[range])
+            .collect::<Vec<_>>();
+        assert_eq!(spans, [":::скрыто:::", ":::не закончено"]);
+        assert!(matches!(
+            protected_ranges(draft),
+            Err(FragmentError::InvalidFragment)
+        ));
+        assert_eq!(
+            protected_ranges("до :::текст::: после").unwrap()[0].1,
+            "текст"
+        );
+    }
 
     /// Использует короткий синтетический конверт для проверки лексики Markdown.
     const URN: &str = "urn:secret:v1:956f084e-8992-4334-a6de-fe84ac055e46:e70f0d95-6784-4125-8dfd-83eac755cecf:AQID";

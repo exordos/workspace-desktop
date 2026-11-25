@@ -255,6 +255,7 @@ mod tests {
         let [stream, topic, key, author] = [(); 4].map(|()| Uuid::new_v4());
         let rows =
             ["1970-01-01T00:00:02.321Z", "1970-01-01T00:00:04Z"].map(|time| HistoryMessage {
+                read: None,
                 reactions: Vec::new(),
                 id: Uuid::new_v4(),
                 stream_id: stream,
@@ -264,6 +265,7 @@ mod tests {
                     payload: KeyServicePayload::Announced { key_uuid: key },
                 },
                 metadata: HistoryMetadata {
+                    native_source: None,
                     author_id: Some(author),
                     created_at: HistoryTime::parse(time).unwrap(),
                     updated_at: None,
@@ -329,6 +331,7 @@ mod tests {
         };
         let rows = (1..=68)
             .map(|id| HistoryMessage {
+                read: None,
                 reactions: Vec::new(),
                 id: Uuid::from_u128(id),
                 stream_id: stream,
@@ -348,6 +351,7 @@ mod tests {
                     }),
                 },
                 metadata: HistoryMetadata {
+                    native_source: None,
                     author_id: Some(author),
                     created_at: HistoryTime::parse("2026-01-01T10:00:00Z").unwrap(),
                     updated_at: None,

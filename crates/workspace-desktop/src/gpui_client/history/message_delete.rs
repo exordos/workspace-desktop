@@ -71,6 +71,11 @@ enum Outcome {
 }
 
 impl MessageDelete {
+    /// Сообщает, перекрывает ли подтверждение часть видимой истории.
+    pub(super) fn is_open(&self) -> bool {
+        self.prompt.is_some()
+    }
+
     /// Закрывает локальную плашку и сохраняет цель операций, у которых ещё нет результата в истории.
     pub(super) fn clear(&mut self) {
         self.prompt = None;
@@ -454,12 +459,14 @@ mod tests {
     fn deletion_target_belongs_to_the_owner_and_open_scope() {
         let author = Uuid::from_u128(1);
         let mut row = HistoryMessage {
+            read: None,
             id: Uuid::from_u128(2),
             stream_id: Uuid::from_u128(3),
             topic_id: Uuid::from_u128(4),
             body: MessageBody::Markdown("Текст".into()),
             reactions: Vec::new(),
             metadata: HistoryMetadata {
+                native_source: None,
                 author_id: Some(author),
                 created_at: HistoryTime::parse("2026-01-01T00:00:00Z").unwrap(),
                 updated_at: None,

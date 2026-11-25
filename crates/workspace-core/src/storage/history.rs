@@ -17,6 +17,10 @@ use crate::{
     },
 };
 
+mod read;
+pub(crate) use read::{HistoryReadFence, HistoryReadGuard, HistoryReadRow};
+pub(super) use read::{apply_read_event, forget_read, reset_read, write_read};
+
 const MEDIA_PROJECTION_CONFLICT: i64 = 1;
 const MEDIA_PROJECTION_CURRENT: i64 = 4;
 
@@ -88,6 +92,7 @@ pub struct HistoryMetadata {
     pub author_id: Option<Uuid>,         // Автор, если сервер передал UUID.
     pub created_at: HistoryTime,         // Время создания для сортировки.
     pub updated_at: Option<HistoryTime>, // Время правки, если оно известно.
+    pub native_source: Option<bool>, // Сервер подтвердил источник Workspace. None у старого кэша.
 }
 
 /// Один серверный счётчик реакций и известные участники группы.
@@ -108,16 +113,24 @@ pub struct HistoryMessage {
     pub body: MessageBody,               // Открытый Markdown или зашифрованный конверт.
     pub metadata: HistoryMetadata,       // Автор и серверное время.
     pub reactions: Vec<MessageReaction>, // Счётчики и выбранные реакции владельца.
+    pub read: Option<bool>, // Флаг текущего пользователя. None, если сервер его ещё не передал.
 }
 
 impl HistoryMessage {
+    /// Разрешает автоотметку для подтверждённого сообщения Workspace в обычном формате.
+    pub fn read_eligible(&self) -> bool {
+        self.metadata.native_source == Some(true) && matches!(self.body, MessageBody::Markdown(_))
+    }
+
     /// Сверяет адрес, автора, время и тело сообщения для цитирования или правки.
     pub fn same_content(&self, other: &Self) -> bool {
         self.id == other.id
             && self.stream_id == other.stream_id
             && self.topic_id == other.topic_id
             && self.body == other.body
-            && self.metadata == other.metadata
+            && self.metadata.author_id == other.metadata.author_id
+            && self.metadata.created_at == other.metadata.created_at
+            && self.metadata.updated_at == other.metadata.updated_at
     }
 }
 
@@ -311,6 +324,7 @@ pub(super) fn initialize(connection: &Connection) -> Result<(), StorageError> {
             "ALTER TABLE sync_messages ADD COLUMN reactions_revision INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
+    read::init(connection)?;
     connection.execute_batch(
         "CREATE INDEX IF NOT EXISTS history_messages_stream_order
             ON sync_messages(account_id, server, organization_id, project_id, user_id, stream_id, created_at, message_id);
@@ -1278,22 +1292,26 @@ fn save_snapshot(
     connection.execute(
         "INSERT INTO sync_messages (account_id, server, organization_id, project_id, user_id,
             message_id, text, stream_id, topic_id, author_id, created_at, updated_at, encryption_key_id,
-            key_service_payload, key_service_canonical_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            key_service_payload, key_service_canonical_id, native_source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
          ON CONFLICT (account_id, server, organization_id, project_id, user_id, message_id) DO UPDATE SET
             text = excluded.text, stream_id = excluded.stream_id, topic_id = excluded.topic_id,
             author_id = COALESCE(excluded.author_id, sync_messages.author_id), created_at = excluded.created_at,
             updated_at = COALESCE(excluded.updated_at, sync_messages.updated_at),
             encryption_key_id = excluded.encryption_key_id, key_service_payload = excluded.key_service_payload,
+            native_source = COALESCE(excluded.native_source, sync_messages.native_source),
             key_service_canonical_id = CASE WHEN excluded.key_service_payload IS NULL THEN NULL
                 ELSE COALESCE(excluded.key_service_canonical_id, sync_messages.key_service_canonical_id) END",
         params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id,
             id, body, stream, message.topic_id.to_string(), message.metadata.author_id.map(|id| id.to_string()),
             message.metadata.created_at.0, message.metadata.updated_at.as_ref().map(|time| &time.0), key_id,
-            service, canonical],
+            service, canonical, message.metadata.native_source],
     )?;
     if let Some(guard) = reaction_guard {
         write_reactions(connection, owner, &id, &message.reactions, revision, guard)?;
+        if let Some(read) = message.read {
+            write_read(connection, owner, message.id, read, revision, Some(guard))?;
+        }
     }
     record_revision(connection, owner, &id, revision, false, Some(cursor))?;
     mark_media_indexed(connection, owner, &id)
@@ -1307,8 +1325,9 @@ fn read_members(
 ) -> Result<Vec<HistoryMessage>, StorageError> {
     let mut query = connection.prepare(
         "SELECT message_id, stream_id, topic_id, text, author_id, created_at, updated_at, encryption_key_id,
-                key_service_payload, key_service_canonical_id, reactions_json
+                key_service_payload, key_service_canonical_id, reactions_json, native_source, is_read
          FROM history_members JOIN sync_messages USING (account_id, server, organization_id, project_id, user_id, message_id)
+         LEFT JOIN history_read_flags USING (account_id, server, organization_id, project_id, user_id, message_id)
          WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3 AND project_id = ?4 AND user_id = ?5
            AND window_id = ?6 ORDER BY created_at, message_id",
     )?;
@@ -1336,6 +1355,8 @@ struct HistoryRecord {
     created: String,                 // Нормализованное время создания.
     updated: Option<String>,         // Нормализованное время последней правки.
     reactions: Vec<MessageReaction>, // Сохранённые группы реакций.
+    native_source: Option<bool>,     // Подтверждённый тип источника.
+    read: Option<bool>,              // Последний известный флаг чтения.
 }
 
 impl TryFrom<HistoryRecord> for HistoryMessage {
@@ -1354,8 +1375,10 @@ impl TryFrom<HistoryRecord> for HistoryMessage {
                 author_id: record.author.as_deref().map(parse).transpose()?,
                 created_at: HistoryTime(record.created),
                 updated_at: record.updated.map(HistoryTime),
+                native_source: record.native_source,
             },
             reactions: record.reactions,
+            read: record.read,
         })
     }
 }
@@ -1371,6 +1394,8 @@ fn history_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryRecord> {
         created: row.get(5)?,
         updated: row.get(6)?,
         reactions: read_reactions_column(row, 10)?,
+        native_source: row.get(11)?,
+        read: row.get(12)?,
     })
 }
 
@@ -1574,8 +1599,9 @@ fn history_message(
 ) -> Result<Option<HistoryMessage>, StorageError> {
     let current = connection.query_row(
         "SELECT message_id, stream_id, topic_id, text, author_id, created_at, updated_at, encryption_key_id,
-                key_service_payload, key_service_canonical_id, reactions_json
-         FROM sync_messages WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
+                key_service_payload, key_service_canonical_id, reactions_json, native_source, is_read
+         FROM sync_messages LEFT JOIN history_read_flags USING (account_id, server, organization_id, project_id, user_id, message_id)
+         WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
            AND project_id = ?4 AND user_id = ?5 AND message_id = ?6
            AND stream_id IS NOT NULL AND topic_id IS NOT NULL AND created_at IS NOT NULL",
         params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id, id.to_string()],
@@ -1597,8 +1623,8 @@ pub(super) fn latest_catalog_message(
     };
     let mut query = connection.prepare_cached(&format!(
         "SELECT message_id, stream_id, topic_id, text, author_id, created_at, updated_at, encryption_key_id,
-                key_service_payload, key_service_canonical_id, reactions_json
-         FROM sync_messages
+                key_service_payload, key_service_canonical_id, reactions_json, native_source, is_read
+         FROM sync_messages LEFT JOIN history_read_flags USING (account_id, server, organization_id, project_id, user_id, message_id)
          WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3 AND project_id = ?4
            AND user_id = ?5 AND stream_id = ?6 AND created_at IS NOT NULL AND {topic_filter}
          ORDER BY created_at DESC, message_id DESC"
@@ -1683,6 +1709,7 @@ fn encrypted_edit_version(
 /// Удаляет окна и отметки владельца при сбросе источника. Старые запросы теряют право записи.
 pub(super) fn reset(connection: &Connection, owner: &OwnerContext) -> Result<(), StorageError> {
     advance(connection, owner, true)?;
+    reset_read(connection, owner)?;
     for table in ["history_windows", "history_changes"] {
         connection.execute(
             &format!(
@@ -1702,11 +1729,11 @@ pub(super) fn record_creation(
     message: &Message,
     placement: Option<&super::MessagePlacement>,
     metadata: Option<&HistoryMetadata>,
-) -> Result<(), StorageError> {
+) -> Result<i64, StorageError> {
     let revision = advance(connection, owner, false)?;
     record_revision(connection, owner, &message.id, revision, false, None)?;
     let (Some(address), Some(metadata)) = (placement, metadata) else {
-        return Ok(());
+        return Ok(revision);
     };
     // Событие вне диапазона не доказывает непрерывность. Но прежний конец больше не актуален.
     connection.execute(
@@ -1726,7 +1753,7 @@ pub(super) fn record_creation(
         params![owner.account_id.0, owner.server, owner.organization_id, owner.project_id, owner.user_id,
             message.id, address.stream_id, address.topic_id, metadata.created_at.0],
     )?;
-    Ok(())
+    Ok(revision)
 }
 
 /// Как сохранённое событие должно повлиять на тело и наблюдателей строки.
@@ -1988,7 +2015,7 @@ mod tests {
     use super::*;
     use crate::{
         context::AccountId,
-        storage::{EventWrite, HistoryChange, MessagePlacement, PreparedSendBody},
+        storage::{EventReadMarks, EventWrite, HistoryChange, MessagePlacement, PreparedSendBody},
     };
 
     /// Создаёт независимый ключ для тестового аккаунта.
@@ -2020,12 +2047,14 @@ mod tests {
     /// Создаёт сообщение с заданным серверным временем.
     fn message(scope: HistoryScope, id: u128, timestamp: &str) -> HistoryMessage {
         HistoryMessage {
+            read: None,
             reactions: Vec::new(),
             id: Uuid::from_u128(id),
             stream_id: scope.stream_id,
             topic_id: scope.topic_id.unwrap(),
             body: MessageBody::Markdown(format!("текст {id}")),
             metadata: HistoryMetadata {
+                native_source: None,
                 author_id: Some(Uuid::from_u128(3)),
                 created_at: HistoryTime::parse(timestamp).unwrap(),
                 updated_at: None,
@@ -2059,6 +2088,217 @@ mod tests {
             panic!("новое окно должно сохраниться")
         };
         id
+    }
+
+    /// Запоздалая страница и сверка не отменяют точный флаг из более свежего события.
+    #[test]
+    fn history_read_exact_events_protect_against_late_snapshots() {
+        let storage = Storage::in_memory().unwrap();
+        let owner = owner("a");
+        let (_, topic) = scopes();
+        let first = message(topic, 10, "2026-01-01T10:00:00Z");
+        let mut second = message(topic, 11, "2026-01-01T10:00:00Z");
+        second.read = Some(false);
+        let mut late = message(topic, 12, "2026-01-01T10:00:00Z");
+        late.read = Some(false);
+        let rows = [first.clone(), second.clone()];
+        let window_id = new_window(&storage, &owner, topic, &rows);
+        let before = storage
+            .prepare_history_page(&owner, topic, HistoryPageTarget::New)
+            .unwrap()
+            .unwrap();
+        let (refresh, _) = storage
+            .prepare_history_read(&owner, topic, window_id, Some(topic))
+            .unwrap()
+            .unwrap();
+        let cursor = Cursor {
+            epoch_generation: "read-test".into(),
+            epoch_version: 1,
+        };
+        let flags = [(second.id, true), (late.id, true)];
+        let applied = storage
+            .apply(
+                &owner,
+                SOURCE_ID,
+                &cursor,
+                EventWrite {
+                    read_marks: Some(EventReadMarks {
+                        flags: &flags,
+                        scope: Some(topic),
+                    }),
+                    ..EventWrite::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(applied.read_scopes, [topic]);
+        let outcome = storage
+            .save_history_page(
+                &owner,
+                before,
+                &[first.clone(), second.clone(), late],
+                HistoryPageEdges::New {
+                    older: HistoryEdge::End,
+                    newer: HistoryEdge::End,
+                },
+            )
+            .unwrap();
+        let HistoryPageOutcome::Saved(late_window_id) = outcome else {
+            panic!("флаги чтения не меняют границы загруженной страницы");
+        };
+        let late_window = storage
+            .history_window(&owner, topic, late_window_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(late_window.messages[2].read, Some(true));
+        assert!(
+            storage
+                .save_history_read(
+                    &owner,
+                    refresh,
+                    &[HistoryReadRow {
+                        id: second.id,
+                        scope: topic,
+                        created_at: second.metadata.created_at.clone(),
+                        read: Some(false),
+                    }]
+                )
+                .unwrap()
+                .is_none()
+        );
+        let window = storage
+            .history_window(&owner, topic, window_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(window.messages[0], first);
+        assert_eq!(window.messages[1].read, Some(true));
+        assert_eq!(window.messages[1].body, second.body);
+        assert_eq!(window.newer, HistoryEdge::More("newer".into()));
+
+        let flags = [(second.id, false)];
+        let explicit_unread = || EventWrite {
+            read_marks: Some(EventReadMarks {
+                flags: &flags,
+                scope: Some(topic),
+            }),
+            ..EventWrite::default()
+        };
+        assert_eq!(
+            storage
+                .apply(&owner, SOURCE_ID, &cursor, explicit_unread())
+                .unwrap()
+                .outcome,
+            super::super::ApplyOutcome::Duplicate,
+        );
+        storage
+            .apply(
+                &owner,
+                SOURCE_ID,
+                &Cursor {
+                    epoch_version: 2,
+                    ..cursor
+                },
+                explicit_unread(),
+            )
+            .unwrap();
+        let window = storage
+            .history_window(&owner, topic, window_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(window.messages[1].read, Some(false));
+    }
+
+    /// Совпавший с кэшем свежий ответ защищает его от запоздалого противоположного флага.
+    #[test]
+    fn history_read_matching_refresh_still_fences_an_older_answer() {
+        let storage = Storage::in_memory().unwrap();
+        let owner = owner("a");
+        let (_, topic) = scopes();
+        let mut row = message(topic, 10, "2026-01-01T10:00:00Z");
+        row.read = Some(false);
+        let window_id = new_window(&storage, &owner, topic, std::slice::from_ref(&row));
+        let prepare = || {
+            storage
+                .prepare_history_read(&owner, topic, window_id, Some(topic))
+                .unwrap()
+                .unwrap()
+                .0
+        };
+        let response = |read| HistoryReadRow {
+            id: row.id,
+            scope: topic,
+            created_at: row.metadata.created_at.clone(),
+            read: Some(read),
+        };
+        let older = prepare();
+        let newer = prepare();
+        assert!(
+            storage
+                .save_history_read(&owner, newer, &[response(false)])
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .save_history_read(&owner, older, &[response(true)])
+                .unwrap()
+                .is_none()
+        );
+        let window = storage
+            .history_window(&owner, topic, window_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(window.messages[0].read, Some(false));
+    }
+
+    /// Подтверждённая граница соблюдает порядок UUID с одинаковым временем и не затрагивает соседнюю тему.
+    #[test]
+    fn history_read_boundary_stays_inside_topic_and_order() {
+        let storage = Storage::in_memory().unwrap();
+        let owner = owner("a");
+        let (stream, topic) = scopes();
+        let other_topic = HistoryScope {
+            topic_id: Some(Uuid::from_u128(4)),
+            ..stream
+        };
+        let mut rows = [
+            message(topic, 10, "2026-01-01T10:00:00Z"),
+            message(other_topic, 11, "2026-01-01T10:00:00Z"),
+            message(topic, 12, "2026-01-01T10:00:00Z"),
+            message(topic, 13, "2026-01-01T10:00:00Z"),
+        ];
+        for row in &mut rows {
+            row.metadata.native_source = Some(true);
+            row.read = Some(false);
+        }
+        let window_id = new_window(&storage, &owner, stream, &rows);
+        let before = storage.history_read_revision(&owner).unwrap();
+        // Снимок прежних флагов может прийти уже после начала серверной отметки.
+        new_window(&storage, &owner, stream, &rows);
+        let boundary = &rows[2];
+        assert!(
+            storage
+                .confirm_history_read(
+                    &owner,
+                    topic,
+                    boundary.id,
+                    &boundary.metadata.created_at,
+                    before,
+                )
+                .unwrap()
+        );
+        let window = storage
+            .history_window(&owner, stream, window_id)
+            .unwrap()
+            .unwrap();
+        let flags: Vec<_> = window.messages.iter().map(|message| message.read).collect();
+        assert_eq!(flags, [Some(true), Some(false), Some(true), Some(false)]);
+        assert!(
+            window
+                .messages
+                .iter()
+                .zip(&rows)
+                .all(|(stored, row)| stored.same_content(row))
+        );
     }
 
     /// Проверяет добавление, дубль журнала и абсолютный счётчик без инвалидации тела.
@@ -2527,7 +2767,9 @@ mod tests {
             .unwrap();
         assert_eq!(links, ["https://example.test/guide"]);
         let stored_file: String = db
-            .query_row("SELECT file FROM messenger_media_refs", [], |row| row.get(0))
+            .query_row("SELECT file FROM messenger_media_refs", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(stored_file, file.to_string());
         assert_eq!(

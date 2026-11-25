@@ -238,7 +238,7 @@ impl MessengerSource {
     }
 
     /// Перечитывает режим и актуальное поколение при каждой проверке композера или отправке.
-    async fn resolve_encrypted_send(
+    pub(super) async fn resolve_encrypted_send(
         &self,
         sync: &Sync,
         profile: &ChatEncryption,

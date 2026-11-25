@@ -118,7 +118,7 @@ fn migrates_profile_without_draft_timestamps() {
         storage.save_plaintext_draft(&access, &saved).unwrap();
     }
     let old = rusqlite::Connection::open(&path).unwrap();
-    old.execute_batch("ALTER TABLE messenger_drafts DROP COLUMN updated_at")
+    old.execute_batch("ALTER TABLE messenger_drafts DROP COLUMN updated_at; ALTER TABLE messenger_drafts DROP COLUMN write_order")
         .unwrap();
     drop(old);
 

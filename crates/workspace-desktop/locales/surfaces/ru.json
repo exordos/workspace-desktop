@@ -110,7 +110,9 @@
     },
     "general": {
       "saveFailed": "Не удалось сохранить настройки",
-      "separateCallWindow": "Открывать звонки в отдельном окне"
+      "separateCallWindow": "Открывать звонки в отдельном окне",
+      "workspaceDirect": "Подключаться к Workspace напрямую",
+      "workspaceDirectHint": "Трафик Workspace пойдёт через Wi-Fi или Ethernet. Применяется после перезапуска приложения."
     },
     "nav": {
       "chats": "Чаты",

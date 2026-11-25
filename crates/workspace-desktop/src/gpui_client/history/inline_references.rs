@@ -3,8 +3,9 @@
 use std::{ops::Range, rc::Rc, sync::Arc};
 
 use gpui::{
-    Div, ElementId, HighlightStyle, InteractiveText, MouseButton, SharedString, Stateful,
-    StyledText, TextLayout, UnderlineStyle, WeakEntity, prelude::*, px,
+    BorderStyle, Bounds, Corners, Div, Edges, ElementId, HighlightStyle, InteractiveText,
+    MouseButton, Pixels, SharedString, Size, Stateful, StyledText, TextLayout, UnderlineStyle,
+    WeakEntity, canvas, point, prelude::*, px, quad,
 };
 use uuid::Uuid;
 use workspace_core::messenger::{
@@ -24,9 +25,15 @@ use super::{
 };
 use crate::gpui_client::{
     preferences::Language,
-    ui::{Palette, TextRole, popup::tooltip, text_role},
+    ui::{Icon, Palette, TextRole, popup::tooltip, text_role},
 };
 use crate::platform::message_time::{format_local_time, format_local_time_zone};
+
+// Пробелы резервируют ширину часов и заметный отступ до подписи.
+const TIME_CHIP_LEADING: &str = "\u{2003}\u{2002}\u{2002}\u{2009}";
+const TIME_CHIP_TRAILING: &str = "\u{2002}";
+pub(super) const TIME_CHIP_RADIUS: Pixels = px(5.);
+pub(super) const TIME_CHIP_ICON: Pixels = px(14.);
 
 /// Часть сообщения со ссылками, разобранная при принятии снимка истории.
 #[derive(Eq, PartialEq)]
@@ -245,7 +252,7 @@ impl InlineText {
 
     /// Берёт короткий видимый текст для цитаты и сохраняет локаль получателя.
     pub(super) fn visible(&self, language: Language) -> String {
-        self.compose(language, |_| None).0
+        self.compose(language, |_| None, false).0
     }
 
     /// Заменяет ссылочные конструкции подписями и запоминает позиции в видимом тексте.
@@ -253,6 +260,7 @@ impl InlineText {
         &self,
         language: Language,
         member_name: impl Fn(Uuid) -> Option<String>,
+        time_chips: bool,
     ) -> (String, Vec<VisibleReference>) {
         let mut visible = String::new();
         let mut targets = Vec::new();
@@ -263,7 +271,15 @@ impl InlineText {
             }
             visible.push_str(&self.source[cursor..link.range.start]);
             let start = visible.len();
+            let reserved = time_chips && matches!(link.target, Some(Target::Time(_)));
+            if reserved {
+                // Левый отступ резервирует место для часов в общей раскладке GPUI.
+                visible.push_str(TIME_CHIP_LEADING);
+            }
             visible.push_str(&link.caption(language, &member_name));
+            if reserved {
+                visible.push_str(TIME_CHIP_TRAILING);
+            }
             targets.push(VisibleReference {
                 original: link.range.clone(),
                 display: start..visible.len(),
@@ -286,7 +302,7 @@ impl InlineText {
             names,
             selection,
         } = input;
-        let (visible, targets) = self.compose(language, |user| names.get(user));
+        let (visible, targets) = self.compose(language, |user| names.get(user), true);
         let visible = SharedString::from(visible);
         let selection_range = selection.as_ref().and_then(|selection| {
             let range = selection.controls.source_range(
@@ -299,7 +315,7 @@ impl InlineText {
         let styled = StyledText::new(visible.clone()).with_highlights(highlight_ranges(
             &targets,
             palette,
-            selection_range,
+            selection_range.clone(),
         ));
         let layout = styled.layout().clone();
         let targets = Rc::new(targets);
@@ -323,6 +339,24 @@ impl InlineText {
             .min_w_0()
             .max_w_full()
             .debug_selector(move || debug_id.clone());
+        let chip_ranges: Vec<_> = targets
+            .iter()
+            .filter(|link| matches!(link.target, Some(Target::Time(_))))
+            .map(|link| link.display.clone())
+            .collect();
+        if !chip_ranges.is_empty() {
+            text = text
+                .relative()
+                // InteractiveText перерисовывает переходы между знаками. При выходе за весь текст это делает обёртка.
+                .on_hover(|_, window, _| window.refresh())
+                .child(time_chip_backgrounds(
+                    layout.clone(),
+                    visible.clone(),
+                    chip_ranges,
+                    selection_range,
+                    palette,
+                ));
+        }
         if let Some(selection) = &selection {
             let controls = selection.controls.clone();
             let body = selection.body.clone();
@@ -406,6 +440,112 @@ impl InlineText {
     }
 }
 
+/// Рисует подложки и часы под глифами после того, как GPUI разложил текст по строкам.
+fn time_chip_backgrounds(
+    layout: TextLayout,
+    text: SharedString,
+    ranges: Vec<Range<usize>>,
+    selection: Option<Range<usize>>,
+    palette: Palette,
+) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |_, (), window, cx| {
+            let hovered = layout.index_for_position(window.mouse_position()).ok();
+            for range in &ranges {
+                let background = if selection
+                    .as_ref()
+                    .is_some_and(|span| span.contains(&range.start))
+                {
+                    palette.accent_soft
+                } else if hovered.is_some_and(|index| range.contains(&index)) {
+                    palette.card_hover
+                } else {
+                    palette.surface
+                };
+                for (bounds, show_clock) in time_chip_bounds(&layout, &text, range) {
+                    window.paint_quad(quad(
+                        bounds,
+                        Corners::all(TIME_CHIP_RADIUS),
+                        background,
+                        Edges::all(px(1.)),
+                        palette.border,
+                        BorderStyle::default(),
+                    ));
+                    if show_clock && bounds.size.width >= TIME_CHIP_ICON + px(2.) {
+                        let icon = Bounds::new(
+                            point(
+                                bounds.left() + px(5.),
+                                bounds.center().y - TIME_CHIP_ICON / 2.,
+                            ),
+                            Size::new(TIME_CHIP_ICON, TIME_CHIP_ICON),
+                        );
+                        let _ = window.paint_svg(
+                            icon,
+                            Icon::MessageTime.path().into(),
+                            Default::default(),
+                            palette.text,
+                            cx,
+                        );
+                    }
+                }
+            }
+        },
+    )
+    .absolute()
+    .inset_0()
+}
+
+/// Пересекает байты плашки с переносами GPUI, чтобы фон не заходил на соседний текст.
+fn time_chip_bounds(
+    layout: &TextLayout,
+    text: &str,
+    range: &Range<usize>,
+) -> Vec<(Bounds<Pixels>, bool)> {
+    let Some(line) = layout.line_layout_for_index(range.start) else {
+        return Vec::new();
+    };
+    let start = text[..range.start]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let Some(origin) = layout.position_for_index(start) else {
+        return Vec::new();
+    };
+    let height = layout.line_height();
+    let chip = range.start - start..range.end - start;
+    let unwrapped = &line.unwrapped_layout;
+    let ends = line
+        .wrap_boundaries()
+        .iter()
+        .map(|boundary| unwrapped.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index)
+        .chain([line.len()]);
+    let mut bounds = Vec::new();
+    let mut start = 0;
+    for (row, end) in ends.enumerate() {
+        let from = chip.start.max(start);
+        let to = chip.end.min(end);
+        // Если узкая строка вмещает лишь отступ, начинаем рисовать с самой подписи.
+        if from < to
+            && to > chip.start + TIME_CHIP_LEADING.len()
+            && from < chip.end - TIME_CHIP_TRAILING.len()
+        {
+            let row_left = unwrapped.x_for_index(start);
+            let left = unwrapped.x_for_index(from);
+            let right = unwrapped.x_for_index(to);
+            let bounds_for_row = Bounds::new(
+                point(origin.x + left - row_left, origin.y + height * row + px(1.)),
+                Size::new(right - left, height - px(2.)),
+            );
+            bounds.push((bounds_for_row, from == chip.start));
+        }
+        if chip.end <= end {
+            break;
+        }
+        start = end;
+    }
+    bounds
+}
+
 /// Возвращает исходный байт у курсора. Выделение включает ссылку целиком либо оставляет её снаружи.
 fn original_position(targets: &[VisibleReference], shown: usize) -> usize {
     map_position(targets, shown, |link| (&link.display, &link.original))
@@ -476,7 +616,8 @@ fn highlight_ranges(
             let mut style = link
                 .map(|target| link_style(target, palette))
                 .unwrap_or_default();
-            style.background_color = selected.then_some(palette.accent_soft);
+            style.background_color =
+                (selected && !matches!(link, Some(Target::Time(_)))).then_some(palette.accent_soft);
             styles.push((start..end, style));
         }
     }
@@ -486,7 +627,11 @@ fn highlight_ranges(
 /// Помечает ссылку цветом и подчёркиванием в рамках одной роли текста.
 fn link_style(target: &Target, palette: Palette) -> HighlightStyle {
     HighlightStyle {
-        color: Some(palette.accent),
+        color: Some(if matches!(target, Target::Time(_)) {
+            palette.text
+        } else {
+            palette.accent
+        }),
         underline: (!matches!(target, Target::User { .. } | Target::Time(_))).then_some(
             UnderlineStyle {
                 thickness: px(1.),
@@ -510,9 +655,11 @@ mod tests {
         );
         let links = open_references(&source);
         let inline = InlineText::new(SharedString::from(source.clone()), 0, &links).unwrap();
-        let (shown, targets) = inline.compose(Language::Ru, |id| {
-            (id == Uuid::from_u128(6)).then(|| "Из каталога".into())
-        });
+        let (shown, targets) = inline.compose(
+            Language::Ru,
+            |id| (id == Uuid::from_u128(6)).then(|| "Из каталога".into()),
+            false,
+        );
         assert_eq!(shown, "До @Аня и Борис @Из каталога сайт битая после");
         assert_eq!(
             targets
@@ -531,6 +678,85 @@ mod tests {
                 ..original_position(&targets, mention.display.end)],
             format!("[Аня](urn:user:{id})")
         );
+    }
+
+    /// Резервирует часы только в истории и оставляет кликабельной всю плашку.
+    #[test]
+    fn time_chip_preserves_source_ranges_and_plain_preview() {
+        let source = "До urn:time:2026-10-13T10:02:00Z после";
+        let inline = InlineText::new(source.into(), 0, &open_references(source)).unwrap();
+        let (shown, targets) = inline.compose(Language::Ru, |_| None, true);
+        let chip = &targets[0];
+        let chip_text = &shown[chip.display.clone()];
+        assert!(chip_text.starts_with(TIME_CHIP_LEADING));
+        assert!(chip_text.ends_with(TIME_CHIP_TRAILING));
+        assert!(matches!(chip.target, Some(Target::Time(_))));
+        assert_eq!(
+            inline.visible(Language::Ru),
+            format!("До {} после", chip_text.trim())
+        );
+        assert_eq!(
+            original_position(&targets, chip.display.start),
+            chip.original.start
+        );
+        assert_eq!(
+            original_position(&targets, chip.display.end),
+            chip.original.end
+        );
+    }
+
+    #[cfg(feature = "gpui-test")]
+    /// Раскладывает длинную дату в реальном узком тексте и оставляет часы у первого слова.
+    #[gpui::test]
+    fn wrapped_time_chip_keeps_one_clock_with_its_caption(cx: &mut gpui::TestAppContext) {
+        /// Одна строка истории в узкой колонке для измерения плашки.
+        struct NarrowBubble {
+            inline: InlineText,         // Исходный текст с абсолютным временем.
+            layout: Option<TextLayout>, // Раскладка GPUI из видимого кадра.
+        }
+
+        impl Render for NarrowBubble {
+            /// Выводит бабл на том же пути, что и история.
+            fn render(
+                &mut self,
+                window: &mut gpui::Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                let (inline, layout) = self.inline.render(InlineRender {
+                    id: "narrow-time-chip".into(),
+                    row: Uuid::nil(),
+                    palette: Palette::for_window(window, cx),
+                    language: Language::En,
+                    conversation: None,
+                    names: &MentionNames::default(),
+                    selection: None,
+                });
+                self.layout = Some(layout);
+                gpui::div().w(px(100.)).child(inline)
+            }
+        }
+
+        let source = "Before\nA urn:time:2026-10-13T10:02:45Z after";
+        let (bubble, ui) = cx.add_window_view(|_, _| NarrowBubble {
+            inline: InlineText::new(source.into(), 0, &open_references(source)).unwrap(),
+            layout: None,
+        });
+        ui.read(|app| {
+            let bubble = bubble.read(app);
+            let (shown, targets) = bubble.inline.compose(Language::En, |_| None, true);
+            let layout = bubble.layout.as_ref().unwrap();
+            let chip = time_chip_bounds(layout, &shown, &targets[0].display);
+            assert!(chip.len() > 1, "дата занимает несколько строк");
+            assert!(chip[0].1, "часы помещаются вместе с первым словом даты");
+            let caption = layout
+                .position_for_index(targets[0].display.start + TIME_CHIP_LEADING.len())
+                .expect("начало подписи");
+            let gap = caption.x - (chip[0].0.left() + px(5.) + TIME_CHIP_ICON);
+            assert!(gap >= px(4.), "отступ после часов: {gap:?}");
+
+            assert!(chip[1..].iter().all(|(_, clock)| !clock));
+            assert!(chip[0].0.top() > layout.bounds().top());
+        });
     }
 
     /// Оставляет код и экранированное время в исходном Markdown, переводя только видимый момент.

@@ -211,6 +211,7 @@ impl ActivityMessages {
             SyncChange::HistoryMessageCreated { .. }
             | SyncChange::HistoryMessageChanged { .. }
             | SyncChange::ActivityChanged
+            | SyncChange::MessengerSourceReady
             | SyncChange::Unread(_) => {}
             _ => return,
         }

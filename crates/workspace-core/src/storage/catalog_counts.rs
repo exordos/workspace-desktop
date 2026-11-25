@@ -166,6 +166,54 @@ pub(super) fn apply(
     Ok(changed)
 }
 
+/// Читает прежнее полное число для той же строки, включая исходный REST-снимок.
+pub(super) fn previous_total(
+    connection: &Connection,
+    owner: &OwnerContext,
+    counts: &CatalogCounts,
+) -> Result<Option<i64>, StorageError> {
+    let stream = counts.stream_id.to_string();
+    let topic = counts.topic_id.map(|id| id.to_string()).unwrap_or_default();
+    let address = params![
+        owner.account_id.0,
+        owner.server,
+        owner.organization_id,
+        owner.project_id,
+        owner.user_id,
+        stream,
+        topic,
+    ];
+    let total = connection
+        .query_row(
+            "SELECT total FROM messenger_catalog_counts
+             WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3 AND project_id = ?4
+             AND user_id = ?5 AND stream_id = ?6 AND topic_id = ?7",
+            address,
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if total.is_some() {
+        return Ok(total);
+    }
+
+    // У первого события ещё нет отдельной строки счётчиков. Берём известное число
+    // из уже сохранённого каталога, не разбирая список всех разговоров в памяти.
+    Ok(connection
+        .query_row(
+            "SELECT CAST(CASE WHEN ?7 = '' THEN json_extract(chat.value, '$.metadata.unread_count')
+                    ELSE (SELECT json_extract(topic.value, '$.metadata.unread_count')
+                          FROM json_each(chat.value, '$.topics') AS topic
+                          WHERE json_extract(topic.value, '$.id') = ?7) END AS INTEGER)
+             FROM messenger_catalog, json_each(messenger_catalog.snapshot) AS chat
+             WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3 AND project_id = ?4
+             AND user_id = ?5 AND json_extract(chat.value, '$.id') = ?6",
+            address,
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten())
+}
+
 /// Удаляет счётчики отозванного канала или одной темы по тому же адресу, что и каталог.
 pub(super) fn remove_scope(
     connection: &Connection,
@@ -257,10 +305,68 @@ mod tests {
     use crate::{
         context::AccountId,
         messenger::SOURCE_ID,
-        storage::{ApplyOutcome, EventWrite, Storage},
+        storage::{ApplyOutcome, EventWrite, HistoryScope, Storage},
     };
     use serde_json::json;
     use uuid::Uuid;
+
+    /// Уменьшение счётчика без отдельного события чтения запрашивает сверку точной темы.
+    #[test]
+    fn catalog_unread_decrease_requests_history_read_revalidation() {
+        let storage = Storage::in_memory().unwrap();
+        let owner = OwnerContext {
+            account_id: AccountId("a".into()),
+            server: "https://test".into(),
+            organization_id: "org".into(),
+            project_id: "project".into(),
+            user_id: "user".into(),
+        };
+        let stream_id = Uuid::from_u128(10);
+        let topic_id = Uuid::from_u128(20);
+        let snapshot = json!([{
+            "id": stream_id, "name": "Канал", "direct": false,
+            "metadata": { "unread_count": 8 },
+            "topics": [{
+                "id": topic_id, "name": "Тема", "metadata": { "unread_count": 4 }
+            }]
+        }])
+        .to_string();
+        storage
+            .save_chat_catalog(&owner, &snapshot, 0, None)
+            .unwrap();
+        let scope = HistoryScope {
+            stream_id,
+            topic_id: Some(topic_id),
+        };
+        let apply = |epoch_version, total| {
+            storage
+                .apply(
+                    &owner,
+                    SOURCE_ID,
+                    &Cursor {
+                        epoch_generation: "epoch".into(),
+                        epoch_version,
+                    },
+                    EventWrite {
+                        catalog_counts: Some(&CatalogCounts {
+                            stream_id,
+                            topic_id: Some(topic_id),
+                            total,
+                            active: total,
+                            passive: 0,
+                        }),
+                        ..EventWrite::default()
+                    },
+                )
+                .unwrap()
+                .count_read_scope
+        };
+        assert_eq!(apply(1, 2), Some(scope));
+        assert_eq!(apply(2, 3), None);
+        assert_eq!(apply(3, 3), None);
+        assert_eq!(apply(4, 1), Some(scope));
+        assert_eq!(apply(4, 0), None);
+    }
 
     /// Поздний REST сохраняет счётчики из журнала, но старые события не откатывают снимок.
     #[test]

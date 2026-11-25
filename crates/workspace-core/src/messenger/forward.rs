@@ -17,8 +17,7 @@ use crate::{
 use super::{
     MessengerSource,
     encryption::fragments::{fragment_links, has_protected_draft},
-    history::OpenHistoryError,
-    quote::{QuoteSourceFence, SourceCheckError},
+    quote::SourceCheckError,
     references::{display_label, media_references},
     send::DirectSendError,
 };
@@ -301,38 +300,6 @@ fn forward_snapshot<'a>(
 }
 
 impl MessengerSource {
-    /// Находит исходное сообщение и проверяет адрес перехода в том же входе.
-    pub async fn resolve_forward_original(
-        &self,
-        sync: &Sync,
-        owner: &OwnerContext,
-        generation: SessionGeneration,
-        source_id: Uuid,
-    ) -> Result<HistoryScope, OpenHistoryError> {
-        let (original, fence) = self
-            .quote_original_with_fence(sync, owner, generation, None, source_id)
-            .await?;
-        let auth = sync.auth();
-        let token = auth
-            .access_token_for_generation(owner, Service::Messenger, generation)
-            .await?;
-        let scope = self
-            .rest
-            .presentation_scope(owner, &token, &original)
-            .await?;
-        let current = auth.with_active_generation(owner, generation, || {
-            let placement = HistoryScope {
-                stream_id: original.stream_id,
-                topic_id: Some(original.topic_id),
-            };
-            QuoteSourceFence::capture(sync.storage(), owner, placement, source_id)
-        })??;
-        if current != fence {
-            return Err(OpenHistoryError::StaleWindow);
-        }
-        Ok(scope)
-    }
-
     /// Берёт канонический зашифрованный снимок и сохраняет его для отправки в обычную тему.
     pub async fn prepare_protected_forward(
         &self,

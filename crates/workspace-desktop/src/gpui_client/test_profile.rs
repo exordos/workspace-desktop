@@ -25,6 +25,24 @@ impl TestLogin {
         })
     }
 
+    /// Готовит отдельный вход для двух аккаунтов сквозного теста на стенде.
+    #[cfg(all(test, feature = "gpui-test"))]
+    pub(super) fn from_test_account(letter: char) -> io::Result<Self> {
+        let (login, password) = match letter {
+            'A' => ("WORKSPACE_TEST_LOGIN_A", "WORKSPACE_TEST_PASSWORD_A"),
+            'B' => ("WORKSPACE_TEST_LOGIN_B", "WORKSPACE_TEST_PASSWORD_B"),
+            _ => return Err(io::Error::other("Тестовый аккаунт должен быть A или B")),
+        };
+        Ok(Self {
+            server: required("WORKSPACE_TEST_URL")?,
+            login: required(login)?,
+            password: required(password)?,
+            project: env::var("WORKSPACE_TEST_PROJECT_ID")
+                .ok()
+                .filter(|value| !value.is_empty()),
+        })
+    }
+
     /// Проходит штатные шаги IAM и сохраняет тестовый вход через переданный Auth.
     pub(super) fn activate(self, auth: &Auth) -> io::Result<()> {
         let attempt = auth

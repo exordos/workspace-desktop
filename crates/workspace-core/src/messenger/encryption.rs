@@ -345,6 +345,32 @@ impl MessageEncryption {
         self.prepare_locked(activation, stream_id, key_id)
     }
 
+    /// Проверяет наличие локального ключа чата для показа редактора; вызывать в рабочем потоке.
+    /// Результат не заменяет проверку режима, прав и ключа перед отправкой.
+    pub fn has_local_key(
+        &self,
+        activation: &EncryptionActivation,
+        stream_id: Uuid,
+    ) -> Result<bool, EncryptionError> {
+        let _operation = self.store_operations.lock().unwrap();
+        let result = self.available_sending_key_locked(activation, stream_id, None);
+        // Выбор аккаунта может измениться во время обращения к системному хранилищу.
+        if !self
+            .selection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|selection| &selection.activation == activation)
+        {
+            return Err(EncryptionError::Stale);
+        }
+        match result {
+            Ok(_) => Ok(true),
+            Err(EncryptionError::MissingKey) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Читает точный ключ после входа в очередь защищённого хранилища.
     fn prepare_locked(
         &self,
@@ -1070,6 +1096,26 @@ mod tests {
             first.key_id()
         );
         assert_eq!(store.0.lock().unwrap().len(), 2);
+    }
+
+    /// Наличие ключа относится только к чату и действующему выбору аккаунта.
+    #[test]
+    fn local_key_presence_tracks_chat_and_active_session() {
+        let keys = MessageEncryption::new(Arc::new(TestKeys::default()));
+        let active = keys.select_session(Some(selection())).unwrap();
+        let other_stream = Uuid::new_v4();
+        assert_eq!(keys.has_local_key(&active, STREAM_ID), Ok(false));
+        keys.save_key(&active, STREAM_ID, KEY_ID, &sample_key())
+            .unwrap();
+        assert_eq!(keys.has_local_key(&active, STREAM_ID), Ok(true));
+        assert_eq!(keys.has_local_key(&active, other_stream), Ok(false));
+        keys.remove_key(&active, STREAM_ID, KEY_ID).unwrap();
+        assert_eq!(keys.has_local_key(&active, STREAM_ID), Ok(false));
+        keys.select_session(None);
+        assert_eq!(
+            keys.has_local_key(&active, STREAM_ID),
+            Err(EncryptionError::Stale)
+        );
     }
 
     /// Проверяет безопасный Markdown и раздельную случайную соль двух одинаковых фрагментов.

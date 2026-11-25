@@ -110,7 +110,9 @@
     },
     "general": {
       "saveFailed": "Could not save settings",
-      "separateCallWindow": "Open calls in a separate window"
+      "separateCallWindow": "Open calls in a separate window",
+      "workspaceDirect": "Connect directly to Workspace",
+      "workspaceDirectHint": "Use Wi-Fi or Ethernet for Workspace traffic. Applies after restarting the app."
     },
     "nav": {
       "chats": "Chats",

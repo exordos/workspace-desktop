@@ -86,7 +86,7 @@ pub(super) fn initialize(connection: &Connection) -> Result<(), StorageError> {
             project_id TEXT NOT NULL, user_id TEXT NOT NULL, draft_id TEXT NOT NULL,
             stream_id TEXT NOT NULL, topic_id TEXT NOT NULL,
             local_version INTEGER NOT NULL CHECK (typeof(local_version) = 'integer' AND local_version > 0),
-            markdown TEXT, reply_context TEXT, updated_at TEXT,
+            markdown TEXT, reply_context TEXT, updated_at TEXT, write_order INTEGER,
             UNIQUE (account_id, server, organization_id, project_id, user_id, draft_id)
          );
          CREATE INDEX IF NOT EXISTS messenger_drafts_by_scope
@@ -114,6 +114,14 @@ pub(super) fn initialize(connection: &Connection) -> Result<(), StorageError> {
     )?;
     if !has_updated_at {
         connection.execute_batch("ALTER TABLE messenger_drafts ADD COLUMN updated_at TEXT;")?;
+    }
+    let has_write_order: bool = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('messenger_drafts') WHERE name = 'write_order')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_write_order {
+        connection.execute_batch("ALTER TABLE messenger_drafts ADD COLUMN write_order INTEGER;")?;
     }
     protected::initialize(connection)
 }
@@ -169,13 +177,52 @@ impl Storage {
         })
     }
 
-    /// Читает указанный UUID или первый сохранённый черновик темы для обычного открытия редактора.
+    /// Читает указанный UUID или последний изменённый черновик темы при обычном открытии.
     pub fn read_plaintext_draft(
         &self,
         access: &DraftAccess,
         draft_id: Option<Uuid>,
     ) -> Result<Option<PlaintextDraft>, StorageError> {
         let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        Self::read_plaintext_draft_locked(&mut connection, access, draft_id)
+    }
+
+    /// Читает локальный снимок только для обычной темы, присутствующей в сохранённом каталоге.
+    /// Не выдаёт разрешения на запись: серверная проверка остаётся отдельной операцией.
+    pub(crate) fn read_catalog_plaintext_draft(
+        &self,
+        owner: &OwnerContext,
+        scope: DraftScope,
+        draft_id: Option<Uuid>,
+    ) -> Result<Option<Option<PlaintextDraft>>, StorageError> {
+        let mut connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let catalog = super::catalog_counts::read_catalog(&connection, owner)?;
+        let allowed = catalog.as_ref().is_some_and(|chats| {
+            chats.iter().any(|chat| {
+                chat.id == scope.stream_id
+                    && chat.metadata.encrypted == Some(false)
+                    && (chat.topics.iter().any(|topic| topic.id == scope.topic_id)
+                        || (chat.direct && chat.metadata.default_topic_id == Some(scope.topic_id)))
+            })
+        });
+        if !allowed {
+            return Ok(None);
+        }
+        let access = DraftAccess {
+            owner: owner.clone(),
+            scope,
+            revision: access_revision(&connection, owner, scope)?,
+        };
+        // Каталог и снимок читаются под одной блокировкой, чтобы отзыв не попал между ними.
+        Self::read_plaintext_draft_locked(&mut connection, &access, draft_id).map(Some)
+    }
+
+    /// Читает черновик под уже захваченной блокировкой базы и проверяет ревизию доступа.
+    fn read_plaintext_draft_locked(
+        connection: &mut Connection,
+        access: &DraftAccess,
+        draft_id: Option<Uuid>,
+    ) -> Result<Option<PlaintextDraft>, StorageError> {
         let transaction = connection.transaction()?;
         access.verify(&transaction)?;
         let owner = &access.owner;
@@ -185,7 +232,7 @@ impl Storage {
                  WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
                  AND project_id = ?4 AND user_id = ?5 AND stream_id = ?6 AND topic_id = ?7
                  AND markdown IS NOT NULL AND (?8 IS NULL OR draft_id = ?8)
-                 ORDER BY sequence LIMIT 1",
+                 ORDER BY write_order DESC NULLS LAST, updated_at DESC NULLS LAST, sequence DESC LIMIT 1",
                 params![
                     owner.account_id.0,
                     owner.server,
@@ -289,12 +336,14 @@ impl Storage {
         }
         transaction.execute(
             "INSERT INTO messenger_drafts (account_id, server, organization_id, project_id,
-             user_id, draft_id, stream_id, topic_id, local_version, markdown, reply_context, updated_at)
+             user_id, draft_id, stream_id, topic_id, local_version, markdown, reply_context, updated_at, write_order)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                     (SELECT COALESCE(MAX(write_order), 0) + 1 FROM messenger_drafts))
              ON CONFLICT (account_id, server, organization_id, project_id, user_id, draft_id)
              DO UPDATE SET local_version = excluded.local_version, markdown = excluded.markdown,
-                           reply_context = excluded.reply_context, updated_at = excluded.updated_at",
+                           reply_context = excluded.reply_context, updated_at = excluded.updated_at,
+                           write_order = excluded.write_order",
             params![
                 owner.account_id.0,
                 owner.server,

@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{
-    Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
+    Connector, MaybeTlsStream, WebSocketStream,
     tungstenite::{
         Error as WebSocketError, Message,
         client::IntoClientRequest,
@@ -23,6 +23,7 @@ use crate::{
     runtime::{SourceError, SourceSession},
     storage::Cursor,
     sync::Event,
+    workspace_direct::WorkspaceRoute,
 };
 
 use super::rest::{IncomingMessage, validate_cursor, wire_event, workspace_origin};
@@ -50,6 +51,7 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub(super) async fn connect(
     session: &SourceSession,
     connector: Option<Connector>,
+    route: &WorkspaceRoute,
 ) -> Result<SocketStream, SourceError> {
     let cursor = session
         .cursor
@@ -60,13 +62,10 @@ pub(super) async fn connect(
         .max_message_size(Some(MAX_EVENT_BYTES))
         .max_frame_size(Some(MAX_EVENT_BYTES));
     // Клиент открывает соединение по заданному адресу и не следует перенаправлениям.
-    let (socket, response) = timeout(
-        CONNECT_TIMEOUT,
-        connect_async_tls_with_config(request, Some(config), false, connector),
-    )
-    .await
-    .map_err(|_| SourceError::Temporary)?
-    .map_err(websocket_error)?;
+    let (socket, response) = timeout(CONNECT_TIMEOUT, route.websocket(request, config, connector))
+        .await
+        .map_err(|_| SourceError::Temporary)?
+        .map_err(websocket_error)?;
     if response
         .headers()
         .get(SEC_WEBSOCKET_PROTOCOL)

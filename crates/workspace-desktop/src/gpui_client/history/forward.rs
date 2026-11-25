@@ -4,18 +4,14 @@
 mod targets;
 
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, IntoElement, Render, WeakEntity, Window, div,
-    prelude::*, px,
+    App, Context, FocusHandle, IntoElement, Render, WeakEntity, Window, div, prelude::*, px,
 };
 use uuid::Uuid;
-use workspace_core::{
-    messenger::forward::{
-        ForwardOrigin, MAX_FORWARD_DEPTH, can_forward_markdown, contains_protected_snapshot,
-    },
-    storage::HistoryScope,
+use workspace_core::messenger::forward::{
+    ForwardOrigin, MAX_FORWARD_DEPTH, can_forward_markdown, contains_protected_snapshot,
 };
 
-use super::{Conversation, State};
+use super::{Conversation, MessageNavigationSource, State};
 use crate::gpui_client::{
     composer::ReplyText,
     contracts::ConversationAddress,
@@ -26,57 +22,10 @@ use crate::gpui_client::{
 };
 use targets::{Picker, Targets};
 
-/// Переход к одному оригиналу, авторитетно проверенный в выбранной сессии.
-pub(in crate::gpui_client) struct OpenForwardOriginal {
-    pub address: ConversationAddress, // Точный экран, на котором нажали ссылку.
-    pub scope: HistoryScope,          // Фактический чат и тема, проверенные сервером.
-    pub id: Uuid,                     // Публичный UUID сообщения для открытия истории вокруг него.
-}
-
-impl EventEmitter<OpenForwardOriginal> for Conversation {}
-
 impl Conversation {
-    /// Открывает только последнюю выбранную ссылку, всё ещё видимую в прежней истории.
+    /// Передаёт UUID оригинала пересылки общему переходу к сообщению.
     pub(super) fn open_forward_original(&mut self, row: Uuid, id: Uuid, cx: &mut Context<Self>) {
-        let Some(runtime) = self
-            .avatar_runtime
-            .clone()
-            .filter(|_| self.viewport.has_forward_source(row, id))
-        else {
-            return;
-        };
-        let address = self.address.clone();
-        self.forward_original = Some(cx.spawn(async move |entity, cx| {
-            let result = runtime
-                .conversation(address, move |services, address| async move {
-                    services
-                        .messenger
-                        .resolve_forward_original(
-                            &services.sync,
-                            &address.route.owner,
-                            address.generation,
-                            id,
-                        )
-                        .await
-                })
-                .await;
-            let _ = entity.update(cx, |view, cx| {
-                view.forward_original = None;
-                let Ok(Ok(scope)) = result.value else {
-                    return;
-                };
-                if view.address == result.address
-                    && view.has_access()
-                    && view.viewport.has_forward_source(row, id)
-                {
-                    cx.emit(OpenForwardOriginal {
-                        address: result.address,
-                        scope,
-                        id,
-                    });
-                }
-            });
-        }));
+        self.emit_message_target(id, MessageNavigationSource::forward(row, id), cx);
     }
 
     /// Проверяет, что у подтверждённой строки есть поддерживаемое тело и доступен диалог.

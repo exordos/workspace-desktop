@@ -7,11 +7,10 @@ mod details;
 pub(in crate::gpui_client) use details::{
     ContactOrigin, ContactPanel, ContactRequest, ContactTarget,
 };
-#[path = "history/forward.rs"]
-mod forward;
-pub(super) use forward::OpenForwardOriginal;
 #[path = "history/encryption.rs"]
 mod encryption;
+#[path = "history/forward.rs"]
+mod forward;
 #[path = "history/fragments.rs"]
 mod fragments;
 mod gallery_source;
@@ -32,6 +31,11 @@ mod media_album;
 mod message_delete;
 #[path = "history/message_menu.rs"]
 mod message_menu;
+#[path = "history/message_navigation.rs"]
+mod message_navigation;
+pub(super) use message_navigation::{
+    MessageNavigationSource, OpenMessageTarget, resolve_message_target,
+};
 #[path = "history/protected_body.rs"]
 mod protected_body;
 #[path = "history/protected_quotes.rs"]
@@ -40,30 +44,37 @@ mod protected_quotes;
 mod quick_actions;
 #[path = "history/reactions.rs"]
 mod reactions;
-#[path = "history/reply.rs"]
-mod reply;
+#[path = "history/read.rs"]
+mod read;
 #[path = "history/references.rs"]
 mod references;
+#[path = "history/reply.rs"]
+mod reply;
 pub(super) use references::OpenConversationReference;
 #[path = "history/source.rs"]
 mod source;
+pub(super) use source::Failure as MessageHistoryError;
 #[path = "history/viewport.rs"]
 mod viewport;
 pub(super) use viewport::GuardedText;
 
-use std::{cell::Cell, collections::HashMap, rc::Rc, sync::Arc};
+use std::{cell::Cell, collections::HashMap, rc::Rc, sync::Arc, time::Duration};
 
 use futures::channel::oneshot;
 use gpui::{
-    AnyView, App, Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyDownEvent, ObjectFit,
-    Pixels, Render, ScrollWheelEvent, StyleRefinement, StyledImage, Subscription, Task, Window,
-    canvas, div, img, prelude::*, px,
+    AnyView, App, BackgroundExecutor, Context, Entity, EventEmitter, FocusHandle, IntoElement,
+    KeyDownEvent, ObjectFit, Pixels, Render, ScrollWheelEvent, StyleRefinement, StyledImage,
+    Subscription, Task, Window, canvas, div, img, prelude::*, px,
 };
+use tokio::sync::broadcast::{Receiver, error::TryRecvError};
 use uuid::Uuid;
 use workspace_core::{
     bootstrap::ChatList,
     messenger::details::SidebarDetails,
-    messenger::catalog::Chat,
+    messenger::{
+        catalog::Chat,
+        encryption::{EncryptionActivation, KeyChange},
+    },
     storage::{HistoryDirection, HistoryEdge, HistoryScope, HistoryWindow, OutboxEntry},
     sync::{HistoryRevocation, SyncChange, SyncUpdate},
 };
@@ -71,7 +82,7 @@ use workspace_core::{
 use self::{
     attachments::{Attachments, PhotoReturn},
     details::Panel,
-    encryption::{HistoryEncryption, PreparedBody},
+    encryption::{HistoryEncryption, PrepareEncrypted, PreparedBody, ciphertexts},
     gallery_source::GalleryExport,
     message_menu::MessageMenu,
     reactions::Reactions,
@@ -84,7 +95,7 @@ use super::{
     composer::{
         Composer, ComposerEvent, DestinationError, QueueWriteOutcome, SendSource, Submission,
     },
-    contracts::{AccountSession, ChatEntry, ConversationAddress},
+    contracts::{AccountSession, ChatEntry, ConversationAddress, ConversationReply},
     preferences::{Language, Preferences},
     right_panel::RightPanel,
     runtime::RuntimeClient,
@@ -95,12 +106,171 @@ use super::{
 };
 
 const HISTORY_PAGE_AHEAD: Pixels = px(1200.);
+const MESSAGE_MARK_DURATION: Duration = Duration::from_secs(2);
 
 /// Точка чтения, которую рабочее окно может восстановить при повторном открытии чата.
 #[derive(Clone, Copy)]
 pub(super) struct ReadingAnchor {
     pub id: Uuid,  // UUID подтверждённого сообщения.
     pub y: Pixels, // Верх пузыря относительно области прокрутки, в логических px.
+}
+
+/// Окно для перехода, проверенное и подготовленное до смены видимой ленты.
+pub(super) struct PreparedMessageHistory {
+    address: ConversationAddress, // Точный адрес запроса, включая ревизию перехода.
+    snapshot: Snapshot,           // Окно с целевым UUID, краями и допуском к вложениям.
+    checked: Vec<PreparedBody>,   // Отзываемые представления целых зашифрованных сообщений.
+    encryption_revision: Option<u64>, // Ревизия защиты уже открытого экрана той же темы.
+    key_changes: Option<MessageHistoryKeys>, // Изменения ключей между подготовкой и показом.
+    flight: Flight,               // Один идентификатор для загрузки, применения и замера.
+}
+
+/// Подготовка с версиями ключей и тел действующего экрана той же темы.
+pub(super) struct MessageHistoryEncryption {
+    account: AccountSession,       // Аккаунт и поколение уже открытого окна.
+    scope: HistoryScope,           // Тема открытого окна.
+    revision: u64,                 // Версия состояния на момент сбора подготовки.
+    preparation: PrepareEncrypted, // Условия приёма расшифрованных сообщений.
+}
+
+/// Следит за ключами до подписки нового экрана и до применения окна в действующем.
+struct MessageHistoryKeys {
+    changes: Receiver<KeyChange>, // Подписка, начатая перед загрузкой цели.
+    activation: EncryptionActivation, // Точный выбор ключевого профиля.
+}
+
+impl PreparedMessageHistory {
+    /// Проверяет, остались ли приготовленные состояния ключей пригодными для первого кадра.
+    pub(super) fn ready_for_show(&mut self) -> bool {
+        let Some(keys) = &mut self.key_changes else {
+            return true;
+        };
+        let window = &self.snapshot.window;
+        let mut output = true;
+        loop {
+            match keys.changes.try_recv() {
+                Ok(change) => {
+                    if change.activation == keys.activation
+                        && change.stream_id == window.scope.stream_id
+                        && ciphertexts(window, self.snapshot.outbox.as_deref().unwrap_or_default())
+                            .any(|(_, key, _)| key == change.key_id)
+                    {
+                        output = false;
+                    }
+                }
+                Err(TryRecvError::Empty) => return output,
+                Err(TryRecvError::Lagged(_) | TryRecvError::Closed) => return false,
+            }
+        }
+    }
+}
+
+/// Запрашивает подтверждённое окно вокруг цели, пока прежний разговор остаётся видимым.
+pub(super) async fn prepare_message_history(
+    runtime: RuntimeClient,
+    address: ConversationAddress,
+    background: BackgroundExecutor,
+    existing: Option<MessageHistoryEncryption>,
+) -> Result<PreparedMessageHistory, MessageHistoryError> {
+    let ChatEntry::Around(id) = address.route.entry else {
+        return Err(Failure::MissingMessage);
+    };
+    let flight = Flight {
+        id: Uuid::new_v4(),
+        load: Load::Open(address.route.entry),
+    };
+    let account = AccountSession {
+        owner: address.route.owner.clone(),
+        generation: address.generation,
+    };
+    let existing = existing.filter(|encryption| {
+        encryption.account == account && encryption.scope == address.route.scope
+    });
+    let encryption_revision = existing.as_ref().map(|encryption| encryption.revision);
+    let key_profile = runtime.message_encryption(&account);
+    let key_changes = key_profile
+        .as_ref()
+        .map(|(engine, activation)| MessageHistoryKeys {
+            changes: engine.subscribe(),
+            activation: activation.clone(),
+        });
+    let preparation = match existing {
+        Some(encryption) => Some(encryption.preparation),
+        None => key_profile.map(|(engine, activation)| {
+            PrepareEncrypted::for_opening(engine, activation, address.route.scope.stream_id)
+        }),
+    };
+    let source = runtime_source(runtime);
+    let (cached, _) = oneshot::channel();
+    let response = source(address.clone(), flight.load, flight.id, cached).await;
+    let snapshot = target_snapshot(response, &address, id)?;
+    let checked = match preparation {
+        Some(preparation) => {
+            preparation
+                .window(
+                    &snapshot.window,
+                    snapshot.outbox.as_deref().unwrap_or_default(),
+                    &background,
+                )
+                .await
+        }
+        None => Vec::new(),
+    };
+    // Пока готовился защищённый текст, журнал мог заменить или отозвать сохранённые строки.
+    let (cached, _) = oneshot::channel();
+    let response = source(
+        address.clone(),
+        Load::Read(snapshot.window.id),
+        flight.id,
+        cached,
+    )
+    .await;
+    let mut latest = target_snapshot(response, &address, id)?;
+    if key_changes.is_some()
+        && !ciphertexts(
+            &snapshot.window,
+            snapshot.outbox.as_deref().unwrap_or_default(),
+        )
+        .eq(ciphertexts(
+            &latest.window,
+            latest.outbox.as_deref().unwrap_or_default(),
+        ))
+    {
+        return Err(Failure::Changed);
+    }
+    latest.media_access = snapshot.media_access;
+    Ok(PreparedMessageHistory {
+        address,
+        snapshot: latest,
+        checked,
+        encryption_revision,
+        key_changes,
+        flight,
+    })
+}
+
+/// Принимает только окно точной области, в котором подтверждён целевой UUID.
+fn target_snapshot(
+    response: ConversationReply<LoadResult>,
+    address: &ConversationAddress,
+    id: Uuid,
+) -> Result<Snapshot, MessageHistoryError> {
+    let snapshot = response
+        .for_current(Some(address))
+        .ok_or(Failure::Changed)??
+        .filter(|snapshot| {
+            snapshot.window.scope == address.route.scope && !snapshot.window.needs_refresh
+        })
+        .ok_or(Failure::Changed)?;
+    if !snapshot
+        .window
+        .messages
+        .iter()
+        .any(|message| message.id == id)
+    {
+        return Err(Failure::MissingMessage);
+    }
+    Ok(snapshot)
 }
 
 /// Один запрос экрана и его идентификатор в журнале.
@@ -149,7 +319,9 @@ struct Heading {
     direct: bool,                 // В заголовке лички оставляем место под аватар.
     direct_peer_id: Option<Uuid>, // UUID собеседника из каталога этого входа, если он известен.
     color: Option<u32>,           // Цвет аватара канала из каталога.
-    encrypted: Option<bool>,     // Серверный режим шифрования независимо от доступности редактора.
+    encrypted: Option<bool>,      // Серверный режим шифрования независимо от доступности редактора.
+    topic_closed: bool,           // Последнее известное состояние выбранной темы.
+    default_topic: Option<Uuid>,  // Тема лички для отзыва до завершения проверки отправки.
     native_markdown: bool,        // Каталог подтвердил обычный нативный разговор.
 }
 
@@ -166,6 +338,19 @@ impl Heading {
             direct: chat.direct,
             color: chat.metadata.color.filter(|color| *color <= 0xFF_FF_FF),
             encrypted: chat.metadata.encrypted,
+            default_topic: chat.metadata.default_topic_id,
+            topic_closed: chat
+                .topics
+                .iter()
+                .find(|topic| {
+                    Some(topic.id)
+                        == scope.topic_id.or_else(|| {
+                            chat.direct
+                                .then_some(chat.metadata.default_topic_id)
+                                .flatten()
+                        })
+                })
+                .is_some_and(|topic| topic.metadata.is_done),
             native_markdown: chat.metadata.native_markdown,
             direct_peer_id: chat
                 .metadata
@@ -200,6 +385,11 @@ pub(super) struct DetailsProfileIntent {
 
 impl EventEmitter<DetailsProfileIntent> for Conversation {}
 
+/// Пользователь явно выбрал хвост вместо ожидаемого перехода к сообщению.
+pub(super) struct HistoryTargetCleared;
+
+impl EventEmitter<HistoryTargetCleared> for Conversation {}
+
 /// История, адрес открытия и очередь сообщений одного экрана.
 pub struct Conversation {
     address: ConversationAddress, // Владелец, область, поколение и ревизия от оболочки.
@@ -209,10 +399,14 @@ pub struct Conversation {
     state: State,                 // Текущее подтверждённое окно или сообщение о проблеме.
     active: Option<Flight>,       // Один запрос истории, пока не применён его последний ответ.
     read_pending: bool, // Во время запроса пришло событие сохранённой истории или очереди.
-    action_error: Option<Flight>, // Запрос, который можно повторить, пока открыта история.
-    outbox: Vec<OutboxEntry>, // Последний снимок очереди в области разговора.
+    read_revalidation: Option<Option<HistoryScope>>, // Область серверной сверки. Some(None) означает всё окно.
+    read_revalidation_waiting: bool, // После ошибки повторяем по фокусу или следующему сигналу Sync.
+    reading: read::Reading,          // Видимость и ход серверных отметок для открытого окна.
+    action_error: Option<Flight>,    // Запрос, который можно повторить, пока открыта история.
+    outbox: Vec<OutboxEntry>,        // Последний снимок очереди в области разговора.
     view_width: Cell<Option<Pixels>>, // Ширина рабочей области от владельца раскладки.
-    viewport: Viewport, // Виртуальный список и его положение.
+    viewport: Viewport,              // Виртуальный список и его положение.
+    message_mark: Option<Task<()>>,  // Снимает отметку последнего перехода после показа цели.
     encryption: Option<HistoryEncryption>, // Только живые представления текущего адреса.
     scroll_direction: Option<HistoryDirection>, // Последний жест, до него проверяем заполнение окна.
     attachments: Attachments, // Карточки и одиночный просмотр вложений этого разговора.
@@ -223,13 +417,17 @@ pub struct Conversation {
     message_menu: MessageMenu, // Меню выбранного подтверждённого сообщения.
     reactions: Reactions,     // Популярность и ожидающие реакции открытого разговора.
     message_delete: message_delete::MessageDelete, // Подтверждение и ход удаления одного сообщения.
-    forward_original: Option<Task<()>>, // Переход к последнему выбранному оригиналу пересылки.
     time_reference: Option<references::TimeReference>, // Панель момента из активной строки истории.
     sending: Option<Sending>, // Рабочий редактор; изолированные тесты истории могут его не подключать.
     heading: Heading,         // Отображаемые названия из текущего каталога.
+    local_key: Option<bool>,  // Наличие локального ключа, None до завершения чтения.
+    local_key_revision: u64,  // Позволяет отбросить результат старого чтения ключей.
+    server_topic_closed: bool, // Серверная проверка отправки подтвердила закрытую тему.
+    local_draft_request: Option<(Uuid, Option<Uuid>)>, // Последняя локально запрошенная тема и UUID.
+    opening_draft_id: Option<Uuid>, // Явно выбранный UUID черновика, если он есть.
     heading_details: Option<Arc<SidebarDetails>>, // Подтверждённое присутствие или состав.
     heading_request: Option<Task<()>>, // Чтение сведений для шапки при закрытой панели.
-    favorites_presentation: bool, // Показывает заголовок «Избранное» для чата с собой.
+    favorites_presentation: bool,   // Показывает заголовок «Избранное» для чата с собой.
     avatar_runtime: Option<RuntimeClient>, // Рабочий поток аватаров. Отсутствует в тестах истории без Core.
     avatars_visible: bool,                 // Разговор показан окном и может запрашивать фото.
     heading_avatars: AvatarImages,         // Подписка на фото собеседника, указанного в шапке.
@@ -245,7 +443,7 @@ impl Conversation {
             .sending
             .as_ref()
             .map(|sending| sending.view.read(app))
-            .filter(|editor| self.has_access() && editor.is_available())
+            .filter(|_| self.local_composer_visible())
             .map(|editor| editor.editor_focus(app));
         (self.history_focus.clone(), editor)
     }
@@ -275,6 +473,55 @@ impl Conversation {
         draft_id: Option<Uuid>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let mut view = Self::configured(address, runtime, right_panel, restore, draft_id, cx);
+        view.start(view.opening_load(), cx);
+        view
+    }
+
+    /// Показывает заранее подготовленное окно в первом кадре нового разговора.
+    pub(super) fn open_prepared(
+        address: ConversationAddress,
+        runtime: RuntimeClient,
+        right_panel: Entity<RightPanel>,
+        prepared: PreparedMessageHistory,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::configured(address, runtime, right_panel, None, None, cx);
+        if view.address == prepared.address {
+            view.show_prepared_message(prepared, cx);
+        } else {
+            view.start(view.opening_load(), cx);
+        }
+        view
+    }
+
+    /// Возвращается к положению ленты из истории переходов, сохраняя адрес экрана.
+    pub(super) fn open_at_reading_position(
+        address: ConversationAddress,
+        runtime: RuntimeClient,
+        right_panel: Entity<RightPanel>,
+        restore: Option<ReadingAnchor>,
+        draft_id: Option<Uuid>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::configured(address, runtime, right_panel, None, draft_id, cx);
+        if !view.is_archived() {
+            view.entry = ChatEntry::Latest;
+            view.restore = restore;
+        }
+        view.start(Load::Open(view.opening_entry()), cx);
+        view
+    }
+
+    /// Подключает редактор, панели и разрешение шифрования до первого показа истории.
+    fn configured(
+        address: ConversationAddress,
+        runtime: RuntimeClient,
+        right_panel: Entity<RightPanel>,
+        restore: Option<ReadingAnchor>,
+        draft_id: Option<Uuid>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let account = AccountSession {
             owner: address.route.owner.clone(),
             generation: address.generation,
@@ -284,13 +531,14 @@ impl Conversation {
         let encryption = activated.map(|(engine, activation)| {
             HistoryEncryption::new(engine, activation, address.route.scope.stream_id, cx)
         });
-        let mut view = Self::with_source(
+        let mut view = Self::unopened(
             address,
             runtime_source(runtime.clone()),
             restore,
             encryption,
             cx,
         );
+        view.opening_draft_id = draft_id;
         if !view.is_archived() {
             view.attach_composer(
                 SendSource::runtime(runtime.clone(), draft_id, activation),
@@ -305,18 +553,35 @@ impl Conversation {
         }
         view.attachments.runtime = Some(runtime.clone());
         view.avatar_runtime = Some(runtime.clone());
+        view.reading.runtime = Some(runtime.clone());
         view.calls.set_runtime(runtime.clone());
         view.load_reaction_usage(cx);
         if let Some(sending) = &view.sending {
-            sending
-                .view
-                .update(cx, |composer, _| composer.attach_drafts(runtime.clone()));
+            sending.view.update(cx, |composer, cx| {
+                composer.attach_drafts(runtime.clone());
+                composer.attach_early_draft(draft_id, cx);
+            });
         }
+        view.refresh_local_key(false, cx);
         view
     }
 
     /// Создаёт экран с заданным источником, в том числе с управляемыми ответами в GPUI-тестах.
+    #[cfg(all(test, feature = "gpui-test"))]
     fn with_source(
+        address: ConversationAddress,
+        source: Source,
+        restore: Option<ReadingAnchor>,
+        encryption: Option<HistoryEncryption>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut conversation = Self::unopened(address, source, restore, encryption, cx);
+        conversation.start(Load::Open(conversation.opening_entry()), cx);
+        conversation
+    }
+
+    /// Создаёт состояние истории, которое ещё не запускает запросы и не отдаёт строки в окно.
+    fn unopened(
         address: ConversationAddress,
         source: Source,
         restore: Option<ReadingAnchor>,
@@ -327,7 +592,7 @@ impl Conversation {
             ChatEntry::Archived => ChatEntry::Latest,
             entry => entry,
         };
-        let mut conversation = Self {
+        Self {
             address,
             entry,
             restore: restore.filter(|_| entry == ChatEntry::Latest),
@@ -335,10 +600,14 @@ impl Conversation {
             state: State::Opening,
             active: None,
             read_pending: false,
+            read_revalidation: None,
+            read_revalidation_waiting: false,
+            reading: read::Reading::default(),
             action_error: None,
             outbox: Vec::new(),
             view_width: Cell::new(None),
             viewport: Viewport::with_page_ahead(HISTORY_PAGE_AHEAD),
+            message_mark: None,
             encryption,
             scroll_direction: None,
             attachments: Attachments::new(cx),
@@ -349,10 +618,14 @@ impl Conversation {
             message_menu: MessageMenu::new(cx.focus_handle()),
             reactions: Reactions::default(),
             message_delete: message_delete::MessageDelete::default(),
-            forward_original: None,
             time_reference: None,
             sending: None,
             heading: Heading::default(),
+            local_key: None,
+            local_key_revision: 0,
+            server_topic_closed: false,
+            local_draft_request: None,
+            opening_draft_id: None,
             heading_details: None,
             heading_request: None,
             favorites_presentation: false,
@@ -362,9 +635,7 @@ impl Conversation {
             history_avatars: AvatarImages::default(),
             history_avatar_users: Vec::new(),
             details: None,
-        };
-        conversation.start(Load::Open(conversation.opening_entry()), cx);
-        conversation
+        }
     }
 
     /// Снимает точку чтения при уходе с экрана. Подтверждённый хвост открывается штатным Latest.
@@ -379,10 +650,156 @@ impl Conversation {
         }
     }
 
+    /// Проверяет, что цель уже находится в действующем, подтверждённом окне.
+    pub(super) fn can_reveal_message(&self, id: Uuid) -> bool {
+        matches!(&self.state, State::Ready(window) if !window.needs_refresh)
+            && !self.read_pending
+            && !self
+                .active
+                .is_some_and(|flight| matches!(flight.load, Load::Read(_)))
+            && self.viewport.contains_confirmed(id)
+    }
+
+    /// Снимает правила подготовки текущей темы для фонового запроса нового окна.
+    pub(super) fn message_history_encryption(&self) -> Option<MessageHistoryEncryption> {
+        let encryption = self.encryption.as_ref()?;
+        Some(MessageHistoryEncryption {
+            account: self.avatar_session(),
+            scope: self.address.route.scope,
+            revision: encryption.revision(),
+            preparation: encryption.prepare_for_navigation(),
+        })
+    }
+
+    /// Показывает цель в существующем списке, сохраняя редактор и его фокус.
+    pub(super) fn reveal_message(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if self.can_reveal_message(id) {
+            self.mark_message(id, Uuid::new_v4(), cx);
+        }
+    }
+
+    /// Применяет готовое окно в текущей теме, сохраняя живой экран и редактор.
+    pub(super) fn apply_prepared_message(
+        &mut self,
+        prepared: PreparedMessageHistory,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let target = &prepared.address;
+        if !self.has_access()
+            || self.is_archived()
+            || self.address.route.scope != target.route.scope
+            || self.address.route.owner != target.route.owner
+            || self.address.generation != target.generation
+            || prepared.encryption_revision.is_some_and(|revision| {
+                self.encryption.as_ref().map(HistoryEncryption::revision) != Some(revision)
+            })
+        {
+            return false;
+        }
+        self.show_prepared_message(prepared, cx);
+        true
+    }
+
+    /// Устанавливает подтверждённые строки и помечает цель до первого кадра.
+    fn show_prepared_message(&mut self, prepared: PreparedMessageHistory, cx: &mut Context<Self>) {
+        let PreparedMessageHistory {
+            address,
+            snapshot,
+            checked,
+            flight,
+            ..
+        } = prepared;
+        if let ChatEntry::Around(id) = address.route.entry {
+            let reread = self.read_pending
+                || self
+                    .active
+                    .is_some_and(|flight| matches!(flight.load, Load::Read(_)));
+            self.active = None;
+            self.read_pending = false;
+            self.reading.clear();
+            self.action_error = None;
+            self.restore = None;
+            self.entry = ChatEntry::Around(id);
+            self.show(snapshot, checked, flight, false, cx);
+            if self.has_access() && self.viewport.contains_confirmed(id) {
+                self.mark_message(id, flight.id, cx);
+                if reread {
+                    self.queue_read(cx);
+                }
+            }
+        }
+    }
+
+    /// Возвращает положение чтения на месте, когда нужное окно уже открыто.
+    pub(super) fn restore_reading_position(
+        &mut self,
+        position: Option<ReadingAnchor>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let usable = match position {
+            Some(position) => self.can_reveal_message(position.id),
+            None => matches!(&self.state, State::Ready(window)
+                if !window.needs_refresh && window.newer == HistoryEdge::End),
+        };
+        if usable {
+            self.clear_message_mark();
+            self.reading.clear_observations();
+            self.entry = ChatEntry::Latest;
+            self.scroll_direction = None;
+            self.viewport.restore_position(position);
+            cx.notify();
+        }
+        usable
+    }
+
+    /// Ставит одноразовую отметку и заменяет таймер предыдущей цели.
+    fn mark_message(&mut self, id: Uuid, op_id: Uuid, cx: &mut Context<Self>) {
+        if !self.viewport.has_visible_message(id) {
+            self.reading.clear_observations();
+        }
+        self.message_mark = None;
+        self.scroll_direction = None;
+        self.viewport.center_message(id, op_id);
+        cx.notify();
+    }
+
+    /// Начинает отсчёт после кадра, в котором впервые выставлена нужная позиция.
+    fn start_message_mark_timer(&mut self, op_id: Uuid, cx: &mut Context<Self>) {
+        if !self.viewport.has_message_mark(op_id) {
+            return;
+        }
+        let delay = cx.background_executor().timer(MESSAGE_MARK_DURATION);
+        self.message_mark = Some(cx.spawn(async move |entity, cx| {
+            delay.await;
+            let _ = entity.update(cx, |view, cx| {
+                if view.viewport.has_message_mark(op_id) {
+                    view.viewport.clear_message_mark();
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    /// Убирает подсветку и отменяет одноразовое центрирование при смене места чтения.
+    fn clear_message_mark(&mut self) {
+        self.message_mark = None;
+        self.viewport.clear_message_mark();
+    }
+
     /// Использует обычную загрузку вокруг UUID для восстановления разрешённого окна.
     fn opening_entry(&self) -> ChatEntry {
         self.restore
             .map_or(self.entry, |anchor| ChatEntry::Around(anchor.id))
+    }
+
+    /// Выбирает первый непрочитанный только для обычного входа без сохранённой цели.
+    fn opening_load(&self) -> Load {
+        let entry = self.opening_entry();
+        if entry == ChatEntry::Latest && !self.is_archived() {
+            Load::OpenUnread
+        } else {
+            Load::Open(entry)
+        }
     }
 
     /// Подключает редактор после создания экрана, пока первое окно истории ещё загружается.
@@ -396,6 +813,12 @@ impl Conversation {
                         conversation.save_submission(sender, submission, cx)
                     }
                     ComposerEvent::DestinationChanged => {
+                        let editor = sender.read(cx);
+                        if editor.destination_error() == Some(DestinationError::TopicClosed) {
+                            conversation.server_topic_closed = true;
+                        } else if editor.is_available() {
+                            conversation.server_topic_closed = false;
+                        }
                         conversation.load_call_settings(cx);
                         cx.notify();
                     }
@@ -430,13 +853,16 @@ impl Conversation {
             _measure: measure,
             measured,
         });
+        if let Some(sending) = &self.sending {
+            sending.view.update(cx, |composer, cx| {
+                composer.check_destination(&sending.source, cx)
+            });
+        }
     }
 
     /// Повторяет проверку отправки, пока история этого разговора доступна.
     fn retry_send_destination(&mut self, cx: &mut Context<Self>) {
-        if self.has_access()
-            && let Some(sending) = &self.sending
-        {
+        if let Some(sending) = &self.sending {
             sending.view.update(cx, |editor, cx| {
                 editor.retry_destination(&sending.source, cx)
             });
@@ -528,13 +954,28 @@ impl Conversation {
             .filter(|catalog| catalog.generation == self.address.generation)
             .and_then(|catalog| catalog.chats.as_ref());
         if let Some(sending) = &self.sending {
-            sending.view.update(cx, |composer, cx| composer.set_reference_chats(chats.cloned(), cx));
+            sending.view.update(cx, |composer, cx| {
+                composer.set_reference_chats(chats.cloned(), cx)
+            });
         }
         let heading = chats
             .and_then(|chats| chats.iter().find(|chat| chat.id == scope.stream_id))
             .map(|chat| Heading::from_chat(chat, scope));
         if !self.is_archived() || heading.is_some() {
             self.set_heading(heading.unwrap_or_default(), cx);
+        }
+        if let Some(chat) =
+            chats.and_then(|chats| chats.iter().find(|chat| chat.id == scope.stream_id))
+            && chat.metadata.encrypted == Some(false)
+            && let Some(topic) = scope.topic_id.or_else(|| {
+                chat.direct
+                    .then_some(chat.metadata.default_topic_id)
+                    .flatten()
+            })
+        {
+            self.load_local_draft(topic, cx);
+        } else {
+            self.local_draft_request = None;
         }
         if self
             .details
@@ -565,6 +1006,118 @@ impl Conversation {
     /// Различает архивный просмотр и рабочую историю того же разговора.
     fn is_archived(&self) -> bool {
         self.address.route.entry == ChatEntry::Archived
+    }
+
+    /// Решает показ поля по локальному каталогу, не ожидая истории и сервера отправки.
+    fn local_composer_visible(&self) -> bool {
+        !self.is_archived()
+            && !matches!(self.state, State::Failed(Failure::AccessLost))
+            && !self.heading.topic_closed
+            && !self.server_topic_closed
+            && (self.heading.chat.is_none()
+                || self.heading.direct
+                || self.address.route.scope.topic_id.is_some())
+            && (self.heading.encrypted != Some(true) || self.local_key == Some(true))
+    }
+
+    /// Асинхронно читает локальное наличие ключа и отбрасывает устаревший результат.
+    fn refresh_local_key(&mut self, keep_current: bool, cx: &mut Context<Self>) {
+        self.local_key_revision = self.local_key_revision.wrapping_add(1);
+        let revision = self.local_key_revision;
+        if !keep_current {
+            self.local_key = None;
+        }
+        cx.notify();
+        let Some(runtime) = &self.avatar_runtime else {
+            return;
+        };
+        let Some((engine, activation)) = runtime.message_encryption(&self.avatar_session()) else {
+            self.local_key = Some(false);
+            return;
+        };
+        let stream = self.address.route.scope.stream_id;
+        let task = cx
+            .background_executor()
+            .spawn(async move { engine.has_local_key(&activation, stream).ok() });
+        cx.spawn(async move |view, cx| {
+            let available = task.await;
+            let _ = view.update(cx, |view, cx| {
+                if view.local_key_revision == revision {
+                    view.local_key = available;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Читает локальный обычный черновик независимо от проверки отправки.
+    fn load_local_draft(&mut self, topic: Uuid, cx: &mut Context<Self>) {
+        let request = (topic, self.opening_draft_id);
+        if self.local_draft_request == Some(request) {
+            return;
+        }
+        let (Some(runtime), Some(sending)) = (&self.avatar_runtime, &self.sending) else {
+            return;
+        };
+        let runtime = runtime.clone();
+        let editor = sending.view.clone();
+        let stamp = editor.read(cx).draft_stamp(cx);
+        let address = self.address.clone();
+        self.local_draft_request = Some(request);
+        cx.spawn(async move |view, cx| {
+            let reply = runtime
+                .conversation(address, move |services, address| async move {
+                    let scope = workspace_core::storage::DraftScope {
+                        stream_id: address.route.scope.stream_id,
+                        topic_id: topic,
+                    };
+                    // Не возвращаем ввод, который другая операция уже передаёт очереди.
+                    services.drafts.wait_for_send(&address, scope).await;
+                    let stored = services
+                        .sync
+                        .read_local_plaintext_draft(
+                            &address.route.owner,
+                            address.generation,
+                            scope,
+                            request.1,
+                        )
+                        .ok()
+                        .flatten()?;
+                    let pending = services
+                        .drafts
+                        .current(&address, scope, request.1)
+                        .filter(|(_, pending, _)| request.1.is_none_or(|id| id == pending.id));
+                    Some(match (stored, pending) {
+                        (Some(saved), Some((_, pending, _)))
+                            if saved.id == pending.id && pending.version > saved.version =>
+                        {
+                            Some(pending)
+                        }
+                        (Some(saved), Some((_, pending, _)))
+                            if request.1.is_none() && saved.id != pending.id =>
+                        {
+                            Some(pending)
+                        }
+                        (Some(saved), _) => Some(saved),
+                        (None, Some((_, pending, _))) => Some(pending),
+                        (None, None) => None,
+                    })
+                })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                if view.local_draft_request != Some(request)
+                    || view.heading.encrypted != Some(false)
+                    || matches!(view.state, State::Failed(Failure::AccessLost))
+                {
+                    return;
+                }
+                if let Some(Ok(Some(saved))) = reply.for_current(Some(&view.address)) {
+                    editor.update(cx, |editor, cx| editor.show_local_draft(saved, stamp, cx));
+                }
+            });
+        })
+        .detach();
     }
 
     /// Включает фото, только пока разговор виден в рабочем разделе окна.
@@ -692,11 +1245,22 @@ impl Conversation {
         }
         self.refresh_open_gallery(&update.change, cx);
         match update.change {
-            SyncChange::MessengerReset => self.restart(cx),
+            SyncChange::MessengerReset => {
+                self.invalidate_send_destination(cx);
+                self.restart(cx);
+            }
+            SyncChange::MessengerSourceReady => {
+                self.rearm_read_revalidation(cx);
+                if self.reading.rearm_failed() {
+                    cx.notify();
+                }
+            }
             SyncChange::QuickReactionUsageChanged => self.load_reaction_usage(cx),
             SyncChange::SidebarDetailsChanged { stream_id } if scope.stream_id == stream_id => {
                 if let Some(sending) = &self.sending {
-                    sending.view.update(cx, |composer, cx| composer.refresh_mention_members(false, cx));
+                    sending.view.update(cx, |composer, cx| {
+                        composer.refresh_mention_members(false, cx)
+                    });
                 }
                 self.refresh_open_details(cx);
                 self.refresh_heading_details(cx);
@@ -715,6 +1279,17 @@ impl Conversation {
                 topic_id,
             }) if scope.stream_id == stream_id => match scope.topic_id {
                 Some(current) if current == topic_id => self.fail(Failure::AccessLost, cx),
+                None if (self.heading.direct || self.heading.chat.is_none())
+                    && self
+                        .heading
+                        .default_topic
+                        .is_none_or(|current| current == topic_id) =>
+                {
+                    self.fail(Failure::AccessLost, cx);
+                    // Личка может получить другую тему по умолчанию. Старый ввод уже отозван.
+                    self.heading.default_topic = None;
+                    self.reopen(cx);
+                }
                 None => {
                     if let Some(sending) = &self.sending {
                         sending
@@ -730,6 +1305,17 @@ impl Conversation {
                 if includes(scope, changed) =>
             {
                 self.queue_read(cx)
+            }
+            SyncChange::HistoryReadChanged { scope: changed }
+                if overlaps_read_scope(scope, changed) =>
+            {
+                self.reading.refresh_blocked(changed.topic_id);
+                self.queue_read(cx)
+            }
+            SyncChange::HistoryReadRevalidate { scope: changed }
+                if changed.is_none_or(|changed| overlaps_read_scope(scope, changed)) =>
+            {
+                self.request_read_revalidation(changed, cx);
             }
             SyncChange::HistoryMessageChanged { message_id }
             | SyncChange::HistoryMessageReactionsChanged { message_id }
@@ -750,6 +1336,7 @@ impl Conversation {
 
     /// Скрывает прежние строки и начинает загрузку выбранного окна.
     fn reopen(&mut self, cx: &mut Context<Self>) {
+        self.clear_message_mark();
         self.calls.cancel();
         self.heading_request.take();
         self.heading_details = None;
@@ -757,10 +1344,12 @@ impl Conversation {
         if let Some(details) = &mut self.details {
             details.clear(&self.address, None, cx);
         }
-        self.invalidate_send_destination(cx);
         self.state = State::Opening;
         self.active = None;
         self.read_pending = false;
+        self.read_revalidation = None;
+        self.read_revalidation_waiting = false;
+        self.reading.clear();
         self.action_error = None;
         self.scroll_direction = None;
         self.outbox.clear();
@@ -773,11 +1362,18 @@ impl Conversation {
         self.message_menu.invalidate(None);
         self.message_delete.clear();
         self.reactions.clear_visible();
+        // Повтор текущего маршрута, в том числе явный переход в конец, сохраняет его цель.
         self.start(Load::Open(self.opening_entry()), cx);
+        if let Some(sending) = &self.sending {
+            sending.view.update(cx, |composer, cx| {
+                composer.check_destination(&sending.source, cx)
+            });
+        }
     }
 
     /// Скрывает историю и делает любые запоздавшие ответы неприменимыми.
     fn fail(&mut self, error: Failure, cx: &mut Context<Self>) {
+        self.clear_message_mark();
         self.calls.cancel();
         self.heading_request.take();
         self.heading_details = None;
@@ -805,6 +1401,9 @@ impl Conversation {
         }
         self.active = None;
         self.read_pending = false;
+        self.read_revalidation = None;
+        self.read_revalidation_waiting = false;
+        self.reading.clear();
         self.action_error = None;
         self.outbox.clear();
         self.viewport.clear();
@@ -825,6 +1424,39 @@ impl Conversation {
             self.read_pending = true;
         } else if let State::Ready(window) = &self.state {
             self.start(Load::Read(window.id), cx);
+        }
+    }
+
+    /// Объединяет несколько входящих событий чтения в одну сверку видимого окна.
+    fn request_read_revalidation(&mut self, changed: Option<HistoryScope>, cx: &mut Context<Self>) {
+        self.merge_read_revalidation(changed);
+        self.read_revalidation_waiting = false;
+        self.start_read_revalidation(cx);
+    }
+
+    /// Сохраняет точную тему, пока сигналы не затронули несколько разных частей истории.
+    fn merge_read_revalidation(&mut self, changed: Option<HistoryScope>) {
+        self.read_revalidation = Some(match self.read_revalidation {
+            Some(pending) if pending != changed => None,
+            _ => changed,
+        });
+    }
+
+    /// Повторяет отложенную сверку после фокуса или восстановления соединения.
+    fn rearm_read_revalidation(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.read_revalidation_waiting) {
+            self.start_read_revalidation(cx);
+        }
+    }
+
+    /// Запускает серверную сверку после окончания текущей операции со снимком.
+    fn start_read_revalidation(&mut self, cx: &mut Context<Self>) {
+        if !self.read_revalidation_waiting
+            && self.active.is_none()
+            && let State::Ready(window) = &self.state
+            && let Some(changed) = self.read_revalidation.take()
+        {
+            self.start(Load::RevalidateRead(window.id, changed), cx);
         }
     }
 
@@ -943,12 +1575,30 @@ impl Conversation {
                 self.start(Load::Open(ChatEntry::Latest), cx);
                 return;
             }
-            Ok(Some(snapshot)) => self.show(snapshot, checked, flight, false, cx),
-            Ok(None) if matches!(flight.load, Load::Read(_) | Load::Extend(_, _)) => {
+            Ok(Some(snapshot)) => {
+                if let Load::RevalidateRead(_, changed) = flight.load {
+                    self.reading
+                        .refresh_blocked(changed.and_then(|scope| scope.topic_id));
+                }
+                self.show(snapshot, checked, flight, false, cx);
+            }
+            Ok(None)
+                if matches!(
+                    flight.load,
+                    Load::Read(_) | Load::Extend(_, _) | Load::RevalidateRead(_, _)
+                ) =>
+            {
                 self.restart(cx);
                 return;
             }
             Err(Failure::AccessLost) => self.fail(Failure::AccessLost, cx),
+            Err(_) if matches!(flight.load, Load::RevalidateRead(_, _)) && self.has_access() => {
+                if let Load::RevalidateRead(_, changed) = flight.load {
+                    // При наличии более свежего события сразу проверим объединённую область.
+                    self.read_revalidation_waiting = self.read_revalidation.is_none();
+                    self.merge_read_revalidation(changed);
+                }
+            }
             Err(Failure::MissingMessage) if self.abandon_restore(flight, cx) => return,
             Err(Failure::MissingMessage) => self.fail(Failure::MissingMessage, cx),
             Err(error) if self.has_access() => {
@@ -965,6 +1615,7 @@ impl Conversation {
             Err(error) => self.fail(error, cx),
             Ok(None) => self.fail(Failure::Changed, cx),
         }
+        self.start_read_revalidation(cx);
         if self.active.is_none() && std::mem::take(&mut self.read_pending) {
             self.queue_read(cx);
         }
@@ -1004,6 +1655,8 @@ impl Conversation {
             window,
             outbox,
             media_access,
+            first_unread,
+            unread_checked,
         } = snapshot;
         if window.scope != self.address.route.scope {
             self.fail(Failure::Changed, cx);
@@ -1030,7 +1683,10 @@ impl Conversation {
             }
             _ => false,
         };
-        let position = match &self.state {
+        let unread_position = first_unread
+            .filter(|_| !cached && self.entry == ChatEntry::Latest && self.restore.is_none())
+            .map(Position::Unread);
+        let position = unread_position.unwrap_or_else(|| match &self.state {
             State::Ready(previous)
                 if cached
                     && previous.id != window.id
@@ -1052,11 +1708,11 @@ impl Conversation {
                 ChatEntry::Latest | ChatEntry::Archived => Position::Tail,
                 ChatEntry::Around(id) => Position::Around(id),
             },
-        };
+        });
         if let Some(outbox) = outbox {
             self.outbox = outbox;
         }
-        if matches!(flight.load, Load::Open(_)) {
+        if flight.load.opens() {
             self.attachments.access = media_access;
         }
         log::debug!(
@@ -1070,6 +1726,18 @@ impl Conversation {
             encryption.accept(&window, &self.outbox, checked);
         }
         self.reconcile_key_responses(&window, cx);
+        if flight.load.opens() {
+            self.reading.fresh = !cached;
+            self.reading.knows_unread = !cached && unread_checked;
+        }
+        self.reading.accept_history(&window);
+        let unread_marker = self
+            .reading
+            .knows_unread
+            .then(|| window.messages.iter().find(|row| row.read == Some(false)))
+            .flatten()
+            .map(|row| row.id);
+        self.viewport.set_unread_marker(unread_marker);
         self.viewport.replace(
             &window,
             &self.outbox,
@@ -1127,10 +1795,7 @@ impl Conversation {
         let State::Ready(window) = &self.state else {
             return;
         };
-        if self
-            .action_error
-            .is_some_and(|error| matches!(error.load, Load::Open(_)))
-        {
+        if self.action_error.is_some_and(|error| error.load.opens()) {
             return;
         }
         let edge = match direction {
@@ -1185,8 +1850,11 @@ impl Conversation {
         if self.active.is_some() && !self.has_access() {
             return;
         }
+        cx.emit(HistoryTargetCleared);
+        self.clear_message_mark();
         self.restore = None;
         self.scroll_direction = None;
+        self.reading.clear_observations();
         if self.entry == ChatEntry::Latest
             && let State::Ready(window) = &self.state
             && window.newer == HistoryEdge::End
@@ -1213,7 +1881,7 @@ impl Conversation {
             return;
         }
         if let Some(failure) = self.action_error.take() {
-            if matches!(failure.load, Load::Open(_)) {
+            if failure.load.opens() {
                 self.restart(cx);
             } else {
                 self.start(failure.load, cx);
@@ -1331,12 +1999,15 @@ impl Conversation {
                     )
                 },
             )
+            .when(self.can_observe_read(), |frame| {
+                frame.child(self.viewport.track_read_frame(cx.entity().downgrade()))
+            })
     }
 
     /// Отличает сетевую догрузку от перечитывания уже сохранённых строк.
     fn has_background_history_load(&self) -> bool {
         self.active
-            .is_some_and(|flight| matches!(flight.load, Load::Open(_) | Load::Extend(_, _)))
+            .is_some_and(|flight| flight.load.opens() || matches!(flight.load, Load::Extend(_, _)))
     }
 
     /// Показывает фоновый запрос поверх списка, сохраняя прокрутку и действия над строками.
@@ -1425,7 +2096,41 @@ impl Conversation {
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
         let editor = sending.view.read(cx);
-        if editor.is_available() {
+        if self.local_composer_visible() {
+            if let Some(error) = editor.destination_error() {
+                let locale = Preferences::read_for(cx, &self.address.route.owner).language;
+                let key = match error {
+                    DestinationError::TopicClosed => "desktop.conversation.sending.topicResolved",
+                    DestinationError::TopicChanged => "desktop.conversation.sending.topicChanged",
+                    DestinationError::DraftUnavailable => {
+                        "desktop.conversation.sending.draftUnavailable"
+                    }
+                    DestinationError::KeyUnavailable => {
+                        "desktop.conversation.sending.keyUnavailable"
+                    }
+                    DestinationError::AccessLost | DestinationError::EncryptionUnavailable => {
+                        "desktop.conversation.sending.unavailable"
+                    }
+                    DestinationError::TopicUnavailable | DestinationError::Unavailable => {
+                        "desktop.conversation.sending.checkFailed"
+                    }
+                };
+                return div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        ConversationNotice {
+                            text: locale.tr(key).into(),
+                            action: Some(Button::new(
+                                "conversation-send-retry",
+                                locale.tr("desktop.conversation.history.checkAgain"),
+                            )),
+                        }
+                        .render(palette, action(cx, Self::retry_send_destination)),
+                    )
+                    .child(sending.view.clone())
+                    .into_any_element();
+            }
             let Some(width) = self
                 .view_width
                 .get()
@@ -1471,7 +2176,24 @@ impl Conversation {
 
         sending.measured.set(None);
         let locale = Preferences::read_for(cx, &self.address.route.owner).language;
-        let error = editor.destination_error();
+        if self.heading.chat.is_some()
+            && !self.heading.direct
+            && self.address.route.scope.topic_id.is_none()
+        {
+            return ConversationNotice {
+                text: locale.tr("chat.selectTopic").into(),
+                action: None,
+            }
+            .render(palette, |_, _| {})
+            .into_any_element();
+        }
+        let error = if self.heading.topic_closed || self.server_topic_closed {
+            Some(DestinationError::TopicClosed)
+        } else if self.heading.encrypted == Some(true) {
+            Some(DestinationError::KeyUnavailable)
+        } else {
+            editor.destination_error()
+        };
         let key = match error {
             None => "desktop.conversation.sending.checkingAccess",
             Some(DestinationError::TopicClosed) => "desktop.conversation.sending.topicResolved",
@@ -1479,7 +2201,9 @@ impl Conversation {
                 "desktop.conversation.sending.unavailable"
             }
             Some(DestinationError::TopicChanged) => "desktop.conversation.sending.topicChanged",
-            Some(DestinationError::DraftUnavailable) => "desktop.conversation.sending.draftUnavailable",
+            Some(DestinationError::DraftUnavailable) => {
+                "desktop.conversation.sending.draftUnavailable"
+            }
             Some(DestinationError::KeyUnavailable) => "desktop.conversation.sending.keyUnavailable",
             Some(DestinationError::TopicUnavailable | DestinationError::Unavailable) => {
                 "desktop.conversation.sending.checkFailed"
@@ -1599,10 +2323,22 @@ impl Conversation {
             .border_1()
             .border_color(palette.border);
         match &self.state {
-            State::Opening => root.child(loading::skeleton(palette)),
-            State::Failed(cause) => {
-                root.child(centered.child(self.render_problem(palette, Some(*cause), cx)))
-            }
+            State::Opening => root.child(loading::skeleton(palette)).children(
+                self.sending
+                    .as_ref()
+                    .map(|sending| self.render_chat_footer(sending, palette, cx)),
+            ),
+            State::Failed(cause) => root
+                .child(centered.child(self.render_problem(palette, Some(*cause), cx)))
+                .children(
+                    (!matches!(cause, Failure::AccessLost))
+                        .then(|| {
+                            self.sending
+                                .as_ref()
+                                .map(|sending| self.render_chat_footer(sending, palette, cx))
+                        })
+                        .flatten(),
+                ),
             State::Ready(history) => {
                 if self.viewport.time_zone_changed() {
                     let position = if history.newer == HistoryEdge::End && self.viewport.at_tail() {
@@ -1653,16 +2389,20 @@ impl Conversation {
                         focus: self.history_focus.clone(),
                         selection: self.viewport.selection(),
                     });
-                    let quick_reply = self.sending.as_ref().is_some_and(|sending| {
-                        sending.view.read(cx).reply_available()
-                    });
+                    let quick_reply = self
+                        .sending
+                        .as_ref()
+                        .is_some_and(|sending| sending.view.read(cx).reply_available());
                     let images: HashMap<_, _> = self
                         .history_avatar_users
                         .iter()
                         .copied()
                         .filter_map(|id| Some((id, self.history_avatars.image(id, cx)?)))
                         .collect();
-                    let activation = self.encryption.as_ref().map(|encryption| &encryption.activation);
+                    let activation = self
+                        .encryption
+                        .as_ref()
+                        .map(|encryption| &encryption.activation);
                     let cards = self.attachments.cards(&self.address, activation, cx);
                     let fragments = self.fragment_runtime(cx);
                     self.viewport
@@ -1670,6 +2410,10 @@ impl Conversation {
                             palette,
                             peer,
                             viewport::HistoryControls {
+                                pending_reads: self.reading.pending(),
+                                read_motion: Some(Motion::from_preference(
+                                    Preferences::animations_enabled(cx),
+                                )),
                                 reply,
                                 quick_reply,
                                 reactions: self.reaction_controls(locale, cx),
@@ -1785,7 +2529,8 @@ impl Conversation {
                 )
                 .children(self.is_archived().then(|| {
                     ConversationNotice {
-                        text: locale.tr("desktop.sidebar.newChats.archivedConversation")
+                        text: locale
+                            .tr("desktop.sidebar.newChats.archivedConversation")
                             .into(),
                         action: None,
                     }
@@ -1801,12 +2546,11 @@ impl Render for Conversation {
     /// Рисует историю и редактор в рабочей области разговора.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::for_window(window, cx);
+        self.observe_read_activation(window, cx);
         self.restore_details_for_verified_history(window, cx);
         if let Some(sending) = &self.sending {
             let editor = sending.view.read(cx);
-            if (!self.has_access() || !editor.is_available())
-                && editor.editor_focus(cx).is_focused(window)
-            {
+            if !self.local_composer_visible() && editor.editor_focus(cx).is_focused(window) {
                 let focus = if self.has_access() {
                     &self.history_focus
                 } else {
@@ -1823,7 +2567,9 @@ impl Render for Conversation {
                 PhotoReturn::History(key, focus) if self.viewport.has_visible_attachment(*key) => {
                     focus
                 }
-                PhotoReturn::Protected(row, focus) if self.viewport.has_visible_message(*row) => focus,
+                PhotoReturn::Protected(row, focus) if self.viewport.has_visible_message(*row) => {
+                    focus
+                }
                 _ if self.has_access() => &self.history_focus,
                 _ => &self.screen_focus,
             };
@@ -1858,6 +2604,11 @@ impl Render for Conversation {
 fn includes(current: HistoryScope, changed: HistoryScope) -> bool {
     current.stream_id == changed.stream_id
         && (current.topic_id.is_none() || current.topic_id == changed.topic_id)
+}
+
+/// Учитывает снимок чтения для всего стрима при открытии его отдельной темы.
+fn overlaps_read_scope(current: HistoryScope, changed: HistoryScope) -> bool {
+    includes(current, changed) || includes(changed, current)
 }
 
 /// Доставляет нажатие кнопки экрану, если оболочка всё ещё его показывает.

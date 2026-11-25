@@ -8,9 +8,10 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, Bounds, Div, Hsla, ImageSource, IntoElement, ListAlignment, ListOffset,
-    ListState, MouseButton, Pixels, Point, RenderOnce, SharedString, Stateful, StyledText,
-    TextLayout, WeakEntity, Window, canvas, div, list, point, prelude::*, px,
+    Animation, AnyElement, App, AvailableSpace, Bounds, Div, Hsla, ImageSource, IntoElement,
+    ListAlignment, ListOffset, ListState, MouseButton, Pixels, Point, RenderOnce, SharedString,
+    Stateful, StyledText, TextLayout, WeakEntity, Window, canvas, div, ease_in_out, list, point,
+    prelude::*, px, size,
 };
 use uuid::Uuid;
 use workspace_core::{
@@ -65,8 +66,8 @@ use crate::gpui_client::{
     preferences::Language,
     ui::{
         Avatar, BubbleContent, Button, DeliveryMark, Icon, MessageBubble, Palette, QuoteSurface,
-        TextRole, activate, ellipsized_label, label, label_width, quote_frame_with_header,
-        text_role,
+        TextRole, activate, animation::Motion, ellipsized_label, label, label_width,
+        quote_frame_with_header, text_role,
     },
 };
 
@@ -74,6 +75,7 @@ use crate::platform::message_time::{CalendarDate, LocalTime};
 
 const DATE_SPACE: Pixels = px(32.);
 const BOTTOM_PADDING: Pixels = px(12.);
+const UNREAD_SPACE: Pixels = px(24.);
 
 /// Строка, которую можно рисовать после переноса снимка на поток UI.
 #[derive(Clone, Eq, PartialEq)]
@@ -92,6 +94,7 @@ struct Row {
     time: RowTime,            // Время сервера или ключ пояснения очереди.
     delivery: Option<DeliveryMark>, // Состояние отправки исходящей строки.
     starts_day: bool,         // Над этой строкой виден новый день.
+    unread_marker: bool,      // Над этой строкой проходит подтверждённая граница непрочитанного.
     starts_group: bool,       // Имя автора и отступ перед началом группы.
     ends_group: bool,         // Аватар собеседника рядом с последней строкой группы.
 }
@@ -150,6 +153,8 @@ impl From<String> for PeerLabel {
 /// Действия строки, связанные с текущим экраном и выбранным языком.
 #[derive(Default)]
 pub(super) struct HistoryControls {
+    pub pending_reads: HashSet<Uuid>, // Строки, до которых сейчас идёт серверная отметка.
+    pub read_motion: Option<Motion>,  // Общая настройка импульса, None у стенда без Core.
     pub reply: Option<ReplyControls>, // Выделение текста и меню подтверждённых строк.
     pub quick_reply: bool, // Готовый обычный редактор позволяет показать быструю кнопку.
     pub quick_hidden: bool, // Активное контекстное меню закрывает быстрые действия.
@@ -177,6 +182,11 @@ impl Row {
     fn inset(&self) -> Pixels {
         let gap = if self.starts_group { px(6.) } else { px(3.) };
         gap + if self.starts_day { DATE_SPACE } else { px(0.) }
+            + if self.unread_marker {
+                UNREAD_SPACE
+            } else {
+                px(0.)
+            }
     }
 
     /// Сравнивает авторство, тему и день двух соседних сообщений.
@@ -199,6 +209,7 @@ impl Row {
 pub(super) enum Position {
     Tail,                   // Перейти к последней строке.
     Around(Uuid),           // Поставить указанное сообщение в начало видимой истории.
+    Unread(Uuid),           // Показать разделитель над первым непрочитанным сообщением.
     Reading,                // Сохранить верхнюю видимую строку и её смещение.
     Restore(ReadingAnchor), // Выставить сохранённую координату после открытия.
 }
@@ -208,6 +219,13 @@ pub(super) enum Position {
 struct Measurement {
     op_id: Uuid,           // Операция, которая поменяла список.
     anchor: ReadingAnchor, // Положение той же строки до замены снимка.
+}
+
+/// Явная цель, которую нужно поставить на место перед первым показом списка.
+#[derive(Clone, Copy)]
+struct MessageCenter {
+    id: Uuid,    // UUID подтверждённой строки.
+    op_id: Uuid, // Операция из журнала перехода.
 }
 
 /// Поправка ожидает ширину списка в первом кадре после правки.
@@ -243,7 +261,11 @@ pub(super) struct Viewport {
     painted: Rc<RefCell<HashMap<Uuid, Bounds<Pixels>>>>, // Фактические прямоугольники строк.
     painted_text: Rc<RefCell<HashMap<Uuid, TextLayout>>>, // Разметка простого текста последнего кадра.
     painted_offset: Rc<Cell<Option<ListOffset>>>, // Смещение, для которого измерены прямоугольники.
-    measure: Option<Measurement>,                 // Следующее измерение после замены снимка.
+    paint_revision: u64, // Номер набора измерений, даже когда список остался на том же смещении.
+    unread_marker: Option<Uuid>, // UUID, полученный из подтверждённого окна истории.
+    measure: Option<Measurement>, // Следующее измерение после замены снимка.
+    message_center: Rc<Cell<Option<MessageCenter>>>, // Одно выставление цели до отрисовки.
+    marked_message: Option<MessageCenter>,        // Строка с временной отметкой перехода.
     edit_anchor: Option<EditAnchor>, // Поправка внутри текста опоры для следующего кадра.
     reflow_anchor: Rc<Cell<Option<ReflowAnchor>>>, // Опора между сменами ширины без жеста.
     ordinary_views: Rc<RefCell<TextRows>>, // Представления обычных баблов рядом с E2EE.
@@ -263,7 +285,11 @@ impl Viewport {
             painted: Rc::default(),
             painted_text: Rc::default(),
             painted_offset: Rc::default(),
+            paint_revision: 0,
+            unread_marker: None,
             measure: None,
+            message_center: Rc::default(),
+            marked_message: None,
             edit_anchor: None,
             reflow_anchor: Rc::default(),
             ordinary_views: Rc::default(),
@@ -276,6 +302,63 @@ impl Viewport {
     /// Возвращает состояние для подключения обработчика прокрутки.
     pub(super) fn list(&self) -> &ListState {
         &self.list
+    }
+
+    /// Исключает временные строки очереди из подтверждённых целей перехода.
+    pub(super) fn contains_confirmed(&self, id: Uuid) -> bool {
+        self.index
+            .get(&id)
+            .is_some_and(|&index| self.rows[index].confirmed())
+    }
+
+    /// Сохраняет подтверждённый разделитель для следующего применения набора строк.
+    pub(super) fn set_unread_marker(&mut self, message_id: Option<Uuid>) {
+        self.unread_marker = message_id;
+    }
+
+    /// Ставит отметку и передаёт центрирование в ближайший проход разметки.
+    pub(super) fn center_message(&mut self, id: Uuid, op_id: Uuid) {
+        self.clear_scroll_corrections();
+        let target = MessageCenter { id, op_id };
+        self.marked_message = Some(target);
+        self.message_center.set(Some(target));
+    }
+
+    /// Снимает отметку и отменяет ожидающее центрирование.
+    pub(super) fn clear_message_mark(&mut self) {
+        self.marked_message = None;
+        self.message_center.set(None);
+    }
+
+    /// Сверяет таймер со всё ещё показанной отметкой операции.
+    pub(super) fn has_message_mark(&self, op_id: Uuid) -> bool {
+        self.marked_message.is_some_and(|mark| mark.op_id == op_id)
+    }
+
+    /// Применяет координату известной строки или ставит список на подтверждённый хвост.
+    pub(super) fn restore_position(&mut self, position: Option<ReadingAnchor>) {
+        self.clear_scroll_corrections();
+        match position {
+            Some(anchor) => {
+                if let Some(&item_ix) = self.index.get(&anchor.id) {
+                    self.list.scroll_to(ListOffset {
+                        item_ix,
+                        offset_in_item: self.rows[item_ix].inset() - anchor.y,
+                    });
+                }
+            }
+            None => self.list.scroll_to(ListOffset {
+                item_ix: self.rows.len(),
+                offset_in_item: px(0.),
+            }),
+        }
+    }
+
+    /// Освобождает поправки к прежней позиции перед явным переходом.
+    fn clear_scroll_corrections(&mut self) {
+        self.measure = None;
+        self.edit_anchor = None;
+        self.reflow_anchor.set(None);
     }
 
     /// Сообщает рабочей области, что история может получить точечную дельту ключа.
@@ -314,9 +397,8 @@ impl Viewport {
         self.painted.borrow_mut().clear();
         self.painted_text.borrow_mut().clear();
         self.painted_offset.set(None);
-        self.measure = None;
-        self.edit_anchor = None;
-        self.reflow_anchor.set(None);
+        self.clear_scroll_corrections();
+        self.clear_message_mark();
         self.ordinary_views.borrow_mut().retain(|_| false);
         self.fragment_views.retain(|_, _, _| false);
     }
@@ -383,7 +465,7 @@ impl Viewport {
     ) {
         let local = LocalTime::system();
         self.time_zone = local.name().to_owned();
-        let rows = build_rows(
+        let mut rows = build_rows(
             history,
             outbox,
             user,
@@ -391,6 +473,13 @@ impl Viewport {
             &mut self.prepared_bodies,
             &local,
         );
+        if let Some(marker) = self.unread_marker
+            && let Some(row) = rows
+                .iter_mut()
+                .find(|row| row.id == marker && row.confirmed())
+        {
+            row.unread_marker = true;
+        }
         let previous_count = self.rows.len();
         let index: HashMap<_, _> = rows
             .iter()
@@ -412,7 +501,7 @@ impl Viewport {
         let anchor = match position {
             Position::Reading => self.anchor(&index),
             Position::Restore(anchor) => index.contains_key(&anchor.id).then_some(anchor),
-            Position::Tail | Position::Around(_) => None,
+            Position::Tail | Position::Around(_) | Position::Unread(_) => None,
         };
         // Одна и та же байтовая позиция имеет смысл, пока текст и маршрут совпадают.
         if self.reflow_anchor.get().is_some_and(|reflow| {
@@ -457,6 +546,12 @@ impl Viewport {
             .then_some(row.body.text.as_ref())
         });
         self.index = Rc::new(index);
+        if self
+            .marked_message
+            .is_some_and(|mark| !self.contains_confirmed(mark.id))
+        {
+            self.clear_message_mark();
+        }
         self.measure = anchor.map(|anchor| Measurement { op_id, anchor });
         log::debug!(
             "gpui_history op_id={op_id} event=rows_applied rows_before={previous_count} rows_after={} row_count_delta={} position={}",
@@ -465,6 +560,7 @@ impl Viewport {
             match position {
                 Position::Tail => "tail",
                 Position::Around(_) => "target",
+                Position::Unread(_) => "unread",
                 Position::Reading => "reading",
                 Position::Restore(_) => "restored",
             }
@@ -479,6 +575,14 @@ impl Viewport {
                     self.list.scroll_to(ListOffset {
                         item_ix,
                         offset_in_item: self.rows[item_ix].inset(),
+                    });
+                }
+            }
+            Position::Unread(id) => {
+                if let Some(&item_ix) = self.index.get(&id) {
+                    self.list.scroll_to(ListOffset {
+                        item_ix,
+                        offset_in_item: px(0.),
                     });
                 }
             }
@@ -587,7 +691,7 @@ impl Viewport {
         })
     }
 
-    /// Проверяет цель у того же подтверждённого сообщения видимого разговора.
+    /// Проверяет цель у сообщения видимого разговора, включая дату в очереди отправки.
     pub(super) fn has_inline_reference(
         &self,
         row: Uuid,
@@ -595,7 +699,8 @@ impl Viewport {
     ) -> bool {
         self.index.get(&row).is_some_and(|&index| {
             let row = &self.rows[index];
-            row.confirmed() && row.body.contains_reference(target)
+            (row.confirmed() || matches!(target, WorkspaceReferenceTarget::Time(_)))
+                && row.body.contains_reference(target)
         })
     }
 
@@ -724,6 +829,8 @@ impl Viewport {
             .flatten();
         let reflow_anchor = self.reflow_anchor.clone();
         let edit_anchor = self.edit_anchor.take();
+        let marked_message = self.marked_message.map(|mark| mark.id);
+        let message_center = self.message_center.clone();
         let memoize = controls.conversation.is_some() && self.has_encrypted_rows();
         let ordinary_views = self.ordinary_views.clone();
         ordinary_views
@@ -732,6 +839,7 @@ impl Viewport {
         self.painted.borrow_mut().clear();
         self.painted_text.borrow_mut().clear();
         self.painted_offset.set(None);
+        self.paint_revision = self.paint_revision.wrapping_add(1);
         let rows = self.rows.clone();
         let row_index = self.index.clone();
         let painted = self.painted.clone();
@@ -771,12 +879,45 @@ impl Viewport {
         let correction = {
             let list = list_state.clone();
             let rows = self.rows.clone();
+            let index = self.index.clone();
             let message = message.clone();
             let measured_line = measured_line.clone();
             let current_width = current_width.clone();
+            let conversation = controls.conversation.clone();
             canvas(
                 move |bounds, window, app| {
                     current_width.set(bounds.size.width);
+                    if bounds.size.height > BOTTOM_PADDING && bounds.size.width > px(0.)
+                        && let Some(center) = message_center.take()
+                        && let Some(&target) = index.get(&center.id)
+                    {
+                        let available = size(
+                            AvailableSpace::Definite(bounds.size.width),
+                            AvailableSpace::MinContent,
+                        );
+                        let offset = centered_offset(&rows, target, bounds.size.height, |index| {
+                            let row = &rows[index];
+                            let (element, _) = message(row, app);
+                            row_container(row, palette, locale)
+                                .child(element)
+                                .into_any_element()
+                                .layout_as_root(available, window, app)
+                                .height
+                        });
+                        list.scroll_to(offset);
+                        log::debug!(
+                            "gpui_history op_id={} event=message_centered anchor_uuid={} item_ix={} offset_px={}",
+                            center.op_id, center.id, offset.item_ix, f32::from(offset.offset_in_item)
+                        );
+                        if let Some(conversation) = conversation.clone() {
+                            app.defer(move |app| {
+                                let _ = conversation.update(app, |view, cx| {
+                                    view.start_message_mark_timer(center.op_id, cx);
+                                });
+                            });
+                        }
+                        return;
+                    }
                     let scroll = list.logical_scroll_top();
                     let row = rows.get(scroll.item_ix);
                     let retained = reflow_anchor.get().filter(|anchor| {
@@ -851,7 +992,14 @@ impl Viewport {
                 (message.into_any_element(), RenderedText::Fresh(layout))
             };
             row_container(row, palette, locale)
-                .child(div().relative().w_full().child(message).child(canvas(|_, _, _| (), move |bounds, (), _, _| {
+                .child(div().relative().w_full().when(marked_message == Some(id), |row| {
+                    row.rounded_md()
+                        .bg(palette.accent.opacity(0.18))
+                        .debug_selector(move || format!("history-message-mark-{id}"))
+                }).child(message).children(
+                    controls.read_motion.filter(|_| controls.pending_reads.contains(&id))
+                        .map(|motion| read_pending_mark(id, palette, motion)),
+                ).child(canvas(|_, _, _| (), move |bounds, (), _, _| {
                     painted.borrow_mut().insert(id, bounds);
                     if let Some(layout) = text_layout.layout() {
                         if let Some((_, op_id, target)) = measured_line.get().filter(|(anchor, _, _)| *anchor == id)
@@ -888,10 +1036,74 @@ impl Viewport {
             .child(items)
     }
 
+    /// После отрисовки истории передаёт только видимые подтверждённые строки текущего кадра.
+    pub(super) fn track_read_frame(
+        &self,
+        conversation: WeakEntity<Conversation>,
+    ) -> impl IntoElement {
+        let revision = self.paint_revision;
+        let rows = self.rows.clone();
+        let index = self.index.clone();
+        let painted = self.painted.clone();
+        let list = self.list.clone();
+        canvas(
+            |_, _, _| (),
+            move |_, (), window, app| {
+                if !window.is_window_active() {
+                    return;
+                }
+                let viewport = list.viewport_bounds();
+                let offset = list.logical_scroll_top();
+                let mut visible = painted
+                    .borrow()
+                    .iter()
+                    .filter_map(|(id, bounds)| {
+                        let &index = index.get(id)?;
+                        (bounds.intersects(&viewport) && rows[index].confirmed())
+                            .then_some((index, *id))
+                    })
+                    .collect::<Vec<_>>();
+                if visible.is_empty() {
+                    return;
+                }
+                visible.sort_unstable_by_key(|&(index, _)| index);
+                let handle = window.window_handle();
+                app.defer(move |app| {
+                    let _ = handle.update(app, |_, window, app| {
+                        if window.is_window_active() {
+                            let _ = conversation.update(app, |view, cx| {
+                                if view.viewport.paint_revision == revision
+                                    && Rc::ptr_eq(&view.viewport.rows, &rows)
+                                    && view.viewport.paint_matches(offset)
+                                    && same_offset(view.viewport.list.logical_scroll_top(), offset)
+                                    && view.viewport.list.viewport_bounds() == viewport
+                                {
+                                    view.observe_read_frame(visible, cx);
+                                }
+                            });
+                        }
+                    });
+                });
+            },
+        )
+        .absolute()
+        .inset_0()
+    }
+
     /// Считает сборки обычного бабла средствами GPUI во время теста обновления ключа.
     #[cfg(all(test, feature = "gpui-test"))]
     pub(super) fn tested_bubble_renders(&self, id: Uuid, cx: &App) -> Option<usize> {
         self.ordinary_views.borrow().renders(id, cx)
+    }
+
+    /// Возвращает строки, для которых список строит разделитель непрочитанного.
+    #[cfg(all(test, feature = "gpui-test"))]
+    pub(super) fn tested_unread_markers(&self) -> Vec<Uuid> {
+        self.rows
+            .iter()
+            .filter(|row| row.unread_marker)
+            .map(|row| row.id)
+            .collect()
     }
 
     /// Считывает идентичность подготовленного тела, чтобы проверить повторное использование на сдвиге.
@@ -1011,6 +1223,29 @@ impl RenderedText {
     }
 }
 
+/// Выбирает действительную первую строку, оставляя место до центра для её соседей.
+fn centered_offset(
+    rows: &[Row],
+    target: usize,
+    height: Pixels,
+    mut measure: impl FnMut(usize) -> Pixels,
+) -> ListOffset {
+    let inset = rows[target].inset();
+    let bubble = measure(target) - inset;
+    let centered_y = ((height - BOTTOM_PADDING - bubble) / 2.).max(px(0.));
+    let mut item_ix = target;
+    let mut offset = inset - centered_y;
+    // Отрицательное смещение первой строки оставило бы пустоту перед ней в GPUI.
+    while item_ix > 0 && offset < px(0.) {
+        item_ix -= 1;
+        offset += measure(item_ix);
+    }
+    ListOffset {
+        item_ix,
+        offset_in_item: offset.max(px(0.)),
+    }
+}
+
 /// Отбирает авторов по реально нарисованным строкам, исключая запас списка за границами окна.
 fn visible_avatar_users(
     rows: &[Row],
@@ -1042,10 +1277,59 @@ fn same_offset(a: ListOffset, b: ListOffset) -> bool {
 
 /// Задаёт отступы для строки списка и для её пробного измерения.
 fn row_container(row: &Row, palette: Palette, locale: Language) -> Div {
-    div().relative().w_full().px_3().pt(row.inset()).children(
-        row.date
-            .filter(|_| row.starts_day)
-            .map(|date| date_separator(palette, date, row.id, locale)),
+    div()
+        .relative()
+        .w_full()
+        .px_3()
+        .pt(row.inset())
+        .children(
+            row.date
+                .filter(|_| row.starts_day)
+                .map(|date| date_separator(palette, date, row.id, locale)),
+        )
+        .children(
+            row.unread_marker
+                .then(|| unread_separator(row, palette, locale)),
+        )
+}
+
+/// Рисует границу непрочитанного, оставляя сообщение адресуемой строкой списка.
+fn unread_separator(row: &Row, palette: Palette, locale: Language) -> Div {
+    let id = row.id;
+    div()
+        .absolute()
+        .top(if row.starts_day { DATE_SPACE } else { px(0.) })
+        .left_3()
+        .right_3()
+        .h(UNREAD_SPACE)
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(div().flex_1().h(px(1.)).bg(palette.accent.opacity(0.35)))
+        .child(label(
+            palette,
+            TextRole::Caption,
+            locale.tr("desktop.conversation.history.unreadMessages"),
+        ))
+        .child(div().flex_1().h(px(1.)).bg(palette.accent.opacity(0.35)))
+        .debug_selector(move || format!("history-unread-{id}"))
+}
+
+/// Подсвечивает текущую отметку одним импульсом и затем оставляет слабый цвет фона.
+fn read_pending_mark(id: Uuid, palette: Palette, motion: Motion) -> AnyElement {
+    motion.animate(
+        div()
+            .absolute()
+            .inset_0()
+            .rounded_md()
+            .debug_selector(move || format!("history-read-pending-{id}")),
+        SharedString::from(format!("read-pending-{id}")),
+        1.,
+        || Animation::new(std::time::Duration::from_millis(650)).with_easing(ease_in_out),
+        move |mark, progress| {
+            let opacity = 0.06 + (std::f32::consts::PI * progress).sin() * 0.08;
+            mark.bg(palette.accent.opacity(opacity))
+        },
     )
 }
 
@@ -2249,6 +2533,7 @@ fn build_rows(
                 time: RowTime::Sent(stamp.map(|local| local.short_time())),
                 delivery: own.then_some(DeliveryMark::Sent),
                 starts_day: false,
+                unread_marker: false,
                 starts_group: false,
                 ends_group: false,
             }
@@ -2307,6 +2592,7 @@ fn build_rows(
                             }
                         }),
                         starts_day: false,
+                        unread_marker: false,
                         starts_group: false,
                         ends_group: false,
                     }

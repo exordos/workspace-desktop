@@ -1,94 +1,178 @@
-//! Запрашивает файл у macOS, загружает его в подтверждённый чат и добавляет ссылку в черновик.
+//! Ведёт карточки композера от выбора до отправки, отмены или удаления.
+//! Состояние хранит порядок добавления, а фоновая работа сверяет попытку и цель перед записью.
 
-use std::{
-    fs::File,
-    io::{Cursor, Read},
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+mod edit;
+mod markup;
+mod presentation;
+mod source;
+mod transport;
+
+use std::{borrow::Cow, path::PathBuf, sync::Arc};
 
 use gpui::{
-    App, Context, Div, FocusHandle, Image, PathPromptOptions, Stateful, Task, div, prelude::*, px,
+    App, Context, Div, FocusHandle, Image, PathPromptOptions, Pixels, Point, RenderImage, Stateful,
+    Task, Window,
 };
 use tokio::sync::watch;
 use uuid::Uuid;
-use workspace_core::{
-    messenger::{
-        encryption::fragments::{fragment_display_spans, has_protected_draft},
-        files::{AttachmentUpload, MAX_ATTACHMENT_UPLOAD_BYTES, UploadAttachmentError},
-    },
-    storage::HistoryScope,
-};
+use workspace_core::messenger::files::UploadedAttachment;
 
-use super::{Composer, Destination};
+use super::{Composer, Destination, toolbar::icon_button};
 use crate::gpui_client::{
     preferences::Language,
-    ui::{Button, ButtonAppearance, Icon, Palette, TextRole, label, popup},
+    runtime::RuntimeClient,
+    ui::{Icon, Palette},
 };
 
-/// Версия темы и выбранной вкладки, которая получит результат загрузки.
+pub(super) use presentation::AttachmentDrag;
+use presentation::{Card, CardId, CardPreview, CardStatus};
+use source::Source;
+use transport::{UploadAttempt, discard_uploaded};
+
+const MAX_CONCURRENT_UPLOADS: usize = 5;
+
+/// Версия подтверждённой темы и режима редактора. Вкладки ответа разделяют список файлов.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct UploadTarget {
-    topic: Uuid,           // Точная серверная тема вместо общей области разговора.
-    check: Uuid,           // Подтверждение той же цели на момент выбора файла.
-    reply_revision: u64,   // Версия вкладок, защищающая соседние черновики.
-    edit_id: Option<Uuid>, // Проверенная исходная запись, если это обычная правка.
+    topic: Uuid,           // Точная серверная тема.
+    check: Uuid,           // Повторная проверка не наследует запросы предыдущего показа.
+    encrypted: bool,       // Какое разрешение Core использует для передачи файла.
+    edit_id: Option<Uuid>, // None для нового сообщения, иначе точная исходная запись.
 }
 
-/// Ошибка, после которой можно выбрать файл заново или явно повторить отправку.
-struct Failure {
-    path: Option<PathBuf>, // Локальный путь повторной попытки. В журналы не передаётся.
-    key: &'static str,     // Перевод причины на языке текущего аккаунта.
-    target: UploadTarget,  // Повтор разрешён только в исходной теме и вкладке.
+/// Открытый системный диалог, который ещё может вернуть список файлов.
+struct Picker {
+    target: UploadTarget, // Цель до открытия диалога.
+    _task: Task<()>,      // Результат диалога игнорируется после смены назначения.
 }
 
-/// Текущая операция выбора или передачи файла.
-struct Pending {
-    id: Uuid,                            // Отличает даже две попытки в той же теме и вкладке.
-    target: UploadTarget,                // Проверенная тема, актуальная до выдачи результата.
-    cancel: Option<watch::Sender<bool>>, // Есть после открытия файла, прерывает передачу в Core.
-    _task: Task<()>,                     // Отменяет ожидание окна при смене разговора.
+/// Один файл и его текущая попытка, независимо от соседних карточек.
+enum Status {
+    Queued, // Файл ждёт свободное место в очереди.
+    Working {
+        attempt: Uuid,               // Меняется при повторе того же вложения.
+        cancel: watch::Sender<bool>, // Отмена сетевого запроса при удалении карточки.
+        progress: Option<u8>,        // None, пока идёт локальное чтение и подготовка.
+    },
+    Ready {
+        file: Uuid,                          // Подтверждённый UUID для сопоставления с текстом.
+        markdown: String,                    // Точное тело ссылки для итогового сообщения.
+        cleanup: Option<UploadedAttachment>, // После возможной передачи серверу удалять опасно.
+    },
+    Error {
+        key: &'static str, // Ключ пояснения на языке аккаунта.
+        retryable: bool,   // Только ошибка передачи допускает повтор с тем же файлом.
+    },
 }
 
-/// Одна операция на редактор. Готовые ссылки хранятся в самом черновике.
+/// Упорядоченная позиция карточки, сохраняющая идентичность во время повтора.
+struct Slot {
+    id: Uuid,                          // Локальный идентификатор для кнопок и перетаскивания.
+    source: Source,                    // Выбранный путь или снимок буфера.
+    content_type: Option<String>,      // MIME после чтения файла.
+    size: Option<u64>,                 // Длина исходного файла в байтах.
+    preview: Option<Arc<RenderImage>>, // Уменьшенный кадр после проверки файла.
+    status: Status,                    // Видимое состояние и данные для следующего действия.
+}
+
+/// Снимок переданной попытки, который ещё можно вернуть после отказа.
+struct Submission {
+    operation: Uuid,              // Операция записи, которой передали ссылки.
+    target: Option<UploadTarget>, // Цель для восстановления после отказа.
+    slots: Vec<Slot>,             // Только готовые карточки конкретной отправки.
+}
+
+/// Вложения одного открытого композера.
 #[derive(Default)]
 pub(super) struct AttachmentState {
-    pending: Option<Pending>, // Отсутствует после отмены, подтверждения или ошибки.
-    failures: Vec<Failure>,   // Ошибки файлов, с которыми закончились отдельные попытки.
-}
-
-/// Файл диска или снимок формата изображения, который macOS передала из буфера.
-enum AttachmentSource {
-    Path(PathBuf),         // Путь существует только на стороне Desktop.
-    Clipboard(Arc<Image>), // Байты были подготовлены системой ввода.
+    target: Option<UploadTarget>, // Версия темы, которой принадлежат новые карточки.
+    picker: Option<Picker>,       // Системный выбор; файлы пока ещё не добавлены.
+    picker_failed: bool,          // Сбой системного окна можно скрыть и открыть выбор вновь.
+    slots: Vec<Slot>,             // Порядок исходного выбора, а не окончания запросов.
+    submission: Option<Submission>, // Ссылки, которыми временно владеет операция записи.
+    edit: edit::Existing,         // Вложения исходного сообщения, которые можно отвязать.
+    strip: presentation::AttachmentStrip, // Положение прокрутки карточек и видимость фокуса.
 }
 
 impl AttachmentState {
-    /// Предупреждает отправку, пока не закончился выбор или загрузка.
+    /// Блокирует отправку, пока в списке остаётся неподтверждённый файл.
     pub(super) fn pending(&self) -> bool {
-        self.pending.is_some()
+        self.slots
+            .iter()
+            .any(|slot| !matches!(slot.status, Status::Ready { .. }))
     }
 
-    /// Прерывает фоновую передачу и закрывает состояние текущего запроса.
-    pub(super) fn cancel(&mut self) {
-        if let Some(pending) = self.pending.take()
-            && let Some(cancel) = pending.cancel.as_ref()
-        {
-            let _ = cancel.send(true);
-        }
-        self.failures.clear();
+    /// Возвращает карточку только для ещё живой попытки передачи.
+    fn working(&mut self, id: Uuid, attempt: Uuid) -> Option<&mut Slot> {
+        self.slots.iter_mut().find(|slot| {
+            slot.id == id
+                && matches!(slot.status, Status::Working { attempt: active, .. } if active == attempt)
+        })
+    }
+
+    /// Собирает ссылки всех ещё временных файлов для очистки снимка черновика.
+    fn temporary_links(&self) -> impl Iterator<Item = (Uuid, &str)> + '_ {
+        self.slots
+            .iter()
+            .chain(self.submission.iter().flat_map(|sending| &sending.slots))
+            .filter_map(Slot::link)
     }
 }
 
-impl Drop for AttachmentState {
-    /// Уведомляет Core об отмене, если окно исчезло до ответа.
-    fn drop(&mut self) {
-        self.cancel();
+impl Slot {
+    /// Возвращает серверный UUID готового файла.
+    fn file(&self) -> Option<Uuid> {
+        self.link().map(|(id, _)| id)
+    }
+
+    /// Возвращает точную временную ссылку даже после её переноса в обычный текст или блок кода.
+    fn link(&self) -> Option<(Uuid, &str)> {
+        match &self.status {
+            Status::Ready { file, markdown, .. } => Some((*file, markdown.as_str())),
+            _ => None,
+        }
+    }
+
+    /// Освобождает текстуру после снятия карточки с экрана.
+    fn release_preview(&mut self, cx: &mut App) {
+        if let Some(image) = self.preview.take() {
+            cx.defer(move |app| app.drop_image(image, None));
+        }
+    }
+
+    /// Отменяет текущую попытку или отдаёт квитанцию для отдельной попытки удаления.
+    fn retire(mut self, cx: &mut App) -> Option<UploadedAttachment> {
+        self.release_preview(cx);
+        match self.status {
+            Status::Working { cancel, .. } => {
+                let _ = cancel.send(true);
+                None
+            }
+            Status::Ready { cleanup, .. } => cleanup,
+            _ => None,
+        }
+    }
+}
+
+/// Освобождает карточки одним заданием, даже если исходный список длиннее очереди команд.
+fn discard_slots(
+    slots: impl IntoIterator<Item = Slot>,
+    runtime: Option<&RuntimeClient>,
+    cx: &mut App,
+) {
+    let receipts = slots
+        .into_iter()
+        .filter_map(|slot| slot.retire(cx))
+        .collect::<Vec<_>>();
+    if let Some(runtime) = runtime.cloned().filter(|_| !receipts.is_empty()) {
+        cx.background_executor()
+            .spawn(async move { discard_uploaded(&runtime, receipts).await })
+            .detach();
     }
 }
 
 impl Composer {
-    /// Передаёт штатному редактору результат подготовленного вложения для сквозной проверки.
+    /// Даёт сквозным тестам показать вложение, восстановленное из существующего черновика.
     #[cfg(all(test, feature = "gpui-test"))]
     pub(in crate::gpui_client) fn tested_complete_attachment(
         &mut self,
@@ -99,227 +183,117 @@ impl Composer {
             .update(cx, |editor, cx| editor.insert_attachment(markdown, cx));
     }
 
-    /// Разрешает передачу файла только при подтверждённой обычной отправке.
-    fn attachment_target(&self, cx: &App) -> Option<UploadTarget> {
+    /// Проверяет доступ и режим перед использованием экрана для фоновой передачи.
+    fn attachment_target(&self) -> Option<UploadTarget> {
         let Destination::Ready {
             topic,
-            encrypted: false,
+            encrypted,
             check_id,
         } = self.destination
         else {
             return None;
         };
-        if self.plain_target.is_none()
-            || self.writing.is_some()
-            || self.draft_runtime.is_none()
-            || has_protected_draft(&self.replies.markdown(self.editor.read(cx).text()))
+        if self.draft_runtime.is_none()
+            || (!encrypted && self.plain_target.is_none())
+            || self
+                .edit
+                .as_ref()
+                .is_some_and(|edit| !edit.access.current())
         {
             return None;
         }
-        let edit_id = if let Some(edit) = &self.edit {
-            if !edit.access.current()
-                || !matches!(&edit.access, super::EditAccess::Fragments(_))
-                || edit.expected.body.markdown().is_none_or(|body| {
-                    !fragment_display_spans(body).is_empty() || has_protected_draft(body)
-                })
-            {
-                return None;
-            }
-            Some(edit.expected.id)
-        } else {
-            None
-        };
         Some(UploadTarget {
             topic,
             check: check_id,
-            reply_revision: self.replies.revision,
-            edit_id,
+            encrypted,
+            edit_id: self.edit.as_ref().map(|edit| edit.expected.id),
         })
     }
 
-    /// Отменяет загрузку при смене вкладки, цели, режима шифрования или доступности.
-    pub(super) fn validate_attachment_target(&mut self, cx: &Context<Self>) {
-        let current = self.attachment_target(cx);
-        if let Some(pending) = &self.attachment_upload.pending
-            && current != Some(pending.target)
-        {
-            self.attachment_upload.cancel();
+    /// Снимает запросы прежней темы и не трогает переключение вкладок ответа.
+    pub(super) fn validate_attachment_target(&mut self, cx: &mut Context<Self>) {
+        let current = self.attachment_target();
+        if self.attachment_upload.target.is_some() && self.attachment_upload.target != current {
+            self.discard_new_attachments(cx);
         }
-        self.attachment_upload
-            .failures
-            .retain(|failure| current == Some(failure.target));
     }
 
-    /// Проверяет, может ли окно принять файлы с диска в этот редактор.
-    pub(super) fn can_drop_attachments(&self, cx: &App) -> bool {
-        !self.attachment_upload.pending() && self.attachment_target(cx).is_some()
+    /// Проверяет возможность добавить файлы поверх уже показанных карточек.
+    pub(super) fn can_drop_attachments(&self, _: &App) -> bool {
+        self.writing.is_none() && self.attachment_target().is_some()
     }
 
-    /// Передаёт перетащенные файлы в тот же путь, который использует диалог выбора.
+    /// Добавляет перетащенные пути в очередь в том порядке, который передала система.
     pub(super) fn drop_attachments(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
-        if self.can_drop_attachments(cx)
-            && let Some(target) = self.attachment_target(cx)
-        {
-            self.start_attachment_uploads(
-                paths.iter().cloned().map(AttachmentSource::Path).collect(),
-                target,
-                cx,
-            );
-        }
+        self.add_attachments(paths.iter().cloned().map(Source::path), cx);
     }
 
-    /// Принимает вставленное изображение только после обычных проверок цели.
+    /// Добавляет снимок буфера в ту же очередь, что системный выбор и перетаскивание.
     pub(super) fn paste_attachment(&mut self, image: Arc<Image>, cx: &mut Context<Self>) {
-        if self.can_drop_attachments(cx)
-            && let Some(target) = self.attachment_target(cx)
-        {
-            self.start_attachment_uploads(vec![AttachmentSource::Clipboard(image)], target, cx);
-        }
+        self.add_attachments([Source::clipboard(image)], cx);
     }
 
-    /// Показывает кнопку файлов, если Core подтвердил обычную отправку.
+    /// Создаёт карточки до начала чтения, чтобы очередь оставалась видимой и упорядоченной.
+    fn add_attachments(
+        &mut self,
+        sources: impl IntoIterator<Item = Source>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.attachment_target().filter(|_| self.writing.is_none()) else {
+            return;
+        };
+        self.validate_attachment_target(cx);
+        self.attachment_upload.target = Some(target);
+        self.attachment_upload.picker_failed = false;
+        self.attachment_upload
+            .slots
+            .extend(sources.into_iter().map(|source| Slot {
+                id: Uuid::new_v4(),
+                source,
+                content_type: None,
+                size: None,
+                preview: None,
+                status: Status::Queued,
+            }));
+        self.pump_attachments(cx);
+        cx.notify();
+    }
+
+    /// Показывает кнопку выбора, пока подтверждён текущий разговор.
     pub(super) fn attachment_button(
         &self,
         palette: Palette,
         language: Language,
         focus: &FocusHandle,
+        compact: bool,
         cx: &Context<Self>,
     ) -> Option<Stateful<Div>> {
-        self.attachment_target(cx)?;
+        self.attachment_target()?;
         let composer = cx.entity().downgrade();
-        let caption = language.tr("desktop.messenger.composer.attachFile");
-        let mut button = Button::new("composer-attach-file", "");
-        button.icon = Some(Icon::Attach);
-        button.appearance = ButtonAppearance::Ghost;
-        button.disabled = self.attachment_upload.pending();
-        Some(
-            button
-                .render(palette, Some(focus), move |_, app| {
-                    let _ = composer.update(app, |composer, cx| composer.choose_attachment(cx));
-                })
-                .size(px(32.))
-                .p_0()
-                .flex_none()
-                .debug_selector(|| "composer-attach-file".into())
-                .tooltip(move |_, app| popup::tooltip(palette, caption.into(), app)),
-        )
+        let glyph = if compact {
+            (Icon::ComposerAttachCompact, [14., 24.])
+        } else {
+            (Icon::ComposerAttach, [14.35, 24.])
+        };
+        Some(icon_button(
+            "composer-attach-file",
+            language.tr("desktop.messenger.composer.attachFile"),
+            glyph,
+            palette,
+            focus,
+            self.writing.is_some() || self.attachment_upload.picker.is_some(),
+            move |_, app| {
+                let _ = composer.update(app, |composer, cx| composer.choose_attachments(cx));
+            },
+        ))
     }
 
-    /// Показывает со стороны редактора факт передачи, повтор и удаление готовых ссылок.
-    pub(super) fn attachments_panel(
-        &self,
-        palette: Palette,
-        language: Language,
-        cx: &Context<Self>,
-    ) -> Option<Stateful<Div>> {
-        let editor = self.editor.read(cx);
-        let mut attachments = editor.attachments().peekable();
-        if attachments.peek().is_none()
-            && !self.attachment_upload.pending()
-            && self.attachment_upload.failures.is_empty()
-        {
-            return None;
-        }
-        let cancel = cx.entity().downgrade();
-        let mut panel = div()
-            .id("composer-attachments")
-            .flex()
-            .flex_col()
-            .gap_1()
-            .max_h(px(132.))
-            .overflow_y_scroll();
-        if let Some(pending) = &self.attachment_upload.pending {
-            let status = if pending.cancel.is_some() {
-                "desktop.messenger.composer.attachmentUploading"
-            } else {
-                "desktop.messenger.composer.attachmentChoosing"
-            };
-            panel = panel.child(
-                attachment_row(palette, language.tr(status)).child(
-                    Button::new(
-                        "composer-attachment-cancel",
-                        language.tr("desktop.messenger.composer.timeCancel"),
-                    )
-                    .render(palette, None, move |_, app| {
-                        let _ = cancel.update(app, |composer, cx| {
-                            composer.attachment_upload.cancel();
-                            cx.notify();
-                        });
-                    }),
-                ),
-            );
-        }
-        for (index, failure) in self.attachment_upload.failures.iter().enumerate() {
-            let target = failure.target;
-            let retry = failure
-                .path
-                .clone()
-                .filter(|_| {
-                    self.can_drop_attachments(cx) && self.attachment_target(cx) == Some(target)
-                })
-                .map(|path| {
-                    let composer = cx.entity().downgrade();
-                    Button::new(
-                        ("composer-attachment-retry", index),
-                        language.tr("desktop.messenger.composer.attachmentRetry"),
-                    )
-                    .render(palette, None, move |_, app| {
-                        let _ = composer.update(app, |composer, cx| {
-                            if composer.can_drop_attachments(cx)
-                                && composer.attachment_target(cx) == Some(target)
-                            {
-                                composer
-                                    .attachment_upload
-                                    .failures
-                                    .retain(|failure| failure.path.as_ref() != Some(&path));
-                                composer.start_attachment_uploads(
-                                    vec![AttachmentSource::Path(path.clone())],
-                                    target,
-                                    cx,
-                                );
-                            }
-                        });
-                    })
-                });
-            let reason = language.tr(failure.key);
-            let caption = failure
-                .path
-                .as_ref()
-                .and_then(|path| path.file_name())
-                .map_or_else(
-                    || reason.to_owned(),
-                    |name| format!("{} · {reason}", name.to_string_lossy()),
-                );
-            panel = panel.child(attachment_row(palette, caption).children(retry));
-        }
-        for (index, (id, offset, name)) in attachments.enumerate() {
-            let composer = cx.entity().downgrade();
-            let button = Button::new(
-                ("composer-attachment-remove", offset),
-                language.tr("desktop.messenger.composer.attachmentRemove"),
-            )
-            .render(palette, None, move |window, app| {
-                let _ = composer.update(app, |composer, cx| {
-                    if !composer.editor.read(cx).composing() {
-                        composer
-                            .editor
-                            .update(cx, |editor, cx| editor.remove_attachment(id, offset, cx));
-                        composer.focus_editor(window, cx);
-                    }
-                });
-            })
-            .debug_selector(move || format!("composer-attachment-remove-{index}").into());
-            panel = panel.child(attachment_row(palette, name.to_owned()).child(button));
-        }
-        Some(panel)
-    }
-
-    /// Открывает штатный выбор файла без передачи пути в сеть.
-    fn choose_attachment(&mut self, cx: &mut Context<Self>) {
-        if self.attachment_upload.pending() {
-            return;
-        }
-        let Some(target) = self.attachment_target(cx) else {
+    /// Открывает один системный диалог без остановки загрузок, которые уже начались.
+    fn choose_attachments(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self
+            .attachment_target()
+            .filter(|_| self.attachment_upload.picker.is_none() && self.writing.is_none())
+        else {
             return;
         };
         let dialog = cx.prompt_for_paths(PathPromptOptions {
@@ -332,289 +306,460 @@ impl Composer {
                     .into(),
             ),
         });
-        self.attachment_upload.failures.clear();
-        let id = Uuid::new_v4();
+        self.attachment_upload.picker_failed = false;
         let task = cx.spawn(async move |entity, cx| {
             let result = dialog.await;
             let _ = entity.update(cx, |composer, cx| {
                 if composer
                     .attachment_upload
-                    .pending
-                    .as_ref()
-                    .map(|pending| pending.id)
-                    != Some(id)
+                    .picker
+                    .take()
+                    .map(|picker| picker.target)
+                    != Some(target)
+                    || composer.attachment_target() != Some(target)
+                    || composer.writing.is_some()
                 {
-                    return;
-                }
-                composer.attachment_upload.pending.take();
-                if composer.attachment_target(cx) != Some(target) {
-                    cx.notify();
                     return;
                 }
                 match result {
                     Ok(Ok(Some(paths))) => {
-                        composer.start_attachment_uploads(
-                            paths.into_iter().map(AttachmentSource::Path).collect(),
-                            target,
-                            cx,
-                        );
+                        composer.add_attachments(paths.into_iter().map(Source::path), cx)
                     }
                     Ok(Ok(None)) => {}
-                    _ => composer.attachment_upload.failures.push(Failure {
-                        path: None,
-                        key: "desktop.messenger.composer.attachmentOpenFailed",
-                        target,
-                    }),
+                    _ => composer.attachment_upload.picker_failed = true,
                 }
                 cx.notify();
             });
         });
-        self.attachment_upload.pending = Some(Pending {
-            id,
+        self.attachment_upload.picker = Some(Picker {
             target,
-            cancel: None,
             _task: task,
         });
         cx.notify();
     }
 
-    /// Читает и загружает файлы по одному, чтобы набор файлов не занял память всего окна.
-    fn start_attachment_uploads(
-        &mut self,
-        sources: Vec<AttachmentSource>,
-        target: UploadTarget,
-        cx: &mut Context<Self>,
-    ) {
-        if self.attachment_upload.pending() || sources.is_empty() {
+    /// Даёт каждому свободному месту первый ожидающий файл.
+    fn pump_attachments(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self
+            .attachment_upload
+            .target
+            .filter(|target| self.attachment_target() == Some(*target))
+        else {
+            return;
+        };
+        let active = self
+            .attachment_upload
+            .slots
+            .iter()
+            .filter(|slot| matches!(slot.status, Status::Working { .. }))
+            .count();
+        let queued = self
+            .attachment_upload
+            .slots
+            .iter_mut()
+            .filter(|slot| matches!(slot.status, Status::Queued))
+            .take(MAX_CONCURRENT_UPLOADS.saturating_sub(active));
+        let runtime = self
+            .draft_runtime
+            .clone()
+            .expect("цель проверена с рабочим потоком");
+        for slot in queued {
+            let attempt = Uuid::new_v4();
+            let (cancel, canceled) = watch::channel(false);
+            slot.status = Status::Working {
+                attempt,
+                cancel,
+                progress: None,
+            };
+            UploadAttempt {
+                id: slot.id,
+                attempt,
+                target,
+                source: slot.source.clone(),
+                canceled,
+                runtime: runtime.clone(),
+                address: self.address.clone(),
+            }
+            .start(cx);
+        }
+    }
+
+    /// Повторяет передачу только для карточки с сетевой ошибкой в её исходной области.
+    fn retry_attachment_card(&mut self, id: CardId, cx: &mut Context<Self>) {
+        let CardId::Upload(id) = id else { return };
+        if !self.can_drop_attachments(cx)
+            || self.attachment_upload.target != self.attachment_target()
+        {
             return;
         }
-        let Some(runtime) = self.draft_runtime.clone() else {
+        let Some(slot) = self
+            .attachment_upload
+            .slots
+            .iter_mut()
+            .find(|slot| slot.id == id)
+        else {
             return;
         };
-        let address = self.address.clone();
-        let scope = HistoryScope {
-            stream_id: address.route.scope.stream_id,
-            topic_id: Some(target.topic),
-        };
-        let (cancel, canceled) = watch::channel(false);
-        let background = cx.background_executor().clone();
-        let id = Uuid::new_v4();
-        let task = cx.spawn(async move |entity, cx| {
-            for source in sources {
-                if *canceled.borrow() {
+        if matches!(
+            slot.status,
+            Status::Error {
+                retryable: true,
+                ..
+            }
+        ) {
+            slot.status = Status::Queued;
+            self.pump_attachments(cx);
+            cx.notify();
+        }
+    }
+
+    /// Скрывает карточку сразу, отменяя незаконченный запрос или планируя удаление нового файла.
+    fn remove_attachment_card(&mut self, id: CardId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.writing.is_some() || self.editor.read(cx).composing() {
+            return;
+        }
+        match id {
+            CardId::Upload(id) if id.is_nil() => self.attachment_upload.picker_failed = false,
+            CardId::Upload(id) => {
+                let Some(index) = self
+                    .attachment_upload
+                    .slots
+                    .iter()
+                    .position(|slot| slot.id == id)
+                else {
                     return;
-                }
-                let path = source.path().map(Path::to_owned);
-                let read = background.spawn(async move { source.load() });
-                let upload_cancel = canceled.clone();
-                let result = match read.await {
-                    Ok(upload) => runtime
-                        .conversation(address.clone(), move |services, address| async move {
-                            services
-                                .messenger
-                                .upload_attachment(
-                                    &services.sync,
-                                    &address.route.owner,
-                                    address.generation,
-                                    scope,
-                                    upload,
-                                    Some(upload_cancel),
-                                )
-                                .await
-                        })
-                        .await
-                        .value
-                        .map_err(|_| "desktop.messenger.composer.attachmentFailed")
-                        .and_then(|result| result.map_err(upload_error)),
-                    Err(error) => Err(error),
                 };
-                let current = entity.update(cx, |composer, cx| {
-                    if composer
-                        .attachment_upload
-                        .pending
-                        .as_ref()
-                        .map(|pending| pending.id)
-                        != Some(id)
-                    {
-                        return false;
-                    }
-                    if composer.attachment_target(cx) != Some(target) {
-                        composer.attachment_upload.cancel();
-                        cx.notify();
-                        return false;
-                    }
-                    match result {
-                        Ok(uploaded) => composer.editor.update(cx, |editor, cx| {
-                            editor.insert_attachment(&uploaded.markdown, cx)
-                        }),
-                        Err(key) => {
-                            composer
-                                .attachment_upload
-                                .failures
-                                .push(Failure { path, key, target })
-                        }
-                    }
-                    cx.notify();
-                    true
-                });
-                if !current.unwrap_or(false) {
-                    return;
+                let slot = self.attachment_upload.slots.remove(index);
+                if let Some(link) = slot.link() {
+                    self.remove_inline_files(&[link], cx);
+                }
+                discard_slots([slot], self.draft_runtime.as_ref(), cx);
+                self.pump_attachments(cx);
+            }
+            card @ CardId::Reference { id, offset } => {
+                if let Some(markdown) = self.remove_existing_attachment(card, cx) {
+                    self.editor.update(cx, |editor, cx| {
+                        editor.remove_attachment_link(&markdown, cx)
+                    });
+                } else if self.edit.is_none() {
+                    self.editor
+                        .update(cx, |editor, cx| editor.remove_attachment(id, offset, cx));
                 }
             }
-            let _ = entity.update(cx, |composer, cx| {
-                if composer
-                    .attachment_upload
-                    .pending
-                    .as_ref()
-                    .map(|pending| pending.id)
-                    == Some(id)
-                {
-                    composer.attachment_upload.pending.take();
-                    cx.notify();
-                }
-            });
-        });
-        self.attachment_upload.pending = Some(Pending {
-            id,
-            target,
-            cancel: Some(cancel),
-            _task: task,
-        });
+        }
+        self.focus_editor(window, cx);
         cx.notify();
     }
-}
 
-impl AttachmentSource {
-    /// Возвращает путь, который можно повторно открыть при явном повторе.
-    fn path(&self) -> Option<&Path> {
-        match self {
-            Self::Path(path) => Some(path),
-            Self::Clipboard(_) => None,
+    /// Соединяет карточки исходного сообщения и новые файлы в порядке добавления.
+    pub(super) fn attachments_panel(
+        &self,
+        palette: Palette,
+        language: Language,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<Stateful<Div>> {
+        let editor = self.editor.read(cx);
+        let editable = self.writing.is_none() && !editor.composing();
+        let protect_fragments = self
+            .plain_target
+            .as_ref()
+            .is_some_and(|target| target.fragments_allowed());
+        let active_files = markup::public_edit_media(editor.text(), protect_fragments);
+        let shown_inline = |link: &str| {
+            active_files
+                .iter()
+                .any(|file| &editor.text()[file.range.clone()] == link)
+        };
+        let mut cards = self.existing_attachment_cards(shown_inline, editable);
+        let temporary: Vec<_> = self
+            .attachment_upload
+            .temporary_links()
+            .map(|(id, _)| id)
+            .collect();
+        let legacy_cards = self.edit.is_none()
+            && !(protect_fragments
+                && workspace_core::messenger::encryption::fragments::has_protected_draft(
+                    editor.text(),
+                ));
+        cards.extend(editor.attachments().filter_map(|(id, offset, name)| {
+            if !legacy_cards || temporary.contains(&id) {
+                return None;
+            }
+            let reference = active_files.iter().find(|file| file.file_id == id);
+            Some(Card {
+                id: CardId::Reference { id, offset },
+                name: name.to_owned(),
+                content_type: reference.and_then(|file| file.metadata.content_type.clone()),
+                size: reference.and_then(|file| file.metadata.size_bytes),
+                preview: None,
+                status: CardStatus::Ready,
+                can_remove: editable,
+                can_inline: false,
+                in_text: false,
+            })
+        }));
+        cards.extend(self.attachment_upload.slots.iter().map(|slot| {
+            Card {
+                id: CardId::Upload(slot.id),
+                name: slot.source.name(),
+                content_type: slot.content_type.clone(),
+                size: slot.size,
+                preview: slot.preview.clone().map(CardPreview::Plain),
+                status: match slot.status {
+                    Status::Queued => CardStatus::Queued,
+                    Status::Working { progress: None, .. } => CardStatus::Validating,
+                    Status::Working {
+                        progress: Some(progress),
+                        ..
+                    } => CardStatus::Uploading(progress),
+                    Status::Ready { .. } => CardStatus::Ready,
+                    Status::Error { key, retryable } => CardStatus::Error { key, retryable },
+                },
+                can_remove: editable,
+                can_inline: editable && slot.file().is_some(),
+                in_text: slot
+                    .link()
+                    .is_some_and(|(_, link)| editor.text().contains(link)),
+            }
+        }));
+        if self.attachment_upload.picker_failed {
+            cards.push(Card {
+                id: CardId::Upload(Uuid::nil()),
+                name: language
+                    .tr("desktop.messenger.composer.attachFile")
+                    .to_owned(),
+                content_type: None,
+                size: None,
+                preview: None,
+                status: CardStatus::Error {
+                    key: "desktop.messenger.composer.attachmentOpenFailed",
+                    retryable: false,
+                },
+                can_remove: true,
+                can_inline: false,
+                in_text: false,
+            });
         }
-    }
-
-    /// Превращает один выбранный источник в ограниченный по размеру снимок файла.
-    fn load(self) -> Result<AttachmentUpload, &'static str> {
-        match self {
-            Self::Path(path) => read_attachment(&path),
-            Self::Clipboard(image) => read_clipboard_image(&image),
-        }
-    }
-}
-
-/// Ставит состояние или имя рядом с кнопкой действия над файлом.
-fn attachment_row(palette: Palette, title: impl Into<gpui::SharedString>) -> Div {
-    div()
-        .flex()
-        .min_w_0()
-        .items_center()
-        .gap_2()
-        .child(Icon::Attach.element(px(16.), palette.icon))
-        .child(
-            label(palette, TextRole::Caption, title)
-                .flex_1()
-                .min_w_0()
-                .truncate(),
+        self.attachment_upload.strip.render(
+            cards,
+            palette,
+            language,
+            cx.entity().downgrade(),
+            window,
+            cx,
         )
-}
+    }
 
-/// Читает обычный непустой файл и не выделяет память сверх лимита загрузки.
-fn read_attachment(path: &Path) -> Result<AttachmentUpload, &'static str> {
-    const READ_FAILED: &str = "desktop.messenger.composer.attachmentOpenFailed";
-    const TOO_LARGE: &str = "desktop.messenger.composer.attachmentTooLarge";
-    let name = path
-        .file_name()
-        .ok_or(READ_FAILED)?
-        .to_string_lossy()
-        .into_owned();
-    let file = File::open(path).map_err(|_| READ_FAILED)?;
-    let metadata = file.metadata().map_err(|_| READ_FAILED)?;
-    if !metadata.is_file() {
-        return Err(READ_FAILED);
+    /// Вставляет готовое изображение в позицию, указанную перетаскиванием его карточки.
+    pub(super) fn insert_inline_attachment(
+        &mut self,
+        id: CardId,
+        point: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.writing.is_some()
+            || self.editor.read(cx).composing()
+            || self.attachment_target().is_none()
+        {
+            return;
+        }
+        let attachment = match id {
+            CardId::Upload(id) => self
+                .attachment_upload
+                .slots
+                .iter()
+                .find_map(|slot| match &slot.status {
+                    Status::Ready { file, markdown, .. }
+                        if slot.id == id && slot.preview.is_some() =>
+                    {
+                        Some((*file, markdown.as_str()))
+                    }
+                    _ => None,
+                }),
+            reference => self.attachment_upload.edit.for_inline(reference),
+        };
+        let Some((file, markdown)) = attachment else {
+            return;
+        };
+        let editor = self.editor.read(cx);
+        let current = self.replies.markdown(editor.text());
+        if current.contains(markdown)
+            || matches!(id, CardId::Upload(_)) && markup::contains_file(&current, file)
+        {
+            return;
+        }
+        let markdown = markdown.to_owned();
+        let temporary = matches!(id, CardId::Upload(_));
+        self.editor.update(cx, |editor, cx| {
+            editor.insert_inline_attachment(&markdown, point, temporary, cx);
+        });
     }
-    let max = MAX_ATTACHMENT_UPLOAD_BYTES as u64;
-    if metadata.len() > max {
-        return Err(TOO_LARGE);
-    }
-    let mut bytes = Vec::new();
-    file.take(max + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| READ_FAILED)?;
-    if bytes.len() as u64 > max {
-        return Err(TOO_LARGE);
-    }
-    if bytes.is_empty() {
-        return Err("desktop.messenger.composer.attachmentEmpty");
-    }
-    let (content_type, dimensions) = detect_attachment(path, &bytes);
-    Ok(AttachmentUpload {
-        name,
-        content_type: content_type.to_owned(),
-        bytes,
-        dimensions,
-    })
-}
 
-/// Даёт вставленному изображению имя и сохраняет MIME системного буфера.
-fn read_clipboard_image(image: &Image) -> Result<AttachmentUpload, &'static str> {
-    let bytes = image.bytes();
-    if bytes.len() > MAX_ATTACHMENT_UPLOAD_BYTES {
-        return Err("desktop.messenger.composer.attachmentTooLarge");
+    /// Убирает изображение из текста, сохраняя его готовую карточку и файл.
+    fn remove_inline_attachment(
+        &mut self,
+        id: CardId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.writing.is_some() || self.editor.read(cx).composing() {
+            return;
+        }
+        match id {
+            CardId::Upload(id) => {
+                let link = self
+                    .attachment_upload
+                    .slots
+                    .iter()
+                    .find(|slot| slot.id == id)
+                    .and_then(Slot::link)
+                    .map(|(file, markdown)| (file, markdown.to_owned()));
+                if let Some((file, markdown)) = link {
+                    self.remove_inline_files(&[(file, &markdown)], cx);
+                }
+            }
+            reference => {
+                if let Some(markdown) = self.attachment_upload.edit.link_for(reference) {
+                    self.editor
+                        .update(cx, |editor, cx| editor.remove_attachment_link(markdown, cx));
+                }
+            }
+        }
+        self.focus_editor(window, cx);
     }
-    if bytes.is_empty() {
-        return Err("desktop.messenger.composer.attachmentEmpty");
-    }
-    let content_type = image.format().mime_type();
-    let extension = match content_type {
-        "image/jpeg" => "jpg",
-        "image/svg+xml" => "svg",
-        _ => content_type.strip_prefix("image/").unwrap_or("png"),
-    };
-    let fingerprint = Uuid::new_v4().simple().to_string();
-    let name = format!("pasted-image-{}.{}", &fingerprint[..8], extension);
-    let (_, dimensions) = detect_attachment(Path::new(&name), bytes);
-    Ok(AttachmentUpload {
-        name,
-        content_type: content_type.to_owned(),
-        bytes: bytes.to_vec(),
-        dimensions,
-    })
-}
 
-/// Получает подсказку MIME, а у поддерживаемого изображения читает только размеры.
-fn detect_attachment(path: &Path, bytes: &[u8]) -> (&'static str, Option<(u32, u32)>) {
-    if let Ok(format) = image::guess_format(bytes) {
-        let dimensions = image::ImageReader::with_format(Cursor::new(bytes), format)
-            .into_dimensions()
-            .ok();
-        return (format.to_mime_type(), dimensions);
+    /// Очищает видимое поле и скрытые вкладки от указанных внутритекстовых ссылок.
+    fn remove_inline_files(&mut self, links: &[(Uuid, &str)], cx: &mut Context<Self>) {
+        if links.is_empty() {
+            return;
+        }
+        self.replies
+            .rewrite_attachment_text(|markdown| markup::without_files(markdown, links));
+        let files = links.iter().map(|(file, _)| *file).collect::<Vec<_>>();
+        self.editor
+            .update(cx, |editor, cx| editor.remove_attachment_files(&files, cx));
+        // Просим сохранить и скрытую вкладку после того, как завершится текущее действие.
+        // При принятой отправке редактор к тому моменту уже успеет очистить старый снимок.
+        let composer = cx.entity().downgrade();
+        cx.defer(move |app| {
+            let _ = composer.update(app, |composer, cx| composer.persist_draft(cx));
+        });
     }
-    if bytes.starts_with(b"%PDF-") {
-        return ("application/pdf", None);
-    }
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(str::to_ascii_lowercase);
-    let mime = match extension.as_deref() {
-        Some("heic") => "image/heic",
-        Some("heif") => "image/heif",
-        Some("mp4" | "m4v") => "video/mp4",
-        Some("mov") => "video/quicktime",
-        Some("webm") => "video/webm",
-        Some("txt" | "md") => "text/plain",
-        _ => "application/octet-stream",
-    };
-    (mime, None)
-}
 
-/// Отличает неполученную квитанцию от явного отказа и локального сбоя.
-fn upload_error(error: UploadAttachmentError) -> &'static str {
-    match error {
-        UploadAttachmentError::TooLarge => "desktop.messenger.composer.attachmentTooLarge",
-        UploadAttachmentError::Empty => "desktop.messenger.composer.attachmentEmpty",
-        UploadAttachmentError::Unknown => "desktop.messenger.composer.attachmentUnknown",
-        _ => "desktop.messenger.composer.attachmentFailed",
+    /// Исключает временные ссылки из черновика, который можно открыть после закрытия композера.
+    pub(super) fn persistent_attachment_markdown<'a>(&self, markdown: &'a str) -> Cow<'a, str> {
+        let links = self.attachment_upload.temporary_links().collect::<Vec<_>>();
+        markup::without_files(markdown, &links).map_or(Cow::Borrowed(markdown), Cow::Owned)
+    }
+
+    /// Возвращает наличие отдельного файла для отправки даже с пустым полем сообщения.
+    pub(super) fn has_ready_attachments(&self) -> bool {
+        self.attachment_upload
+            .slots
+            .iter()
+            .any(|slot| slot.file().is_some())
+            || !self.attachment_upload.edit.is_empty()
+    }
+
+    /// Добавляет подтверждённые ссылки к снимку сообщения, исключая уже вставленные в текст.
+    pub(super) fn attachment_markdown(&self, markdown: &str) -> String {
+        markup::with_attachments(
+            markdown,
+            self.attachment_upload.edit.links(),
+            self.attachment_upload.slots.iter().filter_map(Slot::link),
+            self.edit.is_some(),
+            self.plain_target
+                .as_ref()
+                .is_some_and(|target| target.fragments_allowed()),
+        )
+    }
+
+    /// Передаёт черновые карточки во владение одной операции записи.
+    pub(super) fn begin_attachment_submission(&mut self, operation: Uuid, cx: &mut Context<Self>) {
+        self.attachment_upload.picker.take();
+        self.attachment_upload.picker_failed = false;
+        if !self.attachment_upload.slots.is_empty() {
+            self.attachment_upload.submission = Some(Submission {
+                operation,
+                target: self.attachment_upload.target,
+                slots: std::mem::take(&mut self.attachment_upload.slots),
+            });
+        }
+        cx.notify();
+    }
+
+    /// Завершает передачу карточек или возвращает их после сбоя записи в той же области.
+    pub(super) fn finish_attachment_submission(
+        &mut self,
+        operation: Uuid,
+        accepted: bool,
+        uncertain: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .attachment_upload
+            .submission
+            .as_ref()
+            .is_none_or(|sending| sending.operation != operation)
+        {
+            return;
+        }
+        let mut sending = self
+            .attachment_upload
+            .submission
+            .take()
+            .expect("попытка сверена");
+        if accepted || uncertain {
+            for slot in &mut sending.slots {
+                if let Status::Ready { cleanup, .. } = &mut slot.status {
+                    cleanup.take();
+                }
+            }
+        }
+        if !accepted && self.attachment_target() == sending.target {
+            self.attachment_upload.slots = sending.slots;
+            return;
+        }
+        let files = sending
+            .slots
+            .iter()
+            .filter_map(Slot::link)
+            .collect::<Vec<_>>();
+        self.remove_inline_files(&files, cx);
+        discard_slots(sending.slots, self.draft_runtime.as_ref(), cx);
+    }
+
+    /// Закрывает текущий набор после смены режима или потери разрешения.
+    pub(super) fn discard_attachments(&mut self, cx: &mut Context<Self>) {
+        self.discard_new_attachments(cx);
+        self.attachment_upload.edit.release(cx);
+    }
+
+    /// Закрывает новые карточки и убирает вставленные временные ссылки.
+    pub(super) fn discard_new_attachments(&mut self, cx: &mut Context<Self>) {
+        let slots = std::mem::take(&mut self.attachment_upload.slots);
+        let files = slots.iter().filter_map(Slot::link).collect::<Vec<_>>();
+        self.remove_inline_files(&files, cx);
+        self.attachment_upload.target = None;
+        self.attachment_upload.picker.take();
+        self.attachment_upload.picker_failed = false;
+        discard_slots(slots, self.draft_runtime.as_ref(), cx);
+    }
+
+    /// Освобождает карточки закрытого редактора, сохраняя файлы уже переданной операции.
+    pub(super) fn release_attachments(&mut self, cx: &mut App) {
+        self.attachment_upload.edit.release(cx);
+        discard_slots(
+            self.attachment_upload.slots.drain(..),
+            self.draft_runtime.as_ref(),
+            cx,
+        );
+        if let Some(sending) = self.attachment_upload.submission.take() {
+            for mut slot in sending.slots {
+                slot.release_preview(cx);
+            }
+        }
     }
 }
 
@@ -622,27 +767,55 @@ fn upload_error(error: UploadAttachmentError) -> &'static str {
 mod tests {
     use super::*;
 
-    /// Проверяет, что диск и буфер дают одинаковые байты, MIME и размеры изображения.
+    /// Оставляет ошибки в исходном порядке и принимает только ответ действующей попытки.
     #[test]
-    fn composer_attachment_sources_keep_image_bytes() {
-        let mut bytes = Cursor::new(Vec::new());
-        image::DynamicImage::new_rgba8(2, 3)
-            .write_to(&mut bytes, image::ImageFormat::Png)
-            .unwrap();
-        let image = Image::from_bytes(gpui::ImageFormat::Png, bytes.into_inner());
-        let pasted = read_clipboard_image(&image).unwrap();
-        assert_eq!(pasted.bytes, image.bytes());
-        assert_eq!(pasted.content_type, "image/png");
-        assert_eq!(pasted.dimensions, Some((2, 3)));
-        assert!(pasted.name.ends_with(".png"));
-
-        let folder = tempfile::tempdir().unwrap();
-        let file = folder.path().join("кадр");
-        std::fs::write(&file, image.bytes()).unwrap();
-        let file = read_attachment(&file).unwrap();
-        assert_eq!(file.name, "кадр");
-        assert_eq!(file.bytes, pasted.bytes);
-        assert_eq!(file.content_type, pasted.content_type);
-        assert_eq!(file.dimensions, pasted.dimensions);
+    fn failed_card_blocks_until_removed_and_old_attempt_is_ignored() {
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        let attempt = Uuid::from_u128(3);
+        let (cancel, _) = watch::channel(false);
+        let slot = |id, source: &str, status| Slot {
+            id,
+            source: Source::path(source.into()),
+            content_type: None,
+            size: None,
+            preview: None,
+            status,
+        };
+        let mut state = AttachmentState {
+            slots: vec![
+                slot(
+                    first,
+                    "one.txt",
+                    Status::Error {
+                        key: "test",
+                        retryable: false,
+                    },
+                ),
+                slot(
+                    second,
+                    "two.txt",
+                    Status::Working {
+                        attempt,
+                        cancel,
+                        progress: Some(50),
+                    },
+                ),
+            ],
+            ..AttachmentState::default()
+        };
+        assert!(state.working(second, Uuid::nil()).is_none());
+        assert!(state.pending());
+        let current = state.working(second, attempt).unwrap();
+        current.status = Status::Ready {
+            file: second,
+            markdown: String::new(),
+            cleanup: None,
+        };
+        assert!(state.working(second, attempt).is_none());
+        assert!(state.pending());
+        assert_eq!(state.slots.remove(0).id, first);
+        assert!(!state.pending());
+        assert_eq!(state.temporary_links().collect::<Vec<_>>(), [(second, "")]);
     }
 }

@@ -14,7 +14,7 @@ use uuid::Uuid;
 pub struct DraftListEntry<Preview = String> {
     pub scope: DraftScope,     // Исходный разговор и точная тема редактора.
     pub version: DraftVersion, // UUID и версия, показанные пользователю.
-    pub preview: Preview,       // Короткое превью текста или первой непустой вкладки ответа.
+    pub preview: Preview,      // Короткое превью текста или первой непустой вкладки ответа.
     pub updated_at: Option<HistoryTime>, // Время последней записи. У старых записей может отсутствовать.
     pub from_server: bool, // Истина, если строка прочитана с сервера и не сохранена локально.
 }
@@ -46,7 +46,7 @@ impl Storage {
              WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
                AND project_id = ?4 AND user_id = ?5 AND markdown IS NOT NULL
                AND (markdown != '' OR reply_context IS NOT NULL)
-             ORDER BY updated_at DESC NULLS LAST, sequence DESC",
+             ORDER BY write_order DESC NULLS LAST, updated_at DESC NULLS LAST, sequence DESC",
         )?;
         let mut rows = query.query(params![
             owner.account_id.0,

@@ -381,6 +381,11 @@ impl RightPanel {
         self.modal.is_some()
     }
 
+    /// Сообщает, перекрывает ли модальный слой или плавающая панель рабочую историю.
+    pub(super) fn blocks_reading(&self, window: &Window) -> bool {
+        self.has_modal() || (!self.entries.is_empty() && panel_overlays(window))
+    }
+
     /// Отличает открытый диалог заданного вида от остальных модальных окон.
     pub(super) fn modal_is<V: Render>(&self) -> bool {
         self.modal

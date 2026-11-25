@@ -20,7 +20,10 @@ pub use drafts::{
     DraftWriteOutcome, PlaintextDraft,
 };
 pub use folders::FolderChange;
-pub(crate) use history::{ConfirmedEdit, EncryptedEditVersion, HistoryPageGuard};
+pub(crate) use history::{
+    ConfirmedEdit, EncryptedEditVersion, HistoryPageGuard, HistoryReadFence, HistoryReadGuard,
+    HistoryReadRow,
+};
 pub use history::{
     HistoryDirection, HistoryEdge, HistoryMessage, HistoryMetadata, HistoryPageEdges,
     HistoryPageOutcome, HistoryPageTarget, HistoryScope, HistoryTime, HistoryWindow,
@@ -176,6 +179,12 @@ pub enum HistoryChange {
     RemoveTopic(MessagePlacement), // Стрим и UUID удалённой темы.
 }
 
+/// Точные серверные флаги чтения, принятые в одной записи журнала.
+pub(crate) struct EventReadMarks<'a> {
+    pub flags: &'a [(Uuid, bool)], // Публичный UUID и состояние чтения каждой строки.
+    pub scope: Option<HistoryScope>, // Область события, если сервер передал её явно.
+}
+
 /// Данные одной записи журнала. Пустые поля не меняют соответствующие таблицы.
 #[derive(Default)]
 pub(crate) struct EventWrite<'a> {
@@ -185,6 +194,8 @@ pub(crate) struct EventWrite<'a> {
     pub unread: Option<u32>,                         // Подтверждённый счётчик.
     pub notification_conversation: Option<&'a str>,  // Разговор для цели баннера.
     pub history: Option<&'a HistoryChange>,          // Правка или удаление.
+    pub created_read: Option<bool>,                  // Флаг в снимке нового сообщения.
+    pub read_marks: Option<EventReadMarks<'a>>,      // Точные флаги и область события.
     pub own_reaction: Option<(Uuid, &'a str, bool)>, // Сообщение, эмодзи и выбор текущего пользователя.
     pub folder: Option<FolderChange>,                // Сверка состава папок или удаление связей.
     pub catalog_counts: Option<&'a CatalogCounts>,   // Абсолютные счётчики строки каталога.
@@ -216,6 +227,8 @@ pub(crate) struct AppliedEvent {
     pub avatar_changed: Vec<Uuid>,      // Пользователи, чьи фото или состояния сверки изменились.
     pub history_changed: bool,          // Лента должна применить событие или сверить спорное тело.
     pub reaction_message: Option<Uuid>, // Строка с обновлёнными группами реакций.
+    pub read_scopes: Vec<HistoryScope>, // Темы, в которых обновились флаги известных строк.
+    pub count_read_scope: Option<HistoryScope>, // Снижение счётчика требует сверить флаги области.
 }
 
 /// Причины, по которым локальная база не смогла прочитать или записать данные.
@@ -552,6 +565,7 @@ impl Storage {
         transaction.execute_batch(
             "DELETE FROM history_windows;
              DELETE FROM history_changes;
+             DELETE FROM history_read_flags;
              DELETE FROM sync_messages;
              DELETE FROM messenger_notification_targets;
              DELETE FROM messenger_unread;
@@ -687,6 +701,8 @@ impl Storage {
                     avatar_changed: Vec::new(),
                     history_changed: false,
                     reaction_message: None,
+                    read_scopes: Vec::new(),
+                    count_read_scope: None,
                 });
             }
         }
@@ -700,6 +716,7 @@ impl Storage {
         let history_changed = if let Some(history) = change.history {
             match history::before_change(&transaction, owner, history)? {
                 history::HistoryEventEffect::Write => {
+                    history::forget_read(&transaction, owner, history)?;
                     apply_history(&transaction, owner, history)?;
                     if source == crate::messenger::SOURCE_ID {
                         apply_media_history(&transaction, owner, history)?;
@@ -787,12 +804,21 @@ impl Storage {
             }
         }
 
-        let counts_changed = if source == crate::messenger::SOURCE_ID
+        let (counts_changed, count_read_scope) = if source == crate::messenger::SOURCE_ID
             && let Some(counts) = change.catalog_counts
         {
-            catalog_counts::apply(&transaction, owner, cursor, counts)?
+            let previous = catalog_counts::previous_total(&transaction, owner, counts)?;
+            let changed = catalog_counts::apply(&transaction, owner, cursor, counts)?;
+            let decreased = previous.map_or(counts.total == 0, |previous| {
+                i64::from(counts.total) < previous
+            });
+            let scope = (changed && decreased).then_some(HistoryScope {
+                stream_id: counts.stream_id,
+                topic_id: counts.topic_id,
+            });
+            (changed, scope)
         } else {
-            false
+            (false, None)
         };
         let message_inserted = if let Some(message) = change.message
             && history::before_creation(&transaction, owner, &message.id)?
@@ -801,8 +827,8 @@ impl Storage {
             let (service, canonical) = message.body.key_service_parts()?;
             let inserted = transaction.execute(
                 "INSERT INTO sync_messages
-                 (account_id, server, organization_id, project_id, user_id, message_id, text, stream_id, topic_id, author_id, created_at, updated_at, encryption_key_id, key_service_payload, key_service_canonical_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                 (account_id, server, organization_id, project_id, user_id, message_id, text, stream_id, topic_id, author_id, created_at, updated_at, encryption_key_id, key_service_payload, key_service_canonical_id, native_source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              ON CONFLICT (account_id, server, organization_id, project_id, user_id, message_id)
              DO NOTHING",
                 params![
@@ -821,16 +847,23 @@ impl Storage {
                     key_id,
                     service,
                     canonical,
+                    change.metadata.and_then(|metadata| metadata.native_source),
                 ],
             )? != 0;
             if inserted {
-                history::record_creation(
+                let revision = history::record_creation(
                     &transaction,
                     owner,
                     message,
                     change.placement,
                     change.metadata,
                 )?;
+                if source == crate::messenger::SOURCE_ID
+                    && let (Some(read), Ok(id)) = (change.created_read, message.id.parse())
+                {
+                    // При создании сохранённый флаг уже мог прийти отдельным событием.
+                    history::write_read(&transaction, owner, id, read, revision, Some(0))?;
+                }
                 if source == crate::messenger::SOURCE_ID {
                     history::project_media_message(&transaction, owner, &message.id)?;
                 }
@@ -838,6 +871,13 @@ impl Storage {
             inserted
         } else {
             false
+        };
+        let read_scopes = if source == crate::messenger::SOURCE_ID
+            && let Some(read) = change.read_marks
+        {
+            history::apply_read_event(&transaction, owner, read.flags, read.scope)?
+        } else {
+            Vec::new()
         };
         // Защищённую отправку закрывает только тот же зашифрованный снимок.
         let send_confirmed = if source == crate::messenger::SOURCE_ID
@@ -937,6 +977,8 @@ impl Storage {
             avatar_changed,
             history_changed,
             reaction_message,
+            read_scopes,
+            count_read_scope,
         })
     }
 }
@@ -1433,6 +1475,7 @@ mod tests {
             topic_id: scope.topic_id.to_string(),
         };
         let metadata = HistoryMetadata {
+            native_source: None,
             author_id: None,
             created_at: HistoryTime::parse("2026-01-01T00:00:00Z").unwrap(),
             updated_at: None,
@@ -1637,12 +1680,14 @@ mod tests {
             body: PreparedSendBody::Markdown("sent".into()),
         };
         let response = HistoryMessage {
+            read: None,
             reactions: Vec::new(),
             id: entry.public_id,
             stream_id: entry.stream_id,
             topic_id: entry.topic_id,
             body: MessageBody::Markdown("sent".into()),
             metadata: HistoryMetadata {
+                native_source: None,
                 author_id: Some(author),
                 created_at: HistoryTime::parse("2026-01-01T00:00:00Z").unwrap(),
                 updated_at: None,
@@ -1801,12 +1846,14 @@ mod tests {
             body: PreparedSendBody::Markdown("sent".into()),
         };
         let response = HistoryMessage {
+            read: None,
             reactions: Vec::new(),
             id: entry.public_id,
             stream_id: entry.stream_id,
             topic_id: entry.topic_id,
             body: MessageBody::Markdown("sent".into()),
             metadata: HistoryMetadata {
+                native_source: None,
                 author_id: Some(author),
                 created_at: HistoryTime::parse("2026-01-01T00:00:00Z").unwrap(),
                 updated_at: None,

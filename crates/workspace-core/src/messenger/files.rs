@@ -1,4 +1,4 @@
-//! Открывает вложения из известной истории, объединяет загрузки и выдаёт управляемое чтение.
+//! Открывает вложения из известной истории и предоставляет загрузку и очистку файлов композера.
 
 use std::{
     collections::HashMap,
@@ -34,7 +34,8 @@ mod protected;
 pub(super) mod upload;
 pub use protected::ProtectedPreviewPermit;
 pub use upload::{
-    AttachmentUpload, MAX_ATTACHMENT_UPLOAD_BYTES, UploadAttachmentError, UploadedAttachment,
+    AttachmentUpload, AttachmentUploadControl, AttachmentUploadProgress, DiscardAttachmentError,
+    MAX_ATTACHMENT_UPLOAD_BYTES, UploadAttachmentError, UploadedAttachment,
 };
 
 /// Причина отказа при открытии вложения.

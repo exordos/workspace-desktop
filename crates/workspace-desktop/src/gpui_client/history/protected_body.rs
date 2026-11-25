@@ -2,7 +2,7 @@
 
 use std::{ops::Range, sync::Arc};
 
-use gpui::{AnyElement, App, Div, IntoElement, WeakEntity, div, prelude::*};
+use gpui::{AnyElement, App, Context, Div, IntoElement, WeakEntity, Window, div, prelude::*, px};
 use uuid::Uuid;
 use workspace_core::{
     messenger::{
@@ -16,14 +16,16 @@ use workspace_core::{
 use super::{
     Conversation,
     attachments::{AttachmentKey, Cards, ProtectedAttachment},
-    inline_references::{MentionNames, Reference, reference_in_range, references},
+    inline_references::{
+        MentionNames, Reference, TIME_CHIP_ICON, TIME_CHIP_RADIUS, reference_in_range, references,
+    },
     media_album,
     reply::history_quote,
     viewport::GuardedText,
 };
 use crate::gpui_client::{
     preferences::Language,
-    ui::{Palette, TextRole, activate, text_role},
+    ui::{Icon, Palette, TextRole, activate, text_role},
 };
 
 /// Структура Markdown для одного отзываемого представления. Содержит только позиции и UUID.
@@ -44,16 +46,24 @@ enum Part {
 
 /// Сегмент текста под тем же разрешением ключа.
 enum InlinePart {
-    Text(Range<usize>),            // Неизменившийся исходный текст.
-    Reference(Range<usize>, bool), // Ссылка и признак действия, проверенный при разборе.
+    Text(Range<usize>),                     // Неизменившийся исходный текст.
+    Reference(Range<usize>, ReferenceKind), // Разрешённый вид ссылки без подписи и адреса.
+}
+
+/// Вид оформления защищённой ссылки, определённый при разборе.
+#[derive(Clone, Copy)]
+enum ReferenceKind {
+    Caption, // Подпись ссылки без действия.
+    Link,    // Обычная ссылка с переходом.
+    Time,    // Плашка с локальной датой и часами.
 }
 
 /// Отзываемый источник нажатия. Содержит позицию, но не открытый URL или отображаемую подпись.
 #[derive(Clone)]
 pub(super) struct ProtectedInline {
-    pub row: Uuid, // Сообщение, где пользователь нажал ссылку.
+    pub row: Uuid,                     // Сообщение, где пользователь нажал ссылку.
     pub access: Arc<ProtectedMessage>, // Действующая версия исходного конверта.
-    pub range: Range<usize>, // Границы элемента в неизменном теле этой версии.
+    pub range: Range<usize>,           // Границы элемента в неизменном теле этой версии.
 }
 
 impl ProtectedInline {
@@ -237,7 +247,10 @@ fn append_text(text: &str, range: Range<usize>, links: &[Reference], parts: &mut
     }
     let mut inline = Vec::new();
     let mut cursor = range.start;
-    for link in links.iter().filter(|link| link.range.start >= range.start && link.range.end <= range.end) {
+    for link in links
+        .iter()
+        .filter(|link| link.range.start >= range.start && link.range.end <= range.end)
+    {
         if link.range.start < cursor {
             continue;
         }
@@ -246,7 +259,11 @@ fn append_text(text: &str, range: Range<usize>, links: &[Reference], parts: &mut
         }
         inline.push(InlinePart::Reference(
             link.range.clone(),
-            link.target.is_some(),
+            match link.target {
+                Some(WorkspaceReferenceTarget::Time(_)) => ReferenceKind::Time,
+                Some(_) => ReferenceKind::Link,
+                None => ReferenceKind::Caption,
+            },
         ));
         cursor = link.range.end;
     }
@@ -280,17 +297,32 @@ fn render_reference_line(
                     .max_w_full()
                     .child(GuardedText::range(access.clone(), range.clone()))
                     .into_any_element(),
-                InlinePart::Reference(range, actionable) => {
+                InlinePart::Reference(range, kind) => {
+                    let is_time = matches!(kind, ReferenceKind::Time);
                     let item = text_role(palette, TextRole::Body)
                         .min_w_0()
                         .max_w_full()
+                        .when(is_time, |item| {
+                            item.flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .px(px(5.))
+                                .rounded(TIME_CHIP_RADIUS)
+                                .border_1()
+                                .border_color(palette.border)
+                                .bg(palette.surface)
+                                .child(Icon::MessageTime.element(TIME_CHIP_ICON, palette.text))
+                        })
                         .child(GuardedText::reference(
                             access.clone(),
                             range.clone(),
                             controls.language,
                             controls.names.clone(),
                         ));
-                    let Some(conversation) = controls.conversation.cloned().filter(|_| *actionable)
+                    let Some(conversation) = controls
+                        .conversation
+                        .cloned()
+                        .filter(|_| !matches!(kind, ReferenceKind::Caption))
                     else {
                         return item.into_any_element();
                     };
@@ -299,22 +331,57 @@ fn render_reference_line(
                         access: access.clone(),
                         range: range.clone(),
                     };
-                    activate(
-                        item.id(("history-protected-inline", range.start))
-                            .text_color(palette.accent),
-                        None,
-                        palette,
-                        move |window, cx| {
-                            cx.stop_propagation();
-                            let _ = conversation.update(cx, |view, cx| {
-                                view.activate_protected_reference(&source, window, cx)
-                            });
-                        },
-                    )
+                    let language = controls.language;
+                    let item = item
+                        .id(("history-protected-inline", range.start))
+                        .when(!is_time, |item| item.text_color(palette.accent))
+                        .when(is_time, |item| {
+                            let source = source.clone();
+                            item.hover(move |style| style.bg(palette.card_hover))
+                                .tooltip(move |_, cx| {
+                                    cx.new(|_| ProtectedTimeHint {
+                                        source: source.clone(),
+                                        language,
+                                        palette,
+                                    })
+                                    .into()
+                                })
+                        });
+                    activate(item, None, palette, move |window, cx| {
+                        cx.stop_propagation();
+                        let _ = conversation.update(cx, |view, cx| {
+                            view.activate_protected_reference(&source, window, cx)
+                        });
+                    })
                     .into_any_element()
                 }
             }
         }))
+}
+
+/// Подсказка хранит разрешение и диапазон вместо открытой подписи часового пояса.
+struct ProtectedTimeHint {
+    source: ProtectedInline, // Сообщение и неизменный диапазон даты.
+    language: Language,      // Язык часового пояса.
+    palette: Palette,        // Тема истории при открытии подсказки.
+}
+
+impl Render for ProtectedTimeHint {
+    /// Показывает пояс, только пока источник разрешает чтение.
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        text_role(self.palette, TextRole::Caption)
+            .px_2()
+            .py_1()
+            .rounded(TIME_CHIP_RADIUS)
+            .border_1()
+            .border_color(self.palette.border)
+            .bg(self.palette.surface)
+            .child(GuardedText::reference_zone(
+                self.source.access.clone(),
+                self.source.range.clone(),
+                self.language,
+            ))
+    }
 }
 
 /// Показывает ожидающую цитату через ту же рамку, что и обычный оригинал.

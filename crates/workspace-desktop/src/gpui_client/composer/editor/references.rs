@@ -1,10 +1,14 @@
 //! Показывает подсказки для @ и # и хранит UUID выбранных ссылок рядом с читаемым текстом поля.
 
-use std::{collections::HashSet, ops::Range, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+    sync::Arc,
+};
 
 use gpui::{
-    Context, Corner, Deferred, ElementId, Stateful, Window, anchored, deferred, div, point,
-    prelude::*, px,
+    Context, Corner, Deferred, ElementId, Pixels, Point, Stateful, Window, anchored, deferred, div,
+    point, prelude::*, px,
 };
 use uuid::Uuid;
 use workspace_core::{
@@ -12,6 +16,7 @@ use workspace_core::{
     directory::UserProfile,
     messenger::{
         catalog::Chat,
+        encryption::fragments::protected_draft_spans,
         references::{
             WorkspaceReferenceTarget, build_workspace_reference_markdown, media_references,
             parse_workspace_conversation_link, workspace_reference_prose_at, workspace_references,
@@ -36,6 +41,12 @@ pub(super) struct ReferenceSpan {
     range: Range<usize>,         // Байты видимой подписи в поле.
     markdown: Zeroizing<String>, // Точное исходное написание ссылки для отправки и черновика.
     file_id: Option<Uuid>,       // UUID для управления вложением из ряда под редактором.
+}
+
+/// Подпись свежего файла, которую нужно сохранить при смене вкладки и разметки.
+struct TemporaryFile {
+    markdown: Zeroizing<String>, // Точная ссылка, выданная Core для этого файла.
+    label: String,               // Видимая подпись и представление ссылки в буфере обмена.
 }
 
 /// Текущая команда поиска в точке ввода.
@@ -66,11 +77,13 @@ pub(super) struct References {
     dismissed_at: Option<(u64, usize)>, // Версия и курсор поиска, закрытого Escape.
     spans: Vec<ReferenceSpan>,   // Размещённые ссылки в порядке следования.
     canonical: Option<Zeroizing<String>>, // Текст на проводе, когда в поле есть читаемые подписи.
+    temporary_files: HashMap<Uuid, TemporaryFile>, // Ссылки, которые нельзя раскрыть из редактора.
 }
 
 impl References {
     /// Разбирает только известные ссылки при восстановлении, сохраняя остальной Markdown побайтно.
     pub(super) fn display_markup(
+        &self,
         markdown: &str,
         language: Language,
     ) -> (String, Vec<ReferenceSpan>) {
@@ -100,6 +113,27 @@ impl References {
             let display = reference.name.unwrap_or(reference.label);
             (reference.range, display, Some(reference.file_id))
         }));
+        // Код или другая разметка могут скрыть ссылку от парсера. Подпись временного файла в
+        // редакторе и буфере остаётся подписью даже после восстановления такого текста.
+        let temporary: Vec<_> = self
+            .temporary_files
+            .iter()
+            .flat_map(|(id, file)| {
+                markdown
+                    .match_indices(file.markdown.as_str())
+                    .map(move |(offset, text)| {
+                        (offset..offset + text.len(), file.label.clone(), Some(*id))
+                    })
+            })
+            .collect();
+        if !temporary.is_empty() {
+            entries.retain(|(existing, _, _)| {
+                !temporary
+                    .iter()
+                    .any(|(range, _, _)| range.start < existing.end && range.end > existing.start)
+            });
+            entries.extend(temporary);
+        }
         entries.sort_unstable_by_key(|(range, _, _)| range.start);
         for (range, display, file_id) in entries {
             if range.start < start {
@@ -155,10 +189,45 @@ impl References {
 
     /// Возвращает исходный Markdown для полных ссылок и обычный текст для части подписи.
     pub(super) fn markdown_range(&self, visible: &str, range: Range<usize>) -> String {
+        self.serialize_range(visible, range, false)
+    }
+
+    /// Переносит позицию в Markdown на видимый текст, где ссылка занимает место подписи.
+    pub(super) fn display_offset(spans: &[ReferenceSpan], offset: usize) -> usize {
+        let mut wire = 0;
+        let mut visible = 0;
+        for span in spans {
+            let start = wire + span.range.start - visible;
+            if offset <= start {
+                break;
+            }
+            let end = start + span.markdown.len();
+            if offset < end {
+                return span.range.start;
+            }
+            wire = end;
+            visible = span.range.end;
+        }
+        visible + offset - wire
+    }
+
+    /// Копирует готовые ссылки и подписи файлов, которые ещё принадлежат редактору.
+    pub(super) fn clipboard_range(&self, visible: &str, range: Range<usize>) -> String {
+        self.serialize_range(visible, range, true)
+    }
+
+    /// Собирает ссылки в выделении, пропуская временные UUID при записи в буфер обмена.
+    fn serialize_range(&self, visible: &str, range: Range<usize>, copying: bool) -> String {
         let mut result = String::new();
         let mut start = range.start;
         for span in &self.spans {
-            if span.range.start >= range.start && span.range.end <= range.end {
+            if span.range.start >= range.start
+                && span.range.end <= range.end
+                && !(copying
+                    && span
+                        .file_id
+                        .is_some_and(|id| self.temporary_files.contains_key(&id)))
+            {
                 result.push_str(&visible[start..span.range.start]);
                 result.push_str(&span.markdown);
                 start = span.range.end;
@@ -183,6 +252,7 @@ impl References {
     /// Убирает копии исходного текста при отзыве разрешения на правку.
     pub(super) fn clear_content(&mut self) {
         self.spans.clear();
+        self.temporary_files.clear();
         self.canonical = None;
         self.active = 0;
         self.dismissed_at = None;
@@ -418,7 +488,9 @@ impl Editor {
             self.replace(range, markdown, cx);
             return;
         }
-        let (visible, spans) = References::display_markup(markdown, self.reference_language(cx));
+        let (visible, spans) = self
+            .references
+            .display_markup(markdown, self.reference_language(cx));
         self.replace_with_spans(range, &visible, spans, cx);
     }
 
@@ -447,7 +519,49 @@ impl Editor {
         }
     }
 
-    /// Ставит файл отдельным абзацем перед текстом, чтобы незакрытый код не поглотил ссылку.
+    /// Вставляет изображение в позицию drop, если Markdown прочитает его как вложение.
+    pub(in crate::gpui_client::composer) fn insert_inline_attachment(
+        &mut self,
+        markdown: &str,
+        point: Point<Pixels>,
+        temporary: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(layout) = self.current_layout() else {
+            return false;
+        };
+        if self.composing() {
+            return false;
+        }
+        let index = layout.index_at(point);
+        if self.references.touches_span(&(index..index)) {
+            return false;
+        }
+        // Позиция окна относится к подписи. Проверять нужно полный исходный Markdown.
+        let offset = self.references.markdown_range(&self.text, 0..index).len();
+        let mut candidate = Zeroizing::new(self.text().to_owned());
+        candidate.insert_str(offset, markdown);
+        let Some(reference) = media_references(&candidate)
+            .into_iter()
+            .find(|reference| reference.range == (offset..offset + markdown.len()))
+        else {
+            return false;
+        };
+        if temporary {
+            self.references.temporary_files.insert(
+                reference.file_id,
+                TemporaryFile {
+                    markdown: Zeroizing::new(markdown.to_owned()),
+                    label: reference.name.unwrap_or(reference.label),
+                },
+            );
+        }
+        self.replace_markup(index..index, markdown, cx);
+        true
+    }
+
+    /// Ставит файл отдельным абзацем перед текстом при проверке готового Markdown.
+    #[cfg(all(test, feature = "gpui-test"))]
     pub(in crate::gpui_client::composer) fn insert_attachment(
         &mut self,
         markdown: &str,
@@ -483,6 +597,7 @@ impl Editor {
     }
 
     /// Находит конец начального ряда файлов, сохраняя порядок нескольких загрузок.
+    #[cfg(all(test, feature = "gpui-test"))]
     fn leading_attachment_end(&self) -> usize {
         let mut end = 0;
         for span in &self.references.spans {
@@ -534,7 +649,83 @@ impl Editor {
         } else if range.start == 0 && self.text[range.end..].starts_with("\n\n") {
             range.end += 2;
         }
+        self.erase_attachment_range(range, cx);
+    }
+
+    /// Убирает все вставки временных файлов, сохраняя курсор и незатронутую IME-композицию.
+    pub(in crate::gpui_client::composer) fn remove_attachment_files(
+        &mut self,
+        files: &[Uuid],
+        cx: &mut Context<Self>,
+    ) {
+        self.references
+            .temporary_files
+            .retain(|id, _| !files.contains(id));
+        let ranges: Vec<_> = self
+            .references
+            .spans
+            .iter()
+            .rev()
+            .filter(|span| span.file_id.is_some_and(|id| files.contains(&id)))
+            .map(|span| span.range.clone())
+            .collect();
+        for range in ranges {
+            self.erase_attachment_range(range, cx);
+        }
+    }
+
+    /// Убирает конкретную подпись старого вложения, оставляя другие ссылки на этот файл.
+    pub(in crate::gpui_client::composer) fn remove_attachment_link(
+        &mut self,
+        markdown: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let protected = if self.fragment_edit.is_some() {
+            protected_draft_spans(self.text()).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let ranges: Vec<_> = self
+            .references
+            .spans
+            .iter()
+            .rev()
+            .filter(|span| {
+                if span.file_id.is_none() || span.markdown.as_str() != markdown {
+                    return false;
+                }
+                if protected.is_empty() {
+                    return true;
+                }
+                let start = self
+                    .references
+                    .markdown_range(&self.text, 0..span.range.start)
+                    .len();
+                let end = start + markdown.len();
+                !protected
+                    .iter()
+                    .any(|fragment| start < fragment.end && fragment.start < end)
+            })
+            .map(|span| span.range.clone())
+            .collect();
+        for range in ranges {
+            self.erase_attachment_range(range, cx);
+        }
+    }
+
+    /// Удаляет подпись в видимом тексте, сдвигая прежние позиции за ней.
+    fn erase_attachment_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        let shift = |offset: usize| offset - offset.saturating_sub(range.start).min(range.len());
+        let anchor = shift(self.anchor);
+        let caret = shift(self.caret);
+        let marked = self.marked.as_ref().and_then(|marked| {
+            (marked.end <= range.start || marked.start >= range.end)
+                .then(|| shift(marked.start)..shift(marked.end))
+        });
         self.replace(range, "", cx);
+        self.anchor = anchor;
+        self.caret = caret;
+        self.marked = marked;
     }
 
     /// Преобразует только принятые адреса текущего Workspace перед штатной вставкой из буфера.
@@ -681,7 +872,7 @@ impl Editor {
                 index == active,
                 palette,
             )
-            .debug_selector(move || format!("composer-reference-{index}").into())
+            .debug_selector(move || format!("composer-reference-{index}"))
             .on_click(move |_, window, app| {
                 let _ = input.update(app, |editor, cx| {
                     editor.pick_reference(&normal, false, cx);
@@ -710,7 +901,7 @@ impl Editor {
                     false,
                     palette,
                 )
-                .debug_selector(move || format!("composer-mention-quiet-{index}").into())
+                .debug_selector(move || format!("composer-mention-quiet-{index}"))
                 .on_click(move |_, window, app| {
                     let _ = input.update(app, |editor, cx| {
                         editor.pick_reference(&choice, true, cx);
@@ -772,7 +963,7 @@ mod tests {
     fn restores_mentions_and_conversation_labels_with_their_original_markdown() {
         let id = Uuid::from_u128(42);
         let source = format!("[Лена](urn:user:{id}) и [Общий](urn:stream:{id})");
-        let (mut text, spans) = References::display_markup(&source, Language::Ru);
+        let (mut text, spans) = References::default().display_markup(&source, Language::Ru);
         assert_eq!(text, "@Лена и Общий");
         let mut state = References::default();
         state.replaced(0..0, text.len(), &text, spans);
@@ -871,12 +1062,34 @@ mod tests {
     fn restores_uploaded_attachment_without_showing_its_urn() {
         let id = Uuid::from_u128(66);
         let source = format!("Подпись\n\n![Кадр](urn:image:{id}?name=photo.png)");
-        let (text, spans) = References::display_markup(&source, Language::Ru);
+        let (text, spans) = References::default().display_markup(&source, Language::Ru);
         assert_eq!(text, "Подпись\n\nphoto.png");
         assert_eq!(spans[0].file_id, Some(id));
         let mut state = References::default();
         state.replaced(0..0, text.len(), &text, spans);
         assert_eq!(state.markdown(&text), source);
+    }
+
+    /// Сохраняет подпись временного фото после восстановления текста с разметкой кода.
+    #[test]
+    fn temporary_photo_in_code_copies_only_its_label() {
+        let id = Uuid::from_u128(77);
+        let link = format!("![Кадр](urn:image:{id}?name=photo.png)");
+        let source = format!("`{link}` здесь");
+        let mut state = References::default();
+        state.temporary_files.insert(
+            id,
+            TemporaryFile {
+                markdown: Zeroizing::new(link),
+                label: "photo.png".into(),
+            },
+        );
+        let (text, spans) = state.display_markup(&source, Language::Ru);
+        assert_eq!(text, "`photo.png` здесь");
+        assert_eq!(References::display_offset(&spans, source.len()), text.len());
+        state.replaced(0..0, text.len(), &text, spans);
+        assert_eq!(state.markdown(&text), source);
+        assert_eq!(state.clipboard_range(&text, 0..text.len()), text);
     }
 
     /// Превращает только ссылки на известную тему текущего аккаунта, сохраняя пунктуацию.

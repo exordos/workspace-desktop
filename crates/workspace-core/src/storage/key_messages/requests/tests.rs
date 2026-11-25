@@ -78,6 +78,7 @@ fn pending_key_requests_span_known_topics_and_require_exact_response() {
         author,
     ] = [(); 7].map(|()| Uuid::new_v4());
     let row = |stream_id, topic_id, id, payload| HistoryMessage {
+        read: None,
         reactions: Vec::new(),
         id: Uuid::from_u128(id),
         stream_id,
@@ -87,6 +88,7 @@ fn pending_key_requests_span_known_topics_and_require_exact_response() {
             payload,
         },
         metadata: HistoryMetadata {
+            native_source: None,
             author_id: Some(author),
             created_at: HistoryTime::parse("2026-01-01T10:00:00Z").unwrap(),
             updated_at: None,

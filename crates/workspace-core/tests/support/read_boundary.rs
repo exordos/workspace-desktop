@@ -18,7 +18,11 @@ use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 use workspace_core::{
     auth::AuthError,
-    messenger::{MessengerSource, read::ReadError},
+    messenger::{
+        MessengerSource,
+        message_actions::{MutationReceipt, MutationStatus},
+        read::ReadError,
+    },
     storage::{Cursor, HistoryScope, Storage},
     sync::{Event, Sync},
 };
@@ -29,7 +33,7 @@ const CA: &[u8] = include_bytes!("../../../../tests/fixtures/tls/ca.pem");
 const CERT: &[u8] = include_bytes!("../../../../tests/fixtures/tls/localhost.pem");
 const KEY: &[u8] = include_bytes!("../../../../tests/fixtures/tls/localhost-key.pem");
 
-/// Проверяет ответ, ошибки, отсутствие повтора и отказ старому поколению.
+/// Проверяет синхронный ответ, квитанцию журнала, сырую границу и отказ старому поколению.
 #[tokio::test]
 async fn read_boundary_uses_current_session_and_checks_response() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -50,18 +54,63 @@ async fn read_boundary_uses_current_session_and_checks_response() {
     let stream = Uuid::from_u128(10);
     let topic = Uuid::from_u128(11);
     let message = Uuid::from_u128(12);
+    let ticket = Uuid::from_u128(13);
     let worker = tokio::spawn(async move {
-        for mode in 0..5 {
+        for (mode, verify) in [
+            (0, true),
+            (0, false),
+            (1, true),
+            (1, false),
+            (2, true),
+            (2, false),
+            (3, true),
+            (3, false),
+            (4, true),
+            (4, false),
+            (5, true),
+            (5, false),
+            (6, false),
+            (7, false),
+            (9, true),
+            (8, true),
+            (8, false),
+        ] {
             let (socket, _) = listener.accept().await.unwrap();
             let mut socket = BufReader::new(tls.accept(socket).await.unwrap());
             let mut line = String::new();
             socket.read_line(&mut line).await.unwrap();
-            assert_eq!(
-                line,
-                format!(
-                    "POST /api/workspace/v1/messenger/messages/{message}/actions/read_up_to/invoke HTTP/1.1\r\n"
-                )
-            );
+            if verify {
+                assert_eq!(
+                    line,
+                    format!("GET /api/workspace/v1/messenger/messages/{message} HTTP/1.1\r\n")
+                );
+            } else if mode == 6 {
+                assert_eq!(
+                    line,
+                    format!(
+                        "GET /api/workspace/v1/messenger/message_mutations/{ticket} HTTP/1.1\r\n"
+                    )
+                );
+            } else if mode == 7 {
+                assert!(line.starts_with("GET /api/workspace/v1/messenger/messages/?"));
+                for filter in [
+                    format!("stream_uuid={stream}"),
+                    format!("topic_uuid={topic}"),
+                    "read=false".into(),
+                    "sort_key=created_at".into(),
+                    "sort_dir=asc".into(),
+                    "page_limit=1".into(),
+                ] {
+                    assert!(line.contains(&filter), "не передан фильтр {filter}");
+                }
+            } else {
+                assert_eq!(
+                    line,
+                    format!(
+                        "POST /api/workspace/v1/messenger/messages/{message}/actions/read_up_to/invoke HTTP/1.1\r\n"
+                    )
+                );
+            }
             let mut authorized = false;
             loop {
                 line.clear();
@@ -74,20 +123,60 @@ async fn read_boundary_uses_current_session_and_checks_response() {
                 }
             }
             assert!(authorized);
-            if mode == 4 {
+            if mode == 8 && !verify {
                 entered_server.notify_one();
                 release_server.notified().await;
             }
-            let mut row = json!({"uuid":message,"stream_uuid":stream,"topic_uuid":topic,"project_id":"project","user_uuid":"second","author_uuid":message,"created_at":"2026-01-01T12:00:00Z","payload":{"kind":"markdown","content":"hello"}});
-            if mode == 2 {
-                row["topic_uuid"] = json!(Uuid::from_u128(99));
-            }
-            if mode == 3 {
-                row = json!({});
-            }
-            let status = if mode == 1 { "403 Forbidden" } else { "200 OK" };
+            let mut row = json!({
+                "uuid": message, "stream_uuid": stream, "topic_uuid": topic,
+                "project_id": "project", "user_uuid": "second", "author_uuid": message,
+                "created_at": "2026-01-01T12:00:00Z", "source_name": "native", "read": true,
+                "payload": {"kind": "markdown", "content": "hello"},
+            });
+            let header = if verify {
+                row["read"] = json!(false);
+                if mode == 9 {
+                    row["topic_uuid"] = json!(Uuid::from_u128(99));
+                }
+                String::new()
+            } else {
+                match mode {
+                    2 => {
+                        row["topic_uuid"] = json!(Uuid::from_u128(99));
+                        String::new()
+                    }
+                    3 => {
+                        row = json!({});
+                        String::new()
+                    }
+                    4 | 5 => {
+                        row["read"] = json!(false);
+                        if mode == 5 {
+                            format!("X-Workspace-Mutation-Id: {ticket}\r\n")
+                        } else {
+                            String::new()
+                        }
+                    }
+                    6 => {
+                        row = json!({"uuid":ticket,"project_id":"project","user_uuid":"second","status":"pending"});
+                        String::new()
+                    }
+                    7 => {
+                        row["read"] = json!(false);
+                        row["payload"] = json!({"kind": "future_kind", "content": {"example": 1}});
+                        row = json!([row]);
+                        String::new()
+                    }
+                    _ => String::new(),
+                }
+            };
+            let status = if mode == 1 && !verify {
+                "403 Forbidden"
+            } else {
+                "200 OK"
+            };
             let body = row.to_string();
-            socket.get_mut().write_all(format!("HTTP/1.1 {status}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            socket.get_mut().write_all(format!("HTTP/1.1 {status}\r\nConnection: close\r\nContent-Type: application/json\r\n{header}Content-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
         }
         assert!(
             timeout(Duration::from_millis(300), listener.accept())
@@ -121,11 +210,12 @@ async fn read_boundary_uses_current_session_and_checks_response() {
         stream_id: stream,
         topic_id: Some(topic),
     };
-    assert!(
+    assert_eq!(
         source
             .read_up_to(&sync, &owner, generation, scope, message)
             .await
-            .is_ok()
+            .unwrap(),
+        MutationReceipt::Applied,
     );
     assert!(matches!(
         source
@@ -133,7 +223,7 @@ async fn read_boundary_uses_current_session_and_checks_response() {
             .await,
         Err(ReadError::Http(403))
     ));
-    for _ in 0..2 {
+    for _ in 0..3 {
         assert!(matches!(
             source
                 .read_up_to(&sync, &owner, generation, scope, message)
@@ -141,6 +231,34 @@ async fn read_boundary_uses_current_session_and_checks_response() {
             Err(ReadError::Unknown)
         ));
     }
+    let MutationReceipt::Accepted(ticket) = source
+        .read_up_to(&sync, &owner, generation, scope, message)
+        .await
+        .unwrap()
+    else {
+        panic!("заявка должна остаться в очереди сервера");
+    };
+    assert_eq!(
+        source
+            .mutation_status(&fixture.auth, &ticket)
+            .await
+            .unwrap(),
+        MutationStatus::Pending,
+    );
+    let unknown = source
+        .first_unread(&sync, &owner, generation, scope)
+        .await
+        .unwrap()
+        .expect("неизвестное тело не скрывает границу");
+    assert_eq!(unknown.boundary.target.message_id, message);
+    assert_eq!(unknown.boundary.target.topic_id, topic);
+    assert!(!unknown.eligible);
+    assert!(matches!(
+        source
+            .read_up_to(&sync, &owner, generation, scope, message)
+            .await,
+        Err(ReadError::History(_))
+    ));
     let request = source.read_up_to(&sync, &owner, generation, scope, message);
     let relogin = async {
         timeout(Duration::from_secs(3), entered.notified())

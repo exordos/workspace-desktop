@@ -1,4 +1,4 @@
-//! Получает первый кадр локального видео и открывает проигрыватель macOS.
+//! Готовит уменьшенные изображения и первые кадры видео, открывает проигрыватель macOS.
 
 use std::{
     cell::RefCell,
@@ -10,7 +10,7 @@ use std::{
 
 use block2::RcBlock;
 use objc2::{
-    Encode, Encoding, RefEncode, class, msg_send, msg_send_id,
+    ClassType, Encode, Encoding, RefEncode, class, msg_send, msg_send_id,
     rc::{Retained, autoreleasepool},
     runtime::{AnyObject, Bool},
 };
@@ -18,13 +18,14 @@ use objc2_app_kit::{
     NSBackingStoreType, NSView, NSWindow, NSWindowStyleMask, NSWindowWillCloseNotification,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSData, NSDictionary, NSError, NSNotification, NSNotificationCenter,
+    MainThreadMarker, NSArray, NSData, NSDictionary, NSError, NSNotification, NSNotificationCenter,
     NSNumber, NSObject, NSPoint, NSRect, NSSize, NSString, NSURL,
 };
 
 #[link(name = "AVFoundation", kind = "framework")]
 unsafe extern "C" {
     static AVURLAssetReferenceRestrictionsKey: &'static NSString;
+    static AVMediaTypeVideo: &'static NSString;
 }
 
 #[link(name = "AVKit", kind = "framework")]
@@ -32,7 +33,23 @@ unsafe extern "C" {}
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
+    static kCGColorSpaceSRGB: &'static NSString;
     fn CGImageRelease(image: *mut CGImage);
+    fn CGImageGetWidth(image: *const CGImage) -> usize;
+    fn CGImageGetHeight(image: *const CGImage) -> usize;
+    fn CGColorSpaceCreateWithName(name: *const NSString) -> *mut c_void;
+    fn CGColorSpaceRelease(space: *mut c_void);
+    fn CGBitmapContextCreate(
+        pixels: *mut c_void,
+        width: usize,
+        height: usize,
+        bits_per_component: usize,
+        bytes_per_row: usize,
+        color_space: *mut c_void,
+        bitmap_info: u32,
+    ) -> *mut c_void;
+    fn CGContextDrawImage(context: *mut c_void, rect: NSRect, image: *mut CGImage);
+    fn CGContextRelease(context: *mut c_void);
 }
 
 #[link(name = "ImageIO", kind = "framework")]
@@ -40,6 +57,7 @@ unsafe extern "C" {
     static kCGImageSourceCreateThumbnailFromImageAlways: &'static NSString;
     static kCGImageSourceCreateThumbnailWithTransform: &'static NSString;
     static kCGImageSourceThumbnailMaxPixelSize: &'static NSString;
+    static kCGImageSourceShouldCacheImmediately: &'static NSString;
     fn CGImageSourceCreateWithData(data: *const c_void, options: *const c_void) -> *mut c_void;
     fn CGImageSourceCreateThumbnailAtIndex(
         source: *mut c_void,
@@ -74,6 +92,22 @@ unsafe impl Encode for MediaTime {
 // Для optional-выхода actualTime передаётся указатель на тот же тип.
 unsafe impl RefEncode for MediaTime {
     const ENCODING_REF: Encoding = Encoding::Pointer(&Self::ENCODING);
+}
+
+/// Преобразование кадра из CGAffineTransform, в том же порядке полей, что и в SDK.
+#[repr(C)]
+struct VideoTransform {
+    a: f64,   // Вклад исходной ширины в ширину отображения.
+    b: f64,   // Вклад исходной ширины в высоту отображения.
+    c: f64,   // Вклад исходной высоты в ширину отображения.
+    d: f64,   // Вклад исходной высоты в высоту отображения.
+    _tx: f64, // Сдвиг по горизонтали не меняет размер.
+    _ty: f64, // Сдвиг по вертикали не меняет размер.
+}
+
+// CGFloat на поддерживаемой 64-разрядной macOS имеет тот же вид, что и f64.
+unsafe impl Encode for VideoTransform {
+    const ENCODING: Encoding = Encoding::Struct("CGAffineTransform", &[f64::ENCODING; 6]);
 }
 
 /// Непрозрачный кадр Core Graphics. Используется только через указатель SDK.
@@ -124,6 +158,32 @@ pub(crate) fn stage_video(mut source: impl Read) -> io::Result<tempfile::NamedTe
     Ok(clip)
 }
 
+/// Читает ширину и высоту первого видеотрека в пикселях с учётом поворота кадра.
+/// Вызывается на рабочем потоке с теми же байтами, которые будут отправлены.
+pub(crate) fn video_dimensions(source: impl Read) -> Option<(u32, u32)> {
+    let file = stage_video(source).ok()?;
+    autoreleasepool(|_| {
+        let asset = local_asset(file.path())?;
+        // Синхронный интерфейс чтения дорожки доступен и в macOS 11.
+        unsafe {
+            let tracks: Retained<NSArray<AnyObject>> =
+                msg_send_id![&*asset, tracksWithMediaType: AVMediaTypeVideo];
+            let track = tracks.firstObject()?;
+            let size: NSSize = msg_send![&*track, naturalSize];
+            let transform: VideoTransform = msg_send![&*track, preferredTransform];
+            displayed_video_dimensions(size, transform)
+        }
+    })
+}
+
+/// Возвращает размер прямоугольника, содержащего весь кадр после поворота.
+fn displayed_video_dimensions(size: NSSize, transform: VideoTransform) -> Option<(u32, u32)> {
+    let width = (transform.a.abs() * size.width + transform.c.abs() * size.height).round();
+    let height = (transform.b.abs() * size.width + transform.d.abs() * size.height).round();
+    let valid = 1.0..=f64::from(u32::MAX);
+    (valid.contains(&width) && valid.contains(&height)).then_some((width as u32, height as u32))
+}
+
 /// Возвращает уменьшенный PNG первого кадра. Вызывается на рабочем потоке.
 pub(crate) fn video_poster(path: &Path, max_side: f64) -> Option<Vec<u8>> {
     autoreleasepool(|_| {
@@ -152,22 +212,47 @@ pub(crate) fn video_poster(path: &Path, max_side: f64) -> Option<Vec<u8>> {
     })
 }
 
-/// Уменьшает HEIC или HEIF с учётом ориентации до выделения пикселей исходного размера.
-pub(crate) fn heif_preview(bytes: &[u8], max_side: u32) -> Option<Vec<u8>> {
+/// Распознаёт по марке контейнера изображения, которые читает ImageIO.
+pub(crate) fn heif_mime_type(bytes: &[u8]) -> Option<&'static str> {
+    match bytes.get(4..12)? {
+        b"ftypheic" | b"ftypheix" | b"ftyphevc" | b"ftyphevx" => Some("image/heic"),
+        b"ftypmif1" | b"ftypmsf1" => Some("image/heif"),
+        b"ftypavif" | b"ftypavis" => Some("image/avif"),
+        _ => None,
+    }
+}
+
+/// Содержит уменьшенное изображение для последующего кадрирования в GPUI.
+pub(crate) struct ImagePreview {
+    pub(crate) width: u32,      // Ширина после исправления ориентации, в пикселях.
+    pub(crate) height: u32,     // Высота после исправления ориентации, в пикселях.
+    pub(crate) pixels: Vec<u8>, // Последовательность RGBA, начиная с верхней строки.
+}
+
+/// Уменьшает HEIF-совместимый файл с учётом ориентации до выделения пикселей исходного размера.
+pub(crate) fn heif_preview(bytes: &[u8], max_side: u32) -> Option<ImagePreview> {
     autoreleasepool(|_| {
-        let data = NSData::with_bytes(bytes);
         // NSData и NSDictionary совместимы с одноимёнными объектами Core Foundation.
         unsafe {
+            // NSData читает заимствованные байты до конца синхронного вызова и не освобождает их.
+            let data = NSData::initWithBytesNoCopy_length_freeWhenDone(
+                NSData::alloc(),
+                NonNull::from(bytes.first()?).cast(),
+                bytes.len(),
+                false,
+            );
             let options = NSDictionary::from_id_slice(
                 &[
                     kCGImageSourceCreateThumbnailFromImageAlways,
                     kCGImageSourceCreateThumbnailWithTransform,
                     kCGImageSourceThumbnailMaxPixelSize,
+                    kCGImageSourceShouldCacheImmediately,
                 ],
                 &[
                     NSNumber::new_bool(true),
                     NSNumber::new_bool(true),
                     NSNumber::new_u32(max_side),
+                    NSNumber::new_bool(true),
                 ],
             );
             let source = NonNull::new(CGImageSourceCreateWithData(
@@ -180,14 +265,65 @@ pub(crate) fn heif_preview(bytes: &[u8], max_side: u32) -> Option<Vec<u8>> {
                 Retained::as_ptr(&options).cast(),
             );
             CFRelease(source.as_ptr());
-            encode_png(NonNull::new(image)?)
+            let image = NonNull::new(image)?;
+            let preview = image_preview(image, max_side);
+            CGImageRelease(image.as_ptr());
+            preview
         }
     })
 }
 
+/// Копирует только уменьшенные пиксели Core Graphics, сохраняя цвет и прозрачность.
+unsafe fn image_preview(image: NonNull<CGImage>, max_side: u32) -> Option<ImagePreview> {
+    // Эти флаги из CGBitmapContext задают порядок байтов RGBA с умножением цвета на альфу.
+    const RGBA_PREMULTIPLIED: u32 = (4 << 12) | 1;
+    unsafe {
+        let width = CGImageGetWidth(image.as_ptr());
+        let height = CGImageGetHeight(image.as_ptr());
+        if width == 0 || height == 0 || width.max(height) > max_side as usize {
+            return None;
+        }
+        let stride = width.checked_mul(4)?;
+        let mut pixels = vec![0_u8; stride.checked_mul(height)?];
+        let space = NonNull::new(CGColorSpaceCreateWithName(kCGColorSpaceSRGB))?;
+        // Буфер остаётся на месте до освобождения CGContext.
+        let context = CGBitmapContextCreate(
+            pixels.as_mut_ptr().cast(),
+            width,
+            height,
+            8,
+            stride,
+            space.as_ptr(),
+            RGBA_PREMULTIPLIED,
+        );
+        CGColorSpaceRelease(space.as_ptr());
+        let context = NonNull::new(context)?;
+        let bounds = NSRect::new(
+            NSPoint::new(0., 0.),
+            NSSize::new(width as f64, height as f64),
+        );
+        CGContextDrawImage(context.as_ptr(), bounds, image.as_ptr());
+        CGContextRelease(context.as_ptr());
+        for pixel in pixels.as_chunks_mut::<4>().0 {
+            let alpha = u16::from(pixel[3]);
+            if (1..255).contains(&alpha) {
+                for channel in &mut pixel[..3] {
+                    let original = (u16::from(*channel) * 255 + alpha / 2) / alpha;
+                    *channel = original.min(255) as u8;
+                }
+            }
+        }
+        Some(ImagePreview {
+            width: width as u32,
+            height: height as u32,
+            pixels,
+        })
+    }
+}
+
 /// Забирает владение кадром Core Graphics и возвращает его PNG.
 unsafe fn encode_png(image: NonNull<CGImage>) -> Option<Vec<u8>> {
-    // Оба вызывающих API передают кадр с правилом Create или Copy.
+    // AVFoundation передаёт кадр по правилу Copy.
     unsafe {
         let bitmap: Option<Retained<AnyObject>> = msg_send_id![msg_send_id![class!(NSBitmapImageRep), alloc], initWithCGImage: image.as_ptr()];
         CGImageRelease(image.as_ptr());
@@ -310,5 +446,37 @@ impl Drop for NativeVideoWindow {
     fn drop(&mut self) {
         self.window.close();
         unsafe { self.center.removeObserver(&self.observer) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Читает реальные метаданные короткого локального видео через AVFoundation.
+    #[test]
+    fn video_dimensions_reads_first_local_track() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/media/synthetic-video.mov"
+        ));
+        assert_eq!(video_dimensions(bytes.as_slice()), Some((32, 16)));
+    }
+
+    /// При повороте на 90 градусов ширина и высота кадра меняются местами.
+    #[test]
+    fn video_dimensions_respect_track_rotation() {
+        let rotation = VideoTransform {
+            a: 0.,
+            b: 1.,
+            c: -1.,
+            d: 0.,
+            _tx: 16.,
+            _ty: 0.,
+        };
+        assert_eq!(
+            displayed_video_dimensions(NSSize::new(32., 16.), rotation),
+            Some((16, 32))
+        );
     }
 }

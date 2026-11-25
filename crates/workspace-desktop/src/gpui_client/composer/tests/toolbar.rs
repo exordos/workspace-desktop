@@ -43,8 +43,10 @@ fn toolbar_formats_text_without_submitting_or_disturbing_ime(cx: &mut TestAppCon
     assert_eq!(toggle.left(), compact_toggle.left());
     assert_eq!(toggle.size, size(px(32.), px(32.)));
 
-    // В трёх группах отступы 0 и 8 px, а разделители добавляют 1 px между группами.
+    // Вставка времени идёт перед форматированием даже без доступных файлов.
     let commands = [
+        "composer-toolbar-toggle",
+        "composer-insert-time",
         "composer-format-link",
         "composer-format-bold",
         "composer-format-italic",
@@ -57,22 +59,23 @@ fn toolbar_formats_text_without_submitting_or_disturbing_ime(cx: &mut TestAppCon
         "composer-format-spoiler",
     ]
     .map(|selector| ui.debug_bounds(selector).unwrap());
-    assert_eq!(commands[0].left() - toggle.right(), px(17.));
     for command in &commands {
         assert_eq!(command.size, size(px(32.), px(32.)));
         assert_eq!(command.top(), toolbar.top());
     }
+    // Внутри группы начертаний кнопки стоят вплотную, разделитель даёт зазор 17 px.
     for (pair, gap) in commands
         .windows(2)
-        .zip([0., 0., 0., 17., 8., 17., 8., 8., 8.])
+        .zip([8., 17., 0., 0., 0., 17., 8., 17., 8., 8., 8.])
     {
         assert_eq!(pair[1].left() - pair[0].right(), px(gap));
     }
-    let time = ui.debug_bounds("composer-insert-time").unwrap();
-    assert_eq!(time.size, size(px(32.), px(32.)));
-    assert_eq!(time.origin.y, toolbar.origin.y);
-    assert_eq!(time.left(), commands.last().unwrap().right());
-    assert!(time.right() <= toolbar.right());
+    assert!(commands.last().unwrap().right() <= toolbar.right());
+    assert!(ui.debug_bounds("composer-attach-file").is_none());
+    assert!(
+        ui.debug_bounds("composer-format-encrypted-spoiler")
+            .is_none()
+    );
 
     click(ui, "composer-format-bold");
     assert_eq!(draft(&view, ui), "**Отбор 🧩**");
@@ -132,12 +135,14 @@ fn narrow_toolbar_scrolls_focused_actions_and_keeps_reading_anchor(cx: &mut Test
     let stream_id = ui.read(|app| view.read(app).address().route.scope.stream_id);
     let messages = (1..=60)
         .map(|index| HistoryMessage {
+            read: None,
             id: Uuid::from_u128(index),
             stream_id,
             topic_id: TOPIC,
             body: MessageBody::Markdown("Синтетическая строка".into()),
             reactions: Vec::new(),
             metadata: HistoryMetadata {
+                native_source: None,
                 author_id: Some(Uuid::from_u128(900)),
                 created_at: HistoryTime::parse("2026-11-17T07:10:30Z").unwrap(),
                 updated_at: None,
@@ -182,8 +187,8 @@ fn narrow_toolbar_scrolls_focused_actions_and_keeps_reading_anchor(cx: &mut Test
     let send = ui.debug_bounds("conversation-send").unwrap();
     assert!(send.right() <= px(340.));
 
-    // Те же переходы вызывает Tab в корне штатного окна.
-    for _ in 0..12 {
+    // После поля Tab проходит отправку, переключатель, время и десять команд.
+    for _ in 0..13 {
         ui.update(|window, _| window.focus_next());
         ui.run_until_parked();
     }
@@ -201,7 +206,7 @@ fn narrow_toolbar_scrolls_focused_actions_and_keeps_reading_anchor(cx: &mut Test
     assert!(requests.save.try_recv().is_err());
     assert_eq!(y(ui), initial_y);
 
-    // Обход в обратную сторону возвращает левую кнопку в область прокрутки.
+    // После команды фокус вернулся в поле, затем проходит отправку и переключатель.
     for _ in 0..2 {
         ui.update(|window, _| window.focus_next());
         ui.run_until_parked();
@@ -227,7 +232,7 @@ fn toolbar_keeps_focused_action_visible_after_resize(cx: &mut TestAppContext) {
     allow(&requests, Ok(TOPIC), ui);
     paste(ui, "Сообщение");
     click(ui, "composer-toolbar-toggle");
-    for _ in 0..12 {
+    for _ in 0..13 {
         ui.update(|window, _| window.focus_next());
         ui.run_until_parked();
     }

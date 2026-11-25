@@ -6,6 +6,8 @@ mod time;
 #[cfg(test)]
 mod tests;
 
+use std::{cell::Cell, rc::Rc};
+
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike};
 use gpui::{App, Context, Div, Entity, EventEmitter, Subscription, Window, div, prelude::*, px};
 
@@ -24,7 +26,7 @@ pub enum PickerMode {
     #[default]
     Editable, // Можно менять значение.
     Disabled, // Контролы видны, но не принимают ввод.
-    ReadOnly, // Дата и время видны, элементы управления скрыты.
+    ReadOnly, // Дату и время нельзя изменить, месяцы можно листать.
 }
 
 /// Задаёт язык и оформление для отдельно стоящего или составного компонента.
@@ -85,8 +87,8 @@ fn time_from_seconds(seconds: u32) -> Option<NaiveTime> {
     NaiveTime::from_num_seconds_from_midnight_opt(seconds, 0)
 }
 
-/// Рисует общий фон и отступы календаря или объединённого выбора.
-fn card(palette: Palette) -> Div {
+/// Задаёт размеры и отступы календаря внутри любой поверхности.
+fn picker_body() -> Div {
     div()
         .w_full()
         .max_w(px(PICKER_WIDTH))
@@ -94,6 +96,11 @@ fn card(palette: Palette) -> Div {
         .flex_col()
         .flex_none()
         .p(px(PICKER_INSET))
+}
+
+/// Рисует фон и рамку самостоятельной карточки.
+fn card(palette: Palette) -> Div {
+    picker_body()
         .rounded(SURFACE_RADIUS)
         .border_1()
         .border_color(palette.border)
@@ -113,6 +120,7 @@ pub struct DateTimePicker {
     max: Option<NaiveDateTime>,               // Включительная верхняя граница.
     precision: TimePrecision,                 // Точность значения для экрана.
     options: PickerOptions,                   // Язык, палитра и доступность обоих компонентов.
+    embedded: bool,                           // Фон и рамку рисует внешняя панель.
     time_caption: Option<gpui::SharedString>, // Подпись времени, если она нужна на экране.
     _subscriptions: [Subscription; 2],        // Связывают действия детей с общим значением.
 }
@@ -161,6 +169,7 @@ impl DateTimePicker {
             max: None,
             precision,
             options,
+            embedded: false,
             time_caption: None,
         };
         picker.set_value(value, cx);
@@ -170,6 +179,33 @@ impl DateTimePicker {
     /// Возвращает текущее значение для формы, которая решает, когда его сохранить.
     pub fn value(&self) -> Option<NaiveDateTime> {
         self.value
+    }
+
+    /// Читает значение для подтверждения, включая допустимую цифру в активных часах.
+    pub(crate) fn value_for_confirmation(&self, cx: &App) -> Option<NaiveDateTime> {
+        let value = self.value?;
+        Some(
+            value
+                .date()
+                .and_time(self.time.read(cx).pending_value().unwrap_or(value.time())),
+        )
+    }
+
+    /// Даёт начать клавиатурный выбор с текущего дня календаря.
+    pub(crate) fn focus_date(&self, window: &mut Window, cx: &App) {
+        self.date.read(cx).focus(window);
+    }
+
+    /// Использует фон внешней панели и сохраняет внутренние отступы выбора.
+    pub(crate) fn embedded(mut self) -> Self {
+        self.embedded = true;
+        self
+    }
+
+    /// Сохраняет открытый месяц между перерисовками панели просмотра.
+    pub(crate) fn with_month_offset(self, offset: Rc<Cell<i32>>, cx: &mut Context<Self>) -> Self {
+        self.date.update(cx, |date, _| date.with_month_offset(offset));
+        self
     }
 
     /// Обновляет оба компонента из состояния формы без отправки события обратно.
@@ -287,7 +323,12 @@ impl Render for DateTimePicker {
     /// Рисует календарь и часы на одной поверхности с разделителем.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.options.palette(window, cx);
-        card(palette)
+        let surface = if self.embedded {
+            picker_body()
+        } else {
+            card(palette)
+        };
+        surface
             .id("date-time-picker")
             .debug_selector(|| "date-time-picker".into())
             .gap(px(12.))

@@ -127,6 +127,9 @@ pub use keychain::MacKeychain;
 pub(crate) mod chat_keys;
 
 #[cfg(all(target_os = "macos", feature = "gpui"))]
+pub(crate) mod clipboard;
+
+#[cfg(all(target_os = "macos", feature = "gpui"))]
 pub(crate) mod message_time;
 
 #[cfg(all(target_os = "macos", feature = "gpui"))]

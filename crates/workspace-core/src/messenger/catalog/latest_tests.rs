@@ -121,6 +121,7 @@ fn check_latest_preview(direct: bool) {
         topic_id: Some(topic),
     };
     let metadata = |second| HistoryMetadata {
+        native_source: None,
         author_id: Some(author),
         created_at: time(second),
         updated_at: None,

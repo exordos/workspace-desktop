@@ -477,12 +477,14 @@ async fn own_plain_markdown_edit_can_add_first_fragment_and_observes_origin_revo
     let session = test.session();
     let id = Uuid::new_v4();
     let expected = HistoryMessage {
+        read: None,
         reactions: Vec::new(),
         id,
         stream_id: CHAT,
         topic_id: TOPIC,
         body: MessageBody::Markdown("обычная исходная строка".into()),
         metadata: HistoryMetadata {
+            native_source: None,
             author_id: Some(B),
             created_at: HistoryTime::parse("2026-01-01T12:00:00Z").unwrap(),
             updated_at: None,
@@ -1310,6 +1312,7 @@ async fn encrypted_send_preserves_envelope_and_fails_closed_when_key_changes() {
     };
     let original = delivered(&snapshot);
     let expected = HistoryMessage {
+        read: None,
         reactions: Vec::new(),
         id: snapshot.public_id,
         stream_id: snapshot.stream_id,
@@ -1319,6 +1322,7 @@ async fn encrypted_send_preserves_envelope_and_fails_closed_when_key_changes() {
             ciphertext: ciphertext.clone(),
         },
         metadata: HistoryMetadata {
+            native_source: None,
             author_id: Some(B),
             created_at: HistoryTime::parse("2026-01-01T12:00:00Z").unwrap(),
             updated_at: None,
@@ -2288,6 +2292,7 @@ async fn protected_quote_permit_tracks_committed_original_without_ui_refresh() {
         unreachable!();
     };
     let citing = HistoryMessage {
+        read: None,
         reactions: Vec::new(),
         id: parent.public_id,
         stream_id: parent.stream_id,

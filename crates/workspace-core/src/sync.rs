@@ -29,12 +29,13 @@ use crate::{
     notification_target::{NotificationTarget, NotificationTargetError},
     storage::{
         AvatarEvent, ConfirmedEdit, Cursor, DeliveryStatus, DraftAccess, DraftOpening, DraftScope,
-        DraftVersion, DraftWriteOutcome, EncryptedEditVersion, EventWrite, FolderChange,
-        HistoryChange, HistoryMessage, HistoryMetadata, HistoryPageEdges, HistoryPageGuard,
-        HistoryPageOutcome, HistoryPageTarget, HistoryScope, HistoryWindow, KeyRequestCursor,
-        KeyRequestPage, KeyResponseCursor, KeyResponsePage, KeyServicePayload, Message,
-        MessageBody, MessagePlacement, OutboxEntry, PlaintextDraft, PreparedSend, PreparedSendBody,
-        Storage, StorageError,
+        DraftVersion, DraftWriteOutcome, EncryptedEditVersion, EventReadMarks, EventWrite,
+        FolderChange, HistoryChange, HistoryMessage, HistoryMetadata, HistoryPageEdges,
+        HistoryPageGuard, HistoryPageOutcome, HistoryPageTarget, HistoryReadFence,
+        HistoryReadGuard, HistoryReadRow, HistoryScope, HistoryTime, HistoryWindow,
+        KeyRequestCursor, KeyRequestPage, KeyResponseCursor, KeyResponsePage, KeyServicePayload,
+        Message, MessageBody, MessagePlacement, OutboxEntry, PlaintextDraft, PreparedSend,
+        PreparedSendBody, Storage, StorageError,
         media::{
             MediaCache, MediaCacheError, MediaCachePolicy, MediaClearReport, MediaCopyPage,
             MediaCopyQuery, MediaEstimate, MediaFilter,
@@ -82,7 +83,8 @@ pub enum SyncChange {
     DraftPurgePending, // Локальный черновик закрыт, осталось удалить прежнюю серверную версию.
     Unread(u32),       // Готовое число непрочитанных в папке «Все чаты».
     MessengerReset,    // Кэш очищен. Счётчик неизвестен до снимка с сервера.
-    ActivityChanged, // Полученная отметка чтения или сверка соединения требует обновить активность.
+    ActivityChanged,   // Полученная отметка или новый снимок счётчиков требует обновить активность.
+    MessengerSourceReady, // WebSocket Messenger догнал журнал и готов получать новые события.
     HistoryMessageCreated {
         scope: HistoryScope,    // Стрим и тема сохранённого сообщения.
         message_id: uuid::Uuid, // UUID новой строки в базе.
@@ -92,6 +94,12 @@ pub enum SyncChange {
     },
     HistoryMessageReactionsChanged {
         message_id: Uuid, // UUID строки с изменившимися реакциями.
+    },
+    HistoryReadChanged {
+        scope: HistoryScope, // Тема или окно, где изменились сохранённые флаги чтения.
+    },
+    HistoryReadRevalidate {
+        scope: Option<HistoryScope>, // Область неточного события. None, если сервер её не передал.
     },
     QuickReactionUsageChanged, // Подтверждённое добавление обновило общий список быстрых реакций.
     QuoteOriginChanged {
@@ -142,12 +150,18 @@ pub enum AvatarUpdate {
 /// Изменение, которое источник передаёт для сохранения.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
-    ActivityRead(Cursor), // Сервер подтвердил чтение сообщения или набора сообщений.
+    HistoryRead {
+        cursor: Cursor,              // Позиция события чтения в журнале.
+        flags: Vec<(Uuid, bool)>,    // Публичные UUID и точные флаги из события.
+        scope: Option<HistoryScope>, // Стрим или тема, если это известно из снимка.
+        revalidate: bool,            // Сервер мог отметить другие сообщения в этой области.
+    },
     MessageCreated {
         cursor: Cursor,                      // Позиция, которую сохраняем вместе с сообщением.
         message: Message,                    // Новое сообщение для локальной базы.
         placement: Option<MessagePlacement>, // Стрим и тема из снимка.
         metadata: Option<HistoryMetadata>,   // Автор и время, если снимок пригоден для истории.
+        read: Option<bool>,                  // Флаг чтения владельца в снимке.
     },
     IncomingDirectMessage {
         cursor: Cursor,          // Позиция нового события после готовности WebSocket.
@@ -155,6 +169,7 @@ pub enum Event {
         conversation_id: String, // Проверенный идентификатор личного разговора.
         placement: Option<MessagePlacement>, // Стрим и тема из снимка.
         metadata: Option<HistoryMetadata>, // Автор и время, если снимок пригоден для истории.
+        read: Option<bool>,      // Флаг чтения владельца в снимке.
     },
     HistoryChanged {
         cursor: Cursor,        // Позиция изменения в журнале.
@@ -198,6 +213,7 @@ pub enum Event {
         counts: crate::messenger::catalog::CatalogCounts, // Абсолютные значения канала или темы.
         folder: Option<FolderChange>, // Проверка появления или восстановления канала из того же события.
         sidebar: Option<Box<SidebarChange>>, // Сведения сайдбара из того же серверного снимка.
+        revalidate_read: bool,        // Ручное чтение может затронуть строки окна.
     },
     UnreadBaseline {
         cursor: Cursor, // Позиция сервера перед чтением счётчика. Курсор сообщений не меняется.
@@ -223,7 +239,7 @@ impl Event {
             | Self::FolderChanged { cursor, .. }
             | Self::CatalogCountsChanged { cursor, .. }
             | Self::UnreadBaseline { cursor, .. }
-            | Self::ActivityRead(cursor)
+            | Self::HistoryRead { cursor, .. }
             | Self::SourceReady(cursor)
             | Self::Checkpoint(cursor) => cursor,
         }
@@ -573,6 +589,83 @@ impl Sync {
         })?
     }
 
+    /// Сохраняет текущую версию чтения и отзыва для новой серверной отметки.
+    pub(crate) fn history_read_revision(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+    ) -> Result<HistoryReadFence, SyncError> {
+        Ok(self.auth.with_active_generation(owner, generation, || {
+            self.storage.history_read_revision(owner)
+        })??)
+    }
+
+    /// Возвращает текущий снимок строки перед отправкой границы в исходную тему.
+    pub(crate) fn history_read_candidate(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        scope: HistoryScope,
+        id: Uuid,
+    ) -> Result<Option<HistoryMessage>, SyncError> {
+        Ok(self.auth.with_active_generation(owner, generation, || {
+            self.storage.history_read_candidate(owner, scope, id)
+        })??)
+    }
+
+    /// Применяет только доказанную сервером границу и публикует новую версию флагов.
+    pub(crate) fn confirm_history_read(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        scope: HistoryScope,
+        boundary: Uuid,
+        created_at: &HistoryTime,
+        before: HistoryReadFence,
+    ) -> Result<bool, SyncError> {
+        self.auth.with_active_generation(owner, generation, || {
+            let changed = self
+                .storage
+                .confirm_history_read(owner, scope, boundary, created_at, before)?;
+            if changed {
+                self.publish(owner, generation, SyncChange::HistoryReadChanged { scope });
+                self.publish(owner, generation, SyncChange::ActivityChanged);
+            }
+            Ok(changed)
+        })?
+    }
+
+    /// Фиксирует окно и снимок владельца перед сверкой серверных флагов.
+    pub(crate) fn prepare_history_read(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        window_scope: HistoryScope,
+        window_id: i64,
+        scope: Option<HistoryScope>,
+    ) -> Result<Option<(HistoryReadGuard, Vec<HistoryMessage>)>, SyncError> {
+        Ok(self.auth.with_active_generation(owner, generation, || {
+            self.storage
+                .prepare_history_read(owner, window_scope, window_id, scope)
+        })??)
+    }
+
+    /// Публикует только сохранённые флаги той же сессии и окна.
+    pub(crate) fn save_history_read(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        guard: HistoryReadGuard,
+        messages: &[HistoryReadRow],
+    ) -> Result<(), SyncError> {
+        self.auth.with_active_generation(owner, generation, || {
+            if let Some(scope) = self.storage.save_history_read(owner, guard, messages)? {
+                self.publish(owner, generation, SyncChange::HistoryReadChanged { scope });
+            }
+            Ok(())
+        })?
+    }
+
     /// Применяет страницу той же сессии, которая начала запрос, не двигая курсор событий.
     pub fn save_history_page(
         &self,
@@ -877,6 +970,21 @@ impl Sync {
     ) -> Result<DraftOpening, SyncError> {
         Ok(self.auth.with_active_generation(owner, generation, || {
             self.storage.prepare_draft_opening(owner, stream_id)
+        })??)
+    }
+
+    /// Читает локальный обычный черновик из известного каталога без разрешения на запись.
+    /// Внешний `None` означает отсутствие подходящей темы, внутренний — пустой черновик.
+    pub fn read_local_plaintext_draft(
+        &self,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        scope: DraftScope,
+        draft_id: Option<uuid::Uuid>,
+    ) -> Result<Option<Option<PlaintextDraft>>, SyncError> {
+        Ok(self.auth.with_active_generation(owner, generation, || {
+            self.storage
+                .read_catalog_plaintext_draft(owner, scope, draft_id)
         })??)
     }
 
@@ -1197,15 +1305,16 @@ impl Sync {
         self.auth.with_active_generation(owner, generation, || {
             if matches!(event, Event::SourceReady(_)) {
                 if source == crate::messenger::SOURCE_ID {
-                    self.publish(owner, generation, SyncChange::ActivityChanged);
+                    self.publish(owner, generation, SyncChange::MessengerSourceReady);
                 }
                 return Ok(ApplyOutcome::Applied);
             }
             if let Event::UnreadBaseline { cursor, count } = &event {
                 if self.storage.apply_unread_baseline(owner, cursor, *count)? {
                     self.publish(owner, generation, SyncChange::Unread(*count));
-                } else if source == crate::messenger::SOURCE_ID {
-                    self.publish(owner, generation, SyncChange::ActivityChanged);
+                }
+                if source == crate::messenger::SOURCE_ID {
+                    self.publish(owner, generation, SyncChange::MessengerSourceReady);
                 }
                 return Ok(ApplyOutcome::Applied);
             }
@@ -1230,6 +1339,19 @@ impl Sync {
             let metadata = match &event {
                 Event::MessageCreated { metadata, .. }
                 | Event::IncomingDirectMessage { metadata, .. } => metadata.as_ref(),
+                _ => None,
+            };
+            let created_read = match &event {
+                Event::MessageCreated { read, .. } | Event::IncomingDirectMessage { read, .. } => {
+                    *read
+                }
+                _ => None,
+            };
+            let read_marks = match &event {
+                Event::HistoryRead { flags, scope, .. } => Some(EventReadMarks {
+                    flags,
+                    scope: *scope,
+                }),
                 _ => None,
             };
             let history = match &event {
@@ -1292,6 +1414,8 @@ impl Sync {
                         placement,
                         metadata,
                         history,
+                        created_read,
+                        read_marks,
                         own_reaction,
                         folder,
                         catalog_counts,
@@ -1385,9 +1509,35 @@ impl Sync {
                 }
                 if matches!(
                     event,
-                    Event::ActivityRead(_) | Event::CatalogCountsChanged { .. }
+                    Event::HistoryRead { .. } | Event::CatalogCountsChanged { .. }
                 ) {
                     self.publish(owner, generation, SyncChange::ActivityChanged);
+                }
+                for scope in saved.read_scopes {
+                    self.publish(owner, generation, SyncChange::HistoryReadChanged { scope });
+                }
+                let revalidate = match &event {
+                    Event::HistoryRead {
+                        revalidate: true,
+                        scope,
+                        ..
+                    } => Some(*scope),
+                    Event::CatalogCountsChanged {
+                        revalidate_read: true,
+                        counts,
+                        ..
+                    } => Some(Some(HistoryScope {
+                        stream_id: counts.stream_id,
+                        topic_id: counts.topic_id,
+                    })),
+                    _ => saved.count_read_scope.map(Some),
+                };
+                if let Some(scope) = revalidate {
+                    self.publish(
+                        owner,
+                        generation,
+                        SyncChange::HistoryReadRevalidate { scope },
+                    );
                 }
                 for &user_id in &saved.avatar_changed {
                     self.publish_avatar_change(owner, generation, user_id);

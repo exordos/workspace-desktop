@@ -11,3 +11,4 @@ pub mod notification_target;
 pub mod runtime;
 pub mod storage;
 pub mod sync;
+pub mod workspace_direct;

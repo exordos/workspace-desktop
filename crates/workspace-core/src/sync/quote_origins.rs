@@ -292,12 +292,14 @@ mod tests {
     /// Создаёт обычный снимок с известным либо отсутствующим временем правки.
     fn snapshot(id: Uuid, body: &str, updated: Option<&str>) -> QuoteOrigin {
         QuoteOrigin::from_message(&HistoryMessage {
+            read: None,
             reactions: Vec::new(),
             id,
             stream_id: Uuid::from_u128(1),
             topic_id: Uuid::from_u128(2),
             body: MessageBody::Markdown(body.into()),
             metadata: HistoryMetadata {
+                native_source: None,
                 author_id: Some(Uuid::from_u128(3)),
                 created_at: HistoryTime::parse("2026-01-01T12:00:00Z").unwrap(),
                 updated_at: updated.map(|time| HistoryTime::parse(time).unwrap()),

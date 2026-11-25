@@ -82,6 +82,23 @@ pub(super) struct PrepareEncrypted {
 }
 
 impl PrepareEncrypted {
+    /// Готовит новое окно до создания разговора. Результат ещё проверит экран при показе.
+    pub(super) fn for_opening(
+        engine: Arc<MessageEncryption>,
+        activation: EncryptionActivation,
+        stream_id: Uuid,
+    ) -> Self {
+        Self {
+            engine,
+            activation,
+            stream_id,
+            known: HashMap::new(),
+            key_revisions: HashMap::new(),
+            message_revisions: HashMap::new(),
+            default_revision: 0,
+        }
+    }
+
     /// Шифротекст уходит на исполнитель, а GPUI получает готовые к сверке результаты.
     pub(super) async fn window(
         self,
@@ -228,19 +245,31 @@ impl HistoryEncryption {
 
     /// Снимает только идентификаторы и шифротекст готовых строк перед загрузкой новой страницы.
     pub(super) fn prepare(&self) -> PrepareEncrypted {
+        let mut prepared = self.prepare_for_navigation();
+        prepared.known = self
+            .by_id
+            .iter()
+            .map(|(id, body)| (*id, (body.key_id, body.ciphertext.clone())))
+            .collect();
+        prepared
+    }
+
+    /// Готовит новое окно без материалов, которые могли исчезнуть из прежней ленты.
+    pub(super) fn prepare_for_navigation(&self) -> PrepareEncrypted {
         PrepareEncrypted {
             engine: Arc::clone(&self.engine),
             activation: self.activation.clone(),
             stream_id: self.stream_id,
-            known: self
-                .by_id
-                .iter()
-                .map(|(id, body)| (*id, (body.key_id, body.ciphertext.clone())))
-                .collect(),
+            known: HashMap::new(),
             key_revisions: self.key_revisions.clone(),
             message_revisions: self.message_revisions.clone(),
             default_revision: self.default_revision,
         }
+    }
+
+    /// Возвращает версию защиты окна для проверки отложенного перехода.
+    pub(super) fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Возвращает последнее состояние для строки снимка. Ожидание ключа отображается как блокировка.
@@ -485,7 +514,12 @@ impl Conversation {
             return;
         };
         sending.view.update(cx, |composer, cx| {
-            composer.open_protected_edit(expected.clone(), access.clone(), cx);
+            composer.open_protected_edit(
+                expected.clone(),
+                access.clone(),
+                self.attachments.access.clone(),
+                cx,
+            );
             if let Some(window) = window {
                 composer.focus_editor(window, cx);
             }
@@ -548,6 +582,8 @@ impl Conversation {
 
     /// Обрабатывает дельту ключа отдельно от дерева истории и очереди отправки.
     fn encrypted_key_changed(&mut self, event: Option<(Uuid, bool)>, cx: &mut Context<Self>) {
+        // Изменение одного ключа не обязательно отзывает остальные; пропуск событий требует закрыть поле.
+        self.refresh_local_key(event.is_some(), cx);
         let Some(encryption) = &mut self.encryption else {
             return;
         };
@@ -707,7 +743,7 @@ impl Conversation {
 }
 
 /// Даёт подготовке и проверке те же UUID, которые может показать история и её локальный хвост.
-fn ciphertexts<'a>(
+pub(super) fn ciphertexts<'a>(
     window: &'a HistoryWindow,
     outbox: &'a [OutboxEntry],
 ) -> impl Iterator<Item = (Uuid, Uuid, &'a str)> {

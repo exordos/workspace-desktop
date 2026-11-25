@@ -38,6 +38,7 @@ use crate::{
     auth::SessionSnapshot,
     runtime::{EventSource, EventStream, SourceError, SourceSession},
     sync::{Event, Sync},
+    workspace_direct::WorkspaceRoute,
 };
 
 pub use folder_sync::{FolderRow, FolderSnapshot};
@@ -53,10 +54,12 @@ const NOTIFICATION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct MessengerSource {
     rest: Arc<RestClient>,        // Общий HTTP-клиент для чтения страниц журнала.
     connector: Option<Connector>, // Настройки TLS для сервера с частным центром сертификации.
+    route: WorkspaceRoute,        // Маршрут HTTPS и WebSocket для этого запуска.
     catalog_refresh: Arc<catalog::RefreshGates>, // Общие запросы каталога одного владельца.
     chat_encryption: Option<encrypted_send::ChatEncryption>, // Локальные ключи этого профиля.
     self_chat_requests: activity::SelfChatRequests, // Общий запрос «Избранного» одного входа.
     reaction_requests: reactions::ReactionRequests, // Активные команды переключения реакций.
+    read_requests: read::ReadRequests, // Заявки на чтение в исходных сессиях и темах.
 }
 
 impl MessengerSource {
@@ -77,13 +80,20 @@ impl MessengerSource {
 
     /// Создаёт источник и подготавливает HTTP-клиент.
     pub fn new() -> Result<Self, SourceError> {
+        Self::with_route(WorkspaceRoute::default())
+    }
+
+    /// Использует один маршрут для запросов HTTPS и потока событий WSS.
+    pub fn with_route(route: WorkspaceRoute) -> Result<Self, SourceError> {
         Ok(Self {
-            rest: Arc::new(RestClient::new(None)?),
+            rest: Arc::new(RestClient::with_route(None, &route)?),
             connector: None,
+            route,
             catalog_refresh: Arc::default(),
             chat_encryption: None,
             self_chat_requests: activity::SelfChatRequests::default(),
             reaction_requests: reactions::ReactionRequests::default(),
+            read_requests: read::ReadRequests::default(),
         })
     }
 
@@ -101,10 +111,12 @@ impl MessengerSource {
         Ok(Self {
             rest: Arc::new(RestClient::new(Some(certificate_der))?),
             connector: Some(Connector::Rustls(Arc::new(tls))),
+            route: WorkspaceRoute::default(),
             catalog_refresh: Arc::default(),
             chat_encryption: None,
             self_chat_requests: activity::SelfChatRequests::default(),
             reaction_requests: reactions::ReactionRequests::default(),
+            read_requests: read::ReadRequests::default(),
         })
     }
 }
@@ -125,6 +137,7 @@ impl EventSource for MessengerSource {
                 socket: None,
                 live: false,
                 connector: self.connector.clone(),
+                route: self.route.clone(),
             };
             let events = stream::try_unfold(connection, |mut connection| async move {
                 Ok(connection.next().await?.map(|event| (event, connection)))
@@ -159,6 +172,7 @@ struct Connection {
     socket: Option<socket::SocketStream>, // Открытый поток WebSocket. `None`, пока идёт чтение через HTTP.
     live: bool,                           // Сервер подтвердил завершение догрузки через WebSocket.
     connector: Option<Connector>, // Частный корневой сертификат либо обычное системное доверие.
+    route: WorkspaceRoute,        // Интерфейс для нового соединения WSS.
 }
 
 impl Connection {
@@ -193,7 +207,8 @@ impl Connection {
                 self.session.cursor = Some(event.cursor().clone());
                 return Ok(Some(event));
             }
-            self.socket = Some(socket::connect(&self.session, self.connector.clone()).await?);
+            self.socket =
+                Some(socket::connect(&self.session, self.connector.clone(), &self.route).await?);
         }
 
         let socket = self.socket.as_mut().expect("socket initialized");
@@ -211,6 +226,7 @@ impl Connection {
                                     message,
                                     placement,
                                     metadata,
+                                    read,
                                 },
                                 Some(incoming),
                             ) = (event.as_ref(), incoming)
@@ -232,6 +248,7 @@ impl Connection {
                                         conversation_id: incoming.stream.to_string(),
                                         placement: placement.clone(),
                                         metadata: metadata.clone(),
+                                        read: *read,
                                     }));
                                 }
                                 Ok(Ok(false)) => {}

@@ -74,6 +74,7 @@ fn key_service_sync_emits_scoped_durable_placement_without_notification() {
         epoch_version: 1,
     };
     let event = Event::MessageCreated {
+        read: None,
         cursor: cursor.clone(),
         message: message.clone(),
         placement: Some(MessagePlacement {
@@ -81,6 +82,7 @@ fn key_service_sync_emits_scoped_durable_placement_without_notification() {
             topic_id: topic.to_string(),
         }),
         metadata: Some(HistoryMetadata {
+            native_source: None,
             author_id: Some(Uuid::new_v4()),
             created_at: HistoryTime::parse("2026-01-01T10:00:00Z").unwrap(),
             updated_at: None,
@@ -136,11 +138,13 @@ fn key_service_sync_emits_scoped_durable_placement_without_notification() {
         topic_id: Some(topic),
     };
     let metadata = HistoryMetadata {
+        native_source: None,
         author_id: Some(Uuid::new_v4()),
         created_at: HistoryTime::parse("2026-01-01T10:01:00Z").unwrap(),
         updated_at: None,
     };
     let row = HistoryMessage {
+        read: None,
         reactions: Vec::new(),
         id: next_public,
         stream_id: stream,
@@ -162,6 +166,7 @@ fn key_service_sync_emits_scoped_durable_placement_without_notification() {
     )
     .unwrap();
     let service = Event::MessageCreated {
+        read: None,
         cursor: Cursor {
             epoch_generation: "key-service".into(),
             epoch_version: 2,
@@ -1023,6 +1028,7 @@ fn incoming(version: u64, text: &str) -> Event {
 /// Создаёт событие с заданной позицией, идентификатором и текстом сообщения.
 fn incoming_with_id(version: u64, id: &str, text: &str) -> Event {
     Event::MessageCreated {
+        read: None,
         cursor: Cursor {
             epoch_generation: "test-epoch".into(),
             epoch_version: version,
@@ -1149,9 +1155,25 @@ fn messenger_updates_are_committed_deduplicated_and_scoped_to_the_session() {
     assert_eq!(
         updates.try_recv().unwrap(),
         SyncUpdate {
+            context: first.clone(),
+            generation: first_generation,
+            change: SyncChange::MessengerSourceReady,
+        }
+    );
+    assert_eq!(
+        updates.try_recv().unwrap(),
+        SyncUpdate {
             context: second.clone(),
             generation: second_generation,
             change: SyncChange::Unread(29)
+        }
+    );
+    assert_eq!(
+        updates.try_recv().unwrap(),
+        SyncUpdate {
+            context: second.clone(),
+            generation: second_generation,
+            change: SyncChange::MessengerSourceReady,
         }
     );
     assert_eq!(sync.cursor(&first, "messenger").unwrap(), Some(cursor(10)));
@@ -1172,6 +1194,7 @@ fn messenger_updates_are_committed_deduplicated_and_scoped_to_the_session() {
     assert!(updates.try_recv().is_err());
 
     let live = |version| Event::IncomingDirectMessage {
+        read: None,
         cursor: cursor(version),
         message: Message {
             id: "direct-message".into(),
@@ -1280,6 +1303,7 @@ fn notification_target_requires_matching_session_conversation_and_message() {
         generation(&first),
         "messenger",
         Event::MessageCreated {
+            read: None,
             cursor: cursor.clone(),
             message: message.clone(),
             placement: None,
@@ -1292,6 +1316,7 @@ fn notification_target_requires_matching_session_conversation_and_message() {
         second_generation,
         "messenger",
         Event::IncomingDirectMessage {
+            read: None,
             cursor,
             message,
             conversation_id: "direct-conversation".into(),
@@ -1416,6 +1441,7 @@ async fn runtime_replays_event_after_cursor_write_failure() {
     let fault = rusqlite::Connection::open(&path).unwrap();
     fault.execute_batch("CREATE TRIGGER fail_cursor_replay BEFORE UPDATE ON sync_cursors WHEN NEW.epoch_version = 8 BEGIN SELECT RAISE(ABORT, 'test cursor write failure'); END;").unwrap();
     let event = Event::IncomingDirectMessage {
+        read: None,
         cursor: cursor(8),
         message: Message {
             id: "replayed".into(),

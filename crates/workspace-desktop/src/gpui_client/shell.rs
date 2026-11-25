@@ -463,6 +463,26 @@ impl Shell {
         activity: Option<ActivityPage>,
         draft: Option<Uuid>,
     ) -> Result<Option<ShellEffect>, ()> {
+        self.restore_navigation_inner(route, activity, draft, false)
+    }
+
+    /// Повторно открывает ранее разрешённый адрес, чтобы восстановить точку чтения через Core.
+    pub(super) fn restore_reading_navigation(
+        &mut self,
+        route: &ChatRoute,
+        draft: Option<Uuid>,
+    ) -> Result<Option<ShellEffect>, ()> {
+        self.restore_navigation_inner(Some(route), None, draft, true)
+    }
+
+    /// Разрешает запись истории и отличает смену экрана от повторного открытия области.
+    fn restore_navigation_inner(
+        &mut self,
+        route: Option<&ChatRoute>,
+        activity: Option<ActivityPage>,
+        draft: Option<Uuid>,
+        restore_reading: bool,
+    ) -> Result<Option<ShellEffect>, ()> {
         let selected = self
             .selected()
             .filter(|session| self.is_active(session))
@@ -470,10 +490,11 @@ impl Shell {
         if let Some(page) = activity {
             return Ok(self.open_activity(page, selected.clone()));
         }
-        if (draft.is_some()
-            || self.activity.as_ref().is_none_or(|address| {
-                address.page == ActivityPage::Favorites && route.is_some()
-            }))
+        if !restore_reading
+            && (draft.is_some()
+                || self.activity.as_ref().is_none_or(|address| {
+                    address.page == ActivityPage::Favorites && route.is_some()
+                }))
             && self.conversation.as_ref().map(|address| &address.route) == route
             && self.conversation_draft == draft
         {
@@ -484,7 +505,7 @@ impl Shell {
             if selected.owner != route.owner {
                 return Err(());
             }
-            if route.entry != ChatEntry::Archived {
+            if !restore_reading && route.entry != ChatEntry::Archived {
                 let chats = selected
                     .catalog_chats(
                         self.selected_catalog(),
@@ -525,28 +546,47 @@ impl Shell {
         )
     }
 
-    /// Открывает оригинал пересылки из того же экрана и активного входа.
-    pub(super) fn open_forward_original(
+    /// Создаёт ревизию перехода к сообщению, оставляя исходный экран видимым.
+    pub(super) fn begin_message_navigation(
         &mut self,
         source: &ConversationAddress,
-        scope: HistoryScope,
-        id: Uuid,
+    ) -> Option<NavigationRevision> {
+        if !self.is_message_navigation_current(source, self.revision) {
+            return None;
+        }
+        self.begin_navigation();
+        Some(self.revision)
+    }
+
+    /// Проверяет, что исходный экран принадлежит ещё открытому входу и последнему действию.
+    pub(super) fn is_message_navigation_current(
+        &self,
+        source: &ConversationAddress,
+        revision: NavigationRevision,
+    ) -> bool {
+        self.revision == revision
+            && self.conversation() == Some(source)
+            && self.selected().is_some_and(|session| {
+                session.owner == source.route.owner
+                    && session.generation == source.generation
+                    && self.is_active(session)
+            })
+    }
+
+    /// Применяет новый маршрут после подготовки его окна в том же входе.
+    pub(super) fn finish_message_navigation(
+        &mut self,
+        source: &ConversationAddress,
+        destination: ConversationAddress,
     ) -> Option<ShellEffect> {
-        let session = self.selected()?;
-        if self.conversation() != Some(source)
-            || session.owner != source.route.owner
-            || session.generation != source.generation
-            || !self.is_active(session)
+        if !self.is_message_navigation_current(source, destination.revision)
+            || destination.route.owner != source.route.owner
+            || destination.generation != source.generation
+            || !matches!(destination.route.entry, ChatEntry::Around(_))
         {
             return None;
         }
-        let route = ChatRoute {
-            owner: source.route.owner.clone(),
-            scope,
-            entry: ChatEntry::Around(id),
-        };
-        self.begin_navigation();
-        Some(self.open_conversation(route, source.generation))
+        Some(self.open_conversation(destination.route, destination.generation))
     }
 
     /// Открывает тему из проверенного снимка панели текущего разговора.

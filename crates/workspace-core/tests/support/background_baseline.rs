@@ -34,6 +34,7 @@ async fn background_messenger_baseline() {
     for version in 1..=EVENTS {
         for owner in &owners {
             let event = Event::IncomingDirectMessage {
+                read: None,
                 cursor: Cursor {
                     epoch_generation: "test-epoch".into(),
                     epoch_version: version,
@@ -48,6 +49,7 @@ async fn background_messenger_baseline() {
                     topic_id: uuid::Uuid::from_u128(10002).to_string(),
                 }),
                 metadata: Some(HistoryMetadata {
+                    native_source: None,
                     author_id: Some(uuid::Uuid::from_u128(10003)),
                     created_at: HistoryTime::parse("2026-01-01T00:00:00Z").unwrap(),
                     updated_at: None,

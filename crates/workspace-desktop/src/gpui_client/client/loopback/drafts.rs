@@ -20,11 +20,12 @@ const SECOND_ROW: &str = "history-message-00000000-0000-0000-0000-0000000000a2";
 /// Фиксирует источник и при необходимости откладывает первую проверку перед очередью.
 #[derive(Default)]
 pub(super) struct Fixture {
+    pub(super) hide_local_topic: bool, // В каталоге временно нет личной темы для ранней гонки.
     release: Mutex<Option<oneshot::Receiver<()>>>, // Удерживает проверку источника.
-    checking: AtomicBool,                          // Проверка источника дошла до сервера.
+    checking: AtomicBool,              // Проверка источника дошла до сервера.
     destination: Mutex<Option<oneshot::Receiver<()>>>, // Одна ручная перепроверка цели.
-    destination_waiting: AtomicBool,               // Запрос ручной перепроверки уже удерживается.
-    sent: Mutex<Vec<String>>, // Тексты из подтверждённых POST только для теста.
+    destination_waiting: AtomicBool,   // Запрос ручной перепроверки уже удерживается.
+    sent: Mutex<Vec<String>>,          // Тексты из подтверждённых POST только для теста.
 }
 
 impl Fixture {
@@ -343,7 +344,7 @@ fn reply_draft_survives_navigation_and_restart_without_reviving_queued_input(
     );
 }
 
-/// При ручной проверке ответ скрыт и сохранён. После отзыва ответ старой темы не возвращается.
+/// При повторной проверке ответ остаётся видимым. После отзыва он не возвращается.
 #[gpui::test]
 fn rechecking_keeps_answer_until_explicit_topic_revocation(cx: &mut TestAppContext) {
     use workspace_core::storage::{Cursor, HistoryChange, MessagePlacement};
@@ -351,7 +352,10 @@ fn rechecking_keeps_answer_until_explicit_topic_revocation(cx: &mut TestAppConte
     cx.update(bind_keys);
     let server = Server::serve(Received {
         topic: Some(TopicAcceptance::default()),
-        drafting: Some(Fixture::default()),
+        drafting: Some(Fixture {
+            hide_local_topic: true,
+            ..Fixture::default()
+        }),
         ..Received::default()
     });
     let fixture = server.state.drafting.as_ref().unwrap();
@@ -389,10 +393,10 @@ fn rechecking_keeps_answer_until_explicit_topic_revocation(cx: &mut TestAppConte
         "локальный сервер удерживает проверку",
         |_| fixture.destination_waiting.load(Ordering::SeqCst),
     );
-    assert!(ui.debug_bounds("conversation-send-notice").is_some());
+    assert!(ui.debug_bounds("workspace-composer-editor").is_some());
     assert!(ui.read(|app| {
         let view = client.read(app).conversation.as_ref().unwrap();
-        view.read(app).history_and_editor_focus(app).1.is_none()
+        view.read(app).history_and_editor_focus(app).1.is_some()
     }));
     switch_topic(ui);
     ready_text(
@@ -540,6 +544,260 @@ fn closed_topic_keeps_reply_draft_scoped_to_its_owner(cx: &mut TestAppContext) {
             .attempts
             .load(Ordering::SeqCst),
         0
+    );
+    assert_eq!(
+        futures::executor::block_on(runtime.shutdown()),
+        RuntimeExit::Clean
+    );
+}
+
+/// Локальный черновик доступен до сети и сохраняет правку после перехода в другую тему.
+#[gpui::test]
+fn local_draft_survives_navigation_before_send_confirmation(cx: &mut TestAppContext) {
+    use workspace_core::storage::{DraftScope, DraftWriteOutcome, PlaintextDraft};
+
+    cx.update(bind_keys);
+    let server = Server::serve(Received {
+        topic: Some(TopicAcceptance::default()),
+        drafting: Some(Fixture::default()),
+        ..Received::default()
+    });
+    let fixture = server.state.drafting.as_ref().unwrap();
+    let profile = tempfile::tempdir().unwrap();
+    let (runtime, events) =
+        start_runtime(profile.path(), saved_account(&server, USER, Uuid::nil()));
+    let (client, ui) =
+        cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
+    attach(&client, events, ui);
+    let session = ui.read(|app| client.read(app).shell.selected().unwrap().clone());
+    let owner = session.owner.clone();
+    let generation = session.generation;
+    let scope = DraftScope {
+        stream_id: STREAM.parse().unwrap(),
+        topic_id: TOPIC.parse().unwrap(),
+    };
+    let saved_id = Uuid::from_u128(0xd4);
+    let outcome = futures::executor::block_on(runtime.request(move |services| async move {
+        let opening = services
+            .sync
+            .prepare_draft_opening(&owner, generation, scope.stream_id)?;
+        let (access, _) = services
+            .sync
+            .open_draft(&owner, generation, opening, scope)?;
+        services.sync.save_draft(
+            &owner,
+            generation,
+            &access,
+            &PlaintextDraft {
+                id: saved_id,
+                version: 1,
+                markdown: "Старый черновик".into(),
+                replies: None,
+            },
+        )
+    }))
+    .unwrap()
+    .unwrap();
+    assert_eq!(outcome, DraftWriteOutcome::Saved);
+    let owner = session.owner.clone();
+    let generation = session.generation;
+    let local = futures::executor::block_on(runtime.request(move |services| async move {
+        services
+            .sync
+            .read_local_plaintext_draft(&owner, generation, scope, None)
+    }))
+    .unwrap()
+    .unwrap();
+    assert!(
+        matches!(local, Some(Some(value)) if value.id == saved_id),
+        "Каталог и локальная запись должны быть доступны до перехода"
+    );
+
+    let release = fixture.hold_destination();
+    click(ui, CHAT_ROW);
+    until(
+        ui,
+        "сервер удерживает первую проверку лички",
+        |_| fixture.destination_waiting.load(Ordering::SeqCst),
+    );
+    until(
+        ui,
+        "локальный черновик виден до ответа проверки",
+        |ui| {
+            ui.read(|app| {
+                client.read(app).conversation.as_ref().is_some_and(|view| {
+                    view.read(app)
+                        .tested_composer()
+                        .is_some_and(|composer| composer.read(app).draft(app) == "Старый черновик")
+                })
+            })
+        },
+    );
+    enter(ui, " с правкой");
+    switch_topic(ui);
+    ready_text(
+        &client,
+        ui,
+        CHANNEL_TOPIC.parse().unwrap(),
+        "",
+        "открыта другая тема",
+    );
+    click(ui, CHAT_ROW);
+    until(
+        ui,
+        "ранний ввод вернулся до позднего ответа",
+        |ui| {
+            ui.read(|app| {
+                client.read(app).conversation.as_ref().is_some_and(|view| {
+                    view.read(app).tested_composer().is_some_and(|composer| {
+                        composer.read(app).draft(app) == "Старый черновик с правкой"
+                    })
+                })
+            })
+        },
+    );
+    assert!(release.send(()).is_ok());
+    ready_text(
+        &client,
+        ui,
+        TOPIC.parse().unwrap(),
+        "Старый черновик с правкой",
+        "личка подтвердилась без потери ввода",
+    );
+    until(
+        ui,
+        "правка сохранена в исходный черновик",
+        |_| {
+            futures::executor::block_on(runtime.list_local_drafts(session.clone())).is_ok_and(
+                |rows| {
+                    rows.iter().any(|row| {
+                        row.version.id == saved_id
+                            && row.preview == "Старый черновик с правкой".into()
+                    })
+                },
+            )
+        },
+    );
+    assert_eq!(
+        futures::executor::block_on(runtime.shutdown()),
+        RuntimeExit::Clean
+    );
+}
+
+/// Ранний ввод остаётся выбранным после перезапуска, а прежний черновик не теряется.
+#[gpui::test]
+fn early_input_is_restored_after_restart_with_older_draft(cx: &mut TestAppContext) {
+    use workspace_core::storage::{DraftScope, DraftWriteOutcome, PlaintextDraft};
+
+    cx.update(bind_keys);
+    let server = Server::serve(Received {
+        topic: Some(TopicAcceptance::default()),
+        drafting: Some(Fixture {
+            hide_local_topic: true,
+            ..Fixture::default()
+        }),
+        ..Received::default()
+    });
+    let fixture = server.state.drafting.as_ref().unwrap();
+    let profile = tempfile::tempdir().unwrap();
+    let account = saved_account(&server, USER, Uuid::nil());
+    let (runtime, events) = start_runtime(profile.path(), account.clone());
+    let (client, ui) =
+        cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
+    attach(&client, events, ui);
+    let session = ui.read(|app| client.read(app).shell.selected().unwrap().clone());
+    let owner = session.owner.clone();
+    let generation = session.generation;
+    let scope = DraftScope {
+        stream_id: STREAM.parse().unwrap(),
+        topic_id: TOPIC.parse().unwrap(),
+    };
+    let result = futures::executor::block_on(runtime.request(move |services| async move {
+        let opening = services
+            .sync
+            .prepare_draft_opening(&owner, generation, scope.stream_id)?;
+        let (access, _) = services
+            .sync
+            .open_draft(&owner, generation, opening, scope)?;
+        services.sync.save_draft(
+            &owner,
+            generation,
+            &access,
+            &PlaintextDraft {
+                id: Uuid::from_u128(0xd5),
+                version: 1,
+                markdown: "Старый вариант".into(),
+                replies: None,
+            },
+        )
+    }))
+    .unwrap()
+    .unwrap();
+    assert_eq!(result, DraftWriteOutcome::Saved);
+    let release = fixture.hold_destination();
+    click(ui, CHAT_ROW);
+    until(
+        ui,
+        "сервер удерживает проверку",
+        |_| fixture.destination_waiting.load(Ordering::SeqCst),
+    );
+    until(
+        ui,
+        "поле доступно до сетевой проверки",
+        |ui| ui.debug_bounds("workspace-composer-editor").is_some(),
+    );
+    click(ui, "workspace-composer-editor");
+    ui.simulate_keystrokes("cmd-a");
+    ui.simulate_input("Новый вариант");
+    switch_topic(ui);
+    ready_text(
+        &client,
+        ui,
+        CHANNEL_TOPIC.parse().unwrap(),
+        "",
+        "открылась соседняя тема",
+    );
+    click(ui, CHAT_ROW);
+    until(ui, "ранний ввод вернулся", |ui| {
+        ui.read(|app| {
+            client.read(app).conversation.as_ref().is_some_and(|view| {
+                view.read(app)
+                    .tested_composer()
+                    .is_some_and(|composer| composer.read(app).draft(app) == "Новый вариант")
+            })
+        })
+    });
+    assert!(release.send(()).is_ok());
+    ready_text(
+        &client,
+        ui,
+        TOPIC.parse().unwrap(),
+        "Новый вариант",
+        "новый вариант после проверки",
+    );
+    until(ui, "оба варианта сохранены", |_| {
+        futures::executor::block_on(runtime.list_local_drafts(session.clone())).is_ok_and(|rows| {
+            rows.iter()
+                .any(|row| row.preview == "Старый вариант".into())
+                && rows.iter().any(|row| row.preview == "Новый вариант".into())
+        })
+    });
+    assert_eq!(
+        futures::executor::block_on(runtime.shutdown()),
+        RuntimeExit::Clean
+    );
+
+    let (runtime, events) = start_runtime(profile.path(), account);
+    let (client, ui) =
+        cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
+    attach(&client, events, ui);
+    click(ui, CHAT_ROW);
+    ready_text(
+        &client,
+        ui,
+        TOPIC.parse().unwrap(),
+        "Новый вариант",
+        "после перезапуска восстановлен последний ввод",
     );
     assert_eq!(
         futures::executor::block_on(runtime.shutdown()),

@@ -4,11 +4,15 @@ use std::time::SystemTime;
 
 use gpui::{App, Context, Entity, KeystrokeEvent, Window};
 use uuid::Uuid;
-use workspace_core::auth::SessionStatus;
+use workspace_core::{
+    auth::SessionStatus,
+    sync::{HistoryRevocation, SyncUpdate},
+};
 
-use super::Client;
+use super::{Client, ConversationOpening};
 use crate::gpui_client::{
-    contracts::{AccountSession, ActivityPage, ChatRoute},
+    contracts::{AccountSession, ActivityPage, ChatEntry, ChatRoute},
+    conversation::ReadingAnchor,
     preferences::{IdleTimeout, Preferences, appearance::ThemeChoice, shortcuts::matching},
     ui::{ThemeMode, TopBarSection},
 };
@@ -22,11 +26,23 @@ struct Place {
     draft: Option<Uuid>,    // Черновик, с которым был открыт разговор.
 }
 
+/// Одна остановка в истории переходов, включая переходы внутри той же ленты.
+struct Visit {
+    place: Place,                  // Штатный маршрут, который сохраняет оболочка.
+    reading: Option<PlaceReading>, // Точка чтения перед уходом, если лента была открыта.
+}
+
+/// Позиция чтения в конкретной записи переходов, включая подтверждённый хвост.
+struct PlaceReading {
+    route: ChatRoute,              // Точная область, из которой получена позиция.
+    anchor: Option<ReadingAnchor>, // UUID со смещением или None для хвоста.
+}
+
 /// История переходов внутри одного действующего входа.
 #[derive(Default)]
 pub(super) struct Places {
     account: Option<AccountSession>, // Поколение, которому принадлежат адреса.
-    locations: Vec<Place>,           // Последние 80 подтверждённых экранов.
+    locations: Vec<Visit>,           // Последние 80 подтверждённых остановок.
     cursor: usize,                   // Текущий экран в списке.
     restoring: bool,                 // Переход по истории нельзя записывать как новый.
 }
@@ -42,11 +58,34 @@ impl Places {
             self.locations.clear();
             self.cursor = 0;
         }
-        if account.is_none() || self.locations.get(self.cursor) == Some(&item) {
+        if account.is_none()
+            || self
+                .locations
+                .get(self.cursor)
+                .is_some_and(|visit| visit.place == item)
+        {
             return;
         }
+        self.push(item);
+    }
+
+    /// Добавляет остановку внутри текущей ленты после успешного перехода по UUID.
+    fn record_message(&mut self) {
+        let Some(current) = self.locations.get(self.cursor) else {
+            return;
+        };
+        if !self.restoring {
+            self.push(current.place.clone());
+        }
+    }
+
+    /// Оставляет только прежние остановки и добавляет новую после текущей.
+    fn push(&mut self, place: Place) {
         self.locations.truncate(self.cursor + 1);
-        self.locations.push(item);
+        self.locations.push(Visit {
+            place,
+            reading: None,
+        });
         if self.locations.len() > 80 {
             self.locations.remove(0);
         }
@@ -54,13 +93,39 @@ impl Places {
     }
 
     /// Возвращает позиции в направлении перехода. Можно пропустить уже закрытый разговор.
-    fn candidates(&self, forward: bool) -> impl Iterator<Item = (usize, &Place)> {
+    fn candidates(&self, forward: bool) -> impl Iterator<Item = (usize, &Visit)> {
         let locations = self.locations.iter().enumerate();
         let forward_items = locations.clone().skip(self.cursor.saturating_add(1));
         let back_items = locations.take(self.cursor).rev();
         forward_items
             .filter(move |_| forward)
             .chain(back_items.filter(move |_| !forward))
+    }
+
+    /// Убирает особое восстановление позиции для области, к которой отозван доступ.
+    pub(super) fn revoke_reading(&mut self, update: &SyncUpdate, revoked: HistoryRevocation) {
+        if self.account.as_ref().is_none_or(|account| {
+            account.owner != update.context || account.generation != update.generation
+        }) {
+            return;
+        }
+        for visit in &mut self.locations {
+            if visit.reading.as_ref().is_some_and(|reading| {
+                let scope = reading.route.scope;
+                match revoked {
+                    HistoryRevocation::Stream(id) => scope.stream_id == id,
+                    HistoryRevocation::Topic {
+                        stream_id,
+                        topic_id,
+                    } => {
+                        scope.stream_id == stream_id
+                            && scope.topic_id.is_none_or(|id| id == topic_id)
+                    }
+                }
+            }) {
+                visit.reading = None;
+            }
+        }
     }
 }
 
@@ -129,19 +194,79 @@ impl Client {
         );
     }
 
+    /// Сохраняет место перед переходом в самой записи, чтобы не потерять его в том же чате.
+    pub(super) fn save_place_reading(&mut self, cx: &Context<Self>) {
+        let Some(visit) = self.places.locations.get_mut(self.places.cursor) else {
+            return;
+        };
+        let Some(view) = self.conversation.as_ref().map(|view| view.read(cx)) else {
+            return;
+        };
+        let route = &view.address().route;
+        if self.section == TopBarSection::Chats
+            && visit.place.section == self.section
+            && view.has_access()
+            && (visit.place.conversation.as_ref() == Some(route)
+                || visit.place.activity == Some(ActivityPage::Favorites))
+        {
+            visit.reading = Some(PlaceReading {
+                route: route.clone(),
+                anchor: view.reading_position(),
+            });
+        }
+    }
+
+    /// Записывает показанный UUID, сохраняя физический адрес ленты и её редактор.
+    pub(super) fn record_message_place(&mut self) {
+        self.record_place();
+        self.places.record_message();
+    }
+
     /// Возвращается к ближайшему доступному экрану через штатные команды оболочки.
     fn move_place(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let target = self.places.candidates(forward).find_map(|(index, place)| {
+        if self.message_navigation.take().is_some() {
+            cx.notify();
+        }
+        self.save_place_reading(cx);
+        let target = self.places.candidates(forward).find_map(|(index, visit)| {
+            let place = &visit.place;
+            if let Some(reading) = &visit.reading {
+                if let Some(conversation) = &self.conversation {
+                    let address = conversation.read(cx).address().clone();
+                    if address.route.owner == reading.route.owner
+                        && address.route.scope == reading.route.scope
+                        && (address.route.entry == ChatEntry::Archived)
+                            == (reading.route.entry == ChatEntry::Archived)
+                        && self.shell.conversation_draft() == place.draft
+                        && self.shell.begin_message_navigation(&address).is_some()
+                        && conversation.update(cx, |view, cx| {
+                            view.restore_reading_position(reading.anchor, cx)
+                        })
+                    {
+                        return Some((index, place.section, None, ConversationOpening::Standard));
+                    }
+                }
+                let effect = self
+                    .shell
+                    .restore_reading_navigation(&reading.route, place.draft)
+                    .ok()?;
+                return Some((
+                    index,
+                    place.section,
+                    effect,
+                    ConversationOpening::Reading(reading.anchor),
+                ));
+            }
             let effect = self
                 .shell
                 .restore_navigation(place.conversation.as_ref(), place.activity, place.draft)
                 .ok()?;
-            Some((index, place.section, effect))
+            Some((index, place.section, effect, ConversationOpening::Standard))
         });
-        if let Some((index, section, effect)) = target {
+        if let Some((index, section, effect, opening)) = target {
             self.places.cursor = index;
             self.places.restoring = true;
-            self.apply(effect, cx);
+            self.apply_opening(effect, opening, cx);
             self.open_section(section, cx);
             self.places.restoring = false;
         }

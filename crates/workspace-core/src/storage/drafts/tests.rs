@@ -102,13 +102,163 @@ fn local_draft_survives_legacy_profile_migration_and_reopen() {
     }
     let reopened = Storage::open(&path).unwrap();
     let access = reopened.prepare_draft_access(&owner, scope).unwrap();
-    assert!(reopened.read_plaintext_draft(&access, None).unwrap() == Some(primary));
+    assert!(reopened.read_plaintext_draft(&access, None).unwrap() == Some(secondary.clone()));
+    assert!(
+        reopened
+            .read_plaintext_draft(&access, Some(primary.id))
+            .unwrap()
+            == Some(primary)
+    );
     assert!(
         reopened
             .read_plaintext_draft(&access, Some(secondary.id))
             .unwrap()
             == Some(secondary)
     );
+}
+
+/// Локальный каталог допускает чтение только обычного черновика известной темы владельца.
+#[test]
+fn local_draft_read_requires_plain_catalog_scope() {
+    use crate::messenger::catalog::{Chat, ChatMetadata, Topic, TopicMetadata};
+
+    let storage = Storage::in_memory().unwrap();
+    let owner = owner();
+    let scope = scope(1, 2);
+    let snapshot = draft(7, 1, "локальный текст");
+    let access = storage.prepare_draft_access(&owner, scope).unwrap();
+    storage.save_plaintext_draft(&access, &snapshot).unwrap();
+    assert!(
+        storage
+            .read_catalog_plaintext_draft(&owner, scope, None)
+            .unwrap()
+            .is_none()
+    );
+    let mut chat = Chat {
+        id: scope.stream_id,
+        name: "чат".into(),
+        direct: false,
+        topics: vec![Topic {
+            id: scope.topic_id,
+            name: "тема".into(),
+            metadata: TopicMetadata::default(),
+        }],
+        metadata: ChatMetadata {
+            encrypted: Some(false),
+            ..Default::default()
+        },
+    };
+    let save = |chat: &Chat| {
+        let revision = storage.catalog_revision(&owner).unwrap();
+        storage
+            .save_chat_catalog(
+                &owner,
+                &serde_json::to_string(&[chat]).unwrap(),
+                revision,
+                None,
+            )
+            .unwrap();
+    };
+    save(&chat);
+    assert!(
+        storage
+            .read_catalog_plaintext_draft(&owner, scope, None)
+            .unwrap()
+            == Some(Some(snapshot.clone()))
+    );
+    assert!(
+        storage
+            .read_catalog_plaintext_draft(&owner, scope, Some(Uuid::new_v4()))
+            .unwrap()
+            == Some(None)
+    );
+    assert!(
+        storage
+            .read_catalog_plaintext_draft(&owner, super::tests::scope(1, 3), None)
+            .unwrap()
+            .is_none()
+    );
+    chat.metadata.encrypted = Some(true);
+    save(&chat);
+    assert!(
+        storage
+            .read_catalog_plaintext_draft(&owner, scope, None)
+            .unwrap()
+            .is_none()
+    );
+    chat.metadata.encrypted = None;
+    save(&chat);
+    assert!(
+        storage
+            .read_catalog_plaintext_draft(&owner, scope, None)
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Обычное открытие выбирает недавнюю запись, а явный UUID возвращает нужную версию.
+#[test]
+fn ordinary_draft_open_chooses_most_recent_record() {
+    let storage = Storage::in_memory().unwrap();
+    let owner = owner();
+    let scope = scope(1, 2);
+    let access = storage.prepare_draft_access(&owner, scope).unwrap();
+    let first = draft(1, 1, "старый вариант");
+    let second = draft(2, 1, "ранний ввод");
+    storage.save_plaintext_draft(&access, &first).unwrap();
+    storage.save_plaintext_draft(&access, &second).unwrap();
+    {
+        let connection = storage.connection.lock().unwrap();
+        connection.execute(
+            "UPDATE messenger_drafts SET updated_at = CASE draft_id WHEN ?1 THEN '2026-01-01T00:00:00.000Z' ELSE '2026-01-01T00:00:01.000Z' END",
+            params![first.id.to_string()],
+        ).unwrap();
+    }
+    assert!(storage.read_plaintext_draft(&access, None).unwrap() == Some(second));
+    assert!(
+        storage
+            .read_plaintext_draft(&access, Some(first.id))
+            .unwrap()
+            == Some(first.clone())
+    );
+    let updated = draft(1, 2, "изменённый старый вариант");
+    storage.save_plaintext_draft(&access, &updated).unwrap();
+    {
+        let connection = storage.connection.lock().unwrap();
+        connection
+            .execute(
+                "UPDATE messenger_drafts SET updated_at = '2026-01-01T00:00:00.000Z'",
+                [],
+            )
+            .unwrap();
+    }
+    assert!(storage.read_plaintext_draft(&access, None).unwrap() == Some(updated));
+}
+
+/// После миграции старые записи сортируются по времени, новые — по порядку записи.
+#[test]
+fn draft_order_migration_preserves_legacy_order_and_tracks_new_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("draft-order.sqlite");
+    let owner = owner();
+    let scope = scope(1, 2);
+    let first = draft(1, 1, "первый");
+    let second = draft(2, 1, "второй");
+    {
+        let storage = Storage::open(&path).unwrap();
+        let access = storage.prepare_draft_access(&owner, scope).unwrap();
+        storage.save_plaintext_draft(&access, &first).unwrap();
+        storage.save_plaintext_draft(&access, &second).unwrap();
+    }
+    let old = Connection::open(&path).unwrap();
+    old.execute_batch("UPDATE messenger_drafts SET updated_at = CASE WHEN sequence = 1 THEN '2026-01-01T00:00:01.000Z' ELSE '2026-01-01T00:00:00.000Z' END; ALTER TABLE messenger_drafts DROP COLUMN write_order").unwrap();
+    drop(old);
+    let storage = Storage::open(&path).unwrap();
+    let access = storage.prepare_draft_access(&owner, scope).unwrap();
+    assert!(storage.read_plaintext_draft(&access, None).unwrap() == Some(first));
+    let updated = draft(2, 2, "второй изменён");
+    storage.save_plaintext_draft(&access, &updated).unwrap();
+    assert!(storage.read_plaintext_draft(&access, None).unwrap() == Some(updated));
 }
 
 /// Сохраняет только адрес удаления между запусками и отклоняет обычную запись после защиты.

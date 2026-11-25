@@ -32,6 +32,9 @@ mod stability;
 #[path = "tests/toolbar.rs"]
 mod toolbar;
 
+#[path = "tests/local_composer.rs"]
+mod local_composer;
+
 const MESSAGE: Uuid = Uuid::from_u128(2001);
 const TOPIC: Uuid = Uuid::from_u128(2002);
 
@@ -97,7 +100,12 @@ struct Request<T, U> {
 struct Requests {
     history: mpsc::Receiver<Request<(ConversationAddress, Load), ConversationReply<LoadResult>>>, // Открытие и обновление.
     resolve: mpsc::Receiver<
-        Request<ConversationAddress, ConversationReply<Result<Uuid, DestinationError>>>,
+        Request<
+            ConversationAddress,
+            ConversationReply<
+                Result<crate::gpui_client::composer::ResolvedDestination, DestinationError>,
+            >,
+        >,
     >, // Проверка темы.
     save: mpsc::Receiver<Request<Submission, ConversationReply<QueueWriteOutcome>>>, // Сохранение снимка.
 }
@@ -153,25 +161,7 @@ fn conversation(
     let mut view = Conversation::with_source(address, source, None, None, cx);
     view.attach_composer(
         SendSource {
-            resolve: Arc::new(move |address, _| {
-                let future = send_request(&resolve, address);
-                Box::pin(async move {
-                    let reply: ConversationReply<Result<Uuid, DestinationError>> = future.await;
-                    ConversationReply {
-                        address: reply.address,
-                        value: reply.value.map(|topic| {
-                            crate::gpui_client::composer::ResolvedDestination {
-                                encrypted: false,
-                                topic,
-                                closed: false,
-                                plain_target: None,
-                                restored_protected: false,
-                                draft: None,
-                            }
-                        }),
-                    }
-                })
-            }),
+            resolve: Arc::new(move |address, _| send_request(&resolve, address)),
             save: Arc::new(move |submission| send_request(&save, submission)),
         },
         cx,
@@ -234,6 +224,8 @@ fn publish_with_older(
             .send(ConversationReply {
                 address,
                 value: Ok(Some(Snapshot {
+                    first_unread: None,
+                    unread_checked: false,
                     media_access: None,
                     window: HistoryWindow {
                         id: 7,
@@ -257,6 +249,14 @@ fn allow(requests: &Requests, value: Result<Uuid, DestinationError>, ui: &mut Vi
         input: address,
         reply,
     } = next(&requests.resolve, "проверка темы");
+    let value = value.map(|topic| crate::gpui_client::composer::ResolvedDestination {
+        encrypted: false,
+        topic,
+        closed: false,
+        plain_target: None,
+        restored_protected: false,
+        draft: None,
+    });
     assert!(reply.send(ConversationReply { address, value }).is_ok());
     ui.run_until_parked();
 }
@@ -311,13 +311,13 @@ fn saved(
     ui.run_until_parked();
 }
 
-/// При блокировке отправки пояснение и кнопка занимают компактную плашку под историей.
+/// При ошибке отправки компактное пояснение не скрывает доступное поле.
 #[gpui::test]
 fn blocked_composer_keeps_footer_compact(cx: &mut TestAppContext) {
     let (_, ui, requests) = start(cx);
     publish(&requests, Load::Open(ChatEntry::Latest), vec![], vec![], ui);
     allow(&requests, Err(DestinationError::EncryptionUnavailable), ui);
-    assert!(ui.debug_bounds("workspace-composer-editor").is_none());
+    assert!(ui.debug_bounds("workspace-composer-editor").is_some());
 
     for (width, max_height) in [(650., 48.), (340., 72.), (220., 72.)] {
         ui.simulate_resize(size(px(width), px(530.)));
@@ -341,11 +341,11 @@ fn blocked_composer_keeps_footer_compact(cx: &mut TestAppContext) {
 fn accepts_only_valid_text_and_one_click_while_saving(cx: &mut TestAppContext) {
     let (view, ui, requests) = start(cx);
     publish(&requests, Load::Open(ChatEntry::Latest), vec![], vec![], ui);
-    assert!(ui.debug_bounds("conversation-send-notice").is_some());
-    assert!(ui.debug_bounds("conversation-composer").is_none());
+    assert!(ui.debug_bounds("conversation-send-notice").is_none());
+    assert!(ui.debug_bounds("conversation-composer").is_some());
     allow(&requests, Err(DestinationError::EncryptionUnavailable), ui);
     assert!(ui.debug_bounds("conversation-send-notice").is_some());
-    assert!(ui.debug_bounds("workspace-composer-editor").is_none());
+    assert!(ui.debug_bounds("workspace-composer-editor").is_some());
     ui.simulate_keystrokes("enter");
     assert!(
         requests.save.try_recv().is_err(),
@@ -423,25 +423,90 @@ fn confirm_text_menu(ui: &mut VisualTestContext) {
     ui.run_until_parked();
 }
 
-/// Через штатную панель форматирования вставляет один общий момент в текущий ответ.
+/// Выбирает дату и время в календаре и заменяет выделенный текст общей меткой времени.
 #[gpui::test]
 fn composer_time_picker_inserts_a_canonical_time(cx: &mut TestAppContext) {
+    use crate::platform::message_time::{current_local_datetime, local_datetime_to_utc};
+    use workspace_core::messenger::references::{WorkspaceReferenceTarget, workspace_references};
+
     let (view, ui, requests) = start(cx);
     publish(&requests, Load::Open(ChatEntry::Latest), vec![], vec![], ui);
     allow(&requests, Ok(TOPIC), ui);
-    paste(ui, "Встреча");
+    // GPUI может вернуть границы элемента из отрисованной ранее панели.
+    let panel_open = |ui: &VisualTestContext| {
+        ui.read(|app| {
+            view.read(app)
+                .tested_composer()
+                .unwrap()
+                .read(app)
+                .tested_time_picker_is_open()
+        })
+    };
+    let before = "Встреча X завтра";
+    paste(ui, before);
+    ui.simulate_keystrokes("left left left left left left left shift-left");
     click(ui, "composer-toolbar-toggle");
+    let composer = ui.debug_bounds("conversation-composer").unwrap();
     click(ui, "composer-insert-time");
     assert!(ui.debug_bounds("composer-time-picker").is_some());
+    assert!(ui.debug_bounds("date-time-picker").is_some());
+    assert_eq!(ui.debug_bounds("conversation-composer").unwrap(), composer);
+    assert_eq!(draft(&view, ui), before);
+
+    ui.simulate_keystrokes("escape");
+    ui.run_until_parked();
+    assert!(!panel_open(ui));
+    assert_eq!(draft(&view, ui), before);
+
+    ui.simulate_keystrokes("enter");
+    ui.simulate_event(KeyUpEvent {
+        keystroke: Keystroke::parse("enter").unwrap(),
+    });
+    ui.run_until_parked();
+    assert!(ui.debug_bounds("composer-time-picker").is_some());
+    ui.simulate_click(gpui::point(px(2.), px(2.)), Modifiers::none());
+    ui.run_until_parked();
+    assert!(!panel_open(ui));
+    assert_eq!(draft(&view, ui), before);
+
+    let initial_day = current_local_datetime().date();
+    click(ui, "composer-insert-time");
+    ui.simulate_keystrokes("right enter");
+    click(ui, "time-picker-hour");
+    ui.simulate_keystrokes("1 2");
+    click(ui, "time-picker-minute");
+    ui.simulate_keystrokes("3 4");
+    click(ui, "time-picker-second");
+    ui.simulate_keystrokes("7");
+    assert_eq!(draft(&view, ui), before);
     click(ui, "composer-time-confirm");
 
+    let expected = local_datetime_to_utc(
+        initial_day
+            .succ_opt()
+            .unwrap()
+            .and_hms_opt(12, 34, 7)
+            .unwrap(),
+    )
+    .unwrap();
     let markdown = draft(&view, ui);
     assert!(markdown.starts_with("Встреча urn:time:"));
-    let references = workspace_core::messenger::references::workspace_references(&markdown);
-    assert!(matches!(references.as_slice(), [reference] if matches!(
-        reference.target,
-        workspace_core::messenger::references::WorkspaceReferenceTarget::Time(_)
-    )));
+    assert!(markdown.ends_with(" завтра"));
+    let references = workspace_references(&markdown);
+    assert!(
+        matches!(references.as_slice(), [reference] if reference.target == WorkspaceReferenceTarget::Time(expected))
+    );
+    ui.update(|window, app| {
+        window.draw(app).clear();
+        assert_eq!(view.read(app).keyboard_focus(window, app), Some("редактор"));
+    });
+    assert!(!panel_open(ui));
+
+    click(ui, "conversation-send");
+    let sent = next(&requests.save, "сообщение с выбранной датой");
+    assert_eq!(sent.input.markdown, markdown);
+    saved(sent, Some(MESSAGE), ui);
+    publish(&requests, Load::Read(7), vec![], vec![], ui);
 }
 
 /// Удаляет одну карточку файла перед отправкой и передаёт в очередь только оставшуюся ссылку.
@@ -712,12 +777,14 @@ fn editor_growth_preserves_reading_anchor_and_tail(cx: &mut TestAppContext) {
     let stream_id = ui.read(|app| view.read(app).address().route.scope.stream_id);
     let messages = (1..=60)
         .map(|index| HistoryMessage {
+            read: None,
             id: Uuid::from_u128(index),
             stream_id,
             topic_id: TOPIC,
             body: MessageBody::Markdown("Синтетическая строка".into()),
             reactions: Vec::new(),
             metadata: HistoryMetadata {
+                native_source: None,
                 author_id: Some(Uuid::from_u128(900)),
                 created_at: HistoryTime::parse("2026-11-17T07:10:30Z").unwrap(),
                 updated_at: None,
@@ -918,12 +985,14 @@ fn keeps_unknown_delivery_and_deduplicates_after_confirmation(cx: &mut TestAppCo
     assert!(ui.debug_bounds("history-delivery-unknown").is_some());
 
     let confirmed = HistoryMessage {
+        read: None,
         id: MESSAGE,
         stream_id: scope.stream_id,
         topic_id: TOPIC,
         body: MessageBody::Markdown("Проверка отправки".into()),
         reactions: Vec::new(),
         metadata: HistoryMetadata {
+            native_source: None,
             author_id: Some(Uuid::from_u128(900)),
             created_at: HistoryTime::parse("2026-11-17T07:10:30Z").unwrap(),
             updated_at: None,

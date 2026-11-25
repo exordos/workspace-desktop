@@ -1,7 +1,10 @@
-//! Проверяет файлы редактора, подтверждает обычную цель отправки и создаёт ссылку после multipart.
-//! Ошибку или отмену загрузки не повторяет автоматически, поскольку сервер сам создаёт UUID файла.
+//! Проверяет файл и цель композера, связывает квитанцию multipart с загрузившей сессией.
+//! Неиспользованную квитанцию можно обменять на одну попытку серверной очистки.
 
-use std::future::pending;
+use std::{
+    future::pending,
+    sync::{Arc, Weak},
+};
 
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
@@ -18,7 +21,13 @@ use crate::{
 };
 
 use super::MessengerSource;
-use crate::messenger::{references::build_media_reference_markdown, send::DirectSendError};
+use crate::messenger::{
+    encrypted_send::{ChatEncryption, EncryptedMessageError},
+    encryption::{EncryptionActivation, MessageDecryption},
+    references::build_media_reference_markdown,
+    rest::RestClient,
+    send::DirectSendError,
+};
 
 /// Предел исходного файла в редакторе Electron, в байтах.
 pub const MAX_ATTACHMENT_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
@@ -31,11 +40,47 @@ pub struct AttachmentUpload {
     pub dimensions: Option<(u32, u32)>, // Ширина и высота медиа в пикселях, если известны.
 }
 
-/// Подтверждённое сервером вложение, готовое к вставке в Markdown черновика.
-#[derive(Debug, Eq, PartialEq)]
+/// Параметры наблюдения за одной попыткой загрузки.
+#[derive(Default)]
+pub struct AttachmentUploadControl {
+    pub cancel: Option<watch::Receiver<bool>>, // True или закрытый канал отменяет попытку.
+    pub progress: Option<watch::Sender<AttachmentUploadProgress>>, // Получает число прочитанных байтов.
+}
+
+/// Сколько байтов файла HTTP-клиент взял в тело запроса.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AttachmentUploadProgress {
+    pub loaded_bytes: u64, // Байты, уже переданные HTTP-клиенту.
+    pub total_bytes: u64,  // Полный размер файла, без частей multipart.
+}
+
+/// Квитанция подтверждённой загрузки и одноразовый допуск к серверной очистке.
+/// После передачи ссылки в сообщение квитанцию нужно выбросить.
+#[derive(Debug)]
 pub struct UploadedAttachment {
-    pub id: Uuid,         // UUID, присвоенный файловым API.
-    pub markdown: String, // Каноническая ссылка с заголовком и сведениями о файле.
+    id: Uuid,                      // UUID, выданный файловым API в проверенной квитанции.
+    owner: OwnerContext,           // Владелец файла и адрес сервера из исходного запроса.
+    generation: SessionGeneration, // Вход, который загрузил файл и может запросить очистку.
+    authority: Weak<()>,           // Профиль, в котором сервер подтвердил файл.
+    pub markdown: String,          // Каноническая ссылка с заголовком и сведениями о файле.
+}
+
+impl UploadedAttachment {
+    /// Возвращает UUID для сравнения с сохранённой ссылкой.
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+}
+
+/// Почему серверная очистка подтверждённого вложения не завершилась.
+#[derive(Debug, Error)]
+pub enum DiscardAttachmentError {
+    #[error("attachment cleanup failed with HTTP {0}")]
+    Rejected(u16), // Сервер вернул код, отличный от успеха или отсутствия файла.
+    #[error("attachment cleanup outcome is unknown")]
+    Unknown, // HTTPS оборвался или не удалось начать запрос.
+    #[error(transparent)]
+    Session(#[from] AuthError), // Вход завершился или перестал выдавать токен.
 }
 
 /// Ошибка одной попытки загрузки. Сервер мог создать файл до потери ответа или отмены.
@@ -56,6 +101,8 @@ pub enum UploadAttachmentError {
     #[error(transparent)]
     Destination(#[from] DirectSendError), // Цель не разрешает обычную отправку.
     #[error(transparent)]
+    Encryption(#[from] EncryptedMessageError), // Цель или ключ защищённой отправки больше недоступны.
+    #[error(transparent)]
     Session(#[from] AuthError), // Сессия больше не принимает результат.
     #[error(transparent)]
     Storage(#[from] StorageError), // Локальная версия доступа недоступна.
@@ -63,7 +110,7 @@ pub enum UploadAttachmentError {
 
 /// Подготовленные байты и поля, с которыми будет сопоставляться квитанция сервера.
 pub(in crate::messenger) struct PreparedAttachment {
-    pub(in crate::messenger) bytes: Vec<u8>, // Уходит через multipart без копии.
+    pub(in crate::messenger) bytes: Vec<u8>, // Исходные байты части multipart.
     pub(in crate::messenger) receipt: ExpectedAttachment, // Сверяется после отправки байтов.
 }
 
@@ -78,16 +125,39 @@ pub(in crate::messenger) struct ExpectedAttachment {
 
 impl ExpectedAttachment {
     /// Использует UUID из квитанции только после сверки её полей в REST.
-    pub(in crate::messenger) fn reference(self, id: Uuid) -> UploadedAttachment {
-        UploadedAttachment {
-            id,
-            markdown: build_media_reference_markdown(
-                id,
-                &self.name,
-                &self.mime,
-                self.size,
-                self.dimensions,
-            ),
+    pub(in crate::messenger) fn markdown(self, id: Uuid) -> String {
+        build_media_reference_markdown(id, &self.name, &self.mime, self.size, self.dimensions)
+    }
+}
+
+/// Источник разрешения на отправку для открытого или защищённого композера.
+enum UploadAccess<'a> {
+    Plain {
+        owner: &'a OwnerContext,       // Пользователь и проект источника.
+        generation: SessionGeneration, // Точный вход открытого композера.
+    },
+    Encrypted(&'a EncryptionActivation), // Активный ключевой контекст защищённого композера.
+}
+
+/// Проверенная тема, приём результата из которой зависит от версии доступа и ключа.
+struct UploadDestination<'a> {
+    scope: HistoryScope, // Подтверждённая точная тема.
+    key: Option<(&'a ChatEncryption, MessageDecryption)>, // Отсутствует у открытой отправки.
+}
+
+impl UploadDestination<'_> {
+    /// Выполняет короткую проверку или приём результата под допуском исходного ключа.
+    fn verify<T>(
+        &self,
+        action: impl FnOnce() -> Result<T, UploadAttachmentError>,
+    ) -> Result<T, UploadAttachmentError> {
+        if let Some((profile, key)) = &self.key {
+            profile
+                .keys
+                .authorize_outgoing(key, false, action)
+                .map_err(EncryptedMessageError::from)?
+        } else {
+            action()
         }
     }
 }
@@ -103,7 +173,93 @@ impl MessengerSource {
         upload: AttachmentUpload,
         cancel: Option<watch::Receiver<bool>>,
     ) -> Result<UploadedAttachment, UploadAttachmentError> {
+        self.upload_attachment_with_control(
+            sync,
+            owner,
+            generation,
+            scope,
+            upload,
+            AttachmentUploadControl {
+                cancel,
+                progress: None,
+            },
+        )
+        .await
+    }
+
+    /// Загружает файл обычного композера с наблюдением за байтами и отменой.
+    pub async fn upload_attachment_with_control(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        scope: HistoryScope,
+        upload: AttachmentUpload,
+        control: AttachmentUploadControl,
+    ) -> Result<UploadedAttachment, UploadAttachmentError> {
+        self.upload_attachment_inner(
+            sync,
+            UploadAccess::Plain { owner, generation },
+            scope,
+            upload,
+            control,
+        )
+        .await
+    }
+
+    /// Загружает файл с ACL стрима после проверки точной темы и действующего ключа.
+    pub async fn upload_encrypted_attachment(
+        &self,
+        sync: &Sync,
+        activation: &EncryptionActivation,
+        scope: HistoryScope,
+        upload: AttachmentUpload,
+        control: AttachmentUploadControl,
+    ) -> Result<UploadedAttachment, UploadAttachmentError> {
+        self.upload_attachment_inner(
+            sync,
+            UploadAccess::Encrypted(activation),
+            scope,
+            upload,
+            control,
+        )
+        .await
+    }
+
+    /// Убирает подтверждённый несохранённый файл одной попыткой в его исходной сессии.
+    pub async fn discard_uploaded_attachment(
+        &self,
+        sync: &Sync,
+        upload: UploadedAttachment,
+    ) -> Result<(), DiscardAttachmentError> {
+        if !upload
+            .authority
+            .ptr_eq(&Arc::downgrade(sync.media_authority()))
+        {
+            return Err(AuthError::SessionUnavailable.into());
+        }
+        discard(&self.rest, sync.auth(), upload).await
+    }
+
+    /// Загружает один снимок байтов и выдаёт квитанцию только при действующем доступе.
+    async fn upload_attachment_inner(
+        &self,
+        sync: &Sync,
+        access: UploadAccess<'_>,
+        scope: HistoryScope,
+        upload: AttachmentUpload,
+        control: AttachmentUploadControl,
+    ) -> Result<UploadedAttachment, UploadAttachmentError> {
+        let (owner, generation) = match &access {
+            UploadAccess::Plain { owner, generation } => (*owner, *generation),
+            UploadAccess::Encrypted(activation) => {
+                let session = activation.session();
+                (&session.owner, session.generation)
+            }
+        };
+        let AttachmentUploadControl { cancel, progress } = control;
         let auth = sync.auth();
+        let storage = sync.storage();
         let operation = Uuid::new_v4();
         let bytes = upload.bytes.len();
         log::debug!("Загрузка вложения: op_id={operation} status=started bytes={bytes}");
@@ -111,48 +267,43 @@ impl MessengerSource {
             let prepared = tokio::task::spawn_blocking(move || prepare(upload))
                 .await
                 .map_err(|_| UploadAttachmentError::InvalidInput)??;
-            let storage = sync.storage();
             let initial = auth.with_active_generation(owner, generation, || {
                 storage.media_access_revision(owner, scope)
             })??;
-            let checked = self
-                .resolve_plain_send(sync, owner, generation, scope)
-                .await?;
-            let target = HistoryScope {
-                topic_id: Some(checked.topic_id()),
-                ..scope
-            };
-            // Личка без явно выбранной темы сначала вернула UUID темы по умолчанию.
-            if scope.topic_id.is_none() {
-                self.check_topic_send(
-                    sync,
-                    owner,
-                    generation,
-                    target.stream_id,
-                    checked.topic_id(),
-                )
-                .await?;
-            }
+            let destination = self.resolve_upload_destination(sync, access, scope).await?;
             let token = auth
                 .access_token_for_generation(owner, Service::Messenger, generation)
                 .await?;
-            let version = auth.with_active_generation(owner, generation, || {
-                if storage.media_access_revision(owner, scope)? != initial {
-                    return Err(DirectSendError::AccessLost.into());
-                }
-                Ok::<_, UploadAttachmentError>(storage.media_access_revision(owner, target)?)
-            })??;
+            let version = destination.verify(|| {
+                auth.with_active_generation(owner, generation, || {
+                    if storage.media_access_revision(owner, scope)? != initial {
+                        return Err(DirectSendError::AccessLost.into());
+                    }
+                    Ok(storage.media_access_revision(owner, destination.scope)?)
+                })?
+            })?;
             log::debug!("Загрузка вложения: op_id={operation} status=request");
-            let result = self
+            let (id, markdown) = self
                 .rest
-                .multipart_attachment(owner, &token, target.stream_id, prepared)
-                .await;
-            auth.with_active_generation(owner, generation, || {
-                if storage.media_access_revision(owner, target)? != version {
-                    return Err(DirectSendError::AccessLost.into());
-                }
-                result
-            })?
+                .multipart_attachment(
+                    owner,
+                    &token,
+                    destination.scope.stream_id,
+                    prepared,
+                    progress,
+                )
+                .await?;
+            Ok((
+                UploadedAttachment {
+                    id,
+                    owner: owner.clone(),
+                    generation,
+                    authority: Arc::downgrade(sync.media_authority()),
+                    markdown,
+                },
+                destination,
+                version,
+            ))
         };
         let result = tokio::select! {
             biased;
@@ -160,6 +311,26 @@ impl MessengerSource {
             _ = inactive_session(auth, owner, generation) => Err(AuthError::SessionUnavailable.into()),
             result = attempt => result,
         };
+        let result = result.and_then(|(upload, destination, version)| {
+            let current = destination.verify(|| {
+                auth.with_active_generation(owner, generation, || {
+                    if storage.media_access_revision(owner, destination.scope)? != version {
+                        return Err(DirectSendError::AccessLost.into());
+                    }
+                    Ok(())
+                })?
+            });
+            if let Err(error) = current {
+                // Сервер успел подтвердить файл, но редактор больше не может принять ссылку.
+                let rest = self.rest.clone();
+                let auth = auth.clone();
+                tokio::spawn(async move {
+                    let _ = discard(&rest, &auth, upload).await;
+                });
+                return Err(error);
+            }
+            Ok(upload)
+        });
         let status = match &result {
             Ok(_) => "uploaded",
             Err(UploadAttachmentError::Canceled) => "canceled",
@@ -170,12 +341,89 @@ impl MessengerSource {
             Err(UploadAttachmentError::Rejected(_)) => "rejected",
             Err(UploadAttachmentError::Unknown) => "unknown",
             Err(UploadAttachmentError::Destination(_)) => "invalid_destination",
+            Err(UploadAttachmentError::Encryption(_)) => "invalid_key",
             Err(UploadAttachmentError::Session(_)) => "session_ended",
             Err(UploadAttachmentError::Storage(_)) => "storage_error",
         };
         log::debug!("Загрузка вложения: op_id={operation} status={status}");
         result
     }
+
+    /// Подтверждает режим, стрим и точную тему до отправки файла.
+    async fn resolve_upload_destination<'a>(
+        &'a self,
+        sync: &Sync,
+        access: UploadAccess<'_>,
+        scope: HistoryScope,
+    ) -> Result<UploadDestination<'a>, UploadAttachmentError> {
+        let (topic_id, key) = match access {
+            UploadAccess::Plain { owner, generation } => {
+                let checked = self
+                    .resolve_plain_send(sync, owner, generation, scope)
+                    .await?;
+                let topic = checked.topic_id();
+                // Личка без явно выбранной темы сначала вернула UUID темы по умолчанию.
+                if scope.topic_id.is_none() {
+                    self.check_topic_send(sync, owner, generation, scope.stream_id, topic)
+                        .await?;
+                }
+                (topic, None)
+            }
+            UploadAccess::Encrypted(activation) => {
+                let profile = self
+                    .encryption_profile(activation)
+                    .map_err(EncryptedMessageError::from)?;
+                let (topic, key) = self
+                    .resolve_encrypted_send(sync, profile, activation, scope, None)
+                    .await?;
+                (topic, Some((profile, key)))
+            }
+        };
+        Ok(UploadDestination {
+            scope: HistoryScope {
+                topic_id: Some(topic_id),
+                ..scope
+            },
+            key,
+        })
+    }
+}
+
+/// Делает единственную попытку очистки и связывает её в журнале с отдельной операцией.
+async fn discard(
+    rest: &RestClient,
+    auth: &Auth,
+    upload: UploadedAttachment,
+) -> Result<(), DiscardAttachmentError> {
+    let UploadedAttachment {
+        id,
+        owner,
+        generation,
+        ..
+    } = upload;
+    let operation = Uuid::new_v4();
+    log::debug!("Очистка вложения: op_id={operation} status=started");
+    let attempt = async {
+        let token = auth
+            .access_token_for_generation(&owner, Service::Messenger, generation)
+            .await?;
+        let result = rest.delete_attachment(&owner, &token, id).await;
+        auth.with_active_generation(&owner, generation, || ())?;
+        result
+    };
+    let result = tokio::select! {
+        biased;
+        _ = inactive_session(auth, &owner, generation) => Err(AuthError::SessionUnavailable.into()),
+        result = attempt => result,
+    };
+    let status = match &result {
+        Ok(()) => "discarded",
+        Err(DiscardAttachmentError::Rejected(_)) => "rejected",
+        Err(DiscardAttachmentError::Unknown) => "unknown",
+        Err(DiscardAttachmentError::Session(_)) => "session_ended",
+    };
+    log::debug!("Очистка вложения: op_id={operation} status={status}");
+    result
 }
 
 /// Ставит отмену выше результата, если оба события поступили к одному опросу.
@@ -290,9 +538,9 @@ mod tests {
         })
         .unwrap();
         let id = Uuid::from_u128(2);
-        let attachment = upload.receipt.reference(id);
-        assert!(attachment.markdown.starts_with("!["));
-        let [parsed]: [_; 1] = media_references(&attachment.markdown).try_into().unwrap();
+        let markdown = upload.receipt.markdown(id);
+        assert!(markdown.starts_with("!["));
+        let [parsed]: [_; 1] = media_references(&markdown).try_into().unwrap();
         assert_eq!(parsed.file_id, id);
         assert_eq!(parsed.kind, MediaKind::Image);
         assert_eq!(parsed.name.as_deref(), Some("Фото [1] _ .png"));

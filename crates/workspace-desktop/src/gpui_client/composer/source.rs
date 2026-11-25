@@ -7,10 +7,10 @@ use uuid::Uuid;
 use workspace_core::{
     messenger::{
         encrypted_send::EncryptedMessageError,
-        encryption::{EncryptionActivation, EncryptionError},
+        encryption::{EncryptionActivation, EncryptionError, fragments::FragmentMessageError},
         message_actions::MessageTarget,
         quote::SourceCheckError,
-        send::{DirectSendError, PlainSendTarget},
+        send::{DirectSendError, PlainSendTarget, SendError},
     },
     runtime::SourceError,
     storage::{DraftAccess, DraftScope, PlaintextDraft},
@@ -82,10 +82,12 @@ type Resolve = Arc<
 /// Результат проверки цели и записи снимка в очередь.
 #[derive(Clone, Copy, Debug)]
 pub(in crate::gpui_client) enum QueueWriteOutcome {
-    Saved(Uuid),                              // Публичный UUID подготовленного сообщения.
-    Edited,                                   // Сервер подтвердил правку прежнего сообщения.
-    StaleEdit,                                // Прежняя версия стала недоступна.
-    EditFailed,                               // Сервер не подтвердил правку.
+    Saved(Uuid), // Публичный UUID подготовленного сообщения.
+    Edited,      // Сервер подтвердил правку прежнего сообщения.
+    StaleEdit,   // Прежняя версия стала недоступна.
+    EditFailed {
+        uncertain: bool, // Сервер мог принять правку и начать использовать новые вложения.
+    },
     DestinationUnavailable(DestinationError), // Заново проверяем цель перед повторной отправкой.
     WriteFailed,                              // Запись снимка не подтверждена.
     QuoteUnavailable(SourceCheckError),       // Источники ответа не прошли проверку.
@@ -133,7 +135,7 @@ impl SendSource {
                             };
                             let scope = DraftScope { stream_id, topic_id: topic };
                             services.drafts.wait_for_send(&address, scope).await;
-                            let pending = services.drafts.current(&address, scope);
+                            let pending = services.drafts.current(&address, scope, draft_id);
                             let draft = opening.and_then(|opening| {
                                 services.sync.open_draft_with_id(owner, generation, opening, scope, draft_id)
                             });
@@ -149,7 +151,7 @@ impl SendSource {
                                         if saved.is_none() {
                                             return Err(DestinationError::DraftUnavailable);
                                         }
-                                        services.drafts.current(&address, scope).or(pending)
+                                        services.drafts.current(&address, scope, draft_id).or(pending)
                                     } else {
                                         pending
                                     };
@@ -161,6 +163,7 @@ impl SendSource {
                                         .map(|(_, pending, protected)| (pending, protected));
                                     let (latest, protected) = match (saved, pending) {
                                         (Some(saved), Some((pending, protected))) if saved.id == pending.id && pending.version > saved.version => (Some(pending), protected),
+                                        (Some(saved), Some((pending, protected))) if draft_id.is_none() && saved.id != pending.id => (Some(pending), protected),
                                         (Some(saved), _) => (Some(saved), false),
                                         (None, Some((pending, protected))) => (Some(pending), protected),
                                         (None, None) => (None, false),
@@ -195,6 +198,7 @@ impl SendSource {
                 Box::pin(async move {
                     let op_id = submission.attempt.op_id;
                     let draft = submission.draft.clone();
+                    let editing = submission.edit.is_some();
                     let reply = worker
                         .conversation(submission.address, move |services, address| async move {
                             log::debug!("gpui_send op_id={op_id} event=queue_write_started");
@@ -203,9 +207,11 @@ impl SendSource {
                                     &services.sync, edit, submission.markdown,
                                 ).await {
                                     Ok(_) => QueueWriteOutcome::Edited,
-                                    Err(workspace_core::messenger::encryption::fragments::FragmentMessageError::StaleEdit) =>
+                                    Err(FragmentMessageError::StaleEdit) =>
                                         QueueWriteOutcome::StaleEdit,
-                                    Err(_) => QueueWriteOutcome::EditFailed,
+                                    Err(error) => QueueWriteOutcome::EditFailed {
+                                        uncertain: !matches!(error, FragmentMessageError::Edit(SendError::Rejected(_) | SendError::InvalidInput)),
+                                    },
                                 };
                             }
                             if submission.encrypted {
@@ -223,7 +229,9 @@ impl SendSource {
                                     ).await {
                                         Ok(_) => QueueWriteOutcome::Edited,
                                         Err(EncryptedMessageError::StaleEdit | EncryptedMessageError::NotEditable) => QueueWriteOutcome::StaleEdit,
-                                        Err(_) => QueueWriteOutcome::EditFailed,
+                                        Err(error) => QueueWriteOutcome::EditFailed {
+                                            uncertain: !matches!(error, EncryptedMessageError::Transport(SendError::Rejected(_) | SendError::InvalidInput)),
+                                        },
                                     };
                                 }
                                 if let Err(error) = services.messenger.verify_protected_reply_sources(
@@ -313,7 +321,11 @@ impl SendSource {
                                 .unwrap_or(QueueWriteOutcome::WriteFailed)
                         })
                         .await;
-                    let outcome = reply.value.unwrap_or(QueueWriteOutcome::WriteFailed);
+                    let outcome = reply.value.unwrap_or(if editing {
+                        QueueWriteOutcome::EditFailed { uncertain: true }
+                    } else {
+                        QueueWriteOutcome::WriteFailed
+                    });
                     if let Some(draft) = draft {
                         draft.finish(matches!(outcome, QueueWriteOutcome::Saved(_)));
                     }

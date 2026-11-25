@@ -556,6 +556,86 @@ fn fast_return_to_same_chat_rejects_previous_navigation_and_generation() {
     assert_eq!(shell.conversation(), Some(&current));
 }
 
+/// Общий номер перехода оставляет только последнее действие, сохраняя исходный экран до успеха.
+#[test]
+fn message_navigation_uses_the_same_revision_as_notifications_and_account_selection() {
+    let (mut shell, a, b) = setup();
+    let source = open_sidebar(&mut shell, &a.session);
+    let old_click = request(&mut shell, &b.session);
+    let first = shell.begin_message_navigation(&source).unwrap();
+    let second = shell.begin_message_navigation(&source).unwrap();
+    let destination = |revision| ConversationAddress {
+        route: route(&a.session, ChatEntry::Around(MESSAGE)),
+        generation: a.session.generation,
+        revision,
+    };
+    assert!(!shell.is_message_navigation_current(&source, first));
+    assert!(
+        shell
+            .finish_message_navigation(&source, destination(first))
+            .is_none()
+    );
+    assert!(
+        shell
+            .handle_notification_reply(NotificationReply {
+                request: old_click,
+                result: Ok(route(&b.session, ChatEntry::Around(MESSAGE))),
+            })
+            .is_none()
+    );
+    assert_eq!(shell.conversation(), Some(&source));
+
+    let newer_click = request(&mut shell, &b.session);
+    assert!(
+        shell
+            .finish_message_navigation(&source, destination(second))
+            .is_none()
+    );
+    let third = shell.begin_message_navigation(&source).unwrap();
+    assert!(
+        shell
+            .handle_notification_reply(NotificationReply {
+                request: newer_click,
+                result: Ok(route(&b.session, ChatEntry::Around(MESSAGE))),
+            })
+            .is_none()
+    );
+    shell.handle_action(ShellAction::SelectAccount(b.session.clone()));
+    assert!(
+        shell
+            .finish_message_navigation(&source, destination(third))
+            .is_none()
+    );
+    assert_eq!(shell.selected(), Some(&b.session));
+}
+
+/// Ранее подтверждённая точка чтения открывается для проверки Core даже до обновления каталога.
+#[test]
+fn reading_navigation_reopens_a_resolved_scope_absent_from_catalog() {
+    let (mut shell, a, _) = setup();
+    let source = open_sidebar(&mut shell, &a.session);
+    let revision = shell.begin_message_navigation(&source).unwrap();
+    let mut resolved = route(&a.session, ChatEntry::Around(MESSAGE));
+    resolved.scope.topic_id = Some(Uuid::from_u128(22));
+    let destination = ConversationAddress {
+        route: resolved.clone(),
+        generation: a.session.generation,
+        revision,
+    };
+    assert!(matches!(
+        shell.finish_message_navigation(&source, destination),
+        Some(ShellEffect::OpenConversation(_))
+    ));
+    open_sidebar(&mut shell, &a.session);
+    assert!(
+        shell
+            .restore_navigation(Some(&resolved), None, None)
+            .is_err()
+    );
+    assert!(matches!(shell.restore_reading_navigation(&resolved, None),
+        Ok(Some(ShellEffect::OpenConversation(address))) if address.route == resolved));
+}
+
 /// Ошибка ожидаемого клика остаётся видимой, а подменённая цель его не завершает.
 #[test]
 fn invalid_notification_reports_error_without_replacing_open_conversation() {

@@ -102,7 +102,7 @@ impl Conversation {
                 sending.view.update(cx, |composer, cx| {
                     match reply.value {
                         Ok(Ok(edit)) => {
-                            composer.open_fragment_edit(expected, edit, runtime.engine, runtime.activation, cx);
+                            composer.open_fragment_edit(expected, edit, runtime.engine, runtime.activation, view.attachments.access.clone(), cx);
                             if let Some(window) = window {
                                 composer.focus_editor(window, cx);
                             }

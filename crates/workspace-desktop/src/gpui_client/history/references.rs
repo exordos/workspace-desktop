@@ -1,32 +1,38 @@
 //! Передаёт действия ссылок из истории выбранному разговору, оболочке и правой панели.
+//! Рисует календарь выбранного момента и список тем открытого канала.
 
-use std::rc::Rc;
+use std::{cell::Cell, rc::Rc};
 
+use chrono::Timelike;
 use gpui::{
-    App, Context, Deferred, EventEmitter, FocusHandle, Pixels, Point, Render, SharedString,
+    AnyElement, App, Bounds, Context, Deferred, Element, ElementId, EventEmitter, FocusHandle,
+    GlobalElementId, InspectorElementId, LayoutId, Pixels, Point, Render, SharedString, Style,
     WeakEntity, Window, div, prelude::*, px,
 };
 use uuid::Uuid;
-use workspace_core::messenger::references::{
-    WorkspaceReferenceTarget as Target, message_permalink,
+use workspace_core::{
+    messenger::references::{WorkspaceReferenceTarget as Target, message_permalink},
+    storage::HistoryTime,
 };
 
 use super::{
-    ContactOrigin, ContactPanel, ContactRequest, ContactTarget, Conversation, GuardedText,
-    OpenForwardOriginal, inline_references::MentionNames, protected_body::ProtectedInline,
+    ContactOrigin, ContactPanel, ContactRequest, ContactTarget, Conversation,
+    MessageNavigationSource, inline_references::reference_in_range,
+    protected_body::ProtectedInline,
 };
 use crate::gpui_client::{
+    NextControl, PreviousControl,
     contracts::{ConversationAddress, ConversationReference},
     preferences::{Language, Preferences},
     right_panel::{PanelKey, RightPanel, Scope},
     sidebar::order::sort_topics,
     ui::{
-        Button, ButtonAppearance, Palette, TextRole, label,
-        popup::{MenuInput, menu_layer, menu_navigation, menu_surface},
-        text_role,
+        Button, ButtonAppearance, DateTimePicker, Palette, PickerMode, PickerOptions, TextRole,
+        TimePrecision, label,
+        popup::{menu_layer, menu_surface},
     },
 };
-use crate::platform::message_time::{format_local_time, format_local_time_zone};
+use crate::platform::message_time::local_datetime_for_time;
 
 /// Ссылка, для которой оболочка подбирает точный адрес в текущем каталоге.
 pub(in crate::gpui_client) struct OpenConversationReference {
@@ -41,11 +47,12 @@ pub(super) struct TimeReference {
     source: ReferenceSource, // Исходная ссылка или отзываемая позиция в раскрытом теле.
     anchor: Point<Pixels>,   // Точка открытия в окне.
     focus: FocusHandle,      // Удерживает Escape и Tab внутри всплывающей панели.
+    month_offset: Rc<Cell<i32>>, // Смещение от исходного месяца без хранения защищённой даты.
 }
 
 /// Подтверждает позднее действие на том же элементе обычного или защищённого сообщения.
 #[derive(Clone)]
-enum ReferenceSource {
+pub(super) enum ReferenceSource {
     Open {
         row: Uuid,      // Строка, которая должна оставаться в текущем окне истории.
         target: Target, // Та же цель должна сохраниться после синхронизации.
@@ -55,7 +62,7 @@ enum ReferenceSource {
 
 impl ReferenceSource {
     /// Возвращает исходный бабл для ключа правой панели.
-    fn row(&self) -> Uuid {
+    pub(super) fn row(&self) -> Uuid {
         match self {
             Self::Open { row, .. } => *row,
             Self::Protected(source) => source.row,
@@ -63,7 +70,7 @@ impl ReferenceSource {
     }
 
     /// Повторяет проверку разрешения и версии перед действием и показом результата.
-    fn is_current(&self, view: &Conversation) -> bool {
+    pub(super) fn is_current(&self, view: &Conversation) -> bool {
         view.has_access()
             && match self {
                 Self::Open { row, target } => view.viewport.has_inline_reference(*row, target),
@@ -71,6 +78,36 @@ impl ReferenceSource {
                     .viewport
                     .has_protected_inline_source(source.row, &source.access),
             }
+    }
+
+    /// Читает момент защищённой ссылки под разрешением исходного сообщения.
+    fn with_time<T>(&self, read: impl FnOnce(&HistoryTime) -> Option<T>) -> Option<T> {
+        match self {
+            Self::Open {
+                target: Target::Time(time),
+                ..
+            } => read(time),
+            Self::Protected(source) => source
+                .access
+                .with_body(|text| {
+                    let Target::Time(time) =
+                        reference_in_range(text, source.range.clone())?.target?
+                    else {
+                        return None;
+                    };
+                    read(&time)
+                })
+                .flatten(),
+            _ => None,
+        }
+    }
+
+    /// Передаёт фазы вывода календаря только пока исходный ключ действует.
+    fn with_time_access<T>(&self, draw: impl FnOnce() -> T) -> Option<T> {
+        match self {
+            Self::Open { .. } => Some(draw()),
+            Self::Protected(source) => source.access.with_current(draw),
+        }
     }
 }
 
@@ -122,12 +159,13 @@ impl Conversation {
         if !source.is_current(self) {
             return;
         }
-        self.forward_original = None;
         match target {
             Target::User { user_id, .. } => {
                 self.open_reference_contact(source, *user_id, window, cx)
             }
-            Target::Message(id) => self.open_referenced_message(source, *id, cx),
+            Target::Message(id) => {
+                self.emit_message_target(*id, MessageNavigationSource::reference(source), cx)
+            }
             Target::Stream(id) => self.open_referenced_stream(source, *id, window, cx),
             Target::Topic {
                 stream_id,
@@ -141,7 +179,7 @@ impl Conversation {
             ),
             Target::Url(url) => {
                 if let Some(id) = self.inline_permalink(url) {
-                    self.open_referenced_message(source, id, cx);
+                    self.emit_message_target(id, MessageNavigationSource::reference(source), cx);
                 } else {
                     cx.open_url(url);
                 }
@@ -153,6 +191,7 @@ impl Conversation {
                     source,
                     anchor: window.mouse_position(),
                     focus,
+                    month_offset: Rc::new(Cell::new(0)),
                 });
                 cx.notify();
             }
@@ -164,47 +203,6 @@ impl Conversation {
         let (_, uuid) = url.rsplit_once('/')?;
         let id = Uuid::parse_str(uuid).ok()?;
         (message_permalink(&self.address.route.owner, id).as_deref() == Some(url)).then_some(id)
-    }
-
-    /// Проверяет размещение сообщения через Core, прежде чем менять открытую историю.
-    fn open_referenced_message(
-        &mut self,
-        source: ReferenceSource,
-        id: Uuid,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(runtime) = self.avatar_runtime.clone() else {
-            return;
-        };
-        let address = self.address.clone();
-        self.forward_original = Some(cx.spawn(async move |entity, cx| {
-            let reply = runtime
-                .conversation(address, move |services, address| async move {
-                    services
-                        .messenger
-                        .resolve_forward_original(
-                            &services.sync,
-                            &address.route.owner,
-                            address.generation,
-                            id,
-                        )
-                        .await
-                })
-                .await;
-            let _ = entity.update(cx, |view, cx| {
-                view.forward_original = None;
-                if let Ok(Ok(scope)) = reply.value
-                    && view.address == reply.address
-                    && source.is_current(view)
-                {
-                    cx.emit(OpenForwardOriginal {
-                        address: reply.address,
-                        scope,
-                        id,
-                    });
-                }
-            });
-        }));
     }
 
     /// Просит оболочку найти цель среди маршрутов того же аккаунта.
@@ -323,19 +321,7 @@ impl Conversation {
         }
     }
 
-    /// Закрывает чтение времени по Escape, удерживая фокус в пределах панели.
-    fn time_reference_key(
-        &mut self,
-        input: MenuInput,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if matches!(input, MenuInput::Close) {
-            self.close_reference_time(window, cx);
-        }
-    }
-
-    /// Показывает локальную дату и часовой пояс в доступной области окна.
+    /// Показывает календарь с местной датой и часами в доступной области окна.
     pub(super) fn render_reference_time(
         &mut self,
         window: &mut Window,
@@ -347,57 +333,140 @@ impl Conversation {
             self.close_reference_time(window, cx);
             return None;
         }
-        let locale = Preferences::read_for(cx, &self.address.route.owner).language;
-        let texts = match &time.source {
-            ReferenceSource::Open {
-                target: Target::Time(time),
-                ..
-            } => {
-                let title = format_local_time(time, locale.code());
-                let zone = format_local_time_zone(time, locale.code());
-                [
-                    label(palette, TextRole::Label, title).into_any_element(),
-                    label(palette, TextRole::Caption, time_zone_hint(locale, &zone))
-                        .into_any_element(),
-                ]
-            }
-            ReferenceSource::Protected(source) => [
-                text_role(palette, TextRole::Label)
-                    .child(GuardedText::reference(
-                        source.access.clone(),
-                        source.range.clone(),
-                        locale,
-                        MentionNames::default(),
-                    ))
-                    .into_any_element(),
-                text_role(palette, TextRole::Caption)
-                    .child(GuardedText::reference_zone(
-                        source.access.clone(),
-                        source.range.clone(),
-                        locale,
-                    ))
-                    .into_any_element(),
-            ],
-            _ => return None,
-        };
         let viewport = window.viewport_size();
         let surface = menu_surface(
             "history-reference-time",
             palette,
             viewport,
-            px(280.),
+            px(371.),
             viewport.height,
         )
         .debug_selector(|| "history-reference-time-panel".into())
-        .gap_1()
-        .p_3()
+        .p_0()
+        .overflow_y_scroll()
+        .track_focus(&time.focus)
+        .on_action(|_: &NextControl, _, cx| cx.stop_propagation())
+        .on_action(|_: &PreviousControl, _, cx| cx.stop_propagation())
+        .capture_key_down(cx.listener(|view, event: &gpui::KeyDownEvent, window, cx| {
+            if event.keystroke.key == "escape" && !event.keystroke.modifiers.modified() {
+                cx.stop_propagation();
+                view.close_reference_time(window, cx);
+            }
+        }))
         .on_mouse_down_out(cx.listener(|view, _, window, cx| view.close_reference_time(window, cx)))
-        .children(texts);
-        Some(menu_layer(
-            viewport,
-            time.anchor,
-            menu_navigation(surface, &time.focus, cx, Self::time_reference_key),
-        ))
+        .child(TimeReferencePicker {
+            source: time.source.clone(),
+            month_offset: time.month_offset.clone(),
+            options: PickerOptions {
+                language: Preferences::read_for(cx, &self.address.route.owner).language,
+                palette: Some(palette),
+                mode: PickerMode::ReadOnly,
+            },
+        });
+        Some(menu_layer(viewport, time.anchor, surface))
+    }
+}
+
+/// Календарь одного кадра, который не хранит прочитанную дату в состоянии разговора.
+struct TimeReferencePicker {
+    source: ReferenceSource, // Элемент сообщения, из которого читается момент.
+    options: PickerOptions,  // Язык и палитра текущего окна с режимом чтения.
+    month_offset: Rc<Cell<i32>>, // Открытый месяц относительно исходного момента.
+}
+
+impl IntoElement for TimeReferencePicker {
+    type Element = Self;
+
+    /// Передаёт GPUI элемент с проверками доступа в фазах кадра.
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for TimeReferencePicker {
+    type RequestLayoutState = Option<AnyElement>;
+    type PrepaintState = bool;
+
+    /// Использует ключ внешней панели.
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    /// Использует привязку отладчика внешней панели.
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    /// Собирает локальный календарь, пока доступна точная версия исходной ссылки.
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        self.source
+            .with_time(|time| {
+                let value = local_datetime_for_time(time)?;
+                let precision = if value.second() != 0 || value.nanosecond() != 0 {
+                    TimePrecision::Seconds
+                } else {
+                    TimePrecision::Minutes
+                };
+                let mut picker = cx
+                    .new(|cx| {
+                        DateTimePicker::new(
+                            Some(value),
+                            value.date(),
+                            precision,
+                            self.options,
+                            window,
+                            cx,
+                        )
+                        .embedded()
+                        .with_month_offset(self.month_offset.clone(), cx)
+                    })
+                    .into_any_element();
+                Some((picker.request_layout(window, cx), Some(picker)))
+            })
+            .unwrap_or_else(|| (window.request_layout(Style::default(), [], cx), None))
+    }
+
+    /// Готовит область календаря, пока ключ действует, либо освобождает заготовку.
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        picker: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let allowed = picker.as_mut().is_some_and(|picker| {
+            self.source
+                .with_time_access(|| picker.prepaint(window, cx))
+                .is_some()
+        });
+        if !allowed {
+            *picker = None;
+        }
+        allowed
+    }
+
+    /// Проверяет доступ ещё раз в момент вывода даты и часов.
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        picker: &mut Self::RequestLayoutState,
+        allowed: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if *allowed && let Some(picker) = picker {
+            let _ = self.source.with_time_access(|| picker.paint(window, cx));
+        }
     }
 }
 

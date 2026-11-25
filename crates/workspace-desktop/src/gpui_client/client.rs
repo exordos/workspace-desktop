@@ -5,6 +5,7 @@ mod activity;
 mod encrypted_channel;
 mod history_positions;
 mod key_inbox;
+mod message_navigation;
 mod new_chats;
 mod notification_banner;
 mod preference_runtime;
@@ -23,6 +24,7 @@ use workspace_core::{
 
 use activity::FavoritesLoad;
 use history_positions::HistoryPositions;
+use message_navigation::MessageNavigation;
 use notification_banner::{NotificationBanner, NotificationBannerActions};
 
 use super::{
@@ -33,12 +35,13 @@ use super::{
     },
     avatars::AvatarImages,
     contracts::{
-        AccountSession, AccountSnapshot, ConversationAddress, NotificationRouteError, RuntimeEvent,
-        RuntimeExit, ShellAction, SidebarAction,
+        AccountSession, AccountSnapshot, ChatEntry, ConversationAddress, NotificationRouteError,
+        RuntimeEvent, RuntimeExit, ShellAction, SidebarAction,
     },
     conversation::{
-        Conversation, DetailsProfileAction, DetailsProfileIntent, OpenConversationReference,
-        OpenDetailsTopic, OpenForwardOriginal,
+        Conversation, DetailsProfileAction, DetailsProfileIntent, HistoryTargetCleared,
+        OpenConversationReference, OpenDetailsTopic, OpenMessageTarget, PreparedMessageHistory,
+        ReadingAnchor,
     },
     next_control,
     platform_window::WindowPlatform,
@@ -86,6 +89,13 @@ enum ReturnFocus {
     AccountMenu, // Кнопка выбора аккаунта в шапке.
 }
 
+/// Данные, с которыми клиент открывает подтверждённый оболочкой экран разговора.
+enum ConversationOpening {
+    Standard,                       // Обычное открытие и опора области, если у неё есть Latest.
+    Reading(Option<ReadingAnchor>), // Опора записи переходов, None означает хвост.
+    Prepared(Box<PreparedMessageHistory>), // Подтверждённое окно, уже готовое к первому кадру.
+}
+
 const SIDEBAR_PREFERRED_WIDTH: f32 = 299.;
 const SIDEBAR_MIN_WIDTH: f32 = 240.;
 const SIDEBAR_MAX_WIDTH: f32 = 720.;
@@ -112,6 +122,7 @@ pub(super) struct Client {
     idle: Option<preference_runtime::IdleSession>, // Таймер автовыхода для выбранного входа.
     places: preference_runtime::Places, // Маршруты навигации назад и вперёд выбранного входа.
     conversation: Option<Entity<Conversation>>, // Экран актуального адреса, если он открыт.
+    message_navigation: Option<MessageNavigation>, // Последний переход по UUID или его ошибка.
     favorites_load: Option<FavoritesLoad>, // Запрос или ошибка ещё не открытого чата с собой.
     activity_drafts: Entity<ActivityDrafts>, // Список черновиков и действия для одного видимого входа.
     activity_messages: Entity<ActivityMessages>, // Отметки, упоминания и фоновый счётчик.
@@ -175,6 +186,8 @@ impl Client {
         let right_panel = cx.new(|cx| RightPanel::new(initial_focus.clone(), cx));
         cx.observe(&right_panel, |_, _, cx| cx.notify()).detach();
         sidebar.update(cx, |sidebar, _| sidebar.set_action_panel(&right_panel));
+        let folder_dialog = sidebar.read(cx).folder_dialog();
+        cx.observe(&folder_dialog, |_, _, cx| cx.notify()).detach();
         let activity_drafts = cx.new(|_| ActivityDrafts::new(runtime.clone()));
         cx.subscribe(&activity_drafts, |client, _, draft: &OpenDraft, cx| {
             if client.visible_activity() != Some(&draft.address) {
@@ -242,6 +255,7 @@ impl Client {
             conversation: None,
             encrypted_channel: None,
             key_response_scan: None,
+            message_navigation: None,
             favorites_load: None,
             activity_drafts,
             activity_messages,
@@ -364,6 +378,10 @@ impl Client {
             }
             RuntimeEvent::Sync(update) => {
                 use workspace_core::sync::{HistoryRevocation, SyncChange};
+                self.note_message_navigation_change(Some(update));
+                if let SyncChange::HistoryAccessRevoked(revoked) = update.change {
+                    self.places.revoke_reading(update, revoked);
+                }
                 if let Some((activation, incoming)) = self.runtime.incoming_key(update) {
                     self.queue_key_response(activation, incoming, cx);
                 }
@@ -411,6 +429,7 @@ impl Client {
                 }
             }
             RuntimeEvent::SyncLagged => {
+                self.note_message_navigation_change(None);
                 if let Some(session) = self.shell.selected()
                     && let Some((_, activation)) = self.runtime.message_encryption(session)
                 {
@@ -469,6 +488,16 @@ impl Client {
 
     /// Выполняет команду оболочки и обновляет связанные части того же окна.
     fn apply(&mut self, effect: Option<ShellEffect>, cx: &mut Context<Self>) {
+        self.apply_opening(effect, ConversationOpening::Standard, cx);
+    }
+
+    /// Использует уже готовые данные ленты, когда их передал переход к сообщению или назад.
+    fn apply_opening(
+        &mut self,
+        effect: Option<ShellEffect>,
+        opening: ConversationOpening,
+        cx: &mut Context<Self>,
+    ) {
         let effect = self.reconcile_sign_in(cx).or(effect);
         if let Some(activation) = self.runtime.select_encryption_session(self.shell.selected()) {
             self.reconcile_key_inbox(activation, cx);
@@ -476,10 +505,10 @@ impl Client {
         self.sync_right_panel_context(cx);
         match effect {
             Some(ShellEffect::OpenConversation(address)) => {
-                self.open_conversation_view(address, None, cx);
+                self.open_conversation_view(address, None, opening, cx);
             }
             Some(ShellEffect::OpenDraft(address, id)) => {
-                self.open_conversation_view(address, Some(id), cx);
+                self.open_conversation_view(address, Some(id), opening, cx);
             }
             Some(ShellEffect::CloseConversation) => {
                 self.save_history_position(cx);
@@ -542,6 +571,7 @@ impl Client {
             );
         });
         self.sync_activity(cx);
+        self.prune_message_navigation(cx);
         self.record_place();
         cx.notify();
     }
@@ -551,6 +581,7 @@ impl Client {
         &mut self,
         address: ConversationAddress,
         draft: Option<uuid::Uuid>,
+        opening: ConversationOpening,
         cx: &mut Context<Self>,
     ) {
         self.save_history_position(cx);
@@ -558,17 +589,36 @@ impl Client {
         self.open_section(TopBarSection::Chats, cx);
         let runtime = self.runtime.clone();
         let panel = self.right_panel.clone();
-        let restore = self.history_positions.take(&address);
+        let restore = if matches!(opening, ConversationOpening::Standard)
+            && address.route.entry == ChatEntry::Latest
+        {
+            self.history_positions.take(&address)
+        } else {
+            None
+        };
         let favorites = self
             .shell
             .activity()
             .is_some_and(|address| address.page == super::contracts::ActivityPage::Favorites);
         let conversation = cx.new(|cx| {
-            let mut view = match draft {
-                Some(id) => {
-                    Conversation::open_with_draft(address, runtime, panel, restore, Some(id), cx)
+            let mut view = match opening {
+                ConversationOpening::Prepared(prepared) => {
+                    Conversation::open_prepared(address, runtime, panel, *prepared, cx)
                 }
-                None => Conversation::open(address, runtime, panel, restore, cx),
+                ConversationOpening::Reading(restore) => Conversation::open_at_reading_position(
+                    address, runtime, panel, restore, draft, cx,
+                ),
+                ConversationOpening::Standard => match draft {
+                    Some(id) => Conversation::open_with_draft(
+                        address,
+                        runtime,
+                        panel,
+                        restore,
+                        Some(id),
+                        cx,
+                    ),
+                    None => Conversation::open(address, runtime, panel, restore, cx),
+                },
             };
             view.set_favorites_presentation(favorites);
             view
@@ -578,12 +628,22 @@ impl Client {
                 client.open_details_topic(target, cx)
             }),
         );
-        cx.subscribe(&conversation, |client, _, target: &OpenForwardOriginal, cx| {
-            if client.section == TopBarSection::Chats {
-                let effect = client.shell.open_forward_original(&target.address, target.scope, target.id);
-                client.apply(effect, cx);
-            }
-        })
+        cx.subscribe(
+            &conversation,
+            |client, sender, target: &OpenMessageTarget, cx| {
+                client.open_message_target(&sender, target, cx);
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &conversation,
+            |client, sender, _: &HistoryTargetCleared, cx| {
+                if client.conversation.as_ref() == Some(&sender) {
+                    client.message_navigation = None;
+                    cx.notify();
+                }
+            },
+        )
         .detach();
         cx.subscribe(
             &conversation,
@@ -610,6 +670,7 @@ impl Client {
         if self.sign_in.is_some() || self.status().is_some() {
             return;
         }
+        self.message_navigation = None;
         self.sidebar.update(cx, |view, cx| view.on_hidden(cx));
         let form = cx.new(|cx| SignIn::add_account(self.runtime.clone(), cx));
         cx.subscribe(&form, |client, _, action: &SignInAction, cx| {
@@ -648,6 +709,7 @@ impl Client {
     /// Меняет показанный раздел, сохраняя открытый разговор до возврата в мессенджер.
     fn open_section(&mut self, section: TopBarSection, cx: &mut Context<Self>) {
         if self.status().is_none() && (self.licenses.take().is_some() || self.section != section) {
+            self.message_navigation = None;
             self.section = section;
             if section != TopBarSection::Chats {
                 self.sidebar.update(cx, |view, cx| view.on_hidden(cx));
@@ -665,6 +727,7 @@ impl Client {
 
     /// Открывает лицензионный реестр в рабочей области и закрывает сайдбар версии.
     fn open_licenses(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.message_navigation = None;
         let client = cx.weak_entity();
         let licenses = cx.new(|cx| Licenses::new(client, cx));
         self.licenses = Some(licenses.clone());
@@ -702,6 +765,22 @@ impl Client {
         }
     }
 
+    /// Передаёт истории, осталась ли она открытой и видимой под слоями рабочего окна.
+    fn sync_conversation_read_visibility(&self, window: &Window, cx: &mut Context<Self>) {
+        if let Some(conversation) = &self.conversation {
+            let visible = self.section == TopBarSection::Chats
+                && self.licenses.is_none()
+                && self.sign_in.is_none()
+                && self.status().is_none()
+                && !self.right_panel.read(cx).blocks_reading(window)
+                && !self.sidebar.read(cx).folder_dialog().read(cx).is_open();
+            let address = self.shell.conversation();
+            conversation.update(cx, |view, cx| {
+                view.set_read_surface_visible(visible && address == Some(view.address()), cx);
+            });
+        }
+    }
+
     /// Запоминает опору старого экрана перед тем, как заменить его новым адресом.
     fn save_history_position(&mut self, cx: &Context<Self>) {
         let Some(conversation) = &self.conversation else {
@@ -722,7 +801,10 @@ impl Client {
     /// Снимает подписки со старого разговора до замены его маршрута или входа.
     fn release_old_conversation_avatars(&self, cx: &mut Context<Self>) {
         if let Some(conversation) = &self.conversation {
-            conversation.update(cx, |view, cx| view.set_avatars_visible(false, cx));
+            conversation.update(cx, |view, cx| {
+                view.set_avatars_visible(false, cx);
+                view.set_read_surface_visible(false, cx);
+            });
         }
     }
 
@@ -1068,6 +1150,7 @@ impl Render for Client {
         self.open_requested_profile(window, cx);
         self.open_requested_details_profile(window, cx);
         self.open_requested_encrypted_channel(window, cx);
+        self.sync_conversation_read_visibility(window, cx);
         let palette = Palette::for_window(window, cx);
         let locale = super::preferences::Preferences::read(cx).language;
         let root = div()
@@ -1238,6 +1321,7 @@ impl Render for Client {
                 .p_2()
                 .text_color(palette.danger)
         }))
+        .children(self.render_message_navigation_problem(palette, cx))
         .child(
             div()
                 .flex()
@@ -1553,8 +1637,11 @@ mod tests {
     /// Открывает отдельные страницы из профиля и возвращает фокус в шапку.
     #[gpui::test]
     fn profile_opens_personal_info_and_settings_pages(cx: &mut TestAppContext) {
+        use crate::gpui_client::preferences::{Preferences, workspace_direct};
+
         cx.update(bind_keys);
         let directory = tempfile::tempdir().unwrap();
+        cx.update(|app| Preferences::install(directory.path(), app));
         let (runtime, _events) = RuntimeClient::start_in(directory.path().into()).unwrap();
         let (client, ui) =
             cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
@@ -1596,6 +1683,11 @@ mod tests {
         click(ui, "profile-back");
         click(ui, "profile-settings");
         assert!(ui.debug_bounds("profile-settings-page").is_some());
+        assert!(!ui.read(workspace_direct::enabled));
+        click(ui, "profile-workspace-direct");
+        assert!(ui.read(workspace_direct::enabled));
+        click(ui, "profile-workspace-direct");
+        assert!(!ui.read(workspace_direct::enabled));
         for width in [700., 1200.] {
             ui.simulate_resize(size(px(width), px(640.)));
             ui.run_until_parked();

@@ -114,15 +114,22 @@ const COMMANDS: [Command; 10] = [
     ),
 ];
 const STYLE_GROUP_END: usize = 4;
-const DIVIDERS: [usize; 3] = [0, STYLE_GROUP_END, 6];
+const DIVIDERS: [usize; 2] = [STYLE_GROUP_END, 6];
 const TOOLBAR_GAP: Pixels = px(8.);
 const EXTRA_COMMANDS: usize = 3;
+
+/// Команды панели, которые используют состояние композера.
+pub(super) struct ToolbarExtras {
+    pub file: Option<Stateful<Div>>, // Вложение в подтверждённом обычном разговоре.
+    pub time: Div,                   // Вставка даты и времени в текст.
+    pub fragment: Option<Stateful<Div>>, // Защита выделения в поддерживаемом разговоре.
+}
 
 /// Устойчивый фокус и позиция прокрутки команд одного редактора.
 pub(super) struct Toolbar {
     toggle: FocusHandle,         // Кнопка раскрытия переезжает из поля в ряд.
     commands: [FocusHandle; 10], // Кнопки сохраняют фокус при перерисовке.
-    extras: [FocusHandle; EXTRA_COMMANDS], // Фокус для времени, файла и защищённого фрагмента.
+    extras: [FocusHandle; EXTRA_COMMANDS], // Фокус для файла, времени и защищённого фрагмента.
     scroll: ScrollHandle,        // Показывает команды за правой границей узкого окна.
     last_focused: Option<usize>, // Дочерний элемент, который уже показан прокруткой.
     last_width: Rc<Cell<Pixels>>, // Фактическая ширина ряда после расчёта размеров.
@@ -184,29 +191,70 @@ impl Toolbar {
         palette: Palette,
         can_format: bool,
         language: Language,
-        extras: [Option<AnyElement>; EXTRA_COMMANDS],
+        extras: ToolbarExtras,
         window: &Window,
         cx: &Context<Composer>,
     ) -> Stateful<Div> {
-        let focused = if self.toggle.is_focused(window) {
-            Some((0, self.toggle.clone()))
-        } else {
-            self.commands
-                .iter()
-                .chain(
-                    self.extras
-                        .iter()
-                        .zip(&extras)
-                        .filter_map(|(focus, element)| element.as_ref().map(|_| focus)),
-                )
-                .enumerate()
-                .find(|(_, focus)| focus.is_focused(window))
-                .map(|(index, focus)| {
-                    // В ScrollHandle учитываются и дочерние элементы-разделители.
-                    let child = 1 + index + DIVIDERS.partition_point(|&divider| divider <= index);
-                    (child, focus.clone())
-                })
-        };
+        let [file_focus, time_focus, fragment_focus] = &self.extras;
+        let mut items: Vec<(AnyElement, Option<&FocusHandle>)> = vec![(
+            self.toggle(true, palette, language, cx).into_any_element(),
+            Some(&self.toggle),
+        )];
+        if let Some(file) = extras.file {
+            items.push((file.ml(TOOLBAR_GAP).into_any_element(), Some(file_focus)));
+            items.push((separator(palette).into_any_element(), None));
+        }
+        items.push((
+            extras.time.ml(TOOLBAR_GAP).into_any_element(),
+            Some(time_focus),
+        ));
+        items.push((separator(palette).into_any_element(), None));
+
+        let target = cx.entity().downgrade();
+        for (index, command) in COMMANDS.iter().enumerate() {
+            if DIVIDERS.contains(&index) {
+                items.push((separator(palette).into_any_element(), None));
+            }
+            // Ссылка, жирный, курсив и зачёркивание стоят вплотную внутри одной группы.
+            let gap = if (1..STYLE_GROUP_END).contains(&index) {
+                px(0.)
+            } else {
+                TOOLBAR_GAP
+            };
+            let target = target.clone();
+            let focus = &self.commands[index];
+            let button = icon_button(
+                command.id,
+                language.tr(command.title_key),
+                (command.icon, command.glyph),
+                palette,
+                focus,
+                !can_format,
+                move |window, app| {
+                    let _ = target.update(app, |composer, cx| {
+                        composer
+                            .editor
+                            .update(cx, |editor, cx| editor.apply_format(command.format, cx));
+                        composer.focus_editor(window, cx);
+                    });
+                },
+            );
+            items.push((button.ml(gap).into_any_element(), Some(focus)));
+        }
+        if let Some(fragment) = extras.fragment {
+            items.push((
+                fragment.ml(TOOLBAR_GAP).into_any_element(),
+                Some(fragment_focus),
+            ));
+        }
+
+        // Индекс прокрутки включает разделители и зависит от того, какие кнопки видны.
+        let focused = items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (_, focus))| focus.map(|focus| (index, focus)))
+            .find(|(_, focus)| focus.is_focused(window))
+            .map(|(index, focus)| (index, focus.clone()));
         let focused_index = focused.as_ref().map(|(index, _)| *index);
         if self.last_focused != focused_index {
             self.last_focused = focused_index;
@@ -216,8 +264,7 @@ impl Toolbar {
         }
         let scroll = self.scroll.clone();
         let last_width = self.last_width.clone();
-        let target = cx.entity().downgrade();
-        let mut row = div()
+        div()
             .on_children_prepainted(move |_, window, app| {
                 let width = scroll.bounds().size.width;
                 let resized = last_width.replace(width) != width;
@@ -243,49 +290,22 @@ impl Toolbar {
             .pl(COMPOSER_INSET)
             .overflow_x_scroll()
             .track_scroll(&self.scroll)
-            .child(self.toggle(true, palette, language, cx));
-        for (index, command) in COMMANDS.iter().enumerate() {
-            if DIVIDERS.contains(&index) {
-                row = row.child(separator(palette).ml(TOOLBAR_GAP));
-            }
-            // Ссылка, жирный, курсив и зачёркивание стоят вплотную внутри одной группы.
-            let gap = if (1..STYLE_GROUP_END).contains(&index) {
-                px(0.)
-            } else {
-                TOOLBAR_GAP
-            };
-            let target = target.clone();
-            row = row.child(
-                icon_button(
-                    command.id,
-                    language.tr(command.title_key),
-                    (command.icon, command.glyph),
-                    palette,
-                    &self.commands[index],
-                    !can_format,
-                    move |window, app| {
-                        let _ = target.update(app, |composer, cx| {
-                            composer
-                                .editor
-                                .update(cx, |editor, cx| editor.apply_format(command.format, cx));
-                            composer.focus_editor(window, cx);
-                        });
-                    },
-                )
-                .ml(gap),
-            );
-        }
-        row.children(extras.into_iter().flatten())
+            .children(items.into_iter().map(|(element, _)| element))
     }
 }
 
 /// Отделяет группы команд вертикальной линией по макету.
 fn separator(palette: Palette) -> Div {
-    div().w(px(1.)).h(px(28.)).flex_none().bg(palette.border)
+    div()
+        .ml(TOOLBAR_GAP)
+        .w(px(1.))
+        .h(px(28.))
+        .flex_none()
+        .bg(palette.border)
 }
 
 /// Рисует доступную клавиатуре кнопку, используя общие состояния и подсказку.
-fn icon_button(
+pub(super) fn icon_button(
     id: &'static str,
     title: &'static str,
     (icon, [width, height]): (Icon, [f32; 2]),
@@ -302,12 +322,23 @@ fn icon_button(
     } else {
         palette.icon
     };
+    let toolbar_palette = Palette {
+        card_hover: palette.icon_hover_fill.opacity(0.35),
+        ..palette
+    };
     button
-        .render(palette, Some(focus), activate)
+        .render(toolbar_palette, Some(focus), activate)
         .debug_selector(move || id.into())
+        .group(id)
         .size(px(32.))
         .flex_none()
         .p(px(0.))
-        .child(icon.element(px(width), color).h(px(height)))
+        .child(
+            icon.element(px(width), color)
+                .h(px(height))
+                .when(!disabled, |glyph| {
+                    glyph.group_hover(id, |style| style.text_color(palette.icon_hover))
+                }),
+        )
         .tooltip(move |_, app| popup::tooltip(palette, title.into(), app))
 }

@@ -2,15 +2,20 @@
 
 mod activity_drafts;
 mod calls;
+mod composer_attachments;
 mod drafts;
 mod encryption;
 mod fragment_forward;
 mod gallery;
 mod key_lifecycle;
 mod media;
+mod message_navigation;
 mod new_chats;
 mod position;
 mod reactions;
+mod read_boundary;
+mod shared_scenario;
+mod stand_scenario;
 
 use std::{
     convert::Infallible,
@@ -352,7 +357,9 @@ impl DetailsFixture {
 /// Записывает наблюдения сервера о готовности подключений и принятой отправке.
 #[derive(Default)]
 struct Received {
+    shared: Option<shared_scenario::Fixture>, // Общая история двух тестовых участников.
     media: Option<media::Fixture>, // Карточка фото из обычного сообщения и наблюдения HTTPS.
+    composer_attachments: Option<composer_attachments::Fixture>, // Multipart, удаление и отправка вложений.
     drafting: Option<drafts::Fixture>, // Сообщения и задержка проверки цитаты для черновиков.
     server_drafts: Option<activity_drafts::Fixture>, // Страницы, чтение и удаление серверных черновиков.
     encrypted_history: bool,                         // Штатный каталог и история защищённой лички.
@@ -366,12 +373,14 @@ struct Received {
     encrypted_edits: Mutex<HashMap<Uuid, &'static str>>, // Текущие REST-версии защищённых сообщений.
     encryption_live: Option<broadcast::Sender<RecoverySignal>>, // Правки шифротекста через настоящий WSS.
     history_position: Option<position::Fixture>, // Длинная личка и управляемая догрузка старой страницы.
-    reactions: Option<reactions::Fixture>, // Реакция в истории и её серверные команды.
+    message_navigation: Option<message_navigation::Fixture>, // Цели перехода и задержка страницы истории.
+    read_boundary: Option<read_boundary::Fixture>, // Серверная граница чтения и отложенные счётчики.
+    reactions: Option<reactions::Fixture>,         // Реакция в истории и её серверные команды.
     sent: Mutex<Vec<(Uuid, &'static str)>>, // Публичный UUID и тема принятого POST в порядке поступления.
     ready: AtomicUsize,                     // Сколько подключений подтвердили готовность через WSS.
     targets: AtomicUsize,                   // Сколько проверок доступа к стриму вернул HTTPS.
     direct_topic_changed: AtomicBool,       // Стрим лички объявляет другую тему по умолчанию.
-    direct_topics: bool,                   // Каталог возвращает общую и дополнительную темы лички.
+    direct_topics: bool,                    // Каталог возвращает общую и дополнительную темы лички.
     direct_encrypted: AtomicBool, // После открытия редактора обычный текст может стать недоступен.
     direct_unavailable: AtomicBool, // Проверка стрима лички временно отвечает 503.
     delayed: Option<DelayedHistory>, // Сценарий позднего ответа, если тест его включил.
@@ -531,6 +540,7 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
             .to_str()
             .unwrap();
         let two_accounts = state.delayed.is_some()
+            || state.shared.is_some()
             || state.recovery.is_some()
             || state.topic.is_some()
             || state.protected_wire.is_some()
@@ -576,6 +586,16 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
             && let Some(sender) = &state.encryption_live
         {
             live = Some((sender.subscribe(), false));
+        }
+        if user == USER
+            && let Some(fixture) = &state.read_boundary
+        {
+            live = Some((fixture.live.subscribe(), false));
+        }
+        if user == PEER
+            && let Some(fixture) = &state.shared
+        {
+            live = Some((fixture.live.subscribe(), false));
         }
         let key = request.headers().get(header::SEC_WEBSOCKET_KEY).unwrap();
         let accept = derive_accept_key(key.as_bytes());
@@ -626,7 +646,8 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
     let (user, peer) = match request.headers()[header::AUTHORIZATION].to_str().unwrap() {
         "Bearer local-user" => (USER, PEER),
         "Bearer local-peer"
-            if state.delayed.is_some()
+            if state.shared.is_some()
+                || state.delayed.is_some()
                 || state.recovery.is_some()
                 || state.topic.is_some()
                 || state.protected_wire.is_some()
@@ -636,6 +657,21 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         }
         _ => panic!("HTTPS должен использовать тестовый вход открытого профиля"),
     };
+    if let Some(fixture) = &state.shared
+        && fixture.handles(&request)
+    {
+        return fixture.response(request, user).await;
+    }
+    if let Some(fixture) = &state.read_boundary
+        && let Some(response) = fixture.response(&request, user, peer)
+    {
+        return response;
+    }
+    if let Some(fixture) = &state.composer_attachments
+        && fixture.handles(&request)
+    {
+        return fixture.response(request, user).await;
+    }
     if let Some(media) = &state.media
         && let Some(response) = media.response(&request, user, peer)
     {
@@ -673,9 +709,15 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
     if path == MESSAGES
         && request.method() == Method::GET
         && (query_value(&request, "mentioned") == Some("true")
-            || query_value(&request, "starred") == Some("true"))
+            || query_value(&request, "starred") == Some("true")
+            || query_value(&request, "read") == Some("false"))
     {
         return json_response(StatusCode::OK, json!([]));
+    }
+    if let Some(fixture) = &state.message_navigation
+        && let Some(response) = fixture.response(&request, user, peer).await
+    {
+        return response;
     }
     if let Some(fixture) = &state.new_chats
         && fixture.handles(&request)
@@ -901,7 +943,7 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         "default_topic_uuid": state.direct_topic(),
         "encryption": state.direct_encrypted.load(Ordering::SeqCst), "notification_mode":"all_messages",
     });
-    if state.fragment_forward.is_some() {
+    if state.fragment_forward.is_some() || state.read_boundary.is_some() || state.shared.is_some() {
         stream["source_name"] = json!("native");
     }
     if state.protected_wire.is_some() {
@@ -909,7 +951,11 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
         stream["owner"] = json!(PEER);
         stream["current_encryption_key_uuid"] = json!(encryption::KEY);
         stream["allow_key_sharing_by_holders"] = json!(true);
-        if let Some(preview) = state.protected_wire.as_ref().and_then(encryption::ProtectedWire::preview) {
+        if let Some(preview) = state
+            .protected_wire
+            .as_ref()
+            .and_then(encryption::ProtectedWire::preview)
+        {
             stream["last_message_uuid"] = json!(preview);
         }
     }
@@ -935,6 +981,11 @@ async fn response(mut request: Request<Incoming>, state: Arc<Received>) -> Respo
                 "name": "Общая", "is_default": true},
             {"uuid": NEXT_DIRECT_TOPIC, "stream_uuid": STREAM, "project_id": PROJECT,
                 "user_uuid": user, "name": "Вторая тема"},
+        ]),
+        TOPICS if state.drafting.as_ref().is_some_and(|draft| !draft.hide_local_topic) && state.topic.is_some() => json!([
+            {"uuid": TOPIC, "stream_uuid": STREAM, "project_id": PROJECT, "user_uuid": user,
+                "name": "Общая", "is_default": true},
+            channel_topic(user, TopicGate::Open),
         ]),
         TOPICS if state.topic.is_some() => json!([channel_topic(user, TopicGate::Open)]),
         MESSAGES
@@ -1789,7 +1840,7 @@ fn direct_destination_change_requires_manual_recheck_before_enqueue(cx: &mut Tes
         // Пока цель не перепроверена, даже следующий Enter не пишет снимок.
         assert!(ui.read(|app| {
             let view = client.read(app).conversation.as_ref().unwrap();
-            view.read(app).history_and_editor_focus(app).1.is_none()
+            view.read(app).history_and_editor_focus(app).1.is_some()
         }));
         press_enter(ui);
         assert_eq!(
@@ -2494,8 +2545,11 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
     ui.run_until_parked();
     assert!(ui.debug_bounds("details-topic-menu").is_some());
     click(ui, "details-topic-notification-follow");
-    until(ui, "контекстное меню меняет уведомления указанной темы", |ui| {
-        details.topic_followed.load(Ordering::SeqCst)
+    until(
+        ui,
+        "контекстное меню меняет уведомления указанной темы",
+        |ui| {
+            details.topic_followed.load(Ordering::SeqCst)
             && ui.read(|app| topic.read(app).tested_details(app, |snapshot| matches!(
                 snapshot,
                 Some(SidebarDetails::Channel(channel)) if channel.topics.iter().any(|row|
@@ -2503,7 +2557,8 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
                     row.notification_mode == workspace_core::messenger::details::TopicNotificationMode::Follow
                 )
             )))
-    });
+        },
+    );
     let reads = details.channel_requests.load(Ordering::SeqCst);
     click(ui, CHANNEL_SECOND_TOPIC_ROW);
     until(
@@ -2658,17 +2713,21 @@ fn sidebar_members_offer_only_allowed_actions_and_refresh_after_changes(cx: &mut
     ui.run_until_parked();
     click(ui, PICK_INVITEE);
     click(ui, "details-member-picker-submit");
-    until(ui, "выбранный пользователь отправлен на сервер", |_| {
-        membership.invited.load(Ordering::SeqCst)
-    });
+    until(
+        ui,
+        "выбранный пользователь отправлен на сервер",
+        |_| membership.invited.load(Ordering::SeqCst),
+    );
     until(
         ui,
         "подтверждённый POST добавляет привязку в панель",
         |ui| channel_matches(ui, &|channel| channel.members.len() == 3),
     );
-    until(ui, "подтверждённое приглашение закрывает диалог", |ui| {
-        ui.read(|app| !client.read(app).right_panel.read(app).has_modal())
-    });
+    until(
+        ui,
+        "подтверждённое приглашение закрывает диалог",
+        |ui| ui.read(|app| !client.read(app).right_panel.read(app).has_modal()),
+    );
     click_member_action(ui, REMOVE_INVITEE);
     until(
         ui,
@@ -3206,6 +3265,7 @@ async fn local_wss_recovers_pruned_cursor_and_changed_epoch() {
                         generation,
                         SOURCE_ID,
                         Event::MessageCreated {
+                            read: None,
                             cursor,
                             message: StoredMessage {
                                 id: PEER_ROW.to_string(),

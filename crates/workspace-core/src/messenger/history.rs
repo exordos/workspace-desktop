@@ -1,4 +1,4 @@
-//! Открывает историю, догружает её края и находит окно для уведомления.
+//! Находит точную тему сообщения, открывает историю и догружает её края.
 
 use std::{
     collections::HashSet,
@@ -27,6 +27,7 @@ use crate::{
 use super::{
     MessengerSource,
     files::{MediaFile, OpenMediaError},
+    quote::QuoteSourceFence,
 };
 
 /// Причина, по которой мессенджер не смог вернуть окно.
@@ -240,6 +241,100 @@ impl LatestHistoryOpening<'_> {
 }
 
 impl MessengerSource {
+    /// Сверяет флаги в открытом окне после события с неточной областью прочитанного.
+    pub async fn refresh_history_read(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        window_scope: HistoryScope,
+        window_id: i64,
+        scope: Option<HistoryScope>,
+    ) -> Result<(), OpenHistoryError> {
+        let Some((guard, candidates)) =
+            sync.prepare_history_read(owner, generation, window_scope, window_id, scope)?
+        else {
+            return Ok(());
+        };
+        let Some((first, last)) = candidates.first().zip(candidates.last()) else {
+            return Ok(());
+        };
+        let bounds = (&first.metadata.created_at, &last.metadata.created_at);
+        let auth = sync.auth();
+        let token = auth
+            .access_token_for_generation(owner, Service::Messenger, generation)
+            .await?;
+        let scope = HistoryScope {
+            stream_id: window_scope.stream_id,
+            topic_id: window_scope
+                .topic_id
+                .or_else(|| scope.and_then(|scope| scope.topic_id)),
+        };
+        let ids: HashSet<_> = candidates.iter().map(|message| message.id).collect();
+        let mut marker = None;
+        let mut last_key = None;
+        let mut confirmed = Vec::new();
+        loop {
+            let response = self
+                .rest
+                .history_read_page(owner, &token, scope, bounds, marker.as_deref())
+                .await;
+            auth.with_active_generation(owner, generation, || ())?;
+            let (page, next) = match response {
+                Err(OpenHistoryError::AccessLost) if scope != window_scope => {
+                    // Удаление одной темы не лишает доступа ко всему личному разговору.
+                    self.rest
+                        .check_history_scope(owner, &token, window_scope)
+                        .await?;
+                    auth.with_active_generation(owner, generation, || ())?;
+                    return Err(OpenHistoryError::StaleWindow);
+                }
+                other => other?,
+            };
+            if let Some(first) = page.first()
+                && last_key
+                    .as_ref()
+                    .is_some_and(|key| key >= &(first.created_at.clone(), first.id))
+            {
+                return Err(SourceError::InvalidResponse.into());
+            }
+            last_key = page.last().map(|row| (row.created_at.clone(), row.id));
+            confirmed.extend(page.into_iter().filter(|row| ids.contains(&row.id)));
+            let Some(next) = next else { break };
+            marker = Some(next);
+        }
+        sync.save_history_read(owner, generation, guard, &confirmed)?;
+        Ok(())
+    }
+
+    /// Находит точную тему сообщения и подтверждает право открыть её в указанном входе.
+    pub async fn resolve_message_history_scope(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        id: Uuid,
+    ) -> Result<HistoryScope, OpenHistoryError> {
+        let (original, fence) = self
+            .quote_original_with_fence(sync, owner, generation, None, id)
+            .await?;
+        let auth = sync.auth();
+        let token = auth
+            .access_token_for_generation(owner, Service::Messenger, generation)
+            .await?;
+        let scope = self
+            .rest
+            .presentation_scope(owner, &token, &original)
+            .await?;
+        let current = auth.with_active_generation(owner, generation, || {
+            QuoteSourceFence::capture(sync.storage(), owner, scope, id)
+        })??;
+        if current != fence {
+            return Err(OpenHistoryError::StaleWindow);
+        }
+        Ok(scope)
+    }
+
     /// Считает известные позиции в области, с которой откроется галерея.
     pub fn gallery_counts(
         &self,
