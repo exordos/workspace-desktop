@@ -4,7 +4,9 @@ use gpui::{Context, Div, SharedString, div, prelude::*, px};
 use workspace_desktop::gpui_client::{
     Language,
     ui::{
-        Avatar, Button, DeliveryMark, MessageBubble, Palette, TextRole, label,
+        Avatar, Button, DeliveryMark, MessageBubble, Palette, TextRole,
+        animation::Motion,
+        label,
         poll::{PollAction, PollAddOption, PollBubble, PollOption, PollQuestion, PollResult},
     },
 };
@@ -16,13 +18,21 @@ use super::Panel;
 pub(super) struct Examples {
     choice: Option<SharedString>, // Выбранный вариант первого примера.
     expanded: bool,               // Показывать ли опрос из 20 вопросов по 20 вариантов.
+    motion_disabled: bool,        // Выключено ли движение в интерактивном примере.
 }
 
 impl Examples {
     /// Расставляет состояния опроса рядом с первым интерактивным примером.
-    pub(super) fn render(&self, palette: Palette, cx: &Context<Panel>) -> Div {
+    pub(super) fn render(
+        &self,
+        palette: Palette,
+        panel_id: &'static str,
+        cx: &Context<Panel>,
+    ) -> Div {
         let panel = cx.entity().downgrade();
         let boundary_target = panel.clone();
+        let motion_target = panel.clone();
+        let language = Language::Ru;
         let mut schedule = schedule(
             self.choice.is_some(),
             self.choice.as_ref().map(SharedString::as_str),
@@ -38,11 +48,12 @@ impl Examples {
             participants: self.choice.is_some().then_some(total),
             ..bubble("poll-interactive", vec![schedule])
         }
-        .render(
+        .render_with_motion(
             message(false),
             palette,
-            Language::Ru,
+            language,
             false,
+            Motion::from_preference(!self.motion_disabled),
             move |action, _, app| {
                 if let PollAction::Vote {
                     option, selected, ..
@@ -60,6 +71,19 @@ impl Examples {
         } else {
             "Показать опрос 20 × 20"
         };
+        let motion_label = if self.motion_disabled {
+            "poll_bubble.gallery_motion_off"
+        } else {
+            "poll_bubble.gallery_motion_on"
+        };
+        let motion = Button::new("gallery-poll-motion", language.tr(motion_label))
+            .render(palette, None, move |_, app| {
+                let _ = motion_target.update(app, |panel, cx| {
+                    panel.polls.motion_disabled = !panel.polls.motion_disabled;
+                    cx.notify();
+                });
+            })
+            .debug_selector(move || format!("{panel_id}-poll-motion"));
 
         div()
             .flex()
@@ -67,6 +91,7 @@ impl Examples {
             .min_w_0()
             .gap_3()
             .child(label(palette, TextRole::Heading, "Опросы"))
+            .child(div().flex().child(motion))
             .child(scene(palette, "Одиночный выбор", interactive))
             .children(
                 fixtures()
@@ -459,4 +484,34 @@ fn scene(palette: Palette, title: &'static str, contents: Div) -> Div {
         .gap_1()
         .child(label(palette, TextRole::Label, title))
         .child(contents)
+}
+
+#[cfg(all(test, feature = "gpui-test"))]
+mod tests {
+    use gpui::{Modifiers, TestAppContext, size};
+
+    use super::{super::Gallery, *};
+
+    /// Переключатель тестового опроса действует только в выбранной панели галереи.
+    #[gpui::test]
+    fn poll_motion_can_be_switched_independently_in_each_gallery_panel(cx: &mut TestAppContext) {
+        let (gallery, ui) = cx.add_window_view(|window, cx| Gallery::new(false, window, cx));
+        ui.simulate_resize(size(px(960.), px(2400.)));
+        ui.run_until_parked();
+
+        for (selector, expected) in [
+            ("light-poll-motion", [true, false]),
+            ("dark-poll-motion", [true, true]),
+            ("light-poll-motion", [false, true]),
+        ] {
+            let button = ui.debug_bounds(selector).expect("кнопка анимаций опроса");
+            ui.simulate_click(button.center(), Modifiers::none());
+            ui.run_until_parked();
+            let modes = ui.read(|app| {
+                let gallery = gallery.read(app);
+                [&gallery.light, &gallery.dark].map(|panel| panel.read(app).polls.motion_disabled)
+            });
+            assert_eq!(modes, expected);
+        }
+    }
 }

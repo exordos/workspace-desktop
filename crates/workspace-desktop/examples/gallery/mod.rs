@@ -192,7 +192,7 @@ impl Panel {
                 label(palette, TextRole::Body, "Редактирование недоступно")
                     .text_color(palette.text_muted),
             ))
-            .child(self.polls.render(palette, cx))
+            .child(self.polls.render(palette, self.id, cx))
             .child(self.pickers.render(palette, cx))
     }
 

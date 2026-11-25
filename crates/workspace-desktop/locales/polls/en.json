@@ -18,6 +18,8 @@
     "you_voted": "You voted",
     "view_votes": "View votes",
     "completed_at": "Closed %{date}",
-    "unavailable": "Could not load the poll"
+    "unavailable": "Could not load the poll",
+    "gallery_motion_on": "Poll animations on",
+    "gallery_motion_off": "Poll animations off"
   }
 }

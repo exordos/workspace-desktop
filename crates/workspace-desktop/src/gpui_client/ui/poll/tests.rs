@@ -1,7 +1,10 @@
 //! Проверяет, что бабл показывает только переданные итоги и отдаёт доступные действия.
 
+use std::time::Duration;
+
 use gpui::{
-    Context, FocusHandle, KeyUpEvent, Keystroke, Modifiers, Render, TestAppContext, Window, size,
+    Context, FocusHandle, KeyUpEvent, Keystroke, Modifiers, Pixels, Render, TestAppContext,
+    VisualTestContext, Window, size,
 };
 
 use super::*;
@@ -18,6 +21,8 @@ struct Preview {
     read_only: bool,                    // Бабл открыт для чтения.
     anonymous: bool,                    // Имена участников скрыты.
     show_results: bool,                 // Нужно показать результат и аватары.
+    motion_enabled: Option<bool>,       // None — статичный сценарий, иначе режим анимаций.
+    result_percent: Option<u8>,         // Итог после голосования или None до первого клика.
     actions: Vec<PollAction>,           // Намерения, полученные от компонента.
 }
 
@@ -48,12 +53,12 @@ impl Render for Preview {
                 options: vec![PollOption {
                     id: "option".into(),
                     text: "В среду после обсуждения плана и итогов предыдущей встречи".into(),
-                    selected: false,
+                    selected: self.result_percent == Some(80),
                     enabled: true,
                     correctness: None,
                     result: self.show_results.then_some(PollResult {
                         votes: 6,
-                        percent: 50,
+                        percent: self.result_percent.unwrap_or(50),
                     }),
                     voters: ["А", "Б", "В", "Г", "Д"]
                         .into_iter()
@@ -70,6 +75,31 @@ impl Render for Preview {
             delivery: None,
         };
 
+        let on_action = move |action, _: &mut Window, app: &mut App| {
+            let _ = target.update(app, |view, cx| {
+                if view.motion_enabled.is_some()
+                    && let PollAction::Vote { selected, .. } = &action
+                {
+                    view.show_results = true;
+                    view.result_percent = Some(if *selected { 80 } else { 20 });
+                    cx.notify();
+                }
+                view.actions.push(action);
+            });
+        };
+        let poll = if let Some(enabled) = self.motion_enabled {
+            poll.render_with_motion(
+                message,
+                palette,
+                Language::Ru,
+                false,
+                Motion::from_preference(enabled),
+                on_action,
+            )
+        } else {
+            poll.render(message, palette, Language::Ru, false, on_action)
+        };
+
         div()
             .size_full()
             .when_some(self.initial_focus.as_ref(), |root, focus| {
@@ -77,16 +107,84 @@ impl Render for Preview {
             })
             .child(track_focus_input(cx))
             .on_action(|_: &NextControl, window, _| window.focus_next())
-            .child(poll.render(
-                message,
-                palette,
-                Language::Ru,
-                false,
-                move |action, _, app| {
-                    let _ = target.update(app, |view, _| view.actions.push(action));
-                },
-            ))
+            .child(poll)
     }
+}
+
+/// Читает ширину нарисованной полоски, если результаты уже открылись.
+fn bar_width(ui: &mut VisualTestContext) -> Pixels {
+    ui.debug_bounds("poll-result-bar")
+        .expect("полоска результата")
+        .size
+        .width
+}
+
+/// Рисует кадр после клика или изменения тестового времени.
+fn draw_poll(ui: &mut VisualTestContext) {
+    ui.update(|window, app| window.draw(app).clear());
+}
+
+/// Проверяет первый результат, разворот с видимой ширины и выключение без повтора.
+#[gpui::test]
+fn poll_result_bar_animates_from_visible_width_and_finishes_when_disabled(cx: &mut TestAppContext) {
+    let clock = cx.executor();
+    let (preview, ui) = cx.add_window_view(|_, _| Preview {
+        anonymous: true,
+        motion_enabled: Some(true),
+        ..Preview::default()
+    });
+    ui.simulate_resize(size(px(500.), px(480.)));
+    draw_poll(ui);
+
+    let choice = ui.debug_bounds("poll-choice").unwrap();
+    ui.simulate_click(choice.center(), Modifiers::none());
+    draw_poll(ui);
+    assert_eq!(bar_width(ui), px(0.));
+    assert!(ui.debug_bounds("poll-answer-with-result").is_some());
+    let shown_bubble = ui.debug_bounds("poll-bubble").unwrap();
+    let shown_choice = ui.debug_bounds("poll-choice").unwrap();
+
+    clock.advance_clock(Duration::from_millis(100));
+    draw_poll(ui);
+    let growing = bar_width(ui);
+    let full_width = shown_bubble.size.width - px(24.);
+    assert!(growing > full_width * 0.2 && growing < full_width * 0.8);
+    assert_eq!(ui.debug_bounds("poll-choice"), Some(shown_choice));
+    assert_eq!(ui.debug_bounds("poll-bubble"), Some(shown_bubble));
+
+    ui.simulate_click(shown_choice.center(), Modifiers::none());
+    draw_poll(ui);
+    assert_eq!(bar_width(ui), growing);
+    clock.advance_clock(Duration::from_millis(60));
+    draw_poll(ui);
+    let shrinking = bar_width(ui);
+    assert!(shrinking > full_width * 0.2 && shrinking < growing);
+
+    for enabled in [false, true] {
+        ui.update(|_, app| {
+            preview.update(app, |preview, cx| {
+                preview.motion_enabled = Some(enabled);
+                cx.notify();
+            });
+        });
+        draw_poll(ui);
+        assert!((bar_width(ui) - full_width * 0.2).abs() <= px(1.));
+    }
+}
+
+/// Уже готовый снимок при открытии истории сразу занимает итоговую ширину.
+#[gpui::test]
+fn poll_ready_result_is_static_on_mount(cx: &mut TestAppContext) {
+    let (_, ui) = cx.add_window_view(|_, _| Preview {
+        anonymous: true,
+        show_results: true,
+        motion_enabled: Some(true),
+        ..Preview::default()
+    });
+    ui.simulate_resize(size(px(500.), px(480.)));
+    draw_poll(ui);
+    let full_width = ui.debug_bounds("poll-bubble").unwrap().size.width - px(24.);
+    assert!((bar_width(ui) - full_width * 0.5).abs() <= px(1.));
 }
 
 /// Мышь и клавиатура вызывают одно действие, пока вопрос доступен для ответа.

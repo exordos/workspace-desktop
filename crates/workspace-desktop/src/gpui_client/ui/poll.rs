@@ -4,12 +4,15 @@
 use std::{borrow::Cow, rc::Rc};
 
 use gpui::{
-    App, Div, FontWeight, Hsla, SharedString, Stateful, Window, div, prelude::*, px, relative, rgb,
+    App, Div, FontWeight, SharedString, Stateful, Window, div, prelude::*, px, relative,
     transparent_black,
 };
 
-use super::{Avatar, Icon, MessageBubble, Palette, activate, theme::PANEL_RADIUS};
+use super::animation::Motion;
+use super::{Avatar, MessageBubble, Palette, activate, checkbox::Checkbox, theme::PANEL_RADIUS};
 use crate::gpui_client::Language;
+
+mod result_motion;
 
 const POLL_FONT: &str = "Montserrat";
 const MAX_VOTER_AVATARS: usize = 5;
@@ -91,11 +94,13 @@ pub enum PollAction {
 type OnAction = Rc<dyn Fn(PollAction, &mut Window, &mut App)>;
 
 /// Параметры, общие для вопросов и вариантов одного бабла.
+#[derive(Clone)]
 struct PollStyle {
     palette: Palette,    // Тема активного окна.
     language: Language,  // Язык подписей опроса.
     can_vote: bool,      // Бабл открыт для действий с ответами.
     show_voters: bool,   // Видим список участников публичного опроса.
+    motion: Motion,      // Разрешено ли движение в этом бабле.
     on_action: OnAction, // Передаёт действие родительскому экрану.
 }
 
@@ -117,11 +122,32 @@ impl PollBubble {
         selected: bool,
         on_action: impl Fn(PollAction, &mut Window, &mut App) + 'static,
     ) -> Div {
+        self.render_with_motion(
+            message,
+            palette,
+            language,
+            selected,
+            Motion::from_preference(false),
+            on_action,
+        )
+    }
+
+    /// Показывает изменения уже видимого опроса с учётом настройки анимаций окна.
+    pub fn render_with_motion(
+        self,
+        message: MessageBubble,
+        palette: Palette,
+        language: Language,
+        selected: bool,
+        motion: Motion,
+        on_action: impl Fn(PollAction, &mut Window, &mut App) + 'static,
+    ) -> Div {
         let style = PollStyle {
             palette,
             language,
             can_vote: !self.closed && !self.read_only,
             show_voters: !self.anonymous && !self.read_only,
+            motion,
             on_action: Rc::new(on_action),
         };
         let subtitle = self.subtitle(language);
@@ -300,6 +326,8 @@ impl PollQuestion {
     ) -> Stateful<Div> {
         let palette = style.palette;
         let can_vote = style.can_vote && !self.pending;
+        let options =
+            result_motion::AnimatedOptions::new(self.id.clone(), self.options, can_vote, style);
         div()
             .id(self.id.clone())
             .min_w_0()
@@ -325,13 +353,7 @@ impl PollQuestion {
                     .text_color(palette.text_secondary)
                     .child(subtitle.to_owned())
             }))
-            .child(
-                div().flex().flex_col().gap(px(6.)).min_w_0().children(
-                    self.options
-                        .into_iter()
-                        .map(|option| option.render(&self.id, can_vote, style)),
-                ),
-            )
+            .child(options)
             .when(
                 self.reserve_correct_answer || self.correct_answer.is_some(),
                 |question| {
@@ -370,9 +392,41 @@ impl PollQuestion {
     }
 }
 
+/// Рисует общий список вариантов, выбирая ширину полоски для текущего кадра.
+fn answer_options(
+    question: &SharedString,
+    options: Vec<PollOption>,
+    can_vote: bool,
+    style: &PollStyle,
+    width: impl Fn(&PollOption) -> f32,
+) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .min_w_0()
+        .children(options.into_iter().map(|option| {
+            let result_width = width(&option);
+            option.render(question, can_vote, style, result_width)
+        }))
+}
+
 impl PollOption {
+    /// Превращает видимый процент в долю от доступной ширины.
+    fn target_width(&self) -> f32 {
+        self.result
+            .as_ref()
+            .map_or(0., |result| f32::from(result.percent.min(100)) / 100.)
+    }
+
     /// Рисует отметку, текст, числа и полосу, если вопрос показывает результаты.
-    fn render(self, question: &SharedString, can_vote: bool, style: &PollStyle) -> Stateful<Div> {
+    fn render(
+        self,
+        question: &SharedString,
+        can_vote: bool,
+        style: &PollStyle,
+        result_width: f32,
+    ) -> Stateful<Div> {
         let palette = style.palette;
         let correct = self.correctness == Some(true);
         let highlighted = correct || (self.selected && self.correctness != Some(false));
@@ -406,9 +460,11 @@ impl PollOption {
             .text_size(px(14.))
             .line_height(px(17.))
             .when(can_vote, |choice| choice.hover(|style| style.underline()))
-            .child(indicator(
+            .child(Checkbox::circle(
+                "poll-choice-checkbox",
                 self.selected || correct,
                 if correct { color } else { palette.accent },
+                style.motion,
             ))
             .child(
                 div()
@@ -492,10 +548,10 @@ impl PollOption {
                     .mt(px(6.))
                     .h(px(2.))
                     .min_w_0()
-                    .children(self.result.map(|result| {
+                    .children(self.result.map(|_| {
                         div()
                             .h_full()
-                            .w(relative(f32::from(result.percent.min(100)) / 100.))
+                            .w(relative(result_width))
                             .rounded_full()
                             .bg(if highlighted {
                                 palette.accent
@@ -538,7 +594,12 @@ impl PollAddOption {
             .text_size(px(14.))
             .line_height(px(17.))
             .when(!enabled, |row| row.opacity(0.5))
-            .child(indicator(false, palette.text_secondary))
+            .child(Checkbox::circle(
+                "poll-add-option-marker",
+                false,
+                palette.text_secondary,
+                Motion::from_preference(false),
+            ))
             .child(div().flex_1().min_w_0().text_color(color).child(text));
         div()
             .mt(px(6.))
@@ -554,23 +615,6 @@ impl PollAddOption {
                     .child(style.language.tr("poll_bubble.add_error"))
             }))
     }
-}
-
-/// Рисует общий круг ответа. Цвет верного ответа соответствует зелёному индикатору Workspace.
-fn indicator(checked: bool, color: Hsla) -> Div {
-    div()
-        .size(px(16.))
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_full()
-        .when(checked, |circle| {
-            circle
-                .bg(color)
-                .child(Icon::Check.element(px(8.), rgb(0xffffff).into()))
-        })
-        .when(!checked, |circle| circle.border_1().border_color(color))
 }
 
 /// Добавляет нажатие мышью, фокус и клавиатуру только для доступного действия.

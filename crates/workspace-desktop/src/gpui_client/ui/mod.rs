@@ -2,6 +2,7 @@
 //! и представление чатов. Компоненты получают данные и действия от экрана.
 
 pub mod animation;
+pub mod checkbox;
 mod content;
 mod controls;
 mod conversation_notice;

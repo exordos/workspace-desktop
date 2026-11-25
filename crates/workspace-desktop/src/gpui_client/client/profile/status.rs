@@ -16,8 +16,8 @@ use crate::gpui_client::{
     right_panel::RightPanel,
     runtime::RuntimeClient,
     ui::{
-        Button, ButtonAppearance, Icon, Palette, TextInput, TextInputChanged, TextRole, activate,
-        label,
+        Button, ButtonAppearance, Palette, TextInput, TextInputChanged, TextRole, activate,
+        animation::Motion, checkbox::Checkbox, label,
     },
 };
 
@@ -499,26 +499,12 @@ impl Render for Status {
             .flex()
             .items_center()
             .gap_2()
-            .child(
-                div()
-                    .size(px(16.))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(3.))
-                    .border_1()
-                    .border_color(if self.away {
-                        palette.accent
-                    } else {
-                        palette.icon
-                    })
-                    .when(self.away, |check| {
-                        check
-                            .bg(palette.accent)
-                            .child(Icon::Check.element(px(12.), palette.on_accent))
-                    }),
-            )
+            .child(Checkbox::square(
+                "status-away-checkbox",
+                self.away,
+                palette,
+                Motion::from_preference(ready && Preferences::animations_enabled(cx)),
+            ))
             .child(label(
                 palette,
                 TextRole::Body,
