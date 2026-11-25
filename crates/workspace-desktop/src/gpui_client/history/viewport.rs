@@ -8,9 +8,9 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, Bounds, Div, ImageSource, IntoElement, ListAlignment, ListOffset, ListState,
-    MouseButton, Pixels, Point, SharedString, Stateful, StyledText, TextLayout, WeakEntity, canvas,
-    div, list, point, prelude::*, px,
+    AnyElement, App, Bounds, Div, Hsla, ImageSource, IntoElement, ListAlignment, ListOffset,
+    ListState, MouseButton, Pixels, Point, RenderOnce, SharedString, Stateful, StyledText,
+    TextLayout, WeakEntity, Window, canvas, div, list, point, prelude::*, px,
 };
 use uuid::Uuid;
 use workspace_core::{
@@ -64,7 +64,8 @@ use crate::gpui_client::{
     composer::ReplyText,
     preferences::Language,
     ui::{
-        Avatar, Button, DeliveryMark, Icon, MessageBubble, Palette, TextRole, activate, label,
+        Avatar, BubbleContent, Button, DeliveryMark, Icon, MessageBubble, Palette, QuoteSurface,
+        TextRole, activate, ellipsized_label, label, label_width, quote_frame_with_header,
         text_role,
     },
 };
@@ -1280,6 +1281,7 @@ fn message_row(
                 row,
                 &prepared.parts,
                 bubble_palette,
+                palette.accent,
                 peer,
                 (rows, index),
                 FragmentContent::new(controls, extras.fragments, extras.app.as_deref_mut()),
@@ -1360,6 +1362,7 @@ fn message_row(
                 row,
                 &row.body.parts,
                 bubble_palette,
+                palette.accent,
                 peer,
                 (rows, index),
                 FragmentContent::new(controls, extras.fragments, extras.app.as_deref_mut()),
@@ -1385,10 +1388,48 @@ fn message_row(
     let reactions = controls.reactions.as_ref().filter(|_| {
         confirmed_message && (row.encrypted.is_none() || readable)
     });
-    let chips = reactions.and_then(|reactions| reaction_chips(id, reactions, palette, controls.locale));
-    let accessory = match (accessory, chips) {
-        (Some(existing), Some(chips)) => Some(div().flex().flex_col().gap_1().child(existing).child(chips).into_any_element()),
-        (existing, chips) => existing.or(chips),
+    let chips = reactions.map_or_else(Vec::new, |reactions| {
+        reaction_chips(id, reactions, palette, controls.locale)
+    });
+    let parts = row
+        .body
+        .caption
+        .as_ref()
+        .filter(|_| extras.media.is_some())
+        .map_or(row.body.parts.as_slice(), |caption| {
+            caption.parts.as_slice()
+        });
+    let (content, accessory) = if content.is_some() && has_forward_cards(parts) {
+        (
+            content.map(|content| BubbleContent::Blocks {
+                content,
+                reactions: chips,
+            }),
+            accessory,
+        )
+    } else {
+        let strip = (!chips.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_1()
+                .mt_1()
+                .children(chips)
+                .into_any_element()
+        });
+        let accessory = match (accessory, strip) {
+            (Some(existing), Some(strip)) => Some(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(existing)
+                    .child(strip)
+                    .into_any_element(),
+            ),
+            (existing, strip) => existing.or(strip),
+        };
+        (content.map(BubbleContent::Inline), accessory)
     };
     let commands = (!controls.quick_hidden && confirmed_message)
         .then(|| quick_command(row, controls, reply.is_some(), readable))
@@ -1464,22 +1505,7 @@ fn message_row(
             overlay,
         )
     } else {
-        match (content, accessory, overlay) {
-            (content, accessory, Some(overlay)) => bubble.render_with_overlay(
-                bubble_palette,
-                content,
-                row.ends_group,
-                accessory,
-                overlay,
-            ),
-            (content, Some(accessory), None) => {
-                bubble.render_with_accessory(bubble_palette, content, row.ends_group, accessory)
-            }
-            (Some(content), None, None) => {
-                bubble.render_with_body(bubble_palette, content, row.ends_group)
-            }
-            (None, None, None) => bubble.render_in_group(bubble_palette, row.ends_group),
-        }
+        bubble.render_with_content(bubble_palette, content, row.ends_group, accessory, overlay)
     }
     .debug_selector(move || format!("history-message-{id}"));
     if row.delivery == Some(DeliveryMark::Unknown) {
@@ -1847,6 +1873,7 @@ fn quote_content(
     row: &Row,
     blocks: &[BodyPart],
     palette: Palette,
+    quote_accent: Hsla,
     peer: Option<&PeerLabel>,
     (rows, index): (&[Row], &HashMap<Uuid, usize>),
     mut fragments: FragmentContent<'_>,
@@ -1858,42 +1885,37 @@ fn quote_content(
         .flex()
         .flex_col()
         .min_w_0()
-        .w(px(312.))
+        .when(!has_forward_cards(blocks), |body| body.w(px(312.)))
         .max_w_full()
         .gap_1();
-    let mut inline = Vec::new();
+    let mut flow = FragmentFlow::default();
     let id = row.id;
     for (position, block) in blocks.iter().enumerate() {
         match block {
-            BodyPart::Text(text) if row.body.has_fragments => inline.push(
-                label(palette, TextRole::Body, text.clone())
-                    .min_w_0()
-                    .into_any_element(),
-            ),
-            BodyPart::Text(text) => body = body.child(label(palette, TextRole::Body, text.clone())),
-            BodyPart::Inline(text) if row.body.has_fragments => {
-                inline.push(fragments.inline(id, text, palette));
+            BodyPart::Text(text) => {
+                flow.text(label(palette, TextRole::Body, text.clone()).min_w_0())
             }
-            BodyPart::Inline(text) => body = body.child(fragments.inline(id, text, palette)),
-            BodyPart::Preview(preview) => {
-                body = body.child(label(
+            BodyPart::Inline(text) => flow.text(fragments.inline(id, text, palette)),
+            BodyPart::Preview(preview) => flow.text(
+                label(
                     palette,
                     TextRole::Body,
                     fragments.locale.preview_text(preview),
-                ));
-            }
+                )
+                .min_w_0(),
+            ),
             BodyPart::Fragment { slot, reference } => {
-                inline.push(fragments.render((id, *slot), reference.as_ref(), palette))
+                flow.fragment(fragments.render((id, *slot), reference.as_ref(), palette));
             }
             BodyPart::Forward(forward) => {
-                if !inline.is_empty() {
-                    body = body.child(fragment_line(std::mem::take(&mut inline)));
-                }
-                body = body.child(forward_card(
+                body = flow.append_to(body).child(forward_card(
                     id,
                     position,
                     forward.as_ref(),
-                    palette,
+                    Palette {
+                        accent: quote_accent,
+                        ..palette
+                    },
                     &mut fragments,
                 ));
             }
@@ -1902,9 +1924,7 @@ fn quote_content(
                 author,
                 fragment,
             } => {
-                if !inline.is_empty() {
-                    body = body.child(fragment_line(std::mem::take(&mut inline)));
-                }
+                body = flow.append_to(body);
                 let source = index
                     .get(source_id)
                     .map(|&index| &rows[index])
@@ -1948,10 +1968,14 @@ fn quote_content(
             }
         }
     }
-    if !inline.is_empty() {
-        body = body.child(fragment_line(inline));
-    }
-    Some(body.into_any_element())
+    Some(flow.append_to(body).into_any_element())
+}
+
+/// Отличает самостоятельные снимки от ссылок на оригинал внутри текста.
+fn has_forward_cards(parts: &[BodyPart]) -> bool {
+    parts
+        .iter()
+        .any(|part| matches!(part, BodyPart::Forward(_)))
 }
 
 /// Рисует снимок пересылки. Спойлеры сохраняют исходные чаты и свои отдельные слоты.
@@ -1962,78 +1986,65 @@ fn forward_card(
     palette: Palette,
     fragments: &mut FragmentContent<'_>,
 ) -> gpui::Stateful<Div> {
-    let mut card = div()
-        .id(("forward-card", position))
-        .flex()
-        .flex_col()
-        .min_w_0()
-        .gap_1()
-        .px_2()
-        .py_1()
-        .border_l_2()
-        .border_color(palette.accent);
-    let mut header = div().flex().flex_col().min_w_0().gap_1().child(label(
-        palette,
-        TextRole::Caption,
-        fragments.locale.tr("message.forwarded"),
-    ));
+    let card_id = ("forward-card", position);
     let Some(reference) = reference else {
-        return card.child(header);
+        return quote_frame_with_header(
+            palette,
+            QuoteSurface::Message,
+            label(
+                palette,
+                TextRole::Caption,
+                fragments.locale.tr("message.forwarded"),
+            ),
+            div(),
+        )
+        .py(px(6.))
+        .gap(px(2.))
+        .id(card_id);
     };
-    if !reference.author.is_empty() {
-        header = header.child(label(palette, TextRole::Label, reference.author.clone()));
-    }
-    if let Some(source) = &reference.source {
-        header = header.child(label(palette, TextRole::Caption, source.clone()));
-    }
-    card = if let Some(conversation) = fragments.conversation.cloned() {
-        let target = reference.id;
+    let target = reference.id;
+    let header =
+        div()
+            .min_w_0()
+            .child(ForwardHeader::new(id, reference, palette, fragments.locale));
+    let header = if let Some(conversation) = fragments.conversation.cloned() {
         let header = header
             .id((gpui::ElementId::from(target), "open-forward-original"))
             .border_1()
             .border_color(gpui::transparent_black());
-        card.child(
-            activate(header, None, palette, move |_, cx| {
-                cx.stop_propagation();
-                let _ =
-                    conversation.update(cx, |view, cx| view.open_forward_original(id, target, cx));
-            })
-            .debug_selector(move || format!("forward-original-{id}-{target}")),
-        )
+        activate(header, None, palette, move |_, cx| {
+            cx.stop_propagation();
+            let _ = conversation.update(cx, |view, cx| view.open_forward_original(id, target, cx));
+        })
+        .debug_selector(move || format!("forward-original-{id}-{target}"))
+        .into_any_element()
     } else {
-        card.child(header)
+        header.into_any_element()
     };
-    let mut inline = Vec::new();
+    let mut body = div().flex().flex_col().min_w_0().gap_1();
+    let mut flow = FragmentFlow::default();
     for (position, part) in reference.parts.iter().enumerate() {
         match part {
             BodyPart::Text(text) => {
-                inline.push(
-                    label(palette, TextRole::Body, text.clone())
-                        .min_w_0()
-                        .into_any_element(),
-                );
+                flow.text(label(palette, TextRole::Body, text.clone()).min_w_0());
             }
-            BodyPart::Inline(text) => inline.push(fragments.inline(id, text, palette)),
-            BodyPart::Preview(preview) => inline.push(
+            BodyPart::Inline(text) => flow.text(fragments.inline(id, text, palette)),
+            BodyPart::Preview(preview) => flow.text(
                 label(
                     palette,
                     TextRole::Body,
                     fragments.locale.preview_text(preview),
                 )
-                .min_w_0()
-                .into_any_element(),
+                .min_w_0(),
             ),
             BodyPart::Fragment { slot, reference } => {
-                inline.push(fragments.render((id, *slot), reference.as_ref(), palette));
+                flow.fragment(fragments.render((id, *slot), reference.as_ref(), palette));
             }
             BodyPart::Quote { author, .. } => {
-                inline.push(label(palette, TextRole::Caption, author.clone()).into_any_element());
+                flow.text(label(palette, TextRole::Caption, author.clone()).min_w_0());
             }
             BodyPart::Forward(reference) => {
-                if !inline.is_empty() {
-                    card = card.child(fragment_line(std::mem::take(&mut inline)));
-                }
-                card = card.child(forward_card(
+                body = flow.append_to(body).child(forward_card(
                     id,
                     position,
                     reference.as_ref(),
@@ -2043,21 +2054,138 @@ fn forward_card(
             }
         }
     }
-    if !inline.is_empty() {
-        card = card.child(fragment_line(inline));
-    }
-    card
+    let body = flow
+        .append_to(body)
+        .debug_selector(move || format!("history-forward-body-{id}-{target}"));
+    quote_frame_with_header(palette, QuoteSurface::Message, header, body)
+        .py(px(6.))
+        .gap(px(2.))
+        .id(card_id)
+        .debug_selector(move || format!("history-forward-{id}-{target}"))
 }
 
-/// Укладывает открытый текст и фрагменты в строки доступной ширины бабла.
-fn fragment_line(children: Vec<AnyElement>) -> Div {
-    div()
-        .flex()
-        .flex_wrap()
-        .items_center()
-        .min_w_0()
-        .gap_1()
-        .children(children)
+/// Подписи снимка, ширина которых зависит от шрифта в окне.
+#[derive(IntoElement)]
+struct ForwardHeader {
+    row: Uuid,                    // Идентификатор сообщения с карточкой.
+    target: Uuid,                 // Идентификатор оригинала.
+    author: SharedString,         // Имя автора снимка или нейтральная подпись.
+    source: Option<SharedString>, // Чат, из которого сделана пересылка.
+    time: Option<SharedString>,   // Местное время оригинала, если оно сохранено.
+    palette: Palette,             // Цвета рамки и текста.
+}
+
+impl ForwardHeader {
+    /// Готовит подписи по метаданным и языку текущего разговора.
+    fn new(row: Uuid, forward: &ForwardBody, palette: Palette, locale: Language) -> Self {
+        let author = forward.author.trim();
+        let author = if author.is_empty() {
+            locale.tr("composer.quote")
+        } else {
+            author
+        };
+        Self {
+            row,
+            target: forward.id,
+            author: author.replace(['\n', '\r'], " ").into(),
+            source: forward
+                .source
+                .as_ref()
+                .map(|source| source.label.replace(['\n', '\r'], " ").into()),
+            time: forward.source.as_ref().and_then(|source| {
+                LocalTime::system()
+                    .compact_stamp(&source.created_at, locale.code())
+                    .map(Into::into)
+            }),
+            palette,
+        }
+    }
+}
+
+impl RenderOnce for ForwardHeader {
+    /// Ставит метаданные в одну строку и сокращает подписи по границам графем.
+    fn render(self, window: &mut Window, _: &mut App) -> impl IntoElement {
+        let Self {
+            row,
+            target,
+            author,
+            source,
+            time,
+            palette,
+        } = self;
+        let role = TextRole::Caption;
+        let author_palette = Palette {
+            text_secondary: palette.focus,
+            ..palette
+        };
+        let author_width = label_width(author_palette, role, &author, window);
+        div()
+            .flex()
+            .items_center()
+            .min_w_0()
+            .gap(px(6.))
+            .child(
+                ellipsized_label(author_palette, role, author)
+                    .w(author_width)
+                    .min_w_0(),
+            )
+            .children(source.map(|source| {
+                // Ширина подписи включает внутренний отступ и акцентный разделитель.
+                let width = label_width(palette, role, &source, window) + px(6.);
+                ellipsized_label(palette, role, source)
+                    .w(width)
+                    .min_w_0()
+                    .pl_1()
+                    .border_l_2()
+                    .border_color(palette.accent)
+            }))
+            .children(time.map(|time| {
+                let width = label_width(palette, role, &time, window);
+                ellipsized_label(palette, role, time)
+                    .w(width)
+                    .min_w_0()
+                    .ml_auto()
+                    .debug_selector(move || format!("history-forward-time-{row}-{target}"))
+            }))
+    }
+}
+
+/// Собирает открытый текст и спойлеры между самостоятельными блоками истории.
+#[derive(Default)]
+struct FragmentFlow {
+    parts: Vec<AnyElement>, // Элементы от предыдущей карточки до следующей.
+    has_fragment: bool,     // Спойлеру нужно место рядом с открытым текстом.
+}
+
+impl FragmentFlow {
+    /// Добавляет текстовое содержимое в порядке исходного сообщения.
+    fn text(&mut self, text: impl IntoElement) {
+        self.parts.push(text.into_any_element());
+    }
+
+    /// Оставляет следующий спойлер в потоке окружающего текста.
+    fn fragment(&mut self, fragment: AnyElement) {
+        self.has_fragment = true;
+        self.parts.push(fragment);
+    }
+
+    /// Передаёт тексту ширину колонки. Строка с переносом нужна только для смешанного содержимого.
+    fn append_to(&mut self, body: Div) -> Div {
+        let parts = std::mem::take(&mut self.parts);
+        if std::mem::take(&mut self.has_fragment) {
+            body.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .min_w_0()
+                    .gap_1()
+                    .children(parts),
+            )
+        } else {
+            body.children(parts)
+        }
+    }
 }
 
 /// Готовит историю и добавляет уникальные строки очереди только после подтверждённого хвоста.

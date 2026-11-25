@@ -95,6 +95,27 @@ impl LocalTime {
         self.stamp(&date)
     }
 
+    /// Показывает часы и минуты, а для другого местного дня добавляет короткую дату.
+    pub fn compact_stamp(&self, utc: &HistoryTime, locale: &str) -> Option<String> {
+        let date = date_from_utc(utc)?;
+        let stamp = self.stamp(&date)?;
+        let clock = stamp.short_time();
+        // Текущий момент нужен только для сравнения календарных дней в том же поясе.
+        let now = unsafe { NSDate::now() };
+        if self
+            .stamp(&now)
+            .is_some_and(|today| today.date == stamp.date)
+        {
+            return Some(clock);
+        }
+        let calendar = unsafe {
+            let format = formatter_in_zone(locale, "", &self.fields.timeZone());
+            format.setLocalizedDateFormatFromTemplate(&NSString::from_str("ddMMMy"));
+            format.stringFromDate(&date)
+        };
+        Some(format!("{calendar} {clock}"))
+    }
+
     /// Преобразует дату создания профиля. Дата без часов уже обозначает календарный день.
     pub fn profile_date(&self, value: &str) -> Option<CalendarDate> {
         if value.len() == 10 {
@@ -299,6 +320,20 @@ pub(crate) fn format_local_time_zone(utc: &HistoryTime, locale: &str) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Показывает короткую дату на языке читателя и минуты в его часовом поясе.
+    #[test]
+    fn formats_compact_stamp_in_the_readers_locale_and_zone() {
+        let utc = HistoryTime::parse("2020-01-01T22:15:57Z").unwrap();
+        let moscow = LocalTime::for_test("Europe/Moscow");
+        let russian = moscow.compact_stamp(&utc, "ru").unwrap();
+        assert!(russian.starts_with("02 янв."), "{russian}");
+        assert!(russian.ends_with("01:15"), "{russian}");
+        let new_york = LocalTime::for_test("America/New_York");
+        let english = new_york.compact_stamp(&utc, "en").unwrap();
+        assert!(english.starts_with("Jan 01,"), "{english}");
+        assert!(english.ends_with("17:15"), "{english}");
+    }
 
     /// Проверяет часы и календарный день одного момента в разных поясах.
     #[test]

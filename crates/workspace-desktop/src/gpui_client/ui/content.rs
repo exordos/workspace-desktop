@@ -481,51 +481,46 @@ pub struct MessageBubble {
     pub delivery: Option<DeliveryMark>, // Статус исходящего сообщения.
 }
 
+/// Определяет раскладку тела бабла или подписи под медиа.
+pub(in crate::gpui_client) enum BubbleContent {
+    Inline(AnyElement), // Текст допускает время в своей последней строке.
+    Blocks {
+        content: AnyElement,        // Самостоятельные карточки занимают всю ширину тела.
+        reactions: Vec<AnyElement>, // Кнопки и время укладываются одним потоком.
+    },
+}
+
+impl BubbleContent {
+    /// Расставляет содержимое и время в выбранной раскладке.
+    fn render(self, metadata: Option<Div>) -> Div {
+        match self {
+            Self::Inline(content) => message_body(content, metadata),
+            Self::Blocks { content, reactions } => message_blocks(content, reactions, metadata),
+        }
+    }
+}
+
 impl MessageBubble {
     /// Рисует отдельный пузырь и переносит длинное сообщение по доступной ширине.
     pub fn render(self, palette: Palette) -> Div {
-        self.render_in_group(palette, true)
+        self.render_with_content(palette, None, true, None, None)
     }
 
-    /// Рисует текстовый пузырь с учётом положения сообщения в группе.
-    pub(in crate::gpui_client) fn render_in_group(self, palette: Palette, ends_group: bool) -> Div {
-        let body = self.plain_body(palette);
-        self.render_with_body(palette, body, ends_group)
-    }
-
-    /// Рисует тот же пузырь с выделяемым текстом или блоками цитат.
-    pub(in crate::gpui_client) fn render_with_body(
+    /// Укладывает подготовленное тело и прикрепляет наложение к общему пузырю.
+    pub(in crate::gpui_client) fn render_with_content(
         self,
         palette: Palette,
-        content: impl gpui::IntoElement,
-        ends_group: bool,
-    ) -> Div {
-        self.render_body(palette, content, ends_group, None)
-    }
-
-    /// Показывает дополнительный блок под текстом и временем уже отрисованного сообщения.
-    pub(in crate::gpui_client) fn render_with_accessory(
-        self,
-        palette: Palette,
-        content: Option<gpui::AnyElement>,
-        ends_group: bool,
-        accessory: gpui::AnyElement,
-    ) -> Div {
-        let content = content.unwrap_or_else(|| self.plain_body(palette).into_any_element());
-        self.render_body(palette, content, ends_group, Some(accessory))
-    }
-
-    /// Привязывает наложение к границам самого пузыря и сохраняет разметку строки.
-    pub(in crate::gpui_client) fn render_with_overlay(
-        self,
-        palette: Palette,
-        content: Option<AnyElement>,
+        content: Option<BubbleContent>,
         ends_group: bool,
         accessory: Option<AnyElement>,
-        overlay: impl IntoElement,
+        overlay: Option<AnyElement>,
     ) -> Div {
-        let content = content.unwrap_or_else(|| self.plain_body(palette).into_any_element());
-        self.render_body_with_overlay(palette, content, ends_group, accessory, Some(overlay.into_any_element()))
+        let metadata = self.metadata(palette, false);
+        let body = match content {
+            Some(content) => content.render(metadata),
+            None => message_body(self.plain_body(palette), metadata),
+        };
+        self.render_frame(palette, body, ends_group, accessory, overlay)
     }
 
     /// Расставляет скругления только на углах, где медиа совпадает с краем пузыря.
@@ -551,7 +546,7 @@ impl MessageBubble {
         self,
         palette: Palette,
         media: Div,
-        caption: Option<AnyElement>,
+        caption: Option<BubbleContent>,
         ends_group: bool,
         accessory: Option<AnyElement>,
         overlay: Option<AnyElement>,
@@ -580,11 +575,9 @@ impl MessageBubble {
                     .bg(rgba(0x000000a6))
                     .debug_selector(|| "history-media-time".into())
             })))
-            .children(caption.map(|caption| {
-                message_body(caption, caption_metadata)
-                    .px(px(12.))
-                    .py(px(8.))
-            }))
+            .children(
+                caption.map(|caption| caption.render(caption_metadata).px(px(12.)).py(px(8.))),
+            )
             .children(accessory.map(|accessory| {
                 div()
                     .px(px(12.))
@@ -604,27 +597,15 @@ impl MessageBubble {
             .max_w_full()
     }
 
-    /// Собирает общую разметку пузыря с дополнительным блоком под основным содержимым.
-    fn render_body(
+    /// Собирает фон, автора и выбранную раскладку тела в общий пузырь.
+    fn render_frame(
         self,
         palette: Palette,
-        content: impl gpui::IntoElement,
-        ends_group: bool,
-        accessory: Option<gpui::AnyElement>,
-    ) -> Div {
-        self.render_body_with_overlay(palette, content, ends_group, accessory, None)
-    }
-
-    /// Размещает внутренние блоки в потоке, а панель действий поверх границ пузыря.
-    fn render_body_with_overlay(
-        self,
-        palette: Palette,
-        content: impl IntoElement,
+        body: Div,
         ends_group: bool,
         accessory: Option<AnyElement>,
         overlay: Option<AnyElement>,
     ) -> Div {
-        let body = message_body(content, self.metadata(palette, false));
         let bubble = self
             .surface(palette, ends_group)
             .px(px(12.))
@@ -714,6 +695,31 @@ fn message_body(content: impl IntoElement, metadata: Option<Div>) -> Div {
         .gap_y(px(2.))
         .child(content)
         .children(metadata)
+}
+
+/// Оставляет карточкам ширину тела. Время может перенестись под реакции в узком пузыре.
+fn message_blocks(content: AnyElement, reactions: Vec<AnyElement>, metadata: Option<Div>) -> Div {
+    let footer = (!reactions.is_empty() || metadata.is_some()).then(|| {
+        div()
+            .flex()
+            .flex_wrap()
+            .min_w_0()
+            .items_end()
+            .gap_1()
+            .mt_1()
+            .children(reactions)
+            .children(metadata.map(|time| {
+                time.pl_1()
+                    .debug_selector(|| "message-block-footer-time".into())
+            }))
+            .debug_selector(|| "message-block-footer".into())
+    });
+    div()
+        .flex()
+        .flex_col()
+        .min_w_0()
+        .child(content)
+        .children(footer)
 }
 
 /// Уменьшает радиус со стороны автора, чтобы соседние пузыри выглядели как группа.

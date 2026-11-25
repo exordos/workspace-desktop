@@ -552,61 +552,54 @@ fn focus_reaction(
     }
 }
 
-/// Показывает счётчики реакций подтверждённого сообщения и выделяет выбор пользователя.
+/// Готовит отдельные кнопки со счётчиками и отмечает реакции пользователя.
 pub(super) fn reaction_chips(
     id: Uuid,
     controls: &ReactionControls,
     palette: Palette,
     locale: Language,
-) -> Option<gpui::AnyElement> {
-    let groups = controls.groups(id);
-    if groups.is_empty() {
-        return None;
-    }
-    Some(
-        div()
-            .flex()
-            .flex_wrap()
-            .gap_1()
-            .mt_1()
-            .children(groups.iter().map(|group| {
-                let emoji = SharedString::from(group.emoji.clone());
-                let glyph = reaction_glyph(&emoji).into_owned();
-                let caption =
-                    SharedString::from(locale.tr_with("a11y.quickReaction", &[("emoji", &glyph)]));
-                let mut button = Button::new((ElementId::Uuid(id), emoji.clone()), "");
-                button.disabled = controls.read_only || controls.is_pending(id, &emoji);
-                let controls = controls.clone();
-                let selected = emoji.clone();
-                button
-                    .render(palette, None, move |_, cx| {
-                        cx.stop_propagation();
-                        controls.toggle(id, &selected, cx);
-                    })
-                    .h(px(22.))
-                    .min_w_0()
-                    .px(px(6.))
-                    .gap(px(4.))
-                    .flex_none()
-                    .rounded_full()
-                    .when(group.is_own, |button| {
-                        button.bg(palette.accent_soft).border_color(palette.accent)
-                    })
-                    .block_mouse_except_scroll()
-                    .tooltip(move |_, cx| tooltip(palette, caption.clone(), cx))
-                    .debug_selector(move || format!("history-reaction-chip-{id}-{emoji}"))
-                    .child(
-                        div()
-                            .text_size(px(14.))
-                            .max_w(px(48.))
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .child(glyph),
-                    )
-                    .child(label(palette, TextRole::Caption, group.count.to_string()))
-            }))
-            .into_any_element(),
-    )
+) -> Vec<gpui::AnyElement> {
+    controls
+        .groups(id)
+        .iter()
+        .map(|group| {
+            let emoji = SharedString::from(group.emoji.clone());
+            let glyph = reaction_glyph(&emoji).into_owned();
+            let caption =
+                SharedString::from(locale.tr_with("a11y.quickReaction", &[("emoji", &glyph)]));
+            let mut button = Button::new((ElementId::Uuid(id), emoji.clone()), "");
+            button.disabled = controls.read_only || controls.is_pending(id, &emoji);
+            let controls = controls.clone();
+            let selected = emoji.clone();
+            button
+                .render(palette, None, move |_, cx| {
+                    cx.stop_propagation();
+                    controls.toggle(id, &selected, cx);
+                })
+                .h(px(22.))
+                .min_w_0()
+                .px(px(6.))
+                .gap(px(4.))
+                .flex_none()
+                .rounded_full()
+                .when(group.is_own, |button| {
+                    button.bg(palette.accent_soft).border_color(palette.accent)
+                })
+                .block_mouse_except_scroll()
+                .tooltip(move |_, cx| tooltip(palette, caption.clone(), cx))
+                .debug_selector(move || format!("history-reaction-chip-{id}-{emoji}"))
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .max_w(px(48.))
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .child(glyph),
+                )
+                .child(label(palette, TextRole::Caption, group.count.to_string()))
+                .into_any_element()
+        })
+        .collect()
 }
 
 /// Накладывает уже измеренный элемент после рисования всех обычных строк истории.

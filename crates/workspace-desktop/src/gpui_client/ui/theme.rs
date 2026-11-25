@@ -228,7 +228,7 @@ pub fn label(palette: Palette, role: TextRole, text: impl Into<SharedString>) ->
 }
 
 /// Измеряет подпись тем же шрифтом, которым её рисует шапка.
-pub(super) fn label_width(
+pub(in crate::gpui_client) fn label_width(
     palette: Palette,
     role: TextRole,
     text: &SharedString,

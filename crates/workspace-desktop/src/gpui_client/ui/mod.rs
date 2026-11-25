@@ -25,7 +25,7 @@ pub use content::{
     Avatar, AvatarPresence, AvatarSize, BadgeTone, ChatRow, ChatRowPreview, DeliveryMark,
     MessageBubble, mention_badge, unread_badge,
 };
-pub(in crate::gpui_client) use content::{calendar_date_label, profile_joined_date};
+pub(in crate::gpui_client) use content::{BubbleContent, calendar_date_label, profile_joined_date};
 pub use controls::{Button, ButtonAppearance, FieldAppearance, field};
 pub(in crate::gpui_client) use controls::{
     activate, rounded_surface_corners, sidebar_item, switch_indicator,
@@ -40,9 +40,10 @@ pub use filter_group::{FilterGroup, filter_button};
 pub use focus::track_focus_input;
 pub use icons::{Icon, SEARCH_ICON_SIZE, WorkspaceAssets};
 pub use person_row::PersonRow;
+pub(in crate::gpui_client) use quote::quote_frame_with_header;
 pub use quote::{QuoteSurface, quote_frame, quote_preview};
 pub(crate) use text_input::{TextInput, TextInputChanged, TextInputSubmitted};
 pub(super) use theme::{CONTROL_BORDER, MESSAGE_BUBBLE_MAX_WIDTH, PANEL_RADIUS, SURFACE_RADIUS};
 pub use theme::{Palette, TextRole, ThemeMode, label};
-pub(in crate::gpui_client) use theme::{ellipsized_label, text_role};
+pub(in crate::gpui_client) use theme::{ellipsized_label, label_width, text_role};
 pub use top_bar::{TopBar, TopBarAccount, TopBarAction, TopBarSection, TopBarSelection};

@@ -19,18 +19,33 @@ pub fn quote_frame(
     heading: impl Into<SharedString>,
     body: impl IntoElement,
 ) -> Div {
-    let fill = match surface {
-        QuoteSurface::Message => palette.field,
-        QuoteSurface::TintedMessage => palette.accent_soft,
-        QuoteSurface::Composer => palette.surface,
-    };
     let heading = heading.into().replace(['\r', '\n'], " ");
     // Берём контрастный оттенок Blue Mist, чтобы подпись читалась на всех трёх подложках.
     let title_palette = Palette {
         text: palette.focus,
         ..palette
     };
+    quote_frame_with_header(
+        palette,
+        surface,
+        ellipsized_label(title_palette, TextRole::Label, heading)
+            .debug_selector(|| "quote-frame-heading".into()),
+        body,
+    )
+}
 
+/// Оформляет рамку для цитаты с готовой строкой заголовка.
+pub(in crate::gpui_client) fn quote_frame_with_header(
+    palette: Palette,
+    surface: QuoteSurface,
+    heading: impl IntoElement,
+    body: impl IntoElement,
+) -> Div {
+    let fill = match surface {
+        QuoteSurface::Message => palette.field,
+        QuoteSurface::TintedMessage => palette.accent_soft,
+        QuoteSurface::Composer => palette.surface,
+    };
     div()
         .flex()
         .flex_col()
@@ -42,10 +57,7 @@ pub fn quote_frame(
         .border_l_2()
         .border_color(palette.accent)
         .bg(fill)
-        .child(
-            ellipsized_label(title_palette, TextRole::Label, heading)
-                .debug_selector(|| "quote-frame-heading".into()),
-        )
+        .child(heading)
         .child(body)
 }
 

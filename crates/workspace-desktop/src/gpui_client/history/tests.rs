@@ -807,6 +807,89 @@ fn fixed_topic_groups_and_wraps_at_both_panel_sizes(cx: &mut TestAppContext) {
     );
 }
 
+/// Укладывает две пересылки подряд и увеличивает высоту текста при сужении окна.
+#[gpui::test]
+fn lays_out_consecutive_forward_snapshots_at_available_width(cx: &mut TestAppContext) {
+    use workspace_core::messenger::forward::{ForwardReference, ForwardSource};
+
+    let address = address(ChatEntry::Latest);
+    let (_, ui, requests) = scenario(cx, &address);
+    const FIRST: &str =
+        "history-forward-00000000-0000-0000-0000-000000000001-00000000-0000-0000-0000-000000000029";
+    const SECOND: &str =
+        "history-forward-00000000-0000-0000-0000-000000000001-00000000-0000-0000-0000-00000000002a";
+    const BODY: &str = "history-forward-body-00000000-0000-0000-0000-000000000001-00000000-0000-0000-0000-000000000029";
+    const TIME: &str = "history-forward-time-00000000-0000-0000-0000-000000000001-00000000-0000-0000-0000-000000000029";
+    const NEXT: &str = "history-message-00000000-0000-0000-0000-000000000002";
+    let [first, second] = [41, 42].map(Uuid::from_u128);
+    let forward = |id, snapshot: &str, plain| {
+        ForwardReference {
+            id,
+            author: "Мария Петрова".into(),
+            snapshot: snapshot.into(),
+            plain,
+            source: Some(ForwardSource {
+                label: "Обсуждение проекта".into(),
+                direct: false,
+                created_at: HistoryTime::parse("2026-11-16T16:07:57Z").unwrap(),
+            }),
+        }
+        .to_markdown()
+    };
+    let mut page = window(
+        address.route.scope,
+        1..3,
+        HistoryEdge::End,
+        HistoryEdge::End,
+    );
+    page.messages[0].body = MessageBody::Markdown(format!(
+        "{}\n\n{}",
+        forward(first, "Проверка пересланного сообщения", false),
+        forward(second, "Другой снимок с буквальным текстом", true),
+    ));
+    answer(request(&requests, Load::Open(ChatEntry::Latest)), page, ui);
+
+    let geometry = |ui: &mut VisualTestContext| {
+        let first = ui.debug_bounds(FIRST).unwrap();
+        let second = ui.debug_bounds(SECOND).unwrap();
+        let next = ui.debug_bounds(NEXT).unwrap();
+        let footer = ui.debug_bounds("message-block-footer").unwrap();
+        let sent_at = ui.debug_bounds("message-block-footer-time").unwrap();
+        assert!(
+            first.bottom() <= second.top(),
+            "Карточки пересеклись: {first:?}, {second:?}"
+        );
+        assert!(
+            second.top() - first.bottom() <= px(8.),
+            "Между карточками лишние пустые строки: {first:?}, {second:?}"
+        );
+        assert!(
+            second.bottom() <= footer.top() && footer.bottom() <= next.top(),
+            "У времени есть отдельная строка после карточек"
+        );
+        assert_eq!(first.right(), second.right());
+        assert_eq!(second.right(), sent_at.right());
+        let body = ui.debug_bounds(BODY).unwrap();
+        let time = ui.debug_bounds(TIME).unwrap();
+        assert!(time.bottom() < body.top() && body.bottom() < first.bottom());
+        assert!(body.left() > first.left() && body.right() < first.right());
+        body.size
+    };
+    let wide = geometry(ui);
+    assert_eq!(
+        wide.height,
+        px(20.),
+        "Снимок в широком окне занимает одну строку: {wide:?}"
+    );
+    ui.simulate_resize(size(px(250.), px(400.)));
+    ui.run_until_parked();
+    let narrow = geometry(ui);
+    assert!(
+        narrow.width < wide.width && narrow.height > wide.height,
+        "Снимок переносится при сужении: {wide:?} → {narrow:?}"
+    );
+}
+
 /// Показывает разделитель на местной полуночи и объединяет следующие строки того же дня.
 #[gpui::test]
 fn shows_date_separator_at_local_midnight(cx: &mut TestAppContext) {

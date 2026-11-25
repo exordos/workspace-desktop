@@ -9,7 +9,7 @@ use workspace_core::messenger::{
     encryption::fragments::{
         FragmentDisplayKind, FragmentDisplaySpan, FragmentReference, fragment_display_spans,
     },
-    forward::{ForwardReference, ForwardSpan, MAX_FORWARD_DEPTH, forward_spans},
+    forward::{ForwardReference, ForwardSource, ForwardSpan, MAX_FORWARD_DEPTH, forward_spans},
     quote::{self, Block},
     references::{MediaReference, WorkspaceReferenceTarget},
 };
@@ -64,10 +64,10 @@ pub(super) enum BodyPart {
 /// Части вложенной карточки без открытого текста её зашифрованных фрагментов.
 #[derive(Eq, PartialEq)]
 pub(super) struct ForwardBody {
-    pub id: Uuid,                     // Публичный UUID исходного сообщения для перехода.
-    pub author: SharedString,         // Подпись автора на исходной ссылке.
-    pub source: Option<SharedString>, // Название исходного чата, если было сохранено.
-    pub parts: Vec<BodyPart>,         // Разобранный исходный Markdown без конвертов в тексте.
+    pub id: Uuid,                      // Публичный UUID исходного сообщения для перехода.
+    pub author: SharedString,          // Подпись автора на исходной ссылке.
+    pub source: Option<ForwardSource>, // Исходный чат и время, если были сохранены.
+    pub parts: Vec<BodyPart>,          // Разобранный исходный Markdown без конвертов в тексте.
 }
 
 impl Body {
@@ -278,11 +278,18 @@ fn parse_placements(
             continue;
         }
         if range.start > cursor {
-            parts.push(inline_or_text(
-                text[cursor..range.start].to_owned().into(),
-                start + cursor,
-                links,
-            ));
+            let between = &text[cursor..range.start];
+            // Последовательные карточки уже разделены отступом потока.
+            let card_separator = between.trim().is_empty()
+                && matches!(parts.last(), Some(BodyPart::Forward(_)))
+                && matches!(placement, Placement::Forward(_));
+            if !card_separator {
+                parts.push(inline_or_text(
+                    between.to_owned().into(),
+                    start + cursor,
+                    links,
+                ));
+            }
         }
         match placement {
             Placement::Fragment(span) if span.kind != FragmentDisplayKind::Definition => {
@@ -349,10 +356,11 @@ fn forward_body(reference: &ForwardReference, depth: usize, slot: &mut usize) ->
     ForwardBody {
         id: reference.id,
         author: reference.author.clone().into(),
-        source: reference
-            .source
-            .as_ref()
-            .map(|source| source.label.clone().into()),
+        source: reference.source.as_ref().map(|source| ForwardSource {
+            label: source.label.clone(),
+            direct: source.direct,
+            created_at: source.created_at.clone(),
+        }),
         parts,
     }
 }
