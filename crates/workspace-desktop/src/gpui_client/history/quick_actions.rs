@@ -1,7 +1,11 @@
 //! Рисует быстрые команды у границ сообщения и раскрывает список реакций под указателем.
-//! Хранит только состояние наведения и фокуса видимых пузырей.
+//! Хранит наведение, фокус и переход капсулы только для видимых пузырей.
 
-use std::{cell::RefCell, rc::Rc, time::Duration};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use gpui::{
     App, Bounds, DispatchPhase, Edges, Element, ElementId, FocusHandle, GlobalElementId, Hitbox,
@@ -13,12 +17,15 @@ use workspace_core::messenger::quick_reactions::reaction_glyph;
 
 use super::reactions::{QuickReaction, ReactionControls};
 use crate::gpui_client::{
-    preferences::Language,
-    ui::{Button, ButtonAppearance, Icon, Palette, TextRole, label, popup::tooltip},
+    preferences::{Language, Preferences},
+    ui::{
+        Button, ButtonAppearance, Icon, Palette, TextRole, animation::Motion, label, popup::tooltip,
+    },
 };
 
 const OPEN_DELAY: Duration = Duration::from_millis(150);
 const CLOSE_DELAY: Duration = Duration::from_millis(200);
+const CAPSULE_TRANSITION: Duration = Duration::from_millis(140);
 const PILL_HEIGHT: Pixels = px(24.);
 const COLLAPSED: Pixels = px(24.);
 const CAPSULE: Pixels = px(40.);
@@ -111,19 +118,33 @@ enum Area {
     Capsule = 2,  // Кнопка или раскрытая колонка эмодзи.
 }
 
+/// Начало движения капсулы к текущей цели.
+struct CapsuleTransition {
+    from: f32,        // Доля раскрытия от 0 до 1 в начале движения.
+    started: Instant, // Часы GPUI, которые можно продвинуть в тестовом окне.
+}
+
+/// Состояние капсулы в текущем кадре.
+#[derive(Clone, Copy)]
+struct CapsuleFrame {
+    open: bool,    // Дополнительные реакции уже доступны для выбора.
+    progress: f32, // Видимая доля раскрытия от 0 до 1.
+}
+
 /// Краткое состояние одного видимого сообщения.
 pub(super) struct Interaction {
-    areas: [bool; 3],                 // Где сейчас находится указатель.
-    visible: bool,                    // Сохраняет панель в коротком переходе между участками.
-    open: bool,                       // Колонка раскрыта наведением или клавиатурой.
-    suppressed: bool,                 // Не открывать сразу после выбора или Escape.
-    keyboard_open: bool,              // Колонка раскрыта клавиатурным фокусом.
-    panel_timer: Option<Task<()>>,    // Отложенное скрытие всей панели.
-    strip_timer: Option<Task<()>>,    // Отложенное раскрытие или закрытие колонки.
-    command_focus: FocusHandle,       // Фокус первой верхней команды.
-    trigger_focus: FocusHandle,       // Одна и та же кнопка для первого эмодзи в обоих состояниях.
+    areas: [bool; 3],                      // Где сейчас находится указатель.
+    visible: bool,                         // Сохраняет панель в коротком переходе между участками.
+    open: bool,                            // Колонка раскрыта наведением или клавиатурой.
+    transition: Option<CapsuleTransition>, // None, когда капсула уже в конечном положении.
+    suppressed: bool,                      // Не открывать сразу после выбора или Escape.
+    keyboard_open: bool,                   // Колонка раскрыта клавиатурным фокусом.
+    panel_timer: Option<Task<()>>,         // Отложенное скрытие всей панели.
+    strip_timer: Option<Task<()>>,         // Отложенное раскрытие или закрытие колонки.
+    command_focus: FocusHandle,            // Фокус первой верхней команды.
+    trigger_focus: FocusHandle, // Одна и та же кнопка для первого эмодзи в обоих состояниях.
     reaction_focus: Vec<FocusHandle>, // Фокус вариантов после первого.
-    scroll: ScrollHandle,             // Положение внутри длинной колонки реакций.
+    scroll: ScrollHandle,       // Положение внутри длинной колонки реакций.
 }
 
 impl Interaction {
@@ -133,6 +154,7 @@ impl Interaction {
             areas: [false; 3],
             visible: false,
             open: false,
+            transition: None,
             suppressed: false,
             keyboard_open: false,
             panel_timer: None,
@@ -144,11 +166,62 @@ impl Interaction {
         }
     }
 
-    /// Переключает состояние раскрытия, возвращая прокрутку к первой реакции.
+    /// Мгновенно меняет состояние для клавиатуры, явного выбора или скрытия.
     fn set_open(&mut self, open: bool) {
+        self.transition = None;
         if self.open != open {
             self.open = open;
             self.scroll.scroll_to_bottom();
+        }
+    }
+
+    /// Возвращает видимую долю раскрытия с замедлением к концу перехода.
+    fn progress(&self, now: Instant) -> f32 {
+        let target = f32::from(self.open);
+        self.transition.as_ref().map_or(target, |transition| {
+            let elapsed = now.saturating_duration_since(transition.started);
+            let time = (elapsed.as_secs_f32() / CAPSULE_TRANSITION.as_secs_f32()).min(1.);
+            let eased = 1. - (1. - time).powi(2);
+            transition.from + (target - transition.from) * eased
+        })
+    }
+
+    /// Меняет направление наведения, сохраняя уже показанное положение.
+    fn set_hover_open(&mut self, open: bool, cx: &App) {
+        if self.open == open || (!open && self.keyboard_open) {
+            return;
+        }
+        if !capsule_motion(cx).allows() {
+            self.set_open(open);
+            return;
+        }
+        let now = cx.background_executor().now();
+        let from = self.progress(now);
+        if open && from == 0. {
+            self.scroll.scroll_to_bottom();
+        }
+        self.open = open;
+        self.transition =
+            (from != f32::from(open)).then_some(CapsuleTransition { from, started: now });
+    }
+
+    /// Строит кадр и планирует следующий только пока движение разрешено и продолжается.
+    fn capsule_frame(&mut self, window: &Window, cx: &App) -> CapsuleFrame {
+        let mut progress = f32::from(self.open);
+        if let Some(transition) = &self.transition {
+            let now = cx.background_executor().now();
+            if capsule_motion(cx).allows()
+                && now.saturating_duration_since(transition.started) < CAPSULE_TRANSITION
+            {
+                progress = self.progress(now);
+                window.request_animation_frame();
+            } else {
+                self.transition = None;
+            }
+        }
+        CapsuleFrame {
+            open: self.open,
+            progress,
         }
     }
 
@@ -171,6 +244,11 @@ impl Interaction {
         }
         (keyboard_input && (command || trigger || reaction), keyboard)
     }
+}
+
+/// Читает общий выбор анимаций для перехода капсулы.
+fn capsule_motion(cx: &App) -> Motion {
+    Motion::from_preference(Preferences::animations_enabled(cx))
 }
 
 /// Удерживает панель при переходе из пузыря в вынесенный контрол.
@@ -199,8 +277,10 @@ fn change_hover(
         interaction.panel_timer = Some(window.spawn(cx, async move |cx| {
             timer.await;
             let Some(state) = state.upgrade() else { return };
-            let _ = cx.update(|window, _| {
-                state.borrow_mut().visible = false;
+            let _ = cx.update(|window, cx| {
+                let mut state = state.borrow_mut();
+                state.visible = false;
+                state.set_hover_open(false, cx);
                 window.refresh();
             });
         }));
@@ -215,6 +295,15 @@ fn change_hover(
     if interaction.open == hovered || (hovered && interaction.suppressed) {
         return;
     }
+    if hovered
+        && interaction.transition.is_some()
+        && interaction.progress(cx.background_executor().now()) > 0.
+    {
+        // Пока капсула сворачивается, повторный вход сразу разворачивает её.
+        interaction.set_hover_open(true, cx);
+        window.refresh();
+        return;
+    }
     let state = Rc::downgrade(state);
     let timer = cx
         .background_executor()
@@ -222,8 +311,8 @@ fn change_hover(
     interaction.strip_timer = Some(window.spawn(cx, async move |cx| {
         timer.await;
         let Some(state) = state.upgrade() else { return };
-        let _ = cx.update(|window, _| {
-            state.borrow_mut().set_open(hovered);
+        let _ = cx.update(|window, cx| {
+            state.borrow_mut().set_hover_open(hovered, cx);
             window.refresh();
         });
     }));
@@ -345,16 +434,18 @@ impl QuickActions {
         let mut interaction = state.borrow_mut();
         if keyboard && !interaction.suppressed && choices.len() > 1 {
             interaction.set_open(true);
+        } else if choices.len() == 1 || (!visible && interaction.open) {
+            interaction.set_open(false);
         }
-        let open = interaction.open && choices.len() > 1;
-        let size = if open { CAPSULE } else { COLLAPSED };
+        let frame = interaction.capsule_frame(window, cx);
+        let expanded = frame.open || frame.progress > 0.;
+        let size = COLLAPSED + (CAPSULE - COLLAPSED) * frame.progress;
         let focus = interaction.trigger_focus.clone();
         let left = (center - size / 2.).clamp(
             viewport.left(),
             (viewport.right() - size).max(viewport.left()),
         );
-        if !visible {
-            interaction.set_open(false);
+        if !visible && !expanded {
             if !choices[0].pending {
                 place(
                     div()
@@ -369,7 +460,7 @@ impl QuickActions {
             }
             return;
         }
-        if open {
+        if expanded {
             interaction
                 .reaction_focus
                 .resize_with(choices.len() - 1, || cx.focus_handle());
@@ -380,14 +471,15 @@ impl QuickActions {
             .collect();
         drop(interaction);
         let width = (viewport.size.width - EDGE * 2.).max(px(0.)).min(size);
-        let height = if open {
-            (bottom - viewport.top() - EDGE)
-                .clamp(COLLAPSED, MAX_CAPSULE_HEIGHT)
-                .min(EMOJI_BUTTON * choices.len() as f32 + EDGE)
-        } else {
-            COLLAPSED
-        };
-        let count = if open { choices.len() } else { 1 };
+        let full_height = (bottom - viewport.top() - EDGE)
+            .clamp(COLLAPSED, MAX_CAPSULE_HEIGHT)
+            .min(EMOJI_BUTTON * choices.len() as f32 + EDGE);
+        let height = COLLAPSED + (full_height - COLLAPSED) * frame.progress;
+        let count = if expanded { choices.len() } else { 1 };
+        if expanded && scroll.offset().y <= -scroll.max_offset().height {
+            // Держим первую кнопку снизу, пока меняется её размер. Скролл пользователя сохраняем.
+            scroll.scroll_to_bottom();
+        }
         let palette = self.palette;
         let capsule_state = state.clone();
         let menu =
@@ -395,13 +487,15 @@ impl QuickActions {
                 .id("quick-reactions-capsule")
                 .w(width)
                 .h(height)
+                .relative()
+                .overflow_hidden()
                 .rounded_full()
                 .border_1()
                 .border_color(palette.border)
                 .bg(palette.surface)
                 .shadow_md()
-                .when(open, |view| view.occlude())
-                .when(!open, |view| view.block_mouse_except_scroll())
+                .when(frame.open, |view| view.occlude())
+                .when(!frame.open, |view| view.block_mouse_except_scroll())
                 .on_hover(move |hovered, window, cx| {
                     change_hover(&capsule_state, Area::Capsule, *hovered, window, cx);
                 })
@@ -413,15 +507,22 @@ impl QuickActions {
                         .flex()
                         .flex_col()
                         .items_center()
-                        .when(open, |view| {
-                            view.overflow_y_scroll().track_scroll(&scroll).py(px(1.))
+                        .when(expanded, |view| {
+                            // Обрезаем колонку снизу вверх, сохраняя её внутреннюю область прокрутки.
+                            view.absolute()
+                                .left_0()
+                                .bottom_0()
+                                .h(full_height - px(2.))
+                                .overflow_y_scroll()
+                                .track_scroll(&scroll)
+                                .py(px(frame.progress))
                         })
                         .children(choices[..count].iter().enumerate().rev().map(
                             |(index, choice)| {
                                 self.reaction_button(
                                     choice,
                                     index,
-                                    open,
+                                    frame,
                                     &focuses[index],
                                     state,
                                     &reactions.activate,
@@ -435,7 +536,7 @@ impl QuickActions {
                                     return;
                                 }
                                 let key = event.keystroke.key.as_str();
-                                if key == "escape" && open {
+                                if key == "escape" && frame.open {
                                     close_capsule(&state, true, window);
                                     cx.stop_propagation();
                                 } else if matches!(key, "up" | "down" | "home" | "end")
@@ -445,7 +546,7 @@ impl QuickActions {
                                         &mut state.borrow_mut(),
                                         &choices,
                                         key,
-                                        open,
+                                        frame.open,
                                         window,
                                         cx,
                                     );
@@ -462,7 +563,7 @@ impl QuickActions {
         &self,
         choice: &QuickReaction,
         index: usize,
-        open: bool,
+        frame: CapsuleFrame,
         focus: &FocusHandle,
         state: &Rc<RefCell<Interaction>>,
         activate: &SelectEmoji,
@@ -475,34 +576,37 @@ impl QuickActions {
         let activate = activate.clone();
         let mut button = Button::new(index, "");
         button.appearance = ButtonAppearance::Ghost;
-        button.disabled = choice.pending;
-        let side = if open {
-            EMOJI_BUTTON
-        } else {
-            COLLAPSED - px(2.)
-        };
+        let available = index == 0 || frame.open;
+        button.disabled = choice.pending || !available;
+        let progress = if index == 0 { frame.progress } else { 1. };
+        let compact_side = COLLAPSED - px(2.);
+        let side = compact_side + (EMOJI_BUTTON - compact_side) * progress;
         button
             .render_event(palette, Some(focus), move |event, window, cx| {
                 close_capsule(&state, event.is_keyboard(), window);
                 cx.stop_propagation();
                 activate(&emoji, cx);
             })
-            .track_focus(&focus.clone().tab_stop(!choice.pending))
-            .tab_stop(!choice.pending)
+            .when(available, |button| {
+                button
+                    .track_focus(&focus.clone().tab_stop(!choice.pending))
+                    .tab_stop(!choice.pending)
+                    .tooltip(move |_, cx| tooltip(palette, caption.clone(), cx))
+            })
             .size(side)
             .min_w_0()
             .flex_none()
             .p_0()
             .rounded_full()
             .when(choice.own, |button| button.bg(palette.accent_soft))
-            .tooltip(move |_, cx| tooltip(palette, caption.clone(), cx))
+            .when(index > 0, |button| button.opacity(frame.progress))
             .debug_selector(move || format!("history-quick-reaction-{id}-{index}"))
             .child(
                 div()
                     .max_w_full()
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .text_size(if open { px(22.) } else { px(14.) })
+                    .text_size(px(14. + 8. * progress))
                     .opacity(if choice.pending { 0.45 } else { 1. })
                     .child(choice.glyph.clone()),
             )
@@ -745,7 +849,7 @@ impl IntoElement for QuickActions {
 
 #[cfg(all(test, feature = "gpui-test"))]
 mod tests {
-    use gpui::{Context, Modifiers, Render, TestAppContext};
+    use gpui::{Context, Modifiers, Render, ScrollDelta, ScrollWheelEvent, TestAppContext};
 
     use crate::gpui_client::ui::{ThemeMode, track_focus_input};
 
@@ -839,6 +943,7 @@ mod tests {
     /// Появляется при наведении, раскрывается с задержкой и выбирает видимый эмодзи.
     #[gpui::test]
     fn hover_opens_quick_reactions_without_resizing_the_bubble(cx: &mut TestAppContext) {
+        cx.update(|app| Preferences::set_animations_enabled(app, false).unwrap());
         let clock = cx.executor().clone();
         let (root, ui) = cx.add_window_view(|window, cx| Fixture::new(false, window, cx));
         let surface = ui.debug_bounds("quick-test-surface").unwrap();
@@ -874,6 +979,98 @@ mod tests {
         // GPUI запоминает последние координаты селектора даже после удаления элемента.
         ui.simulate_click(collapsed.center(), Modifiers::none());
         ui.read(|app| assert_eq!(&*root.read(app).selected.borrow(), &["👍"]));
+    }
+
+    /// Раскрывает капсулу вверх и меняет направление без скачка при возврате указателя.
+    #[gpui::test]
+    fn quick_reactions_reverse_hover_motion_without_moving_the_bubble(cx: &mut TestAppContext) {
+        let clock = cx.executor();
+        let (root, ui) = cx.add_window_view(|window, cx| Fixture::new(false, window, cx));
+        let surface = ui.debug_bounds("quick-test-surface").unwrap();
+        ui.simulate_mouse_move(surface.center(), None, Modifiers::none());
+        ui.run_until_parked();
+        let collapsed = ui.debug_bounds(CAPSULE_BOUNDS).unwrap();
+        ui.simulate_mouse_move(collapsed.center(), None, Modifiers::none());
+        clock.advance_clock(OPEN_DELAY);
+        ui.run_until_parked();
+        assert_eq!(ui.debug_bounds(CAPSULE_BOUNDS), Some(collapsed));
+
+        clock.advance_clock(CAPSULE_TRANSITION / 2);
+        ui.update(|window, _| window.refresh());
+        ui.run_until_parked();
+        let opening = ui.debug_bounds(CAPSULE_BOUNDS).unwrap();
+        assert!(opening.size.height > collapsed.size.height);
+        assert_eq!(opening.bottom(), collapsed.bottom());
+
+        clock.advance_clock(CAPSULE_TRANSITION / 2);
+        ui.update(|window, _| window.refresh());
+        ui.run_until_parked();
+        let expanded = ui.debug_bounds(CAPSULE_BOUNDS).unwrap();
+        assert!(expanded.size.height > opening.size.height);
+        let target = ui.debug_bounds(SECOND_REACTION).unwrap().center();
+        ui.simulate_event(ScrollWheelEvent {
+            position: target,
+            delta: ScrollDelta::Pixels(point(px(0.), px(16.))),
+            ..Default::default()
+        });
+        ui.run_until_parked();
+        let scrolled = ui.debug_bounds(SECOND_REACTION).unwrap().center();
+        assert!(scrolled.y > target.y);
+
+        ui.simulate_mouse_move(point(px(10.), px(10.)), None, Modifiers::none());
+        clock.advance_clock(CLOSE_DELAY);
+        ui.run_until_parked();
+        assert_eq!(ui.debug_bounds(SECOND_REACTION).unwrap().center(), scrolled);
+        clock.advance_clock(CAPSULE_TRANSITION / 2);
+        ui.update(|window, _| window.refresh());
+        ui.run_until_parked();
+        let closing = ui.debug_bounds(CAPSULE_BOUNDS).unwrap();
+        assert!(closing.size.height < expanded.size.height && closing.size.height > COLLAPSED);
+        assert_eq!(closing.bottom(), collapsed.bottom());
+
+        ui.simulate_mouse_move(closing.center(), None, Modifiers::none());
+        ui.run_until_parked();
+        assert_eq!(ui.debug_bounds(CAPSULE_BOUNDS), Some(closing));
+        clock.advance_clock(CAPSULE_TRANSITION / 2);
+        ui.update(|window, _| window.refresh());
+        ui.run_until_parked();
+        assert!(ui.debug_bounds(CAPSULE_BOUNDS).unwrap().size.height > closing.size.height);
+
+        clock.advance_clock(CAPSULE_TRANSITION / 2);
+        ui.update(|window, _| window.refresh());
+        ui.run_until_parked();
+        assert_eq!(ui.debug_bounds(CAPSULE_BOUNDS), Some(expanded));
+        assert_eq!(ui.debug_bounds("quick-test-surface"), Some(surface));
+        let target = ui.debug_bounds(SECOND_REACTION).unwrap().center();
+        ui.simulate_click(target, Modifiers::none());
+        ui.run_until_parked();
+        ui.read(|app| assert_eq!(&*root.read(app).selected.borrow(), &["👍"]));
+        assert_eq!(ui.debug_bounds(CAPSULE_BOUNDS), Some(collapsed));
+    }
+
+    /// Выключение завершает текущий переход, а включение оставляет капсулу на месте.
+    #[gpui::test]
+    fn quick_reactions_finish_motion_when_animations_are_disabled(cx: &mut TestAppContext) {
+        let clock = cx.executor();
+        let (_, ui) = cx.add_window_view(|window, cx| Fixture::new(false, window, cx));
+        let surface = ui.debug_bounds("quick-test-surface").unwrap();
+        ui.simulate_mouse_move(surface.center(), None, Modifiers::none());
+        ui.run_until_parked();
+        let collapsed = ui.debug_bounds(CAPSULE_BOUNDS).unwrap();
+        ui.simulate_mouse_move(collapsed.center(), None, Modifiers::none());
+        clock.advance_clock(OPEN_DELAY);
+        ui.run_until_parked();
+        assert_eq!(ui.debug_bounds(CAPSULE_BOUNDS), Some(collapsed));
+
+        ui.update(|_, app| Preferences::set_animations_enabled(app, false).unwrap());
+        ui.run_until_parked();
+        let expanded = ui.debug_bounds(CAPSULE_BOUNDS).unwrap();
+        assert!(expanded.size.height > COLLAPSED);
+        assert_eq!(expanded.bottom(), collapsed.bottom());
+
+        ui.update(|_, app| Preferences::set_animations_enabled(app, true).unwrap());
+        ui.run_until_parked();
+        assert_eq!(ui.debug_bounds(CAPSULE_BOUNDS), Some(expanded));
     }
 
     /// Запрос ключа доступен сразу и не требует наведения на закрытое сообщение.
