@@ -575,9 +575,16 @@ impl MessageBubble {
                     .bg(rgba(0x000000a6))
                     .debug_selector(|| "history-media-time".into())
             })))
-            .children(
-                caption.map(|caption| caption.render(caption_metadata).px(px(12.)).py(px(8.))),
-            )
+            .children(caption.map(|caption| {
+                let caption = match caption {
+                    // Интерактивный текст не задаёт ширину сам, поэтому отдаём ему свободное место.
+                    BubbleContent::Inline(content) => BubbleContent::Inline(
+                        div().flex_1().min_w_0().child(content).into_any_element(),
+                    ),
+                    blocks => blocks,
+                };
+                caption.render(caption_metadata).px(px(12.)).py(px(8.))
+            }))
             .children(accessory.map(|accessory| {
                 div()
                     .px(px(12.))
@@ -752,6 +759,61 @@ fn message_bubble_radii(own: bool, ends_group: bool) -> Corners<Pixels> {
 #[cfg(test)]
 mod radius_tests {
     use super::*;
+
+    #[cfg(feature = "gpui-test")]
+    /// Короткая подпись под широким медиа остаётся в одной строке рядом со временем.
+    #[gpui::test]
+    fn media_caption_keeps_available_width(cx: &mut gpui::TestAppContext) {
+        /// Показывает пузырь с медиа и короткой подписью.
+        struct CaptionExample;
+        impl gpui::Render for CaptionExample {
+            /// Собирает подпись тем же способом, что и история.
+            fn render(
+                &mut self,
+                window: &mut gpui::Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                let palette = Palette::for_window(window, cx);
+                let caption = div()
+                    .flex()
+                    .flex_col()
+                    .min_w_0()
+                    .max_w_full()
+                    .gap_1()
+                    .child(
+                        super::super::text_role(palette, TextRole::Body)
+                            .min_w_0()
+                            .max_w_full()
+                            .child(gpui::InteractiveText::new(
+                                "link",
+                                gpui::StyledText::new("Отец"),
+                            ))
+                            .debug_selector(|| "caption-text".into()),
+                    );
+                MessageBubble {
+                    author: None,
+                    body: "".into(),
+                    time: Some("10:32".into()),
+                    own: false,
+                    delivery: None,
+                }
+                .render_with_media(
+                    palette,
+                    div().w(px(400.)).h(px(100.)),
+                    Some(BubbleContent::Inline(caption.into_any_element())),
+                    true,
+                    None,
+                    None,
+                )
+            }
+        }
+        let (_, ui) = cx.add_window_view(|_, _| CaptionExample);
+        let text = ui.debug_bounds("caption-text").unwrap();
+        assert!(
+            text.size.width > px(30.) && text.size.height < px(30.),
+            "Подпись перенеслась по буквам: {text:?}"
+        );
+    }
 
     /// Проверяет четыре формы пузыря по направлению и месту сообщения в группе.
     #[test]
