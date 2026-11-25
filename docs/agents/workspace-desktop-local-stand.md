@@ -13,7 +13,7 @@ cargo stand
 (
     stand_env=$(cargo stand env A) &&
     eval "$stand_env" &&
-    cargo dev --test-profile
+    cargo dev
 )
 ```
 

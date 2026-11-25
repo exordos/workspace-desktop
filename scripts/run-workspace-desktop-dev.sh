@@ -57,7 +57,7 @@ if [ -z "$identity" ]; then
     identity=${identity:-Workspace Desktop Local Development}
 fi
 if [ "$identity" = - ]; then
-    printf '%s\n' 'Для cargo dev нужен постоянный сертификат подписи.' >&2
+    printf '%s\n' 'Для cargo dev --normal-profile нужен постоянный сертификат подписи.' >&2
     exit 1
 fi
 run_dir="$target_dir/dev-run"

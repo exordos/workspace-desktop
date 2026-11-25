@@ -4,14 +4,16 @@ set -eu
 project_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$project_dir"
 
+usage='cargo dev [--test-profile|--normal-profile]'
 case "${1-}:$#" in
-    :0|--test-profile:1) ;;
+    :0) set -- --test-profile ;;
+    --test-profile:1|--normal-profile:1) ;;
     --help:1|-h:1)
-        printf '%s\n' 'cargo dev [--test-profile]'
+        printf '%s\n' "$usage" 'По умолчанию открывается временный тестовый профиль.'
         exit 0
         ;;
     *)
-        printf '%s\n' 'Использование: cargo dev [--test-profile]' >&2
+        printf 'Использование: %s\n' "$usage" >&2
         exit 2
         ;;
 esac

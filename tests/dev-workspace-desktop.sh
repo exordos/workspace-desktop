@@ -106,7 +106,7 @@ wait_for_launch() {
     exit 1
 }
 
-start_watcher
+start_watcher --normal-profile
 wait_for_launch 1 700
 first_pid=$launched_pid
 printf 'build output\n' > "$fixture/target/output"
@@ -138,16 +138,16 @@ fi
 # Повторный запуск должен использовать локальный бинарник без скачивания.
 printf '#!/bin/sh\nexit 1\n' > "$fixture/bin/curl"
 chmod +x "$fixture/bin/curl"
-start_watcher
+start_watcher --normal-profile
 wait_for_launch 4
 [ "$(wc -l < "$fixture/sign-operations")" -eq 4 ]
 kill -TERM "$watcher_pid"
 wait "$watcher_pid"
 watcher_pid=
 
-# Режим агента берёт окружение из файла и запускает бинарник без вызова codesign.
+# Запуск без аргументов берёт тестовое окружение из файла и обходится без codesign.
 printf 'WORKSPACE_TEST_LOGIN_A=agent-fixture\n' > "$fixture/.env.test.local"
-start_watcher --test-profile
+start_watcher
 wait_for_launch 5
 [ "$(wc -l < "$fixture/sign-operations")" -eq 4 ]
 first_profile=$(cat "$fixture/agent-profile")
