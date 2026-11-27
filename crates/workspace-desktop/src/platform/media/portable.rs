@@ -27,10 +27,4 @@ impl VideoWindow {
     pub(crate) fn open(_: tempfile::NamedTempFile, _: &str) -> Option<Self> {
         None
     }
-
-    /// Подтверждает, что в тестовом клиенте проигрыватель недоступен.
-    #[cfg(all(test, feature = "gpui-test"))]
-    pub(crate) fn is_open(&self) -> bool {
-        match *self {}
-    }
 }

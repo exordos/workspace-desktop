@@ -105,7 +105,7 @@ impl Playback {
 
 impl Conversation {
     /// Проверяет, что после нажатия файл передан проигрывателю.
-    #[cfg(all(test, feature = "gpui-test"))]
+    #[cfg(all(test, feature = "gpui-test", target_os = "macos"))]
     pub(in crate::gpui_client) fn tested_video_open(&self) -> bool {
         self.attachments.video.0.as_ref().is_some_and(|entry| {
             matches!(&entry.status, Status::Playing { _window: window, .. } if window.is_open())

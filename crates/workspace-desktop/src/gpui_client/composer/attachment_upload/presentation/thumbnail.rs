@@ -93,6 +93,7 @@ mod tests {
     }
 
     /// Использует ImageIO для тестового HEIC, который не читается растровым декодером Rust.
+    #[cfg(target_os = "macos")]
     #[test]
     fn attachment_thumbnail_reads_heic_via_image_io() {
         let bytes = include_bytes!(concat!(
