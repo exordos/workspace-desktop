@@ -1,30 +1,44 @@
 //! Связывает главное окно GPUI с треем, уведомлениями и остановкой фоновой работы.
 //! Здесь находятся настройки окна и обработчики системных действий.
 
+#[cfg(target_os = "macos")]
 pub(super) mod macos;
 mod window_size;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use futures::{StreamExt, channel::mpsc};
+use futures::StreamExt;
+#[cfg(target_os = "macos")]
+use futures::channel::mpsc;
 use gpui::{
-    AnyWindowHandle, App, AppContext, Entity, Global, KeyBinding, Menu, MenuItem, Subscription,
+    AnyWindowHandle, App, AppContext, Entity, Global, KeyBinding, Subscription,
     Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, px, size,
 };
+#[cfg(target_os = "macos")]
+use gpui::{Menu, MenuItem};
 use workspace_core::context::{AccountId, OwnerContext};
 
 use super::{
     contracts::RuntimeExit,
-    preferences::{Language, NotificationSound, Preferences},
+    preferences::Preferences,
     runtime::RuntimeClient,
 };
+use crate::platform::notifications::{NotificationClick, NotificationError, NotificationPermission, Notifications};
+#[cfg(target_os = "macos")]
 use crate::platform::{
-    notifications::{NotificationClick, NotificationError, NotificationPermission, Notifications},
     tray::{Command, Tray},
     wake::WakeObserver,
 };
+#[cfg(target_os = "macos")]
+use super::preferences::{Language, NotificationSound};
+#[cfg(target_os = "macos")]
+use macos::NativeWindow;
 use window_size::{SizeObserver, SizeWriter};
+
+/// Бэкенды Windows и Linux управляют окном через GPUI.
+#[cfg(not(target_os = "macos"))]
+type NativeWindow = std::convert::Infallible;
 
 actions!(workspace_window, [Quit]);
 
@@ -33,18 +47,21 @@ static NEXT_OPERATION: AtomicU64 = AtomicU64::new(1);
 /// Держит адаптеры одного рабочего окна до штатного выхода приложения.
 pub struct WindowPlatform {
     window: AnyWindowHandle, // Окно, которое поднимается при системном действии.
-    native: Option<macos::NativeWindow>, // Ссылка macOS для восстановления из Dock.
+    native: Option<NativeWindow>, // Ссылка macOS для восстановления из Dock.
     runtime: RuntimeClient,  // Фоновая работа, которую нужно остановить до выхода.
     notifications: Notifications, // Центр уведомлений и связь баннера с исходной целью.
     permission: Option<NotificationPermission>, // Последний применённый ответ macOS.
     permission_read: u64,    // Номер последнего чтения, чтобы отсеять поздние ответы.
     requesting_permission: bool, // Системный запрос занимает кнопку до чтения нового статуса.
     quitting: bool,          // Идёт завершение, повторные действия отбрасываются.
+    #[cfg(target_os = "macos")]
     tray: Option<Tray>,      // Меню Workspace живёт вместе с оконным циклом.
+    #[cfg(target_os = "macos")]
     _wake: WakeObserver,     // Передаёт пробуждение macOS фоновой работе.
     _bounds: Entity<SizeObserver>, // Подписка на размеры главного окна.
     size_writer: Option<SizeWriter>, // Ждёт последнюю запись при выходе.
     _closed: Subscription,   // Обычное закрытие окна тоже завершает фон.
+    #[cfg(target_os = "macos")]
     _menu_task: Task<()>,    // Получает действия из меню трея.
     _click_task: Option<Task<()>>, // Передаёт нажатие по баннеру в оболочку.
 }
@@ -80,23 +97,29 @@ impl WindowPlatform {
         if app.try_global::<Self>().is_some() {
             return Err(std::io::Error::other("Адаптеры окна уже подключены").into());
         }
+        #[cfg(target_os = "macos")]
         let main_thread = macos::main_thread()
             .ok_or_else(|| std::io::Error::other("Окну Workspace нужен главный поток"))?;
+        #[cfg(target_os = "macos")]
         let native = window.update(app, |_, window, _| {
             macos::NativeWindow::find(&window.window_title(), main_thread)
         })?;
+        #[cfg(not(target_os = "macos"))]
+        let native: Option<NativeWindow> = None;
         log::debug!(
             "event=workspace_native_window attached={}",
             native.is_some()
         );
+        #[cfg(target_os = "macos")]
         let (commands, mut menu) = mpsc::unbounded();
-        let language = Preferences::read(app).language;
-        let (show, quit) = menu_labels(language);
+        #[cfg(target_os = "macos")]
         let tray = if std::env::var_os("WORKSPACE_DESKTOP_DISABLE_TRAY").is_none() {
+            let (show, quit) = menu_labels(Preferences::read(app).language);
             Tray::install(main_thread, commands, show, quit)
         } else {
             None
         };
+        #[cfg(target_os = "macos")]
         let has_tray = tray.is_some();
 
         let size_writer = SizeWriter::new(profile, app);
@@ -107,11 +130,19 @@ impl WindowPlatform {
             window.on_window_should_close(app, move |window, app| {
                 // Здесь окно ещё доступно, даже если скоро уйдёт из GPUI без трея.
                 window_size::record(window, close_native.as_ref(), &close_sizes);
+                #[cfg(not(target_os = "macos"))]
+                {
+                    // При закрытии последнего окна Linux завершает цикл GPUI. Сначала ждём Bootstrap.
+                    app.defer(Self::request_quit);
+                    return false;
+                }
+                #[cfg(target_os = "macos")]
                 if has_tray {
                     let op_id = operation();
                     log::debug!("op_id={op_id} event=workspace_window_hide");
                     app.hide();
                 }
+                #[cfg(target_os = "macos")]
                 !has_tray
             });
             app.new(|cx| SizeObserver::new(window, native.clone(), sizes, cx))
@@ -122,6 +153,7 @@ impl WindowPlatform {
                 Self::request_quit(app);
             }
         });
+        #[cfg(target_os = "macos")]
         let menu_task = app.spawn(async move |app| {
             while let Some(command) = menu.next().await {
                 if app
@@ -136,6 +168,7 @@ impl WindowPlatform {
             }
         });
 
+        #[cfg(target_os = "macos")]
         let wake = WakeObserver::subscribe(main_thread, runtime.wake_sender());
         let notifications = Notifications::new();
         let click_task = notifications.take_clicks().map(|mut clicks| {
@@ -161,16 +194,20 @@ impl WindowPlatform {
             permission_read: 0,
             requesting_permission: false,
             quitting: false,
+            #[cfg(target_os = "macos")]
             tray,
+            #[cfg(target_os = "macos")]
             _wake: wake,
             _bounds: bounds,
             size_writer: Some(size_writer),
             _closed: closed,
+            #[cfg(target_os = "macos")]
             _menu_task: menu_task,
             _click_task: click_task,
         });
-        app.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        app.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
         app.on_action(|_: &Quit, app| Self::request_quit(app));
+        #[cfg(target_os = "macos")]
         bind_menu_labels(app, |app, show, quit| {
             set_app_menu(app, quit);
             if let Some(tray) = app.try_global::<Self>().and_then(|platform| platform.tray.as_ref())
@@ -295,12 +332,15 @@ impl WindowPlatform {
             return;
         };
         let target = &click.target;
-        let settings = Preferences::read_for(app, &target.context);
-        if settings.notification_sound != NotificationSound::None {
-            super::notification_audio::preview(settings.notification_sound);
-        }
-        if settings.dock_bounce {
-            macos::request_attention();
+        #[cfg(target_os = "macos")]
+        {
+            let settings = Preferences::read_for(app, &target.context);
+            if settings.notification_sound != NotificationSound::None {
+                super::notification_audio::preview(settings.notification_sound);
+            }
+            if settings.dock_bounce {
+                macos::request_attention();
+            }
         }
         let AccountId(account) = &target.context.account_id;
         let id = format!(
@@ -382,11 +422,13 @@ impl WindowPlatform {
 }
 
 /// Получает тексты системных команд по языку выбранного входа.
+#[cfg(target_os = "macos")]
 fn menu_labels(language: Language) -> (&'static str, &'static str) {
     (language.tr("desktop.menu.showWindow"), language.tr("desktop.menu.quit"))
 }
 
 /// Передаёт подписи при первом запуске и при смене языка выбранного входа.
+#[cfg(target_os = "macos")]
 fn bind_menu_labels(app: &mut App, mut update: impl FnMut(&mut App, &'static str, &'static str) + 'static) {
     let mut previous = Preferences::read(app).language;
     let (show, quit) = menu_labels(previous);
@@ -403,6 +445,7 @@ fn bind_menu_labels(app: &mut App, mut update: impl FnMut(&mut App, &'static str
 }
 
 /// Заменяет главное меню GPUI, сохраняя системное действие закрытия приложения.
+#[cfg(target_os = "macos")]
 fn set_app_menu(app: &mut App, quit: &'static str) {
     app.set_menus(vec![Menu {
         name: "Workspace Desktop".into(),
@@ -423,10 +466,11 @@ fn notification_text(app: &App, owner: &OwnerContext, label: &str) -> (&'static 
 fn raise_window(
     app: &mut App,
     window: AnyWindowHandle,
-    native: Option<macos::NativeWindow>,
+    _native: Option<NativeWindow>,
     op_id: u64,
 ) {
-    if let Some(native) = native {
+    #[cfg(target_os = "macos")]
+    if let Some(native) = _native {
         // Восстановление вызывает оконные события. Делаем это после выхода из App::update.
         app.foreground_executor()
             .spawn(async move { native.restore_from_dock() })
@@ -465,7 +509,7 @@ fn deliver_click(
 fn apply_click(
     app: &mut App,
     window: AnyWindowHandle,
-    native: Option<macos::NativeWindow>,
+    native: Option<NativeWindow>,
     click: NotificationClick,
     on_click: &mut impl FnMut(NotificationClick, &mut Window, &mut App),
 ) {

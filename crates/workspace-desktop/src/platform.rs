@@ -9,10 +9,10 @@ use std::sync::Mutex;
 use workspace_core::auth::{AccountRecord, AccountStore, StoreError};
 use workspace_core::context::AccountId;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 mod profile;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 pub use profile::state_directory;
 
 /// Хранилище записей аккаунтов в одном JSON-файле.
@@ -123,16 +123,32 @@ mod keychain;
 #[cfg(target_os = "macos")]
 pub use keychain::MacKeychain;
 
-#[cfg(all(target_os = "macos", feature = "gpui"))]
+#[cfg(all(
+    feature = "gpui",
+    any(target_os = "macos", target_os = "windows", target_os = "linux")
+))]
 pub(crate) mod chat_keys;
 
-#[cfg(all(target_os = "macos", feature = "gpui"))]
+#[cfg(all(feature = "gpui", any(target_os = "windows", target_os = "linux")))]
+pub(crate) mod protected;
+
+#[cfg(all(
+    feature = "gpui",
+    any(target_os = "macos", target_os = "windows", target_os = "linux")
+))]
 pub(crate) mod clipboard;
 
 #[cfg(all(target_os = "macos", feature = "gpui"))]
 pub(crate) mod message_time;
 
-#[cfg(all(target_os = "macos", feature = "gpui"))]
+#[cfg(all(feature = "gpui", any(target_os = "windows", target_os = "linux")))]
+#[path = "platform/message_time_portable.rs"]
+pub(crate) mod message_time;
+
+#[cfg(all(
+    feature = "gpui",
+    any(target_os = "macos", target_os = "windows", target_os = "linux")
+))]
 pub(crate) mod media;
 
 #[cfg(feature = "macos-adapters")]

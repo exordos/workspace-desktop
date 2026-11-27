@@ -393,7 +393,7 @@ fn message_navigation_loaded_permalink_supersedes_delayed_window(cx: &mut TestAp
     let draft = "Черновик набран во время перехода";
     click(ui, "workspace-composer-editor");
     ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(draft.into())));
-    ui.simulate_keystrokes("cmd-v");
+    ui.simulate_keystrokes("secondary-v");
     ui.run_until_parked();
     let source_y = |ui: &VisualTestContext| {
         ui.read(|app| {

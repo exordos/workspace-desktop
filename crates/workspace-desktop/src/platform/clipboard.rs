@@ -1,15 +1,15 @@
-//! Читает пути файлов, которые пользователь скопировал в системный буфер macOS.
+//! Читает пути файлов, которые пользователь скопировал в системный буфер.
 
 use std::path::PathBuf;
 
 /// Забирает записи типа file URL при явной вставке в рабочий редактор.
 pub(crate) fn file_paths() -> Vec<PathBuf> {
     // В GPUI-тестах буфер изолирован. Реальные файлы пользователя ему недоступны.
-    #[cfg(test)]
+    #[cfg(any(test, not(target_os = "macos")))]
     {
         Vec::new()
     }
-    #[cfg(not(test))]
+    #[cfg(all(not(test), target_os = "macos"))]
     {
         use objc2_app_kit::{NSPasteboard, NSPasteboardTypeFileURL};
         use objc2_foundation::NSURL;

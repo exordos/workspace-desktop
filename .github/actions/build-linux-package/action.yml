@@ -1,0 +1,21 @@
+name: Build Workspace Desktop for Linux
+description: Build and verify the Linux x64 package on Ubuntu 24.04
+runs:
+  using: composite
+  steps:
+    - name: Install build dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          binutils libdbus-1-dev libfontconfig1-dev libfreetype-dev \
+          libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+          libxkbcommon-dev libxkbcommon-x11-dev pkg-config
+    - name: Build and verify the package
+      shell: bash
+      run: |
+        rustup toolchain install stable --profile minimal
+        cargo +stable build --locked --release --target x86_64-unknown-linux-gnu -p workspace-desktop --bin workspace-desktop
+        bash scripts/bundle-workspace-desktop-linux.sh \
+          target/x86_64-unknown-linux-gnu/release/workspace-desktop \
+          workspace-desktop-linux-x64.tar.gz

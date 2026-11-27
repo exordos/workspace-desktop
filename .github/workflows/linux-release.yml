@@ -1,0 +1,36 @@
+name: Linux prerelease
+
+on:
+  push:
+    tags: ['v*-linux-preview.*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-release-${{ github.ref }}
+
+jobs:
+  release:
+    name: Publish Linux x64 preview
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v') && contains(github.ref_name, '-linux-preview.')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: cargo check-architecture
+      - uses: ./.github/actions/build-linux-package
+      - name: Publish the verified archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" workspace-desktop-linux-x64.tar.gz \
+            --verify-tag --prerelease --latest=false \
+            --title "Workspace Desktop for Linux $TAG" \
+            --notes 'Linux x86-64 preview for Ubuntu 24.04. Download the tar.gz archive and follow the included README. CI verifies the executable and its dependencies. Graphical sessions still need field testing.'

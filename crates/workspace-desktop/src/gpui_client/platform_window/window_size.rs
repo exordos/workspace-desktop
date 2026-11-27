@@ -9,7 +9,7 @@ use std::{
 use gpui::{App, Context, Pixels, Size, Subscription, Task, Window, WindowBounds, px, size};
 use tokio::sync::watch;
 
-use super::macos::NativeWindow;
+use super::NativeWindow;
 
 const FILE_NAME: &str = "window-size.json";
 const DEFAULT_SIZE: [f32; 2] = [MIN_WIDTH, MIN_HEIGHT];
@@ -93,13 +93,16 @@ impl SizeObserver {
 /// Принимает размер только из видимого окна в обычном режиме.
 pub(super) fn record(
     window: &Window,
-    native: Option<&NativeWindow>,
+    _native: Option<&NativeWindow>,
     updates: &watch::Sender<SizeUpdate>,
 ) {
     if !matches!(window.window_bounds(), WindowBounds::Windowed(_))
         || window.is_maximized()
-        || native.is_some_and(|native| !native.is_ordinary())
     {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    if _native.is_some_and(|native| !native.is_ordinary()) {
         return;
     }
     let size = window.viewport_size();

@@ -1684,7 +1684,9 @@ mod tests {
     /// Открывает отдельные страницы из профиля и возвращает фокус в шапку.
     #[gpui::test]
     fn profile_opens_personal_info_and_settings_pages(cx: &mut TestAppContext) {
-        use crate::gpui_client::preferences::{Preferences, workspace_direct};
+        use crate::gpui_client::preferences::Preferences;
+        #[cfg(target_os = "macos")]
+        use crate::gpui_client::preferences::workspace_direct;
 
         cx.update(bind_keys);
         let directory = tempfile::tempdir().unwrap();
@@ -1730,11 +1732,14 @@ mod tests {
         click(ui, "profile-back");
         click(ui, "profile-settings");
         assert!(ui.debug_bounds("profile-settings-page").is_some());
-        assert!(!ui.read(workspace_direct::enabled));
-        click(ui, "profile-workspace-direct");
-        assert!(ui.read(workspace_direct::enabled));
-        click(ui, "profile-workspace-direct");
-        assert!(!ui.read(workspace_direct::enabled));
+        #[cfg(target_os = "macos")]
+        {
+            assert!(!ui.read(workspace_direct::enabled));
+            click(ui, "profile-workspace-direct");
+            assert!(ui.read(workspace_direct::enabled));
+            click(ui, "profile-workspace-direct");
+            assert!(!ui.read(workspace_direct::enabled));
+        }
         for width in [700., 1200.] {
             ui.simulate_resize(size(px(width), px(640.)));
             ui.run_until_parked();
@@ -1894,7 +1899,7 @@ mod tests {
         );
         press_key(ui, "escape");
         assert!(!ui.read(|app| client.read(app).right_panel.read(app).has_modal()));
-        press_key(ui, "cmd-k");
+        press_key(ui, "secondary-k");
         assert!(!ui.update(|window, app| {
             client
                 .read(app)

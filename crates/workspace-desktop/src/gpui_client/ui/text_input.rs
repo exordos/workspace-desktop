@@ -115,12 +115,18 @@ impl TextInput {
             KeyBinding::new("right", Right, context),
             KeyBinding::new("shift-left", SelectLeft, context),
             KeyBinding::new("shift-right", SelectRight, context),
+            #[cfg(target_os = "macos")]
             KeyBinding::new("cmd-left", Start, context),
+            #[cfg(target_os = "macos")]
             KeyBinding::new("cmd-right", End, context),
-            KeyBinding::new("cmd-a", SelectAll, context),
-            KeyBinding::new("cmd-c", Copy, context),
-            KeyBinding::new("cmd-x", Cut, context),
-            KeyBinding::new("cmd-v", Paste, context),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("home", Start, context),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("end", End, context),
+            KeyBinding::new("secondary-a", SelectAll, context),
+            KeyBinding::new("secondary-c", Copy, context),
+            KeyBinding::new("secondary-x", Cut, context),
+            KeyBinding::new("secondary-v", Paste, context),
         ]);
     }
 

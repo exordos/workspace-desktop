@@ -13,7 +13,9 @@ mod gpui_tests {
         storage::HistoryScope,
     };
 
-    use super::super::{NotificationClick, apply_click, bind_menu_labels, notification_text};
+    use super::super::{NotificationClick, apply_click, notification_text};
+    #[cfg(target_os = "macos")]
+    use super::super::bind_menu_labels;
     use crate::gpui_client::{
         contracts::{
             AccountSession, AccountSnapshot, ChatEntry, ChatRoute, NotificationReply, RuntimeEvent,
@@ -76,6 +78,7 @@ mod gpui_tests {
     }
 
     /// Подписи меню меняются при выборе языка и при переходе между двумя входами.
+    #[cfg(target_os = "macos")]
     #[gpui::test]
     fn menu_labels_follow_preferences_and_account_switch(cx: &mut TestAppContext) {
         let first = account("first", 1).session.owner;

@@ -90,3 +90,68 @@ jobs:
           archive: false
           if-no-files-found: error
           retention-days: 14
+
+  linux:
+    name: Linux app (x64)
+    needs: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/build-linux-package
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: workspace-desktop-linux-x64.tar.gz
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    name: Windows app (x64)
+    needs: lint
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
+      - name: Build and verify the executable
+        shell: pwsh
+        run: |
+          $sdkBin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/bin'
+          $fxc = Get-ChildItem (Join-Path $sdkBin '10.*/x64/fxc.exe') -File |
+            Sort-Object { [version]$_.Directory.Parent.Name } -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe was not found' }
+          $env:GPUI_FXC_PATH = $fxc.FullName
+          cargo +stable-x86_64-pc-windows-msvc build --locked --release --target x86_64-pc-windows-msvc -p workspace-desktop --bin workspace-desktop
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = 'target/x86_64-pc-windows-msvc/release/workspace-desktop.exe'
+          $archive = 'workspace-desktop-windows-x64.zip'
+          Compress-Archive -LiteralPath $exe -DestinationPath $archive
+          $verify = Join-Path $env:RUNNER_TEMP 'workspace-desktop-windows-x64'
+          Expand-Archive -LiteralPath $archive -DestinationPath $verify
+          $packagedExe = Join-Path $verify 'workspace-desktop.exe'
+          $stream = [System.IO.File]::OpenRead($packagedExe)
+          try {
+            $header = [System.IO.BinaryReader]::new($stream)
+            $stream.Position = 0x3c
+            $stream.Position = $header.ReadUInt32()
+            if ($header.ReadUInt32() -ne 0x4550 -or $header.ReadUInt16() -ne 0x8664) {
+              throw 'Expected an x64 PE executable'
+            }
+          } finally {
+            $stream.Dispose()
+          }
+          $helpText = & $packagedExe --help
+          if ($LASTEXITCODE -ne 0 -or $helpText -notlike 'Usage: workspace-desktop *') {
+            throw 'The packaged Windows executable failed the smoke test'
+          }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: workspace-desktop-windows-x64.zip
+          archive: false
+          if-no-files-found: error
+          retention-days: 14

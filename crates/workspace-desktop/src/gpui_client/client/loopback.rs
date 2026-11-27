@@ -1539,7 +1539,7 @@ fn direct_topic_click_and_submission_preserve_exact_topic(cx: &mut TestAppContex
     );
     click(ui, "workspace-composer-editor");
     ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(MARKER.to_owned())));
-    ui.simulate_keystrokes("cmd-v");
+    ui.simulate_keystrokes("secondary-v");
     ui.run_until_parked();
     click(ui, "conversation-send");
     until(
@@ -1594,7 +1594,7 @@ fn catalog_click_and_submission_reach_https_queue(cx: &mut TestAppContext) {
     ui.simulate_keystrokes("escape");
     tab_to_catalog_search(&client, ui);
     ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string("Тест".to_owned())));
-    ui.simulate_keystrokes("cmd-v");
+    ui.simulate_keystrokes("secondary-v");
     ui.run_until_parked();
     assert!(ui.debug_bounds("catalog-clear").is_some());
     ui.simulate_keystrokes("down enter");
@@ -1672,7 +1672,7 @@ fn catalog_click_and_submission_reach_https_queue(cx: &mut TestAppContext) {
     ui.run_until_parked();
     assert!(ui.update(|window, _| editor_focus.is_focused(window)));
     ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(MARKER.to_owned())));
-    ui.simulate_keystrokes("cmd-v");
+    ui.simulate_keystrokes("secondary-v");
     ui.run_until_parked();
 
     // Сужаем то же окно с черновиком и убеждаемся, что отправляется тот же текст.
@@ -1822,7 +1822,7 @@ fn direct_destination_change_requires_manual_recheck_before_enqueue(cx: &mut Tes
     let refocus = |ui: &mut VisualTestContext| click(ui, "workspace-composer-editor");
     refocus(ui);
     ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(MARKER.into())));
-    ui.simulate_keystrokes("cmd-v");
+    ui.simulate_keystrokes("secondary-v");
 
     for direct_gate in [
         &server.state.direct_encrypted,
@@ -1887,7 +1887,7 @@ fn direct_destination_change_requires_manual_recheck_before_enqueue(cx: &mut Tes
         .store(true, Ordering::SeqCst);
     refocus(ui);
     ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(MARKER.into())));
-    ui.simulate_keystrokes("cmd-v");
+    ui.simulate_keystrokes("secondary-v");
     press_enter(ui);
     until(
         ui,
@@ -2118,7 +2118,7 @@ fn conversation_details_stay_with_the_verified_route(cx: &mut TestAppContext) {
     let composer = ui.read(|app| first.read(app).tested_composer().unwrap().clone());
     click(ui, "workspace-composer-editor");
     ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(MARKER.into())));
-    ui.simulate_keystrokes("cmd-v shift-tab pageup");
+    ui.simulate_keystrokes("secondary-v shift-tab pageup");
     ui.run_until_parked();
     assert_eq!(
         ui.update(|window, app| first.read(app).keyboard_focus(window, app)),
@@ -2709,7 +2709,7 @@ fn sidebar_members_offer_only_allowed_actions_and_refresh_after_changes(cx: &mut
     );
     click(ui, "details-member-picker-query");
     ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string("коллега".into())));
-    ui.simulate_keystrokes("cmd-v");
+    ui.simulate_keystrokes("secondary-v");
     ui.run_until_parked();
     click(ui, PICK_INVITEE);
     click(ui, "details-member-picker-submit");
@@ -2843,7 +2843,7 @@ fn explicit_topic_accepts_mouse_and_keyboard_in_each_account(cx: &mut TestAppCon
     );
     click(ui, "workspace-composer-editor");
     ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(MARKER.to_owned())));
-    ui.simulate_keystrokes("cmd-v");
+    ui.simulate_keystrokes("secondary-v");
     ui.run_until_parked();
     click(ui, "conversation-send");
     until(ui, "единственный POST от B", |_| {
@@ -2881,7 +2881,7 @@ fn explicit_topic_accepts_mouse_and_keyboard_in_each_account(cx: &mut TestAppCon
     });
     tab_to_catalog_search(&client, ui);
     ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string("Длинная тема".into())));
-    ui.simulate_keystrokes("cmd-v");
+    ui.simulate_keystrokes("secondary-v");
     ui.run_until_parked();
     assert!(ui.debug_bounds("catalog-clear").is_some());
     assert!(ui.debug_bounds(CHANNEL_TOPIC_ROW).is_some());
@@ -2934,7 +2934,7 @@ fn explicit_topic_accepts_mouse_and_keyboard_in_each_account(cx: &mut TestAppCon
         Some("редактор")
     );
     ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(MARKER.to_owned())));
-    ui.simulate_keystrokes("cmd-v");
+    ui.simulate_keystrokes("secondary-v");
     press_enter(ui);
     until(ui, "единственный POST от A", |_| {
         acceptance.sent.lock().unwrap().len() >= 2
@@ -2981,7 +2981,7 @@ fn explicit_topic_is_rechecked_before_queue_and_before_post(cx: &mut TestAppCont
     *acceptance.gate.lock().unwrap() = TopicGate::Closed;
     click(ui, "workspace-composer-editor");
     ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(MARKER.to_owned())));
-    ui.simulate_keystrokes("cmd-v");
+    ui.simulate_keystrokes("secondary-v");
     press_enter(ui);
     until(
         ui,

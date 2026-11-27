@@ -8,13 +8,11 @@ use gpui::{
     Window, div, prelude::*, px,
 };
 
+#[cfg(target_os = "macos")]
+use crate::gpui_client::{notification_audio, preferences::{NotificationSound, workspace_direct}};
 use crate::gpui_client::{
     contracts::AccountSession,
-    notification_audio,
-    preferences::{
-        ChatClick, IdleTimeout, Language, NotificationSound, PreferenceValues, Preferences,
-        workspace_direct,
-    },
+    preferences::{ChatClick, IdleTimeout, Language, PreferenceValues, Preferences},
     right_panel::RightPanel,
     runtime::RuntimeClient,
     ui::{Icon, Palette, activate, switch_indicator},
@@ -28,6 +26,7 @@ pub(in crate::gpui_client::client) use hotkeys::Hotkeys;
 #[derive(Clone, Copy)]
 enum Section {
     ChatClick, // Маршрут строки канала.
+    #[cfg(target_os = "macos")]
     Sound,     // Звук уведомлений.
     Language,  // Язык приложения.
     Timeout,   // Автоматический выход.
@@ -59,6 +58,7 @@ struct OptionRow<Choose = fn(&mut PreferenceValues)> {
     subtitle: Option<&'static str>, // Подсказка при наличии.
     active: bool,                   // Показывает галочку выбора.
     choose: Choose,                 // Записывает значение в снимок профиля.
+    #[cfg(target_os = "macos")]
     preview: Option<NotificationSound>, // Звук для предпрослушивания у варианта выбора.
 }
 
@@ -226,6 +226,7 @@ impl General {
             let weak = weak.clone();
             let id = row.id;
             let choose = row.choose;
+            #[cfg(target_os = "macos")]
             let preview = row.preview;
             list = list.child(activate(
                 div()
@@ -263,6 +264,9 @@ impl General {
                 palette,
                 move |window, app| {
                     let _ = weak.update(app, |view, cx| {
+                        #[cfg(not(target_os = "macos"))]
+                        view.save(window, cx, &choose);
+                        #[cfg(target_os = "macos")]
                         if view.save(window, cx, &choose)
                             && let Some(sound) = preview
                         {
@@ -317,6 +321,7 @@ impl General {
     }
 
     /// Показывает общий переключатель маршрута и сохраняет выбор для следующего запуска.
+    #[cfg(target_os = "macos")]
     fn workspace_direct_row(
         &mut self,
         lang: Language,
@@ -370,11 +375,9 @@ impl Render for General {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::for_window(window, cx);
         let settings = Preferences::read(cx);
-        let (lang, chat_click, sound, dock_bounce, separate_call_window, idle_timeout) = (
+        let (lang, chat_click, separate_call_window, idle_timeout) = (
             settings.language,
             settings.chat_click,
-            settings.notification_sound,
-            settings.dock_bounce,
             settings.separate_call_window,
             settings.idle_timeout,
         );
@@ -392,7 +395,7 @@ impl Render for General {
             cx,
             Self::open_hotkeys,
         );
-        div()
+        let page = div()
             .id("profile-settings-page")
             .debug_selector(|| "profile-settings-page".into())
             .flex_1()
@@ -424,6 +427,7 @@ impl Render for General {
                         subtitle: None,
                         active: chat_click == ChatClick::General,
                         choose: |value| value.chat_click = ChatClick::General,
+                        #[cfg(target_os = "macos")]
                         preview: None,
                     },
                     OptionRow {
@@ -432,36 +436,40 @@ impl Render for General {
                         subtitle: Some(lang.tr("settings.chatClickActionAvatarHint")),
                         active: chat_click == ChatClick::LatestTopic,
                         choose: |value| value.chat_click = ChatClick::LatestTopic,
+                        #[cfg(target_os = "macos")]
                         preview: None,
                     },
                 ],
                 palette,
                 cx,
-            ))
+            ));
+        #[cfg(target_os = "macos")]
+        let page = page
             .child(self.section(
                 Section::Sound,
                 "profile-sound",
                 (
                     lang.tr("settings.notificationSound"),
                     None,
-                    Some(sound_name(lang, sound)),
+                    Some(sound_name(lang, settings.notification_sound)),
                 ),
                 Icon::VolumeUp,
                 palette,
                 cx,
             ))
-            .children(self.options(Section::Sound, sound_options(lang, sound), palette, cx))
+            .children(self.options(Section::Sound, sound_options(lang, settings.notification_sound), palette, cx))
             .child(self.switch(
                 (
                     "profile-dock-bounce",
                     lang.tr("settings.dockBounce"),
                     Icon::DesktopWindows,
                 ),
-                dock_bounce,
+                settings.dock_bounce,
                 palette,
                 cx,
                 |value| value.dock_bounce = !value.dock_bounce,
-            ))
+            ));
+        let page = page
             .child(
                 self.switch(
                     (
@@ -475,8 +483,10 @@ impl Render for General {
                     |value| value.separate_call_window = !value.separate_call_window,
                 )
                 .gap(px(4.)),
-            )
-            .child(self.workspace_direct_row(lang, palette, cx))
+            );
+        #[cfg(target_os = "macos")]
+        let page = page.child(self.workspace_direct_row(lang, palette, cx));
+        page
             .child(self.section(
                 Section::Language,
                 "profile-language",
@@ -493,6 +503,7 @@ impl Render for General {
                     subtitle: None,
                     active: lang == language,
                     choose: move |value: &mut PreferenceValues| value.language = language,
+                    #[cfg(target_os = "macos")]
                     preview: None,
                 }),
                 palette,
@@ -528,6 +539,7 @@ impl Render for General {
 }
 
 /// Возвращает подпись звука в строке и списке выбора.
+#[cfg(target_os = "macos")]
 fn sound_name(lang: Language, sound: NotificationSound) -> &'static str {
     match sound {
         NotificationSound::Default => lang.tr("settings.soundDefault"),
@@ -540,6 +552,7 @@ fn sound_name(lang: Language, sound: NotificationSound) -> &'static str {
 }
 
 /// Собирает список звуков в порядке Electron.
+#[cfg(target_os = "macos")]
 fn sound_options(lang: Language, active: NotificationSound) -> impl Iterator<Item = OptionRow> {
     use NotificationSound::*;
     let definitions: [(_, _, fn(&mut PreferenceValues)); 6] = [
@@ -615,6 +628,7 @@ fn timeout_options(lang: Language, active: IdleTimeout) -> impl Iterator<Item = 
             subtitle: None,
             active: active == timeout,
             choose,
+            #[cfg(target_os = "macos")]
             preview: None,
         })
 }

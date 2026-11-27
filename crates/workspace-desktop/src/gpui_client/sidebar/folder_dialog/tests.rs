@@ -181,7 +181,7 @@ fn create_folder_retries_the_same_command_and_traps_input(cx: &mut TestAppContex
     h.ui.simulate_keystrokes("enter");
     assert!(h.commands.borrow().is_empty());
 
-    h.ui.simulate_keystrokes("cmd-a");
+    h.ui.simulate_keystrokes("secondary-a");
     h.ui.simulate_input("  Проекты  ");
     h.click("folder-dialog-color-3");
     h.click("folder-dialog-name");

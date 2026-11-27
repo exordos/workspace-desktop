@@ -258,7 +258,7 @@ fn long_history_keeps_reading_position_and_input(cx: &mut TestAppContext) {
         assert!(viewport.y(added).is_some());
     });
     click(ui, "workspace-composer-editor");
-    ui.simulate_keystrokes("cmd-a right");
+    ui.simulate_keystrokes("secondary-a right");
     let new_tail = Uuid::from_u128(LAST_ROW + 2);
     changed(
         &view,
