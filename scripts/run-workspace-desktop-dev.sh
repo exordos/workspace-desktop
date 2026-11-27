@@ -1,8 +1,13 @@
 #!/bin/sh
 set -eu
 
-# Сборка остаётся в общем target. Подписываем только отдельную копию для cargo dev.
+# Галерея и клиент переиспользуют каталог сборки текущего worktree.
 target_dir=${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-target}}
+if [ "${1-}" = --gallery ]; then
+    exec cargo run --target-dir "$target_dir" -p workspace-desktop --example ui_gallery
+fi
+
+# Для обычного профиля подписываем отдельную копию клиента.
 cargo build --target-dir "$target_dir" -p workspace-desktop --bin workspace-desktop
 binary="$target_dir/debug/workspace-desktop"
 

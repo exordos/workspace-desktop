@@ -4,12 +4,13 @@ set -eu
 project_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$project_dir"
 
-usage='cargo dev [--test-profile|--normal-profile]'
+usage='cargo dev [--test-profile|--normal-profile|--gallery]'
 case "${1-}:$#" in
     :0) set -- --test-profile ;;
-    --test-profile:1|--normal-profile:1) ;;
+    --test-profile:1|--normal-profile:1|--gallery:1) ;;
     --help:1|-h:1)
-        printf '%s\n' "$usage" 'По умолчанию открывается временный тестовый профиль.'
+        printf '%s\n' "$usage" 'По умолчанию открывается временный тестовый профиль.' \
+            '--gallery открывает галерею компонентов с автопересборкой.'
         exit 0
         ;;
     *)

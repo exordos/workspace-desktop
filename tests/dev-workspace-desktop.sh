@@ -16,7 +16,7 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$fixture/.cargo" "$fixture/tools/workspace-dev/src" "$fixture/scripts" "$fixture/bin" \
-    "$fixture/crates/workspace-desktop/src" "$fixture/target"
+    "$fixture/crates/workspace-desktop/src" "$fixture/crates/workspace-desktop/examples" "$fixture/target"
 cp "$project_dir/.cargo/config.toml" "$fixture/.cargo/"
 cp "$project_dir/tools/workspace-dev/Cargo.toml" "$project_dir/tools/workspace-dev/Cargo.lock" \
     "$fixture/tools/workspace-dev/"
@@ -53,6 +53,25 @@ fn main() -> std::io::Result<()> {
     } else {
         assert!(std::env::current_exe()?.ends_with("dev-run/workspace-desktop"));
     }
+    let mut launches = OpenOptions::new().create(true).append(true).open("launches")?;
+    writeln!(launches, "{}", std::process::id())?;
+    std::thread::sleep(std::time::Duration::from_secs(60));
+    Ok(())
+}
+EOF
+gallery_data="$fixture/crates/workspace-desktop/examples/gallery-label.txt"
+printf 'before\n' > "$gallery_data"
+cat > "$fixture/crates/workspace-desktop/examples/ui_gallery.rs" <<'EOF'
+//! Показывает, какую версию примера собрал и запустил наблюдатель.
+
+use std::fs::OpenOptions;
+use std::io::Write;
+
+/// Записывает данные сборки и PID, затем ждёт остановки наблюдателя.
+fn main() -> std::io::Result<()> {
+    assert!(std::env::current_exe()?.ends_with("target/debug/examples/ui_gallery"));
+    assert!(std::env::var_os("WORKSPACE_TEST_LOGIN_A").is_none());
+    std::fs::write("gallery-label", include_str!("gallery-label.txt"))?;
     let mut launches = OpenOptions::new().create(true).append(true).open("launches")?;
     writeln!(launches, "{}", std::process::id())?;
     std::thread::sleep(std::time::Duration::from_secs(60));
@@ -161,3 +180,25 @@ kill -TERM "$watcher_pid"
 wait "$watcher_pid"
 watcher_pid=
 [ ! -e "$last_profile" ]
+
+# Галерея собирает пример без входа и подхватывает новые данные из того же каталога.
+start_watcher --gallery
+wait_for_launch 7
+first_pid=$launched_pid
+[ "$(cat "$fixture/gallery-label")" = before ]
+printf 'after\n' > "$gallery_data.tmp"
+mv "$gallery_data.tmp" "$gallery_data"
+wait_for_launch 8
+[ "$(cat "$fixture/gallery-label")" = after ]
+[ "$(wc -l < "$fixture/sign-operations")" -eq 4 ]
+if kill -0 "$first_pid" 2>/dev/null; then
+    printf '%s\n' 'Первый процесс галереи остался запущен.' >&2
+    exit 1
+fi
+kill -TERM "$watcher_pid"
+wait "$watcher_pid"
+watcher_pid=
+if kill -0 "$launched_pid" 2>/dev/null; then
+    printf '%s\n' 'Последний процесс галереи остался запущен.' >&2
+    exit 1
+fi
