@@ -46,7 +46,17 @@ cargo run --locked -p workspace-desktop --bin workspace-desktop
 - Перед загрузкой архива в Actions проверяем архитектуру и запускаем распакованный бинарник с `--help`.
 - Для предварительных сборок Windows и Linux ещё нужны нативные уведомления, трей, вставка файлов из буфера, предпросмотр HEIF и воспроизведение видео. Сборки для ARM64 остаются отдельным этапом.
 
-### Публикация в GitHub Releases
+## Публикация в GitHub Releases
+
+Для релизов используется окружение `macos-release` с доступом для тегов версий `v*`. Чтобы включить подпись Apple, добавьте все пять секретов под теми же именами, что в [окружении Workspace UI](https://github.com/exordos/workspace_ui/blob/d2935e8a42cfc3d6c29527eb4da1f6274d604c89/docs/MACOS_SIGNING.md#step-5-cicd-signing-github-actions).
+
+| Секрет | Значение |
+| --- | --- |
+| `MACOS_CERTIFICATE_P12_BASE64` | Экспорт сертификата `Developer ID Application` с приватным ключом в `.p12`, закодированный в Base64. |
+| `MACOS_CERTIFICATE_PASSWORD` | Пароль экспорта `.p12`. |
+| `APPLE_API_PRIVATE_KEY_P8_BASE64` | Ключ команды App Store Connect в `.p8`, закодированный в Base64. |
+| `APPLE_API_KEY_ID` | ID ключа App Store Connect. |
+| `APPLE_API_ISSUER_ID` | Issuer ID команды App Store Connect. |
 
 После успешного прогона на `main` поставьте тег новой версии на проверенный коммит. Подготовьте описание выпуска в Markdown и укажите файл при создании аннотированного тега.
 
@@ -57,4 +67,8 @@ git push origin refs/tags/v0.1.0
 
 Для предварительного выпуска используйте суффикс, например `v0.1.0-rc.1`. Для легковесного тега GitHub сгенерирует заметки по истории изменений.
 
-В прогоне по новому тегу GitHub собирает и проверяет все четыре пакета. Затем публикует один выпуск `Workspace Desktop v…` с описанием и четырьмя архивами в Assets. Архивы остаются доступны после истечения срока хранения артефактов Actions. [Выпуски Workspace Desktop](https://github.com/exordos/workspace-desktop/releases)
+В прогоне по новому тегу GitHub собирает и проверяет все четыре пакета. Пока все пять секретов отсутствуют, в релиз попадают исходные ZIP для Intel и Apple Silicon с ad hoc подписью. GitHub Actions предупреждает об этом в журнале, а macOS может потребовать ручного разрешения при первом запуске.
+
+Когда настроены все пять секретов, CI подписывает обе `.app` с Hardened Runtime, отправляет ZIP на нотарификацию Apple и прикрепляет полученный билет к `.app`. Затем CI распаковывает финальные ZIP и проверяет подпись и билет. Если задана только часть секретов или подпись, нотарификация либо проверка завершается с ошибкой, публикация останавливается. [Нотарификация ZIP](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow)
+
+После успешных проверок GitHub публикует выпуск `Workspace Desktop v…` с описанием и четырьмя архивами в Assets. Архивы остаются доступны после истечения срока хранения артефактов Actions. [Выпуски Workspace Desktop](https://github.com/exordos/workspace-desktop/releases)

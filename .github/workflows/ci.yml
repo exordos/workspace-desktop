@@ -145,10 +145,101 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  package_macos_release:
+    name: Prepare macOS release packages
+    if: github.event_name == 'push' && github.ref_type == 'tag' && github.event.created
+    needs: macos
+    runs-on: macos-15
+    environment: macos-release
+    timeout-minutes: 45
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: workspace-desktop-macos-*.zip
+          path: macos-builds
+          merge-multiple: true
+          skip-decompress: true
+      - name: Use Apple signing when configured
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_API_PRIVATE_KEY_P8_BASE64: ${{ secrets.APPLE_API_PRIVATE_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          secret_names=(MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD
+            APPLE_API_PRIVATE_KEY_P8_BASE64 APPLE_API_KEY_ID APPLE_API_ISSUER_ID)
+          missing_secrets=()
+          for name in "${secret_names[@]}"; do
+            if [[ -z "${!name}" ]]; then
+              missing_secrets+=("$name")
+            fi
+          done
+          if (( ${#missing_secrets[@]} == ${#secret_names[@]} )); then
+            echo '::warning::Apple signing is not configured. The macOS release will use the ad hoc ZIPs.'
+            mkdir release-macos
+            cp macos-builds/workspace-desktop-macos-{x86_64,arm64}.zip release-macos/
+            exit 0
+          fi
+          if (( ${#missing_secrets[@]} > 0 )); then
+            printf '::error::Missing macOS release secret: %s\n' "${missing_secrets[@]}"
+            exit 1
+          fi
+
+          umask 077
+          signing_dir=$(mktemp -d "$RUNNER_TEMP/workspace-signing.XXXXXX")
+          keychain="$signing_dir/signing.keychain-db"
+          trap 'security delete-keychain "$keychain" 2>/dev/null || true; rm -rf "$signing_dir"' EXIT
+          keychain_password=$(openssl rand -hex 32)
+          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 -D > "$signing_dir/certificate.p12"
+          printf '%s' "$APPLE_API_PRIVATE_KEY_P8_BASE64" | base64 -D > "$signing_dir/AuthKey.p8"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$signing_dir/certificate.p12" -f pkcs12 -k "$keychain" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          identity=$(security find-identity -v -p codesigning "$keychain" |
+            awk '/"Developer ID Application: / { print $2 }')
+          if [[ ! "$identity" =~ ^[[:xdigit:]]{40}$ ]]; then
+            echo '::error::The P12 must contain exactly one valid Developer ID Application identity'
+            exit 1
+          fi
+
+          mkdir release-macos
+          for arch in x86_64 arm64; do
+            archive="workspace-desktop-macos-$arch.zip"
+            app="$signing_dir/$arch/Workspace Desktop.app"
+            ditto -x -k "macos-builds/$archive" "$signing_dir/$arch"
+            codesign --force --keychain "$keychain" --sign "$identity" --options runtime --timestamp "$app"
+            codesign --verify --strict "$app"
+            ditto -c -k --keepParent "$app" "$signing_dir/$archive"
+            xcrun notarytool submit "$signing_dir/$archive" --wait --output-format json \
+              --key "$signing_dir/AuthKey.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" \
+              | tee "$signing_dir/$arch-notary.json"
+            jq -e '.status == "Accepted"' "$signing_dir/$arch-notary.json" > /dev/null
+            xcrun stapler staple "$app"
+
+            ditto -c -k --keepParent "$app" "release-macos/$archive"
+            ditto -x -k "release-macos/$archive" "$signing_dir/verified/$arch"
+            verified_app="$signing_dir/verified/$arch/Workspace Desktop.app"
+            test -x "$verified_app/Contents/MacOS/workspace-desktop"
+            codesign --verify --strict "$verified_app"
+            xcrun stapler validate "$verified_app"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-release-packages
+          path: release-macos/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
   release:
     name: Publish GitHub Release
     if: github.event_name == 'push' && github.ref_type == 'tag' && github.event.created
-    needs: [lint, test, macos, linux, windows]
+    needs: [lint, test, package_macos_release, linux, windows]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -160,10 +251,14 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: workspace-desktop-*
+          pattern: workspace-desktop-{linux,windows}-*
           path: release-assets
           merge-multiple: true
           skip-decompress: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: macos-release-packages
+          path: release-assets
       - name: Create the release with all four packages
         shell: bash
         env:
