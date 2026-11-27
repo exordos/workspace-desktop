@@ -8,10 +8,10 @@ use std::{
 };
 
 use gpui::{
-    Animation, AnyElement, App, AvailableSpace, Bounds, Div, HighlightStyle, Hsla, ImageSource,
-    IntoElement, ListAlignment, ListOffset, ListState, MouseButton, Pixels, Point, RenderOnce,
-    SharedString, Stateful, StyledText, TextLayout, WeakEntity, Window, canvas, div, ease_in_out,
-    list, point, prelude::*, px, rgb, rgba, size,
+    Animation, AnyElement, App, AvailableSpace, Bounds, Div, FontStyle, FontWeight, HighlightStyle,
+    Hsla, ImageSource, IntoElement, ListAlignment, ListOffset, ListState, MouseButton, Pixels,
+    Point, RenderOnce, SharedString, Stateful, StyledText, TextLayout, WeakEntity, Window, canvas,
+    div, ease_in_out, list, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use uuid::Uuid;
 use workspace_core::{
@@ -39,12 +39,14 @@ use super::{
     protected_quotes::{QuotePresentation, QuoteSlot, render_quote},
     quick_actions::{QuickActions, QuickCommand, QuickReactions, reaction_chips},
     reactions::ReactionControls,
-    reply::{ReplyControls, Selection, history_quote},
+    reply::{ReplyControls, Selection, byte_at, history_quote},
 };
 
 #[path = "body.rs"]
-mod body;
-use body::{Body, BodyPart, ForwardBody};
+pub(super) mod body;
+use body::{
+    Body, BodyPart, ForwardBody, MarkdownBreak, MarkdownDocument, MarkdownRun, MarkdownTokenKind,
+};
 
 #[path = "floating_avatar.rs"]
 mod floating_avatar;
@@ -1541,13 +1543,14 @@ fn message_row(
                     .protected
                     .get(&id)
                     .is_none_or(|layout| layout.has_terminal_text());
-                let protected_tail = terminal_text
-                    .then(|| tail_suffix.clone())
-                    .flatten()
-                    .filter(|_| {
-                        text.with_body(|body| !body.ends_with('\n') && !body.ends_with('\r'))
-                            .unwrap_or(false)
-                    });
+                let protected_tail =
+                    terminal_text
+                        .then(|| tail_suffix.clone())
+                        .flatten()
+                        .filter(|_| {
+                            text.with_body(|body| !body.ends_with('\n') && !body.ends_with('\r'))
+                                .unwrap_or(false)
+                        });
                 let body = if let Some(layout) = controls.protected.get(&id) {
                     has_body = !separate_album || layout.has_footer();
                     layout.render(
@@ -1659,7 +1662,7 @@ fn message_row(
         let caption_tail_suffix = prepared
             .parts
             .last()
-            .is_some_and(|part| matches!(part, BodyPart::Text(_) | BodyPart::Inline(_)))
+            .is_some_and(|part| matches!(part, BodyPart::Text { .. } | BodyPart::Inline { .. }))
             .then(|| {
                 (!prepared.text.ends_with('\n') && !prepared.text.ends_with('\r'))
                     .then(|| tail_suffix.as_ref())
@@ -1687,10 +1690,15 @@ fn message_row(
                             conversation: controls.conversation.as_ref(),
                             names: &controls.mention_names,
                             tail_suffix,
+                            markdown: Some((
+                                &row.body.caption.as_ref().unwrap().markdown,
+                                span.range.clone(),
+                            )),
                             selection: Some(InlineSelection {
                                 controls: reply,
                                 body: &row.body.text,
                                 offset: span.range.start,
+                                allowed_range: None,
                             }),
                         })
                         .0
@@ -1720,9 +1728,11 @@ fn message_row(
                 true,
                 bubble_palette,
                 palette.accent,
+                window,
                 caption_tail_suffix.cloned(),
                 peer,
                 (rows, index),
+                None,
                 FragmentContent::new(controls, extras.fragments, extras.app.as_deref_mut()),
             );
             has_inline_tail = caption_tail_suffix.is_some() && !prepared.text.trim().is_empty();
@@ -1772,7 +1782,7 @@ fn message_row(
             )
         }
     } else {
-        if let [BodyPart::Inline(text)] = row.body.parts.as_slice() {
+        if let [BodyPart::Inline { text, range }] = row.body.parts.as_slice() {
             let tail_suffix = (!row.body.text.ends_with('\n') && !row.body.text.ends_with('\r'))
                 .then(|| tail_suffix.clone())
                 .flatten();
@@ -1785,10 +1795,12 @@ fn message_row(
                 conversation: controls.conversation.as_ref(),
                 names: &controls.mention_names,
                 tail_suffix,
+                markdown: Some((&row.body.markdown, range.clone())),
                 selection: reply.map(|controls| InlineSelection {
                     controls,
                     body: &row.body.text,
                     offset: 0,
+                    allowed_range: None,
                 }),
             });
             text_layout = Some(layout);
@@ -1798,53 +1810,31 @@ fn message_row(
                 .then(|| tail_reserve.as_ref())
                 .flatten();
             has_inline_tail = reserve.is_some();
-            let (body, layout) = if let Some(controls) = reply {
-                let (body, layout) = match reserve {
-                    Some(reserve) => controls.selectable_with_tail(
-                        id,
-                        &row.body.text,
-                        reserve.suffix(),
-                        bubble_palette,
-                    ),
-                    None => controls.selectable(id, &row.body.text, bubble_palette),
-                };
-                (body.min_w_0().max_w_full().into_any_element(), layout)
-            } else {
-                let visible = reserve.map_or_else(
-                    || row.body.text.clone(),
-                    |reserve| reserve.append(&row.body.text),
-                );
-                let text = StyledText::new(visible.clone());
-                let text = if reserve.is_some() {
-                    text.with_highlights([(
-                        row.body.text.len() + crate::gpui_client::ui::BUBBLE_TAIL_BREAK.len()
-                            ..visible.len(),
-                        HighlightStyle {
-                            color: Some(bubble_palette.text.opacity(0.)),
-                            ..Default::default()
-                        },
-                    )])
-                } else {
-                    text
-                };
-                let layout = text.layout().clone();
-                (
-                    text_role(bubble_palette, TextRole::Body)
-                        .min_w_0()
-                        .max_w_full()
-                        .child(text)
-                        .into_any_element(),
-                    layout,
-                )
-            };
+            let inline = InlineText::markdown(row.body.text.clone());
+            let (body, layout) = inline.render(InlineRender {
+                id: SharedString::from(format!("history-inline-{id}-0")).into(),
+                row: id,
+                palette: bubble_palette,
+                language: controls.locale,
+                conversation: controls.conversation.as_ref(),
+                names: &controls.mention_names,
+                selection: reply.map(|controls| InlineSelection {
+                    controls,
+                    body: &row.body.text,
+                    offset: 0,
+                    allowed_range: None,
+                }),
+                tail_suffix: reserve.map(|_| tail_suffix.clone()).flatten(),
+                markdown: Some((&row.body.markdown, 0..row.body.text.len())),
+            });
             text_layout = Some(layout);
-            Some(body)
+            Some(body.into_any_element())
         } else {
             let terminal_tail = row
                 .body
                 .parts
                 .last()
-                .is_some_and(|part| matches!(part, BodyPart::Text(_) | BodyPart::Inline(_)))
+                .is_some_and(|part| matches!(part, BodyPart::Text { .. } | BodyPart::Inline { .. }))
                 .then(|| {
                     (!row.body.text.ends_with('\n') && !row.body.text.ends_with('\r'))
                         .then(|| tail_suffix.clone())
@@ -1856,9 +1846,11 @@ fn message_row(
                 false,
                 bubble_palette,
                 palette.accent,
+                window,
                 terminal_tail.clone(),
                 peer,
                 (rows, index),
+                reply,
                 FragmentContent::new(controls, extras.fragments, extras.app.as_deref_mut()),
             );
             has_inline_tail = content.is_some() && terminal_tail.is_some();
@@ -1889,10 +1881,7 @@ fn message_row(
             caption.parts.as_slice()
         });
     let inline_tail = has_inline_tail && !has_reaction_chips;
-    let (content, accessory) = if content.is_some()
-        && has_forward_cards(parts)
-        && !inline_tail
-    {
+    let (content, accessory) = if content.is_some() && has_forward_cards(parts) && !inline_tail {
         (
             content.map(|content| BubbleContent::Blocks {
                 content,
@@ -2104,6 +2093,9 @@ fn call_bubble(
     let card = call_card(palette, own, title, room, location, time, delivery, None);
     let card = div()
         .relative()
+        .w(px(353.))
+        .max_w(relative(0.88))
+        .min_w_0()
         .flex()
         .flex_col()
         .child(card)
@@ -2150,33 +2142,18 @@ fn call_card(
         text_muted: rgba(0xffffff4d).into(),
         message_time: rgba(0xffffff80).into(),
         accent: palette.presence_online,
+        danger: rgba(0xffffff80).into(),
         ..palette
     };
-    let status = delivery.filter(|_| own).map(|state| match state {
-        DeliveryMark::Pending | DeliveryMark::Unknown => {
-            Icon::Pending.element(px(16.), card_palette.message_time)
-        }
-        DeliveryMark::Sent => Icon::Check.element(px(16.), card_palette.message_time),
-        DeliveryMark::Delivered => Icon::DoneAll.element(px(16.), card_palette.message_time),
-        DeliveryMark::Read => Icon::DoneAll.element(px(16.), palette.presence_online),
-        DeliveryMark::Failed => Icon::Error.element(px(16.), card_palette.message_time),
-    });
-    let metadata = (time.is_some() || status.is_some()).then(|| {
-        div()
-            .ml_auto()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(4.))
-            .children(time.map(|time| {
-                label(card_palette, TextRole::Caption, time)
-                    .text_color(card_palette.message_time)
-                    .text_size(px(14.))
-                    .line_height(px(16.))
-            }))
-            .children(status)
-    });
-    let mut first_line = div()
+    let metadata = MessageBubble {
+        author: None,
+        body: SharedString::default(),
+        time,
+        own,
+        delivery,
+    }
+    .metadata(card_palette, false);
+    let first_line = div()
         .flex()
         .min_w_0()
         .items_center()
@@ -2186,26 +2163,39 @@ fn call_card(
                 .text_color(palette.presence_online)
                 .flex_none(),
         )
-        .child(ellipsized_label(card_palette, TextRole::Label, room).flex_shrink());
-    if let Some(location) = location.filter(|name| !name.trim().is_empty()) {
-        first_line = first_line
-            .child(
-                div()
-                    .w(px(3.))
-                    .h(px(16.))
-                    .rounded(px(2.))
-                    .bg(rgb(0xf458d2))
-                    .flex_none(),
-            )
-            .child(
-                ellipsized_label(card_palette, TextRole::Caption, location)
-                    .text_color(card_palette.text_muted)
-                    .text_size(px(14.))
-                    .line_height(px(16.))
-                    .flex_shrink(),
-            );
-    }
-    first_line = first_line
+        .child(
+            ellipsized_label(card_palette, TextRole::Label, room)
+                .min_w_0()
+                .flex_shrink(),
+        );
+    let location = location
+        .filter(|name| !name.trim().is_empty())
+        .map(|location| {
+            div()
+                .flex()
+                .min_w_0()
+                .items_start()
+                .gap_x(px(6.))
+                .child(
+                    div()
+                        .w(px(3.))
+                        .h(px(16.))
+                        .mt(px(2.))
+                        .rounded(px(2.))
+                        .bg(rgb(0xf458d2))
+                        .flex_none(),
+                )
+                .child(
+                    label(card_palette, TextRole::Caption, location)
+                        .text_color(card_palette.text_muted)
+                        .text_size(px(14.))
+                        .line_height(px(16.))
+                        .whitespace_normal()
+                        .min_w_0()
+                        .flex_1(),
+                )
+        });
+    let first_line = first_line
         .child(div().flex_1().min_w_0())
         .child(Icon::Phone.element(px(18.), palette.presence_online));
     let mut card = div()
@@ -2213,9 +2203,9 @@ fn call_card(
         .flex_col()
         .justify_between()
         .gap_y(px(4.))
-        .w(px(353.))
+        .w_full()
         .max_w_full()
-        .h(if join.is_some() { px(108.) } else { px(76.) })
+        .min_h(if join.is_some() { px(108.) } else { px(76.) })
         .min_w_0()
         .p(px(12.))
         .rounded(px(8.))
@@ -2223,6 +2213,7 @@ fn call_card(
         .rounded_br(if own { px(0.) } else { px(8.) })
         .bg(rgb(0x1c2b20))
         .child(first_line)
+        .children(location)
         .child(
             div()
                 .flex()
@@ -2576,8 +2567,11 @@ impl<'a> FragmentContent<'a> {
         &mut self,
         row: Uuid,
         text: &InlineText,
+        range: std::ops::Range<usize>,
+        markdown: &MarkdownDocument,
         palette: Palette,
         tail_suffix: Option<SharedString>,
+        selection: Option<InlineSelection<'_>>,
     ) -> AnyElement {
         let id = SharedString::from(format!("history-inline-{row}-{}", self.inline_index));
         self.inline_index += 1;
@@ -2588,8 +2582,9 @@ impl<'a> FragmentContent<'a> {
             language: self.locale,
             conversation: self.conversation,
             names: self.mention_names,
-            selection: None,
+            selection,
             tail_suffix,
+            markdown: Some((markdown, range)),
         })
         .0
         .into_any_element()
@@ -2652,9 +2647,11 @@ fn quote_content(
     caption: bool,
     palette: Palette,
     quote_accent: Hsla,
+    window: &Window,
     tail_suffix: Option<SharedString>,
     peer: Option<&PeerLabel>,
     (rows, index): (&[Row], &HashMap<Uuid, usize>),
+    selection: Option<&ReplyControls>,
     mut fragments: FragmentContent<'_>,
 ) -> Option<gpui::AnyElement> {
     let blocks = if caption {
@@ -2665,9 +2662,12 @@ fn quote_content(
     } else {
         row.body.parts.as_slice()
     };
-    if !row.body.has_fragments && matches!(blocks, [BodyPart::Text(_)]) {
-        return None;
-    }
+    let markdown = row
+        .body
+        .caption
+        .as_ref()
+        .filter(|_| caption)
+        .map_or(&row.body.markdown, |caption| &caption.markdown);
     let mut body = div()
         .flex()
         .flex_col()
@@ -2676,30 +2676,43 @@ fn quote_content(
         .max_w_full()
         .gap_1()
         .debug_selector(move || format!("history-quote-content-{}", row.id));
-    let mut flow = FragmentFlow::default();
+    let selection = selection.map(|controls| FlowSelection {
+        row: row.id,
+        controls: controls.clone(),
+        body: row.body.text.clone(),
+        safe_ranges: safe_selection_ranges(blocks, row.body.text.len()),
+    });
+    let mut flow = FragmentFlow::new(
+        blocks
+            .iter()
+            .any(|part| matches!(part, BodyPart::Fragment { .. })),
+        format!("history-body-{}", row.id).into(),
+        selection,
+    );
     let id = row.id;
     for (position, block) in blocks.iter().enumerate() {
         let is_terminal = position + 1 == blocks.len();
         match block {
-            BodyPart::Text(text) => {
-                let text_element = if is_terminal {
-                    tail_suffix.as_ref().map_or_else(
-                        || label(palette, TextRole::Body, text.clone()).min_w_0().into_any_element(),
-                        |suffix| tail_text_content(palette, text, suffix),
-                    )
-                } else {
-                    label(palette, TextRole::Body, text.clone())
-                        .min_w_0()
-                        .into_any_element()
-                };
-                flow.text(text_element)
-            }
-            BodyPart::Inline(text) => flow.text(fragments.inline(
-                id,
+            BodyPart::Text { text, range } => flow.markdown_text(
                 text,
+                range.clone(),
+                markdown,
                 palette,
-                is_terminal.then(|| tail_suffix.clone()).flatten(),
-            )),
+                window,
+                is_terminal.then(|| tail_suffix.as_ref()).flatten(),
+            ),
+            BodyPart::Inline { text, range } => {
+                let selection = flow.inline_selection(range.clone());
+                flow.text(fragments.inline(
+                    id,
+                    text,
+                    range.clone(),
+                    markdown,
+                    palette,
+                    is_terminal.then(|| tail_suffix.clone()).flatten(),
+                    selection,
+                ));
+            }
             BodyPart::Preview(preview) => flow.text(
                 label(
                     palette,
@@ -2708,10 +2721,18 @@ fn quote_content(
                 )
                 .min_w_0(),
             ),
-            BodyPart::Fragment { slot, reference } => {
-                flow.fragment(fragments.render((id, *slot), reference.as_ref(), palette));
-            }
-            BodyPart::Forward(forward) => {
+            BodyPart::Fragment {
+                slot,
+                reference,
+                range,
+            } => flow.fragment(
+                fragments.render((id, *slot), reference.as_ref(), palette),
+                format!("history-fragment-flow-{id}-{slot}").into(),
+                markdown_fragment_style(markdown, range.clone()),
+            ),
+            BodyPart::Forward {
+                reference: forward, ..
+            } => {
                 body = flow.append_to(body).child(forward_card(
                     id,
                     position,
@@ -2720,6 +2741,7 @@ fn quote_content(
                         accent: quote_accent,
                         ..palette
                     },
+                    window,
                     &mut fragments,
                 ));
             }
@@ -2808,7 +2830,7 @@ fn quote_content(
 fn has_forward_cards(parts: &[BodyPart]) -> bool {
     parts
         .iter()
-        .any(|part| matches!(part, BodyPart::Forward(_)))
+        .any(|part| matches!(part, BodyPart::Forward { .. }))
 }
 
 /// Рисует снимок пересылки. Спойлеры сохраняют исходные чаты и свои отдельные слоты.
@@ -2817,6 +2839,7 @@ fn forward_card(
     position: usize,
     reference: Option<&ForwardBody>,
     palette: Palette,
+    window: &Window,
     fragments: &mut FragmentContent<'_>,
 ) -> gpui::Stateful<Div> {
     let card_id = ("forward-card", position);
@@ -2855,13 +2878,33 @@ fn forward_card(
         header.into_any_element()
     };
     let mut body = div().flex().flex_col().min_w_0().gap_1();
-    let mut flow = FragmentFlow::default();
+    let mut flow = FragmentFlow::new(
+        reference
+            .parts
+            .iter()
+            .any(|part| matches!(part, BodyPart::Fragment { .. })),
+        format!("history-forward-body-{id}-{target}").into(),
+        None,
+    );
     for (position, part) in reference.parts.iter().enumerate() {
         match part {
-            BodyPart::Text(text) => {
-                flow.text(label(palette, TextRole::Body, text.clone()).min_w_0());
-            }
-            BodyPart::Inline(text) => flow.text(fragments.inline(id, text, palette, None)),
+            BodyPart::Text { text, range } => flow.markdown_text(
+                text,
+                range.clone(),
+                &reference.markdown,
+                palette,
+                window,
+                None,
+            ),
+            BodyPart::Inline { text, range } => flow.text(fragments.inline(
+                id,
+                text,
+                range.clone(),
+                &reference.markdown,
+                palette,
+                None,
+                None,
+            )),
             BodyPart::Preview(preview) => flow.text(
                 label(
                     palette,
@@ -2870,18 +2913,25 @@ fn forward_card(
                 )
                 .min_w_0(),
             ),
-            BodyPart::Fragment { slot, reference } => {
-                flow.fragment(fragments.render((id, *slot), reference.as_ref(), palette));
-            }
+            BodyPart::Fragment {
+                slot,
+                reference: fragment_reference,
+                range,
+            } => flow.fragment(
+                fragments.render((id, *slot), fragment_reference.as_ref(), palette),
+                format!("history-forward-fragment-flow-{id}-{slot}").into(),
+                markdown_fragment_style(&reference.markdown, range.clone()),
+            ),
             BodyPart::Quote { author, .. } => {
                 flow.text(label(palette, TextRole::Caption, author.clone()).min_w_0());
             }
-            BodyPart::Forward(reference) => {
+            BodyPart::Forward { reference, .. } => {
                 body = flow.append_to(body).child(forward_card(
                     id,
                     position,
                     reference.as_ref(),
                     palette,
+                    window,
                     fragments,
                 ));
             }
@@ -2984,41 +3034,455 @@ impl RenderOnce for ForwardHeader {
 }
 
 /// Собирает открытый текст и спойлеры между самостоятельными блоками истории.
-#[derive(Default)]
 struct FragmentFlow {
-    parts: Vec<AnyElement>, // Элементы от предыдущей карточки до следующей.
-    has_fragment: bool,     // Спойлеру нужно место рядом с открытым текстом.
+    parts: Vec<AnyElement>,    // Элементы от предыдущей карточки до следующей.
+    split_text: bool,          // Слова делятся только при соседстве со спойлерами.
+    debug_scope: SharedString, // Уникальная строка для поиска разметки в GPUI-тесте.
+    next_run: usize,           // Порядок видимых текстовых элементов внутри этой строки.
+    selection: Option<FlowSelection>, // Выделение только в обычном диапазоне между скрытыми элементами.
+}
+
+/// Связывает drag мыши с одним безопасным непрерывным диапазоном исходного тела.
+struct FlowSelection {
+    row: Uuid,                                // Строка, к которой привязано выделение.
+    controls: ReplyControls,                  // Состояние выделения строки истории.
+    body: SharedString,                       // Исходное тело, которое позже проверит Core.
+    safe_ranges: Vec<std::ops::Range<usize>>, // Видимые участки между secret и вложенными карточками.
+}
+
+impl FlowSelection {
+    /// Находит участок, который целиком покрывает указанный Markdown run.
+    fn allowed_range(&self, range: &std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
+        self.safe_ranges
+            .iter()
+            .find(|safe| safe.start <= range.start && range.end <= safe.end)
+            .cloned()
+    }
+}
+
+/// Делит исходное тело по синтаксису, заменённому интерактивными или закрытыми карточками.
+fn safe_selection_ranges(parts: &[BodyPart], length: usize) -> Vec<std::ops::Range<usize>> {
+    let mut visible = parts
+        .iter()
+        .filter_map(|part| match part {
+            BodyPart::Text { range, .. } | BodyPart::Inline { range, .. } => Some(range.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    visible.sort_by_key(|range| range.start);
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for range in visible {
+        let start = range.start.min(length);
+        let end = range.end.min(length);
+        if start >= end {
+            continue;
+        }
+        if let Some(previous) = ranges.last_mut()
+            && previous.end == start
+        {
+            previous.end = end;
+        } else {
+            ranges.push(start..end);
+        }
+    }
+    ranges
+}
+
+/// Объединяет стили, которые обрамляют место зашифрованного элемента.
+#[derive(Default)]
+struct FragmentMarkdownStyle {
+    bold: bool,   // Strong применяется к надписи кнопки.
+    italic: bool, // Наклон применяется к надписи кнопки.
+    strike: bool, // Текстовая подпись перечёркивается.
+    code: bool,   // Для подписи используется моноширинный шрифт.
+}
+
+/// Выбирает действующие стили Markdown для исходного диапазона custom элемента.
+fn markdown_fragment_style(
+    markdown: &MarkdownDocument,
+    range: std::ops::Range<usize>,
+) -> FragmentMarkdownStyle {
+    markdown
+        .formats_in(range)
+        .fold(FragmentMarkdownStyle::default(), |mut style, format| {
+            style.bold |= format.bold;
+            style.italic |= format.italic;
+            style.strike |= format.strike;
+            style.code |= format.code;
+            style
+        })
 }
 
 impl FragmentFlow {
+    /// Готовит поток с учётом того, есть ли в нём встраиваемые фрагменты.
+    fn new(split_text: bool, debug_scope: SharedString, selection: Option<FlowSelection>) -> Self {
+        Self {
+            parts: Vec::new(),
+            split_text,
+            debug_scope,
+            next_run: 0,
+            selection,
+        }
+    }
+
+    /// Готовит selection contract для отдельного inline renderer.
+    fn inline_selection(&self, range: std::ops::Range<usize>) -> Option<InlineSelection<'_>> {
+        let selection = self.selection.as_ref()?;
+        let allowed_range = selection.allowed_range(&range)?;
+        Some(InlineSelection {
+            controls: &selection.controls,
+            body: &selection.body,
+            offset: range.start,
+            allowed_range: Some(allowed_range),
+        })
+    }
+
     /// Добавляет текстовое содержимое в порядке исходного сообщения.
     fn text(&mut self, text: impl IntoElement) {
-        self.parts.push(text.into_any_element());
+        let text = text.into_any_element();
+        self.parts.push(if self.split_text {
+            // У интерактивного текста нет intrinsic width; строка задаёт ему ширину бабла.
+            div().w_full().flex_none().child(text).into_any_element()
+        } else {
+            text
+        });
+    }
+
+    /// Рисует текстовые узлы из полного разбора Markdown, вставляя слова между спойлерами.
+    fn markdown_text(
+        &mut self,
+        source: &str,
+        range: std::ops::Range<usize>,
+        markdown: &MarkdownDocument,
+        palette: Palette,
+        window: &Window,
+        tail_suffix: Option<&SharedString>,
+    ) {
+        let mut runs = markdown.visible_runs_in(range.clone());
+        if runs.is_empty() && !source.is_empty() {
+            runs.push(MarkdownRun {
+                source_range: range.clone(),
+                content_range: range.clone(),
+                text: source.to_owned().into(),
+                bold: false,
+                italic: false,
+                strike: false,
+                code: false,
+                break_kind: None,
+                kind: MarkdownTokenKind::Plain,
+            });
+        }
+        let has_runs = !runs.is_empty();
+        let last_text = runs.iter().rposition(|run| !run.text.is_empty());
+        for (run_index, run) in runs.into_iter().enumerate() {
+            match run.break_kind {
+                Some(MarkdownBreak::Soft) => {
+                    self.push_markdown_text(" ", &run, None, palette, window, 0);
+                    continue;
+                }
+                Some(MarkdownBreak::Hard) => {
+                    let index = self.next_run;
+                    self.next_run += 1;
+                    let selector = format!("history-markdown-break-{}-{index}", self.debug_scope);
+                    self.parts.push(
+                        div()
+                            .w_full()
+                            .h_0()
+                            .debug_selector(move || selector.clone())
+                            .into_any_element(),
+                    );
+                    continue;
+                }
+                Some(MarkdownBreak::Paragraph) => {
+                    let index = self.next_run;
+                    self.next_run += 1;
+                    let selector = format!("history-markdown-break-{}-{index}", self.debug_scope);
+                    self.parts.push(
+                        div()
+                            .w_full()
+                            .h(px(6.))
+                            .debug_selector(move || selector.clone())
+                            .into_any_element(),
+                    );
+                    continue;
+                }
+                None => {}
+            }
+            let chunks = if self.split_text {
+                split_whitespace_runs(&run.text)
+            } else {
+                vec![(0, run.text.as_ref())]
+            };
+            for (chunk_index, (chunk_offset, chunk)) in chunks.iter().enumerate() {
+                let tail = (Some(run_index) == last_text && chunk_index + 1 == chunks.len())
+                    .then_some(tail_suffix)
+                    .flatten();
+                self.push_markdown_text(chunk, &run, tail, palette, window, *chunk_offset);
+            }
+        }
+        if !has_runs {
+            if let Some(suffix) = tail_suffix {
+                let fallback = MarkdownRun {
+                    source_range: range.clone(),
+                    content_range: range.clone(),
+                    text: source.to_owned().into(),
+                    bold: false,
+                    italic: false,
+                    strike: false,
+                    code: false,
+                    break_kind: None,
+                    kind: MarkdownTokenKind::Plain,
+                };
+                self.push_markdown_text(source, &fallback, Some(suffix), palette, window, 0);
+            }
+        }
+    }
+
+    /// Добавляет один видимый кусок и присваивает ему последовательный test selector.
+    fn push_markdown_text(
+        &mut self,
+        text: &str,
+        run: &MarkdownRun,
+        tail_suffix: Option<&SharedString>,
+        palette: Palette,
+        window: &Window,
+        chunk_offset: usize,
+    ) {
+        let index = self.next_run;
+        self.next_run += 1;
+        let selector = format!("history-markdown-run-{}-{index}", self.debug_scope);
+        self.parts.push(render_markdown_text(
+            text,
+            run,
+            tail_suffix,
+            palette,
+            selector.into(),
+            window,
+            self.selection.as_ref().and_then(|selection| {
+                selection.allowed_range(&run.source_range).map(|allowed| {
+                    (
+                        selection.row,
+                        selection.controls.clone(),
+                        selection.body.clone(),
+                        allowed,
+                    )
+                })
+            }),
+            chunk_offset,
+        ));
     }
 
     /// Оставляет следующий спойлер в потоке окружающего текста.
-    fn fragment(&mut self, fragment: AnyElement) {
-        self.has_fragment = true;
-        self.parts.push(fragment);
+    fn fragment(
+        &mut self,
+        fragment: AnyElement,
+        selector: SharedString,
+        style: FragmentMarkdownStyle,
+    ) {
+        let mut wrapper = div().flex_shrink_0().child(fragment);
+        if style.bold {
+            wrapper = wrapper.font_weight(FontWeight::BOLD);
+        }
+        if style.italic {
+            wrapper = wrapper.italic();
+        }
+        if style.strike {
+            wrapper = wrapper.line_through();
+        }
+        if style.code {
+            wrapper = wrapper.font_family("monospace");
+        }
+        self.parts.push(
+            wrapper
+                .debug_selector(move || selector.to_string())
+                .into_any_element(),
+        );
     }
 
-    /// Передаёт тексту ширину колонки. Строка с переносом нужна только для смешанного содержимого.
+    /// Собирает текстовые элементы в общую строку, сохраняя ширину колонки.
     fn append_to(&mut self, body: Div) -> Div {
         let parts = std::mem::take(&mut self.parts);
-        if std::mem::take(&mut self.has_fragment) {
+        if !parts.is_empty() {
             body.child(
                 div()
                     .flex()
                     .flex_wrap()
-                    .items_center()
+                    .items_start()
                     .min_w_0()
-                    .gap_1()
+                    .w_full()
                     .children(parts),
             )
         } else {
-            body.children(parts)
+            body
         }
     }
+}
+
+/// Разбивает видимый текст на группы пробелов и слов для вставки спойлера между ними.
+fn split_whitespace_runs(text: &str) -> Vec<(usize, &str)> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut previous_whitespace = None;
+    for (index, character) in text.char_indices() {
+        let whitespace = character.is_whitespace();
+        if previous_whitespace.is_some_and(|previous| previous != whitespace) {
+            chunks.push((start, &text[start..index]));
+            start = index;
+        }
+        previous_whitespace = Some(whitespace);
+    }
+    if start < text.len() {
+        chunks.push((start, &text[start..]));
+    }
+    chunks
+}
+
+/// Создаёт одно видимое слово со стилями Markdown и невидимым запасом для времени.
+fn render_markdown_text(
+    text: &str,
+    run: &MarkdownRun,
+    tail_suffix: Option<&SharedString>,
+    palette: Palette,
+    selector: SharedString,
+    window: &Window,
+    selection: Option<(Uuid, ReplyControls, SharedString, std::ops::Range<usize>)>,
+    chunk_offset: usize,
+) -> AnyElement {
+    let mut visible = text.to_owned();
+    let mut highlights = Vec::new();
+    let style = HighlightStyle {
+        font_weight: run.bold.then_some(FontWeight::BOLD),
+        font_style: run.italic.then_some(FontStyle::Italic),
+        strikethrough: run.strike.then_some(gpui::StrikethroughStyle {
+            thickness: px(1.),
+            color: Some(palette.text),
+        }),
+        background_color: run.code.then_some(palette.surface),
+        ..Default::default()
+    };
+    if !text.is_empty() && (run.bold || run.italic || run.strike || run.code) {
+        highlights.push((0..text.len(), style));
+    }
+    if let Some(suffix) = tail_suffix {
+        visible.push_str(crate::gpui_client::ui::BUBBLE_TAIL_BREAK);
+        let tail_start = visible.len();
+        visible.push_str(suffix);
+        highlights.push((
+            tail_start..visible.len(),
+            HighlightStyle {
+                color: Some(palette.text.opacity(0.)),
+                ..Default::default()
+            },
+        ));
+    }
+    let styled = StyledText::new(visible.clone());
+    let styled = if highlights.is_empty() {
+        styled
+    } else {
+        styled.with_highlights(highlights)
+    };
+    let layout = styled.layout().clone();
+    let measured: SharedString = visible.clone().into();
+    let width = crate::gpui_client::ui::label_width(palette, TextRole::Body, &measured, window);
+    let mut element = text_role(palette, TextRole::Body)
+        .w(width)
+        .min_w_0()
+        .flex_shrink_0()
+        .max_w_full()
+        .child(styled)
+        .debug_selector(move || selector.to_string());
+    if let Some((row, controls, body, allowed)) = selection {
+        let mouse_layout = layout.clone();
+        let mouse_text = visible.clone();
+        let drag_layout = layout;
+        let drag_text = visible;
+        let click_run = run.clone();
+        let drag_run = run.clone();
+        let click_chunk = text.to_owned();
+        let drag_chunk = click_chunk.clone();
+        let click_body = body.clone();
+        let drag_body = body.clone();
+        let drag = controls.clone();
+        let click_allowed = allowed.clone();
+        let drag_allowed = allowed;
+        element = element
+            .cursor(gpui::CursorStyle::IBeam)
+            .on_mouse_down(MouseButton::Left, move |event, window, _| {
+                let display = byte_at(&mouse_layout, &mouse_text, event.position);
+                let index = markdown_source_position(
+                    &click_body,
+                    &click_run,
+                    chunk_offset,
+                    &click_chunk,
+                    display,
+                );
+                controls.start_selection_in(
+                    row,
+                    body.clone(),
+                    click_allowed.clone(),
+                    index,
+                    window,
+                );
+            })
+            .on_mouse_move(move |event, window, _| {
+                if event.dragging() {
+                    let display = byte_at(&drag_layout, &drag_text, event.position);
+                    let index = markdown_source_position(
+                        &drag_body,
+                        &drag_run,
+                        chunk_offset,
+                        &drag_chunk,
+                        display,
+                    );
+                    drag.extend_selection_in(row, drag_allowed.clone(), index, window);
+                }
+            });
+    }
+    if run.code {
+        element = element.font_family("monospace");
+    }
+    element.into_any_element()
+}
+
+/// Переводит позицию над видимым куском в границу UTF-8 исходного Markdown.
+fn markdown_source_position(
+    body: &str,
+    run: &MarkdownRun,
+    chunk_offset: usize,
+    chunk: &str,
+    display: usize,
+) -> usize {
+    let display = clamp_utf8_boundary(chunk, display);
+    let run_offset = chunk_offset + display;
+    if run.content_range.len() == run.text.len() {
+        return run
+            .content_range
+            .start
+            .saturating_add(run_offset)
+            .min(run.content_range.end);
+    }
+    let visible_chars = run
+        .text
+        .get(..run_offset)
+        .map_or(0, |text| text.chars().count());
+    let Some(source) = body.get(run.content_range.clone()) else {
+        return run.content_range.start;
+    };
+    source
+        .char_indices()
+        .nth(visible_chars)
+        .map_or(run.content_range.end, |(offset, _)| {
+            run.content_range.start + offset
+        })
+}
+
+/// Поднимает произвольный byte offset к началу ближайшего UTF-8 символа.
+fn clamp_utf8_boundary(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset = offset.saturating_sub(1);
+    }
+    offset
 }
 
 /// Готовит историю и добавляет уникальные строки очереди только после подтверждённого хвоста.
@@ -3207,6 +3671,53 @@ fn delivery_caption_key(status: DeliveryStatus) -> &'static str {
             "desktop.messenger.history.deliveryPlaintextUnavailable"
         }
         DeliveryStatus::Rejected(_) => "desktop.messenger.history.deliveryRejected",
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    /// Выделяемые участки останавливаются на обеих сторонах каждого secret fragment.
+    #[test]
+    fn safe_selection_ranges_exclude_secret_source_ranges() {
+        let parts = [
+            BodyPart::Text {
+                text: "До ".into(),
+                range: 0..5,
+            },
+            BodyPart::Fragment {
+                slot: 0,
+                reference: None,
+                range: 5..13,
+            },
+            BodyPart::Text {
+                text: " после".into(),
+                range: 13..24,
+            },
+        ];
+
+        assert_eq!(safe_selection_ranges(&parts, 24), vec![0..5, 13..24]);
+    }
+
+    /// Переводит указатель по кириллице только на границы символов исходного Markdown.
+    #[test]
+    fn markdown_selection_maps_utf8_boundaries() {
+        let text: SharedString = "привет".into();
+        let run = MarkdownRun {
+            source_range: 0..text.len(),
+            content_range: 0..text.len(),
+            text: text.clone(),
+            bold: false,
+            italic: false,
+            strike: false,
+            code: false,
+            break_kind: None,
+            kind: MarkdownTokenKind::Plain,
+        };
+
+        assert_eq!(markdown_source_position(&text, &run, 4, "ивет", 2), 6);
+        assert_eq!(markdown_source_position(&text, &run, 4, "ивет", 1), 4);
     }
 }
 

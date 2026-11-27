@@ -7,12 +7,14 @@ use uuid::Uuid;
 use workspace_core::{
     messenger::{
         encryption::ProtectedMessage,
+        encryption::fragments::fragment_display_spans,
         quote::{self, Block},
         references::{WorkspaceReferenceTarget, media_references},
     },
     storage::media::MediaKind,
 };
 
+use super::viewport::body::MarkdownFormatMap;
 use super::{
     Conversation,
     attachments::{AttachmentKey, Cards, ProtectedAttachment},
@@ -29,7 +31,7 @@ use crate::gpui_client::{
 };
 
 /// Структура Markdown для одного отзываемого представления. Содержит только позиции и UUID.
-pub(super) struct ProtectedLayout(Vec<Part>); // Отображаемые блоки в порядке исходного текста.
+pub(super) struct ProtectedLayout(Vec<Part>, Arc<MarkdownFormatMap>); // Блоки и безопасная карта форматирования.
 
 /// Один блок защищённого Markdown.
 enum Part {
@@ -87,6 +89,17 @@ impl ProtectedLayout {
     pub(super) fn parse(text: &str) -> Self {
         let media = media_references(text);
         let links = references(text);
+        let opaque_ranges = media
+            .iter()
+            .map(|reference| reference.range.clone())
+            .chain(
+                fragment_display_spans(text)
+                    .into_iter()
+                    .map(|span| span.range),
+            )
+            .chain(links.iter().map(|reference| reference.range.clone()))
+            .collect::<Vec<_>>();
+        let markdown = Arc::new(MarkdownFormatMap::new(text, &opaque_ranges));
         let mut parts = Vec::new();
         for block in quote::blocks(text) {
             match block {
@@ -113,7 +126,7 @@ impl ProtectedLayout {
                 }
             }
         }
-        Self(parts)
+        Self(parts, markdown)
     }
 
     /// Проверяет повторный клик по той же ссылке, сохранившейся в текущем теле.
@@ -191,6 +204,7 @@ impl ProtectedLayout {
         quote: impl Fn(usize, Palette, bool, Option<(&Cards, &mut App, Language)>) -> AnyElement,
     ) -> Div {
         let mut media = media;
+        let markdown = self.1.clone();
         let mut content = div().flex().flex_col().min_w_0().max_w_full().gap_1();
         let mut quote_position = 0;
         for (position, part) in self.0.iter().enumerate() {
@@ -198,10 +212,17 @@ impl ProtectedLayout {
             let item = match part {
                 Part::Text(range) => {
                     let text = match (is_terminal, tail_suffix.clone()) {
-                        (true, Some(suffix)) => {
-                            GuardedText::range_with_tail(access.clone(), range.clone(), suffix)
-                        }
-                        _ => GuardedText::range(access.clone(), range.clone()),
+                        (true, Some(suffix)) => GuardedText::range_with_tail_and_markdown_map(
+                            access.clone(),
+                            range.clone(),
+                            suffix,
+                            Some(markdown.clone()),
+                        ),
+                        _ => GuardedText::range_with_markdown_map(
+                            access.clone(),
+                            range.clone(),
+                            Some(markdown.clone()),
+                        ),
                     };
                     text_role(palette, TextRole::Body)
                         .min_w_0()
@@ -216,6 +237,7 @@ impl ProtectedLayout {
                     parts,
                     is_terminal.then(|| tail_suffix.clone()).flatten(),
                     &references,
+                    markdown.clone(),
                 )
                 .into_any_element(),
                 Part::Quote(_) => {
@@ -301,6 +323,26 @@ fn append_text(text: &str, range: Range<usize>, links: &[Reference], parts: &mut
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::super::viewport::body::MarkdownFormatMap;
+
+    /// Хранит стили и позиции, но не оставляет открытый текст зашифрованной ссылки.
+    #[test]
+    fn protected_markdown_map_keeps_only_ranges_across_an_opaque_fragment() {
+        let source = "**Слева [секрет](urn:secret:v1:закрыто) справа**";
+        let start = source.find("[секрет]").unwrap();
+        let end = source[start..].find(')').unwrap() + start + 1;
+        let opaque = start..end;
+        let map = MarkdownFormatMap::new(source, std::slice::from_ref(&opaque));
+
+        assert!(map.formats_in(opaque.clone()).any(|format| format.bold));
+        assert!(map.formats_in(0..start).any(|format| format.bold));
+        assert!(format!("{map:?}").find("urn:secret").is_none());
+        assert!(format!("{map:?}").find("закрыто").is_none());
+    }
+}
+
 /// Привязывает нажатия к отзыву ключа и рисует подписи через защищённые фазы GPUI.
 fn render_reference_line(
     row: Uuid,
@@ -309,6 +351,7 @@ fn render_reference_line(
     parts: &[InlinePart],
     tail_suffix: Option<gpui::SharedString>,
     controls: &ProtectedReferenceControls<'_>,
+    markdown: Arc<MarkdownFormatMap>,
 ) -> Div {
     div()
         .flex()
@@ -320,10 +363,17 @@ fn render_reference_line(
             match part {
                 InlinePart::Text(range) => {
                     let text = match (is_terminal, tail_suffix.clone()) {
-                        (true, Some(suffix)) => {
-                            GuardedText::range_with_tail(access.clone(), range.clone(), suffix)
-                        }
-                        _ => GuardedText::range(access.clone(), range.clone()),
+                        (true, Some(suffix)) => GuardedText::range_with_tail_and_markdown_map(
+                            access.clone(),
+                            range.clone(),
+                            suffix,
+                            Some(markdown.clone()),
+                        ),
+                        _ => GuardedText::range_with_markdown_map(
+                            access.clone(),
+                            range.clone(),
+                            Some(markdown.clone()),
+                        ),
                     };
                     text_role(palette, TextRole::Body)
                         .min_w_0()

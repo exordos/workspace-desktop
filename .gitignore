@@ -1,3 +1,4 @@
 /target/
 /.env.test.local
 /.workspace-desktop-observer/
+.DS_Store

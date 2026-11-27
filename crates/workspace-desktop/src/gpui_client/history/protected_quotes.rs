@@ -353,6 +353,9 @@ impl Conversation {
 
     /// Снимает устаревшие оригиналы после изменения ключа в любой теме текущего входа.
     pub(super) fn quoted_key_changed(&mut self, stream: Uuid, key: Uuid, cx: &mut Context<Self>) {
+        for row in self.viewport.fragment_views.invalidate_key(stream, key, cx) {
+            self.viewport.invalidate_row_height(row);
+        }
         if let Some(encryption) = &mut self.encryption {
             let rows = encryption.quotes.invalidate_key(stream, key);
             self.refresh_quote_rows(rows, cx);

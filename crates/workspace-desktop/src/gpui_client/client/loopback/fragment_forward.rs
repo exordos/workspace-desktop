@@ -1,4 +1,4 @@
-//! Проверяет пересылку, отдельный спойлер и отзыв ключа в настоящем окне на локальном HTTPS.
+//! Проверяет пересылку нескольких спойлеров и отзыв ключа в настоящем окне на локальном HTTPS.
 
 use workspace_core::messenger::{
     encryption::{GroupKey, fragments::fragment_links},
@@ -10,7 +10,7 @@ use super::*;
 const ORIGINAL: &str = "10000000-0000-4000-8000-000000000042";
 const SECRET: &str = "PRIVATE-FORWARD-FIXTURE";
 // Синтетический конверт для ключа [7;32], вычислен отдельно через Node/OpenSSL.
-const SNAPSHOT: &str = "до [секрет](urn:secret:v1:10000000-0000-4000-8000-000000000005:10000000-0000-4000-8000-000000000080:FRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzS7qvkRcF5D89oetxPZ5cK3tfeCp8PQ-abZkA4ZwxWKxd0A0sAgR-g) после";
+const SNAPSHOT: &str = "до   [первый секрет](urn:secret:v1:10000000-0000-4000-8000-000000000005:10000000-0000-4000-8000-000000000080:FRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzS7qvkRcF5D89oetxPZ5cK3tfeCp8PQ-abZkA4ZwxWKxd0A0sAgR-g) между   словами [второй секрет](urn:secret:v1:10000000-0000-4000-8000-000000000005:10000000-0000-4000-8000-000000000080:FRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzS7qvkRcF5D89oetxPZ5cK3tfeCp8PQ-abZkA4ZwxWKxd0A0sAgR-g) после";
 
 /// Нативная смешанная строка и её подтверждённая пересылка в тему другого канала.
 #[derive(Default)]
@@ -224,13 +224,12 @@ fn forward_dialog_posts_canonical_fragment_and_reveal_uses_origin_key(cx: &mut T
     assert_eq!(parsed.id.to_string(), ORIGINAL);
     assert_eq!(parsed.snapshot, SNAPSHOT);
     assert!(parsed.source.unwrap().direct);
-    assert_eq!(
-        fragment_links(&parsed.snapshot)[0]
-            .reference
-            .stream_id()
-            .to_string(),
-        STREAM
-    );
+    let links = fragment_links(&parsed.snapshot);
+    assert_eq!(links.len(), 2);
+    assert!(links.iter().all(|link| {
+        link.reference.stream_id().to_string() == STREAM
+            && link.reference.key_id().to_string() == encryption::KEY
+    }));
     assert!(!body.contains(SECRET));
 
     let chevron = ui.debug_bounds(CHANNEL_CHEVRON).unwrap().center();
@@ -244,14 +243,57 @@ fn forward_dialog_posts_canonical_fragment_and_reveal_uses_origin_key(cx: &mut T
     click(ui, CHANNEL_TOPIC_ROW);
     let id = sent["uuid"].as_str().unwrap();
     // GPUI принимает только статический селектор. UUID здесь выдала реальная очередь.
-    let spoiler: &'static str = Box::leak(format!("encrypted-fragment-{id}-0").into_boxed_str());
-    let revealed: &'static str = Box::leak(format!("{spoiler}-revealed").into_boxed_str());
+    let spoiler = |position| {
+        Box::leak(format!("encrypted-fragment-{id}-{position}").into_boxed_str()) as &'static str
+    };
+    let revealed = |position| {
+        Box::leak(format!("{}-revealed", spoiler(position)).into_boxed_str()) as &'static str
+    };
+    let wrapper = |position| {
+        Box::leak(format!("history-forward-fragment-flow-{id}-{position}").into_boxed_str())
+            as &'static str
+    };
+    let spoilers = [spoiler(0), spoiler(1)];
+    let revealed = [revealed(0), revealed(1)];
     until(
         ui,
-        "вложенный спойлер в другой теме",
-        |ui| ui.debug_bounds(spoiler).is_some(),
+        "оба вложенных спойлера в другой теме",
+        |ui| {
+            spoilers
+                .iter()
+                .all(|selector| ui.debug_bounds(selector).is_some())
+        },
     );
-    assert!(ui.debug_bounds(revealed).is_none());
+    assert!(
+        revealed
+            .iter()
+            .all(|selector| ui.debug_bounds(selector).is_none())
+    );
+    let first = ui.debug_bounds(wrapper(0)).unwrap();
+    let second = ui.debug_bounds(wrapper(1)).unwrap();
+    assert!(
+        first.top() < second.top() || (first.top() == second.top() && first.left() < second.left()),
+        "Два спойлера должны идти в исходном порядке: {first:?}, {second:?}"
+    );
+    let words = (0..20)
+        .filter_map(|index| {
+            let selector: &'static str = Box::leak(
+                format!("history-markdown-run-history-forward-body-{id}-{ORIGINAL}-{index}")
+                    .into_boxed_str(),
+            );
+            ui.debug_bounds(selector)
+        })
+        .collect::<Vec<_>>();
+    let precedes = |left: gpui::Bounds<gpui::Pixels>, right: gpui::Bounds<gpui::Pixels>| {
+        left.top() < right.top() || (left.top() == right.top() && left.right() <= right.left())
+    };
+    assert!(words.iter().any(|word| precedes(*word, first)));
+    assert!(
+        words
+            .iter()
+            .any(|word| precedes(first, *word) && precedes(*word, second))
+    );
+    assert!(words.iter().any(|word| precedes(second, *word)));
     let account = ui.read(|app| client.read(app).shell.selected().unwrap().clone());
     let (engine, activation) = runtime.message_encryption(&account).unwrap();
     let key_id = Uuid::parse_str(encryption::KEY).unwrap();
@@ -301,27 +343,67 @@ fn forward_dialog_posts_canonical_fragment_and_reveal_uses_origin_key(cx: &mut T
         .save_key(&activation, origin, key_id, &GroupKey::from_bytes([7; 32]))
         .unwrap();
     // Готовая строка остаётся свёрнутой, поэтому первый успешный клик должен раскрыть её.
-    let ready: &'static str = Box::leak(format!("{spoiler}-ready").into_boxed_str());
+    let ready: [&'static str; 2] = spoilers
+        .map(|spoiler| Box::leak(format!("{spoiler}-ready").into_boxed_str()) as &'static str);
     until(
         ui,
-        "фрагмент готов под исходным ключом",
-        |ui| ui.debug_bounds(ready).is_some(),
+        "оба фрагмента готовы под исходным ключом",
+        |ui| {
+            ready
+                .iter()
+                .all(|selector| ui.debug_bounds(selector).is_some())
+        },
     );
-    let point = ui.debug_bounds(ready).unwrap().center();
-    ui.simulate_mouse_move(point, None, Modifiers::none());
-    click(ui, ready);
-    until(
-        ui,
-        "кнопка раскрывает фрагмент под исходным ключом",
-        |ui| ui.debug_bounds(revealed).is_some(),
+    for (position, selector) in ready.into_iter().enumerate() {
+        let point = ui.debug_bounds(selector).unwrap().center();
+        ui.simulate_mouse_move(point, None, Modifiers::none());
+        click(ui, selector);
+        until(
+            ui,
+            "нажатие раскрывает очередной независимый фрагмент",
+            |ui| {
+                ui.debug_bounds(revealed[position]).is_some()
+                    && revealed.iter().enumerate().all(|(index, selector)| {
+                        if index <= position {
+                            ui.debug_bounds(selector).is_some()
+                        } else {
+                            ui.debug_bounds(selector).is_none()
+                        }
+                    })
+            },
+        );
+    }
+    assert!(
+        revealed
+            .iter()
+            .all(|selector| ui.debug_bounds(selector).is_some()),
+        "оба фрагмента раскрыты перед отзывом ключа"
     );
     engine.remove_key(&activation, origin, key_id).unwrap();
     until(
         ui,
-        "удаление ключа закрывает вложенный спойлер",
+        "удаление ключа закрывает оба вложенных спойлера",
         |ui| {
             ui.update(|window, app| window.draw(app).clear());
-            ui.debug_bounds(spoiler).is_some() && ui.debug_bounds(revealed).is_none()
+            let slots_collapsed_and_unreadable = ui.read(|app| {
+                client
+                    .read(app)
+                    .conversation
+                    .as_ref()
+                    .map(|conversation| {
+                        conversation
+                            .read(app)
+                            .tested_fragment_key_state(origin, key_id, app)
+                    })
+                    .is_some_and(|slots| {
+                        slots.len() == 2
+                            && slots.iter().all(|(_, expanded, has_secret_access)| {
+                                !expanded && !has_secret_access
+                            })
+                    })
+            });
+            slots_collapsed_and_unreadable
+                && spoilers.iter().all(|selector| ui.debug_bounds(selector).is_some())
         },
     );
     assert_eq!(

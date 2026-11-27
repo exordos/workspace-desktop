@@ -666,7 +666,7 @@ impl MessageBubble {
     }
 
     /// Показывает время и статус с цветом фона текста или кадра.
-    pub(super) fn metadata(&self, palette: Palette, on_media: bool) -> Option<Div> {
+    pub(in crate::gpui_client) fn metadata(&self, palette: Palette, on_media: bool) -> Option<Div> {
         let color = if on_media {
             rgba(0xffffffff).into()
         } else {

@@ -17,6 +17,7 @@ use workspace_core::messenger::{
     },
 };
 
+use super::viewport::body::{MarkdownBreak, MarkdownDocument, MarkdownTokenKind};
 use super::{
     Conversation,
     message_menu::MenuHit,
@@ -213,6 +214,7 @@ struct VisibleReference {
     original: Range<usize>, // Весь Markdown-элемент в локальных координатах блока.
     display: Range<usize>,  // Заменившие этот элемент байты подписи для GPUI.
     target: Option<Target>, // Действие есть только у разрешённого типа ссылки.
+    exact: bool,            // При true байтовые позиции текста совпадают один к одному.
 }
 
 /// Параметры показа ссылок в одной строке и допустимые действия.
@@ -225,6 +227,7 @@ pub(super) struct InlineRender<'a> {
     pub names: &'a MentionNames, // Уже известные имена старых упоминаний.
     pub selection: Option<InlineSelection<'a>>, // Общая координата выделения открытого текста.
     pub tail_suffix: Option<SharedString>, // Невидимый резерв времени после последнего символа.
+    pub markdown: Option<(&'a MarkdownDocument, Range<usize>)>, // Полный разбор владельца текста.
 }
 
 /// Привязывает выделение видимых слов к точному исходному телу для цитирования.
@@ -232,9 +235,18 @@ pub(super) struct InlineSelection<'a> {
     pub controls: &'a ReplyControls, // Мышь и сохранённый диапазон текущей истории.
     pub body: &'a SharedString,      // Подтверждённое тело, с которым сверит Core.
     pub offset: usize,               // Положение начала этого блока в теле.
+    pub allowed_range: Option<Range<usize>>, // Безопасный непрерывный участок без скрытых элементов.
 }
 
 impl InlineText {
+    /// Создаёт Markdown-текст без специальных ссылок для общего интерактивного рендерера.
+    pub(super) fn markdown(source: SharedString) -> Self {
+        Self {
+            source,
+            references: Vec::new(),
+        }
+    }
+
     /// Возвращает заготовку только там, где есть видимая специальная ссылка.
     pub(super) fn new(source: SharedString, offset: usize, whole: &[Reference]) -> Option<Self> {
         let references: Vec<_> = whole
@@ -285,11 +297,95 @@ impl InlineText {
                 original: link.range.clone(),
                 display: start..visible.len(),
                 target: link.target.clone(),
+                exact: false,
             });
             cursor = link.range.end;
         }
         visible.push_str(&self.source[cursor..]);
         (visible, targets)
+    }
+
+    /// Собирает видимый Markdown в той же строке, сохраняя источник действий и выделения.
+    fn compose_markdown(
+        &self,
+        document: &MarkdownDocument,
+        owner_range: Range<usize>,
+        language: Language,
+        member_name: impl Fn(Uuid) -> Option<String>,
+        time_chips: bool,
+        palette: Palette,
+    ) -> (
+        String,
+        Vec<VisibleReference>,
+        Vec<(Range<usize>, HighlightStyle)>,
+    ) {
+        let mut visible = String::new();
+        let mut targets = Vec::new();
+        let mut highlights = Vec::new();
+        let mut cursor = owner_range.start;
+        for link in &self.references {
+            let link_range =
+                owner_range.start + link.range.start..owner_range.start + link.range.end;
+            if link_range.start < cursor || link_range.end > owner_range.end {
+                continue;
+            }
+            append_markdown_slice(
+                document,
+                owner_range.start,
+                &self.source,
+                cursor..link_range.start,
+                &mut visible,
+                &mut targets,
+                &mut highlights,
+            );
+            let style_start = visible.len();
+            if time_chips && matches!(link.target, Some(Target::Time(_))) {
+                visible.push_str(TIME_CHIP_LEADING);
+            }
+            visible.push_str(&link.caption(language, &member_name));
+            if time_chips && matches!(link.target, Some(Target::Time(_))) {
+                visible.push_str(TIME_CHIP_TRAILING);
+            }
+            let display = style_start..visible.len();
+            targets.push(VisibleReference {
+                original: link.range.clone(),
+                display: display.clone(),
+                target: link.target.clone(),
+                exact: false,
+            });
+            let label_range = link
+                .label_range
+                .as_ref()
+                .map(|range| owner_range.start + range.start..owner_range.start + range.end);
+            if link.caption(language, &member_name) == link.label
+                && let Some(label_range) = label_range
+            {
+                let mut display_cursor = display.start;
+                for run in document.visible_runs_in(label_range) {
+                    let end = display_cursor + run.text.len();
+                    if display_cursor < end
+                        && let Some(style) =
+                            markdown_highlight(document, run.source_range.clone(), palette)
+                    {
+                        highlights.push((display_cursor..end, style));
+                    }
+                    display_cursor = end;
+                }
+            } else if let Some(style) = markdown_highlight(document, link_range.clone(), palette) {
+                highlights.push((display, style));
+            }
+            cursor = link_range.end;
+        }
+        append_markdown_slice(
+            document,
+            owner_range.start,
+            &self.source,
+            cursor..owner_range.end,
+            &mut visible,
+            &mut targets,
+            &mut highlights,
+        );
+        (visible, targets, highlights)
     }
 
     /// Оставляет участки в общей разметке строки и направляет действие в открытый разговор.
@@ -303,9 +399,25 @@ impl InlineText {
             names,
             selection,
             tail_suffix,
+            markdown,
         } = input;
         let source_length = self.source.len();
-        let (mut visible, targets) = self.compose(language, |user| names.get(user), true);
+        let (mut visible, targets, markdown_highlights) = markdown.map_or_else(
+            || {
+                let (visible, targets) = self.compose(language, |user| names.get(user), true);
+                (visible, targets, Vec::new())
+            },
+            |(document, range)| {
+                self.compose_markdown(
+                    document,
+                    range,
+                    language,
+                    |user| names.get(user),
+                    true,
+                    palette,
+                )
+            },
+        );
         let tail_range = tail_suffix.map(|suffix| {
             visible.push_str(BUBBLE_TAIL_BREAK);
             let start = visible.len();
@@ -313,6 +425,7 @@ impl InlineText {
             start..visible.len()
         });
         let visible = SharedString::from(visible);
+        let has_selection = selection.is_some();
         let selection_range = selection.as_ref().and_then(|selection| {
             let range = selection.controls.source_range(
                 row,
@@ -321,7 +434,8 @@ impl InlineText {
             )?;
             Some(display_position(&targets, range.start)..display_position(&targets, range.end))
         });
-        let mut highlights = highlight_ranges(&targets, palette, selection_range.clone());
+        let mut highlights = markdown_highlights;
+        highlights.extend(highlight_ranges(&targets, palette, selection_range.clone()));
         if let Some(range) = tail_range {
             highlights.push((
                 range,
@@ -376,7 +490,9 @@ impl InlineText {
             let controls = selection.controls.clone();
             let body = selection.body.clone();
             let offset = selection.offset;
-            let source_end = offset + self.source.len();
+            let allowed_range = selection.allowed_range.clone().unwrap_or(0..body.len());
+            let click_allowed = allowed_range.clone();
+            let drag_allowed = allowed_range;
             let click_map = targets.clone();
             let click_layout = layout.clone();
             let click_text = visible.clone();
@@ -388,9 +504,10 @@ impl InlineText {
                 .cursor(gpui::CursorStyle::IBeam)
                 .on_mouse_down(MouseButton::Left, move |event, window, _| {
                     let byte = byte_at(&click_layout, &click_text, event.position);
-                    controls.start_selection(
+                    controls.start_selection_in(
                         row,
                         body.clone(),
+                        click_allowed.clone(),
                         offset + original_position(&click_map, byte).min(source_length),
                         window,
                     );
@@ -398,9 +515,9 @@ impl InlineText {
                 .on_mouse_move(move |event, window, _| {
                     if event.dragging() {
                         let byte = byte_at(&drag_layout, &drag_text, event.position);
-                        drag.extend_selection(
+                        drag.extend_selection_in(
                             row,
-                            offset..=source_end,
+                            drag_allowed.clone(),
                             offset + original_position(&drag_map, byte).min(source_length),
                             window,
                         );
@@ -451,7 +568,20 @@ impl InlineText {
                 cx.stop_propagation();
             });
         }
-        (text.child(widget), layout)
+        let content = text.child(widget);
+        if has_selection {
+            (
+                gpui::div()
+                    .id(SharedString::from(format!("history-reply-wrapper-{row}")))
+                    .min_w_0()
+                    .max_w_full()
+                    .child(content)
+                    .debug_selector(move || format!("history-reply-body-{row}")),
+                layout,
+            )
+        } else {
+            (content, layout)
+        }
     }
 }
 
@@ -580,19 +710,281 @@ fn map_position(
     let mut previous = (0, 0);
     for link in targets {
         let (from, to) = ranges(link);
+        if from.is_empty() && position == from.start {
+            previous = (from.end, to.end);
+            continue;
+        }
         if position <= from.start {
             break;
         }
         if position < from.end {
             return if position - from.start < from.end - position {
-                to.start
+                if link.exact && from.len() == to.len() {
+                    to.start + position - from.start
+                } else {
+                    to.start
+                }
             } else {
-                to.end
+                if link.exact && from.len() == to.len() {
+                    to.start + position - from.start
+                } else {
+                    to.end
+                }
             };
         }
         previous = (from.end, to.end);
     }
     previous.1 + (position - previous.0)
+}
+
+/// Добавляет разобранный участок и его позиционную связь с исходным Markdown.
+fn append_markdown_slice(
+    document: &MarkdownDocument,
+    owner_offset: usize,
+    source: &str,
+    range: Range<usize>,
+    visible: &mut String,
+    targets: &mut Vec<VisibleReference>,
+    highlights: &mut Vec<(Range<usize>, HighlightStyle)>,
+) {
+    let runs = document.visible_runs_in(range.clone());
+    if runs.is_empty() {
+        // Если разбор не дал текстовых узлов, диапазон содержит только Markdown-разделители.
+        // Не показываем их как будто это обычный текст; выделение остаётся нулевой видимой ширины.
+        targets.push(VisibleReference {
+            original: range.start.saturating_sub(owner_offset)
+                ..range.end.saturating_sub(owner_offset),
+            display: visible.len()..visible.len(),
+            target: None,
+            exact: false,
+        });
+        return;
+    }
+    let mut cursor = range.start;
+    for run in runs {
+        let source_start = run.source_range.start.max(range.start);
+        let source_end = run.source_range.end.min(range.end);
+        if cursor < source_start {
+            targets.push(VisibleReference {
+                original: cursor - owner_offset..source_start - owner_offset,
+                display: visible.len()..visible.len(),
+                target: None,
+                exact: false,
+            });
+        }
+        let display_start = visible.len();
+        if let Some(kind) = run.break_kind {
+            match kind {
+                MarkdownBreak::Paragraph => visible.push_str("\n\n"),
+                MarkdownBreak::Hard | MarkdownBreak::Soft => visible.push('\n'),
+            }
+            targets.push(VisibleReference {
+                original: source_start.saturating_sub(owner_offset)
+                    ..source_end.saturating_sub(owner_offset),
+                display: display_start..visible.len(),
+                target: None,
+                exact: false,
+            });
+            cursor = cursor.max(source_end);
+            continue;
+        }
+        if run.kind == MarkdownTokenKind::Synthetic {
+            visible.push_str(&run.text);
+            targets.push(VisibleReference {
+                original: source_start.saturating_sub(owner_offset)
+                    ..source_end.saturating_sub(owner_offset),
+                display: display_start..visible.len(),
+                target: None,
+                exact: false,
+            });
+            cursor = cursor.max(source_end);
+            continue;
+        }
+        let local_start = source_start.saturating_sub(owner_offset);
+        let local_end = source_end.saturating_sub(owner_offset);
+        if let Some(raw) = source.get(local_start..local_end) {
+            let mut source_cursor = source_start;
+            for (source_range, text, exact) in mapped_markdown_segments(raw, source_start, run.kind)
+            {
+                if source_cursor < source_range.start {
+                    targets.push(VisibleReference {
+                        original: source_cursor - owner_offset..source_range.start - owner_offset,
+                        display: visible.len()..visible.len(),
+                        target: None,
+                        exact: false,
+                    });
+                }
+                let shown_start = visible.len();
+                visible.push_str(&text);
+                targets.push(VisibleReference {
+                    original: source_range.start.saturating_sub(owner_offset)
+                        ..source_range.end.saturating_sub(owner_offset),
+                    display: shown_start..visible.len(),
+                    target: None,
+                    exact,
+                });
+                source_cursor = source_range.end;
+            }
+            if source_cursor < source_end {
+                targets.push(VisibleReference {
+                    original: source_cursor - owner_offset..source_end - owner_offset,
+                    display: visible.len()..visible.len(),
+                    target: None,
+                    exact: false,
+                });
+            }
+        }
+        let display = display_start..visible.len();
+        if display_start < visible.len() && (run.bold || run.italic || run.strike || run.code) {
+            highlights.push((
+                display.clone(),
+                HighlightStyle {
+                    font_weight: run.bold.then_some(gpui::FontWeight::BOLD),
+                    font_style: run.italic.then_some(gpui::FontStyle::Italic),
+                    strikethrough: run.strike.then_some(gpui::StrikethroughStyle {
+                        thickness: px(1.),
+                        color: None,
+                    }),
+                    ..HighlightStyle::default()
+                },
+            ));
+        }
+        cursor = cursor.max(source_end);
+    }
+    if cursor < range.end {
+        targets.push(VisibleReference {
+            original: cursor - owner_offset..range.end - owner_offset,
+            display: visible.len()..visible.len(),
+            target: None,
+            exact: false,
+        });
+    }
+}
+
+/// Делит токен на точные символы и преобразования, чтобы выделение не смещалось через весь run.
+fn mapped_markdown_segments(
+    source: &str,
+    offset: usize,
+    kind: MarkdownTokenKind,
+) -> Vec<(Range<usize>, String, bool)> {
+    let mut segments = Vec::new();
+    let mut cursor = 0;
+    let mut line_start = true;
+    while cursor < source.len() {
+        let rest = &source[cursor..];
+        if kind == MarkdownTokenKind::IndentedCode && line_start {
+            let indent = rest
+                .bytes()
+                .take_while(|byte| *byte == b' ')
+                .take(4)
+                .count();
+            if indent == 4 {
+                cursor += indent;
+                line_start = false;
+                continue;
+            }
+            line_start = false;
+        }
+        if matches!(kind, MarkdownTokenKind::Plain | MarkdownTokenKind::ImageAlt)
+            && let Some((length, decoded)) = decode_markdown_entity(rest)
+        {
+            segments.push((offset + cursor..offset + cursor + length, decoded, false));
+            cursor += length;
+            continue;
+        }
+        if matches!(kind, MarkdownTokenKind::Plain | MarkdownTokenKind::ImageAlt)
+            && rest.starts_with('\\')
+        {
+            let next = rest[1..].chars().next();
+            if let Some(character) = next.filter(char::is_ascii_punctuation) {
+                let length = 1 + character.len_utf8();
+                segments.push((
+                    offset + cursor..offset + cursor + length,
+                    character.to_string(),
+                    false,
+                ));
+                cursor += length;
+                continue;
+            }
+        }
+        let character = rest.chars().next().expect("nonempty token remainder");
+        let length = character.len_utf8();
+        if character == '\r' && rest.starts_with("\r\n") {
+            let value = if matches!(kind, MarkdownTokenKind::InlineCode) {
+                " "
+            } else {
+                "\n"
+            };
+            segments.push((
+                offset + cursor..offset + cursor + 2,
+                value.to_owned(),
+                false,
+            ));
+            cursor += 2;
+            line_start = kind == MarkdownTokenKind::IndentedCode;
+        } else if character == '\n' && kind == MarkdownTokenKind::InlineCode {
+            segments.push((offset + cursor..offset + cursor + 1, " ".to_owned(), false));
+            cursor += 1;
+            line_start = false;
+        } else {
+            segments.push((
+                offset + cursor..offset + cursor + length,
+                character.to_string(),
+                true,
+            ));
+            cursor += length;
+            line_start = kind == MarkdownTokenKind::IndentedCode && character == '\n';
+        }
+    }
+    segments
+}
+
+/// Возвращает одну CommonMark-сущность и её декодированный символ.
+fn decode_markdown_entity(source: &str) -> Option<(usize, String)> {
+    let end = source.find(';')?;
+    let entity = source.get(1..end)?;
+    let decoded = if let Some(hex) = entity
+        .strip_prefix("#x")
+        .or_else(|| entity.strip_prefix("#X"))
+    {
+        markdown::decode_numeric(hex, 16)
+    } else if let Some(decimal) = entity.strip_prefix('#') {
+        markdown::decode_numeric(decimal, 10)
+    } else {
+        markdown::decode_named(entity, true)?
+    };
+    Some((end + 1, decoded))
+}
+
+/// Наследует видимое оформление ссылки от общего Markdown-разбора.
+fn markdown_highlight(
+    document: &MarkdownDocument,
+    range: Range<usize>,
+    palette: Palette,
+) -> Option<HighlightStyle> {
+    let mut style = HighlightStyle::default();
+    for format in document.formats_in(range) {
+        style.font_weight = format
+            .bold
+            .then_some(gpui::FontWeight::BOLD)
+            .or(style.font_weight);
+        style.font_style = format
+            .italic
+            .then_some(gpui::FontStyle::Italic)
+            .or(style.font_style);
+        style.strikethrough = format
+            .strike
+            .then_some(gpui::StrikethroughStyle {
+                thickness: px(1.),
+                color: None,
+            })
+            .or(style.strikethrough);
+        style.background_color = format
+            .code
+            .then_some(palette.surface.opacity(0.55))
+            .or(style.background_color);
+    }
+    (style != HighlightStyle::default()).then_some(style)
 }
 
 /// Разводит пересекающиеся выделение и оформление ссылки по неперекрывающимся частям.
@@ -746,6 +1138,7 @@ mod tests {
                     names: &MentionNames::default(),
                     selection: None,
                     tail_suffix: None,
+                    markdown: None,
                 });
                 self.layout = Some(layout);
                 gpui::div().w(px(100.)).child(inline)
@@ -782,5 +1175,77 @@ mod tests {
         let copied = localize_copied_times(source.to_owned(), Language::Ru);
         assert!(copied.starts_with("`urn:time:2026-10-13T10:02:00Z` и "));
         assert_eq!(copied.matches("urn:time:").count(), 1);
+    }
+
+    /// Не показывает Markdown-разделители, если у исходного диапазона нет видимых узлов.
+    #[test]
+    fn markdown_only_delimiters_do_not_fall_back_to_raw_source() {
+        let source = "[](https://example.com)";
+        let document = MarkdownDocument::new(source, &[]);
+        let mut visible = String::new();
+        let mut targets = Vec::new();
+        let mut highlights = Vec::new();
+
+        append_markdown_slice(
+            &document,
+            0,
+            source,
+            0..source.len(),
+            &mut visible,
+            &mut targets,
+            &mut highlights,
+        );
+
+        assert!(visible.is_empty());
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].original, 0..source.len());
+        assert!(targets[0].display.is_empty());
+        assert!(highlights.is_empty());
+    }
+
+    /// Оставляет точную привязку выделения вокруг entity и нормализованного code span.
+    #[test]
+    fn markdown_source_mapping_stays_exact_after_transformed_tokens() {
+        let source = "before &amp; after `left\nright` tail";
+        let document = MarkdownDocument::new(source, &[]);
+        let mut visible = String::new();
+        let mut targets = Vec::new();
+        let mut highlights = Vec::new();
+
+        append_markdown_slice(
+            &document,
+            0,
+            source,
+            0..source.len(),
+            &mut visible,
+            &mut targets,
+            &mut highlights,
+        );
+
+        assert_eq!(visible, "before & after left right tail");
+        for needle in ["before", "after", "right", "tail"] {
+            let display = visible.find(needle).unwrap();
+            let original = source.find(needle).unwrap();
+            assert_eq!(original_position(&targets, display), original, "{needle}");
+        }
+
+        let indented = "    first\n    second";
+        let document = MarkdownDocument::new(indented, &[]);
+        let mut shown = String::new();
+        let mut mapped = Vec::new();
+        append_markdown_slice(
+            &document,
+            0,
+            indented,
+            0..indented.len(),
+            &mut shown,
+            &mut mapped,
+            &mut Vec::new(),
+        );
+        assert_eq!(shown, "first\nsecond");
+        assert_eq!(
+            original_position(&mapped, shown.find("second").unwrap()),
+            indented.find("second").unwrap()
+        );
     }
 }

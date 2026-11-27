@@ -12,11 +12,12 @@ use super::super::{
     protected_quotes::QuoteText,
     references::time_zone_hint,
 };
+use super::body::{MarkdownBreak, MarkdownFormatMap};
 use crate::platform::message_time::format_local_time_zone;
 use gpui::{
     App, AvailableSpace, Bounds, Element, ElementId, GlobalElementId, InspectorElementId,
-    IntoElement, LayoutId, Pixels, SharedString, Size, Style, TextAlign, WhiteSpace, Window,
-    WrappedLine,
+    IntoElement, LayoutId, Pixels, SharedString, Size, Style, TextAlign, TextRun, WhiteSpace,
+    Window, WrappedLine,
 };
 use workspace_core::messenger::{
     catalog::ProtectedSidebarSummary,
@@ -35,6 +36,7 @@ pub(in crate::gpui_client) struct ProtectedText(pub Arc<ProtectedMessage>); // C
 pub(in crate::gpui_client) struct GuardedText {
     source: TextSource, // Снимок либо его байтовый диапазон, действующие только вместе с разрешением.
     tail_suffix: Option<SharedString>, // Невидимое место под время последней строки обычного тела.
+    markdown: Option<Arc<MarkdownFormatMap>>, // Карта Markdown хранит только ranges и flags.
 }
 
 /// Общие источники отзываемого текста. Открытая строка не становится полем GPUI Entity.
@@ -47,12 +49,12 @@ enum TextSource {
         range: Range<usize>,           // Границы заранее проверенной ссылки в теле.
         language: Language, // Используется для времени и подписи неизвестного пользователя.
         names: MentionNames, // Уже доступный справочник того же аккаунта.
-        zone: bool, // Показывает пояс выбранного момента в отдельной строке панели.
+        zone: bool,         // Показывает пояс выбранного момента в отдельной строке панели.
     },
     Sidebar {
         access: Arc<ProtectedSidebarSummary>, // Ключ, который разрешает читать подпись.
-        mounted: Rc<Cell<bool>>, // Текущее место подписи в каталоге.
-        locale: Language, // Язык служебных вставок видимого аккаунта.
+        mounted: Rc<Cell<bool>>,              // Текущее место подписи в каталоге.
+        locale: Language,                     // Язык служебных вставок видимого аккаунта.
     },
     Quote {
         access: QuoteText, // Исходный и цитирующий ключи с проверенными связью и сроком жизни.
@@ -94,16 +96,45 @@ impl TextSource {
                     })
                 })
                 .flatten(),
-            Self::Sidebar { access, mounted, locale } => mounted.get().then(|| {
-                access.with_preview(|preview| {
-                    let text = Zeroizing::new(locale.preview_text(preview));
-                    read(&text)
+            Self::Sidebar {
+                access,
+                mounted,
+                locale,
+            } => mounted
+                .get()
+                .then(|| {
+                    access.with_preview(|preview| {
+                        let text = Zeroizing::new(locale.preview_text(preview));
+                        read(&text)
+                    })
                 })
-            }).flatten(),
+                .flatten(),
             Self::Quote {
                 access,
                 placeholder,
             } => access.with_text(placeholder, read),
+        }
+    }
+
+    /// Читает полный источник под ключом и возвращает только выбранный диапазон Markdown.
+    fn with_markdown_source<T>(
+        &self,
+        map: Option<Arc<MarkdownFormatMap>>,
+        read: impl FnOnce(&str, Range<usize>, Arc<MarkdownFormatMap>) -> T,
+    ) -> Option<T> {
+        match self {
+            Self::Body(access, requested) => access
+                .with_body(|source| {
+                    let range = checked_markdown_range(source, requested.clone())?;
+                    let map = map.unwrap_or_else(|| Arc::new(MarkdownFormatMap::new(source, &[])));
+                    Some(read(source, range, map))
+                })
+                .flatten(),
+            Self::Fragment(access) => access.with_text(|source| {
+                let map = map.unwrap_or_else(|| Arc::new(MarkdownFormatMap::new(source, &[])));
+                read(source, 0..source.len(), map)
+            }),
+            _ => None,
         }
     }
 
@@ -112,10 +143,94 @@ impl TextSource {
         match self {
             Self::Quote { access, .. } => access.with_current(action),
             Self::Reference { access, .. } => access.with_current(action),
-            Self::Sidebar { access, mounted, .. } => mounted.get().then(|| access.with_preview(|_| action())).flatten(),
+            Self::Sidebar {
+                access, mounted, ..
+            } => mounted
+                .get()
+                .then(|| access.with_preview(|_| action()))
+                .flatten(),
             _ => self.with_text(|_| action()),
         }
     }
+}
+
+/// Возвращает диапазон, только если он лежит в источнике на границах UTF-8.
+fn checked_markdown_range(source: &str, requested: Option<Range<usize>>) -> Option<Range<usize>> {
+    let range = requested.unwrap_or(0..source.len());
+    source.get(range.clone())?;
+    Some(range)
+}
+
+/// Строит отрисовываемые строки только внутри разрешённого кадра.
+fn shape_markdown_text(
+    style: &gpui::TextStyle,
+    source: &str,
+    range: Range<usize>,
+    map: &MarkdownFormatMap,
+    tail_suffix: Option<&SharedString>,
+) -> (Zeroizing<String>, Vec<TextRun>) {
+    let mut shaped = Zeroizing::new(String::new());
+    let mut runs = Vec::new();
+    map.for_each_visible_run_in(source, range, |run, text| {
+        let content = match run.break_kind {
+            Some(MarkdownBreak::Soft) => " ",
+            Some(MarkdownBreak::Paragraph) => "\n\n",
+            Some(MarkdownBreak::Hard) => "\n",
+            None => text,
+        };
+        if content.is_empty() {
+            return;
+        }
+        shaped.push_str(content);
+        let mut text_run = style.to_run(content.len());
+        if run.bold {
+            text_run.font = text_run.font.bold();
+        }
+        if run.italic {
+            text_run.font = text_run.font.italic();
+        }
+        if run.code {
+            text_run.font.family = "monospace".into();
+            text_run.background_color = Some(style.color.opacity(0.08));
+        }
+        if run.strike {
+            text_run.strikethrough = Some(gpui::StrikethroughStyle {
+                thickness: gpui::px(1.),
+                color: Some(style.color),
+            });
+        }
+        runs.push(text_run);
+    });
+    if runs.is_empty() {
+        runs.push(style.to_run(0));
+    }
+    if let Some(suffix) = tail_suffix {
+        shaped.push_str(BUBBLE_TAIL_BREAK);
+        shaped.push_str(suffix);
+        let tail_len = BUBBLE_TAIL_BREAK.len() + suffix.len();
+        let mut tail_run = style.to_run(tail_len);
+        tail_run.color = style.color.opacity(0.);
+        runs.push(tail_run);
+    }
+    (shaped, runs)
+}
+
+/// Сохраняет raw служебные подписи без Markdown-преобразования.
+fn shape_raw_text(
+    style: &gpui::TextStyle,
+    text: &str,
+    tail_suffix: Option<&SharedString>,
+) -> (Zeroizing<String>, Vec<TextRun>) {
+    let mut shaped = Zeroizing::new(text.to_owned());
+    let mut runs = vec![style.to_run(text.len())];
+    if let Some(suffix) = tail_suffix {
+        shaped.push_str(BUBBLE_TAIL_BREAK);
+        shaped.push_str(suffix);
+        let mut tail_run = style.to_run(BUBBLE_TAIL_BREAK.len() + suffix.len());
+        tail_run.color = style.color.opacity(0.);
+        runs.push(tail_run);
+    }
+    (shaped, runs)
 }
 
 impl GuardedText {
@@ -135,6 +250,7 @@ impl GuardedText {
                 zone: false,
             },
             tail_suffix: None,
+            markdown: None,
         }
     }
 
@@ -153,6 +269,7 @@ impl GuardedText {
                 zone: true,
             },
             tail_suffix: None,
+            markdown: None,
         }
     }
 
@@ -161,6 +278,7 @@ impl GuardedText {
         Self {
             source: TextSource::Fragment(access),
             tail_suffix: None,
+            markdown: None,
         }
     }
 
@@ -172,28 +290,43 @@ impl GuardedText {
                 placeholder,
             },
             tail_suffix: None,
+            markdown: None,
         }
     }
-    /// Отображает только выбранный диапазон без создания постоянной копии Markdown.
-    pub(in crate::gpui_client) fn range(
+    /// Показывает срез под исходным ключом и общей range-only картой Markdown.
+    pub(in crate::gpui_client) fn range_with_markdown_map(
         access: Arc<ProtectedMessage>,
         range: Range<usize>,
+        markdown: Option<Arc<MarkdownFormatMap>>,
     ) -> Self {
         Self {
             source: TextSource::Body(access, Some(range)),
             tail_suffix: None,
+            markdown,
         }
     }
 
     /// Добавляет невидимый резерв к проверенному диапазону защищённого тела.
+    #[cfg(test)]
     pub(in crate::gpui_client) fn range_with_tail(
         access: Arc<ProtectedMessage>,
         range: Range<usize>,
         suffix: SharedString,
     ) -> Self {
+        Self::range_with_tail_and_markdown_map(access, range, suffix, None)
+    }
+
+    /// Добавляет карту Markdown и невидимый резерв времени к защищённому срезу.
+    pub(in crate::gpui_client) fn range_with_tail_and_markdown_map(
+        access: Arc<ProtectedMessage>,
+        range: Range<usize>,
+        suffix: SharedString,
+        markdown: Option<Arc<MarkdownFormatMap>>,
+    ) -> Self {
         Self {
             source: TextSource::Body(access, Some(range)),
             tail_suffix: Some(suffix),
+            markdown,
         }
     }
 
@@ -204,8 +337,13 @@ impl GuardedText {
         locale: Language,
     ) -> Self {
         Self {
-            source: TextSource::Sidebar { access, mounted, locale },
+            source: TextSource::Sidebar {
+                access,
+                mounted,
+                locale,
+            },
             tail_suffix: None,
+            markdown: None,
         }
     }
 }
@@ -216,6 +354,7 @@ impl ProtectedText {
         GuardedText {
             source: TextSource::Body(self.0, None),
             tail_suffix: Some(suffix),
+            markdown: None,
         }
     }
 }
@@ -235,6 +374,7 @@ impl IntoElement for ProtectedText {
         GuardedText {
             source: TextSource::Body(self.0, None),
             tail_suffix: None,
+            markdown: None,
         }
     }
 }
@@ -286,6 +426,7 @@ impl Element for GuardedText {
         let prepared = frame.lines.clone();
         let access = self.source.clone();
         let tail_suffix = self.tail_suffix.clone();
+        let markdown = self.markdown.clone();
         let layout =
             window.request_measured_layout(Style::default(), move |known, available, window, _| {
                 let width = if style.white_space == WhiteSpace::Normal {
@@ -298,40 +439,38 @@ impl Element for GuardedText {
                 };
                 let mut prepared = prepared.borrow_mut();
                 prepared.clear();
-                access
-                    .with_text(|text| {
-                        let mut shaped = Zeroizing::new(text.to_owned());
-                        let mut runs = vec![style.to_run(text.len())];
-                        if let Some(suffix) = &tail_suffix {
-                            shaped.push_str(BUBBLE_TAIL_BREAK);
-                            shaped.push_str(suffix);
-                            let tail_len = BUBBLE_TAIL_BREAK.len() + suffix.len();
-                            let mut tail_run = style.to_run(tail_len);
-                            tail_run.color = style.color.opacity(0.);
-                            runs.push(tail_run);
-                        }
-                        let Ok(lines) = window.text_system().shape_text(
-                            SharedString::new(shaped.as_str()),
-                            font_size,
-                            &runs,
-                            width,
-                            style.line_clamp,
-                        ) else {
-                            return Size::default();
-                        };
-                        let result =
-                            lines
-                                .iter()
-                                .fold(Size::<Pixels>::default(), |mut size, line| {
-                                    let line = line.size(line_height);
-                                    size.height += line.height;
-                                    size.width = size.width.max(line.width).ceil();
-                                    size
-                                });
-                        prepared.extend(lines);
-                        result
-                    })
-                    .unwrap_or_default()
+                let text = match &access {
+                    TextSource::Body(..) | TextSource::Fragment(..) => {
+                        access.with_markdown_source(markdown.clone(), |source, range, map| {
+                            shape_markdown_text(&style, source, range, &map, tail_suffix.as_ref())
+                        })
+                    }
+                    _ => {
+                        access.with_text(|text| shape_raw_text(&style, text, tail_suffix.as_ref()))
+                    }
+                };
+                let Some((shaped, runs)) = text else {
+                    return Size::default();
+                };
+                let Ok(lines) = window.text_system().shape_text(
+                    SharedString::new(shaped.as_str()),
+                    font_size,
+                    &runs,
+                    width,
+                    style.line_clamp,
+                ) else {
+                    return Size::default();
+                };
+                let result = lines
+                    .iter()
+                    .fold(Size::<Pixels>::default(), |mut size, line| {
+                        let line = line.size(line_height);
+                        size.height += line.height;
+                        size.width = size.width.max(line.width).ceil();
+                        size
+                    });
+                prepared.extend(lines);
+                result
             });
         (layout, frame)
     }
@@ -398,10 +537,22 @@ mod tests {
 
     use super::super::super::protected_body::{ProtectedLayout, ProtectedReferenceControls};
     use super::*;
-    use crate::platform::chat_keys::ProfileChatKeys;
     use crate::gpui_client::ui::{
         BubbleContent, DeliveryMark, MessageBubble, Palette, TextRole, text_role,
     };
+    use crate::platform::chat_keys::ProfileChatKeys;
+
+    /// Не разрешает ошибочному срезу расшириться до всего защищённого источника.
+    #[test]
+    fn protected_markdown_range_rejects_invalid_utf8_and_bounds() {
+        let source = "ё Secret";
+        assert_eq!(checked_markdown_range(source, Some(0..2)), Some(0..2));
+        assert_eq!(checked_markdown_range(source, Some(1..3)), None);
+        assert_eq!(
+            checked_markdown_range(source, Some(0..source.len() + 1)),
+            None
+        );
+    }
 
     /// Показывает защищённое тело с резервом времени внутри отзываемого текстового элемента.
     struct ProtectedTailView {
@@ -525,12 +676,9 @@ mod tests {
     impl Render for MeasureProbe {
         /// Проводит обе фазы в одном кадре, чтобы порядок операций был управляемым.
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let element = self
-                .holder
-                .with_body(|text| 0..text.len())
-                .map(|range| {
-                    GuardedText::range_with_tail(self.holder.clone(), range, "MMMMM".into())
-                });
+            let element = self.holder.with_body(|text| 0..text.len()).map(|range| {
+                GuardedText::range_with_tail(self.holder.clone(), range, "MMMMM".into())
+            });
             let mut element = element;
             let engine = self.engine.clone();
             let activation = self.activation.clone();

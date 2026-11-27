@@ -28,10 +28,11 @@ use crate::gpui_client::{
 
 /// Выделение одного проверенного снимка тела.
 struct Fragment {
-    id: Uuid,           // Сообщение, в котором началось выделение.
-    body: SharedString, // Версия текста, из которой рассчитаны байты.
-    anchor: usize,      // Исходная позиция курсора.
-    caret: usize,       // Последняя позиция во время растягивания диапазона.
+    id: Uuid,              // Сообщение, в котором началось выделение.
+    body: SharedString,    // Версия текста, из которой рассчитаны байты.
+    allowed: Range<usize>, // Непрерывный обычный участок без скрытых элементов.
+    anchor: usize,         // Исходная позиция курсора.
+    caret: usize,          // Последняя позиция во время растягивания диапазона.
 }
 
 impl Fragment {
@@ -85,7 +86,9 @@ impl Selection {
         if selected.id != id || selected.body.as_ref() != text {
             return None;
         }
-        let fragment = text.get(selected.range())?;
+        let range = selected.range();
+        let clipped = range.start.max(selected.allowed.start)..range.end.min(selected.allowed.end);
+        let fragment = text.get(clipped)?;
         (!fragment.trim().is_empty()).then(|| fragment.to_owned())
     }
 }
@@ -112,7 +115,8 @@ impl ReplyControls {
             .as_ref()
             .filter(|selected| selected.id == id && selected.body == *body)?;
         let range = selected.range();
-        let clipped = range.start.max(span.start)..range.end.min(span.end);
+        let clipped = range.start.max(span.start).max(selected.allowed.start)
+            ..range.end.min(span.end).min(selected.allowed.end);
         (!clipped.is_empty()).then(|| clipped.start - span.start..clipped.end - span.start)
     }
 
@@ -129,11 +133,28 @@ impl ReplyControls {
         index: usize,
         window: &mut Window,
     ) {
+        self.start_selection_in(id, body.clone(), 0..body.len(), index, window);
+    }
+
+    /// Начинает выделение только внутри непрерывного разрешённого участка тела.
+    pub(super) fn start_selection_in(
+        &self,
+        id: Uuid,
+        body: SharedString,
+        allowed: Range<usize>,
+        index: usize,
+        window: &mut Window,
+    ) {
+        if allowed.start > allowed.end || allowed.end > body.len() {
+            return;
+        }
+        let index = index.clamp(allowed.start, allowed.end);
         let mut selection = self.selection.borrow_mut();
         selection.focused = Some(id);
         selection.fragment = Some(Fragment {
             id,
             body,
+            allowed,
             anchor: index,
             caret: index,
         });
@@ -154,43 +175,30 @@ impl ReplyControls {
             && span.contains(&selection.anchor)
             && index != selection.caret
         {
-            selection.caret = index;
+            selection.caret = index.clamp(selection.allowed.start, selection.allowed.end);
             window.refresh();
         }
     }
 
-    /// Оборачивает простой текст с живым выделением, не меняя метрики пузыря.
-    pub(super) fn selectable(
+    /// Продлевает выделение в пределах исходного безопасного участка.
+    pub(super) fn extend_selection_in(
         &self,
         id: Uuid,
-        body: &SharedString,
-        palette: Palette,
-    ) -> (Stateful<Div>, TextLayout) {
-        self.selectable_text(id, body, 0..body.len(), body.clone(), None, palette)
-    }
-
-    /// Добавляет невидимый резерв времени, оставляя мыши диапазон исходного тела.
-    pub(super) fn selectable_with_tail(
-        &self,
-        id: Uuid,
-        body: &SharedString,
-        tail_suffix: &str,
-        palette: Palette,
-    ) -> (Stateful<Div>, TextLayout) {
-        let mut visible = body.to_string();
-        visible.push_str(BUBBLE_TAIL_BREAK);
-        visible.push_str(tail_suffix);
-        self.selectable_text(
-            id,
-            body,
-            0..body.len(),
-            visible.into(),
-            Some(
-                body.len() + BUBBLE_TAIL_BREAK.len()
-                    ..body.len() + BUBBLE_TAIL_BREAK.len() + tail_suffix.len(),
-            ),
-            palette,
-        )
+        allowed: Range<usize>,
+        index: usize,
+        window: &mut Window,
+    ) {
+        if let Some(selection) = self.selection.borrow_mut().fragment.as_mut()
+            && selection.id == id
+            && selection.allowed == allowed
+        {
+            let index = index.clamp(allowed.start, allowed.end);
+            if index == selection.caret {
+                return;
+            }
+            selection.caret = index;
+            window.refresh();
+        }
     }
 
     /// Показывает часть тела и сохраняет выделение в координатах исходного сообщения.
@@ -725,6 +733,46 @@ mod tests {
                 "Зашифрованный фрагмент Зашифрованный фрагмент Пересланное сообщение"
             );
         }
+    }
+
+    /// Ограничивает цитату соседним обычным диапазоном и сохраняет UTF-8 границы.
+    #[test]
+    fn selection_fragment_does_not_cross_hidden_source_range() {
+        let body: SharedString = "До секрет после".into();
+        let allowed = 0.."До ".len();
+        let selection = Selection {
+            fragment: Some(Fragment {
+                id: Uuid::nil(),
+                body: body.clone(),
+                allowed: allowed.clone(),
+                anchor: 0,
+                caret: body.len(),
+            }),
+            ..Selection::default()
+        };
+
+        assert_eq!(
+            selection.fragment(Uuid::nil(), &body).as_deref(),
+            Some("До ")
+        );
+        assert!(body.is_char_boundary(allowed.end));
+
+        let allowed = body.len() - " после".len()..body.len();
+        let selection = Selection {
+            fragment: Some(Fragment {
+                id: Uuid::nil(),
+                body: body.clone(),
+                allowed: allowed.clone(),
+                anchor: body.len(),
+                caret: 0,
+            }),
+            ..Selection::default()
+        };
+        assert_eq!(
+            selection.fragment(Uuid::nil(), &body).as_deref(),
+            Some(" после")
+        );
+        assert!(body.is_char_boundary(allowed.start));
     }
 }
 

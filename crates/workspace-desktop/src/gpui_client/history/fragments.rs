@@ -57,6 +57,19 @@ impl Conversation {
         })
     }
 
+    /// Возвращает открытые forwarding slots для проверки отзыва в GPUI-тестах.
+    #[cfg(all(test, feature = "gpui-test"))]
+    pub(in crate::gpui_client) fn tested_fragment_key_state(
+        &self,
+        stream: Uuid,
+        key: Uuid,
+        app: &App,
+    ) -> Vec<(Uuid, bool, bool)> {
+        self.viewport
+            .fragment_views
+            .tested_key_state(stream, key, app)
+    }
+
     /// Проверяет исходную строку в Core и переносит правку только в оставшийся открытым редактор.
     pub(super) fn edit_fragments(
         &self,
@@ -203,6 +216,52 @@ impl FragmentViews {
             }
         }
         affected.into_iter().collect()
+    }
+
+    /// Закрывает фрагменты точного ключа и создаёт их заново после следующего кадра.
+    pub(super) fn invalidate_key(
+        &self,
+        stream: Uuid,
+        key: Uuid,
+        cx: &mut Context<Conversation>,
+    ) -> Vec<Uuid> {
+        let mut entries = self.0.borrow_mut();
+        let mut affected = HashSet::new();
+        entries.slots.retain(|&(row, _), entry| {
+            if (entry.reference.stream_id(), entry.reference.key_id()) != (stream, key) {
+                return true;
+            }
+            entry.spoiler.update(cx, FragmentSpoiler::revoke);
+            affected.insert(row);
+            false
+        });
+        affected.into_iter().collect()
+    }
+
+    /// Возвращает слоты ключа и их раскрытие для GPUI-тестов отзыва.
+    #[cfg(all(test, feature = "gpui-test"))]
+    pub(super) fn tested_key_state(
+        &self,
+        stream: Uuid,
+        key: Uuid,
+        app: &App,
+    ) -> Vec<(Uuid, bool, bool)> {
+        self.0
+            .borrow()
+            .slots
+            .iter()
+            .filter(|(_, entry)| {
+                (entry.reference.stream_id(), entry.reference.key_id()) == (stream, key)
+            })
+            .map(|(&(row, _), entry)| {
+                let spoiler = entry.spoiler.read(app);
+                let has_secret_access = matches!(
+                    &spoiler.state,
+                    FragmentState::Ready(access) if access.with_text(|_| ()).is_some()
+                );
+                (row, spoiler.expanded, has_secret_access)
+            })
+            .collect()
     }
 
     /// Показывает отказ ровно тем слотам, где ждали подтверждённый ответ исходной темы.

@@ -907,6 +907,117 @@ fn terminal_paragraph_after_forward_keeps_inline_metadata(cx: &mut TestAppContex
     assert_eq!(metadata.right(), body.right());
 }
 
+/// Проверяет перенос открытого текста и времени после двух защищённых фрагментов.
+#[gpui::test]
+fn multiple_secret_fragments_keep_body_geometry_at_different_widths(cx: &mut TestAppContext) {
+    let address = address(ChatEntry::Latest);
+    let (_, ui, requests) = scenario(cx, &address);
+    let mut page = window(
+        address.route.scope,
+        1..2,
+        HistoryEdge::End,
+        HistoryEdge::End,
+    );
+    let stream = "956f084e-8992-4334-a6de-fe84ac055e46";
+    let first_key = "e70f0d95-6784-4125-8dfd-83eac755cecf";
+    let second_key = "e70f0d95-6784-4125-8dfd-83eac755ced0";
+    page.messages[0].body = MessageBody::Markdown(
+        format!(
+            "До   [обычной ссылки](https://example.test/path) [первого](urn:secret:v1:{stream}:{first_key}:AQID) между   ними [второго](urn:secret:v1:{stream}:{second_key}:BAUG) после\n\n{} Сверхдлинноесловобезпробеловдолжнопереноситьсявнутрипузыря",
+            "Завершающий текст должен переноситься рядом со временем. ".repeat(8),
+        )
+        .into(),
+    );
+    answer(request(&requests, Load::Open(ChatEntry::Latest)), page, ui);
+
+    let measure = |ui: &mut VisualTestContext| {
+        let body = ui
+            .debug_bounds("message-body")
+            .expect("Тело сообщения видно");
+        let metadata = ui
+            .debug_bounds("message-meta")
+            .expect("Время сообщения видно");
+        assert!(
+            ui.debug_bounds("history-inline-00000000-0000-0000-0000-000000000001-0")
+                .is_some(),
+            "Обычная ссылка сохраняет свой inline-компонент рядом с фрагментами"
+        );
+        let inline = ui
+            .debug_bounds("history-inline-00000000-0000-0000-0000-000000000001-0")
+            .unwrap();
+        assert!(
+            inline.size.width > px(48.) && inline.size.height <= px(42.),
+            "Обычная Markdown-ссылка должна оставаться горизонтальной: bounds={inline:?}"
+        );
+        let first_fragment = ui
+            .debug_bounds("history-fragment-flow-00000000-0000-0000-0000-000000000001-0")
+            .expect("Первый защищённый элемент занимает место в потоке");
+        let second_fragment = ui
+            .debug_bounds("history-fragment-flow-00000000-0000-0000-0000-000000000001-1")
+            .expect("Второй защищённый элемент занимает отдельное место");
+        let words = (0..32)
+            .filter_map(|index| {
+                let selector = format!(
+                    "history-markdown-run-history-body-00000000-0000-0000-0000-000000000001-{index}"
+                );
+                ui.debug_bounds(Box::leak(selector.into_boxed_str()))
+                    .map(|bounds| (index, bounds))
+            })
+            .collect::<Vec<_>>();
+        for (index, bounds) in &words {
+            assert!(
+                bounds.size.width > px(8.) && bounds.size.height < px(100.),
+                "Текстовый фрагмент не должен превращаться в узкую вертикальную колонку: run={index}, bounds={bounds:?}"
+            );
+        }
+        let first_middle_word = words
+            .iter()
+            .find(|(index, _)| *index == 0)
+            .map(|(_, bounds)| *bounds)
+            .expect("Открытое слово между фрагментами видно");
+        let last_word = words
+            .last()
+            .map(|(_, bounds)| *bounds)
+            .expect("Завершающие слова сообщения видны");
+        let precedes = |left: gpui::Bounds<gpui::Pixels>, right: gpui::Bounds<gpui::Pixels>| {
+            left.top() < right.top() || (left.top() == right.top() && left.right() <= right.left())
+        };
+        assert!(
+            precedes(inline, first_fragment),
+            "Ссылка должна идти перед первым фрагментом"
+        );
+        assert!(
+            precedes(first_fragment, first_middle_word)
+                && precedes(first_middle_word, second_fragment),
+            "Открытый текст должен оставаться между двумя фрагментами"
+        );
+        assert!(
+            precedes(second_fragment, last_word),
+            "Хвост должен идти после второго фрагмента"
+        );
+        assert_eq!(metadata.bottom(), body.bottom());
+        assert_eq!(metadata.right(), body.right());
+        let row = ui
+            .debug_bounds("history-message-00000000-0000-0000-0000-000000000001")
+            .expect("Пузырь сообщения виден");
+        assert!(
+            body.right() <= row.right(),
+            "Текст не выходит за ширину бабла"
+        );
+        (body.size, row.size)
+    };
+
+    let wide = measure(ui);
+    ui.simulate_resize(size(px(250.), px(400.)));
+    ui.run_until_parked();
+    let narrow = measure(ui);
+    assert!(
+        narrow.0.height > wide.0.height,
+        "Два фрагмента и открытый текст должны переложиться по узкой ширине: {wide:?} → {narrow:?}"
+    );
+    assert!(narrow.1.height > wide.1.height);
+}
+
 /// У хвоста дельта двух строк не пересобирает вид неподвижного обычного бабла.
 #[gpui::test]
 fn encrypted_history_keeps_tail_and_plain_render_in_the_first_frame(cx: &mut TestAppContext) {
