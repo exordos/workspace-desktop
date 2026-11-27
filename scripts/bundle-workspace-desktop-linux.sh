@@ -16,8 +16,10 @@ fi
 staging=$(mktemp -d)
 trap 'rm -rf -- "$staging"' EXIT
 package=workspace-desktop-linux-x64
-mkdir "$staging/$package"
+project_dir=$(cd -- "$(dirname -- "$0")/.." && pwd)
+mkdir -p "$staging/$package/licenses/xattr"
 install -m 755 "$executable" "$staging/$package/workspace-desktop"
+install -m 644 "$project_dir/third_party/xattr-0.2.3/"LICENSE-* "$staging/$package/licenses/xattr/"
 cat > "$staging/$package/README.txt" <<'EOF'
 Workspace Desktop for Linux x86_64
 
