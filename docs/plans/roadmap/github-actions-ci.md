@@ -10,7 +10,7 @@
 | --- | --- | --- | --- |
 | macOS | `macos-15-intel` | `macos-15` | Release-сборка приложения, проверка архитектуры и подписи пакета, запуск бинарника с `--help`. |
 | Linux | `ubuntu-24.04` | — | Переносимые тесты, release-сборка приложения и `tar.gz`. |
-| Windows | `windows-2025` | — | Переносимые тесты, release-сборка приложения и ZIP. |
+| Windows | `windows-2025` | — | Release-сборка приложения и ZIP. |
 
 В успешном прогоне на странице Actions доступны два ZIP с `Workspace Desktop.app`, ZIP с `workspace-desktop.exe` и архив `workspace-desktop-linux-x64.tar.gz`. Скрипт упаковки macOS использует ad hoc подпись. Срок хранения — 14 дней. Команда `--help` проверяет запуск процесса. Проверка окна, входа и системных уведомлений описана в [критериях выпуска](gpui-ui-parity-release.md).
 
@@ -20,7 +20,7 @@
 
 ## Приложение для Linux и Windows
 
-Windows и Linux используют общий оконный клиент GPUI. Переносимые тесты в CI по-прежнему выполняются с `--no-default-features`. Утилита `workspace-auth` пока использует Keychain macOS.
+Windows и Linux используют общий оконный клиент GPUI. CI запускает переносимые тесты на Ubuntu x64 с `--no-default-features`. Утилита `workspace-auth` пока использует Keychain macOS.
 
 ### Локальный запуск на Windows x64
 
