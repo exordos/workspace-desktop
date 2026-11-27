@@ -2,7 +2,9 @@
 
 ## Первый этап
 
-[Workflow CI](../../../.github/workflows/ci.yml) запускается при push в `CI` и `main`, при pull request в `main` и вручную после появления workflow в основной ветке. Он выполняет `cargo fmt --all -- --check` и `cargo check-architecture` в отдельном задании. Сборки и тесты используют Rust stable и версии зависимостей из `Cargo.lock`.
+[Workflow CI](../../../.github/workflows/ci.yml) запускается при push в `CI` и `main`, при pull request в `main` и вручную после появления workflow в основной ветке. Он выполняет `cargo check-architecture` в отдельном задании. Сборки и тесты используют Rust stable и версии зависимостей из `Cargo.lock`.
+
+Проверку форматирования можно включить после отдельного прогона `cargo fmt` по репозиторию. На исходном `main` проверка форматирования завершалась с ошибкой.
 
 | ОС | x86-64 | ARM64 | Что проверяем |
 | --- | --- | --- | --- |
