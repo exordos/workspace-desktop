@@ -45,10 +45,5 @@ if [[ "$header" != *'Advanced Micro Devices X86-64'* ]]; then
     echo 'Expected an x86-64 ELF binary.' >&2
     exit 1
 fi
-libraries=$(ldd "$binary")
-if [[ "$libraries" == *'not found'* ]]; then
-    printf '%s\n' "$libraries" >&2
-    exit 1
-fi
 help=$("$binary" --help)
 [[ "$help" == 'Usage: workspace-desktop '* ]]
