@@ -115,6 +115,9 @@ impl Shell {
             ShellAction::Sidebar(SidebarAction::OpenChat { route, generation }) => {
                 self.open_sidebar_route(route, generation)
             }
+            ShellAction::Sidebar(SidebarAction::OpenChatDetails { route, generation }) => {
+                self.open_sidebar_route(route, generation)
+            }
             ShellAction::Sidebar(SidebarAction::OpenCreatedTopic { session, stream_id, topic }) => {
                 self.open_created_topic(&session, stream_id, topic)
             }

@@ -33,9 +33,9 @@ use super::{
     preferences::{ChatClick, Language, Preferences as AppPreferences, appearance::ChatDensity},
     runtime::RuntimeClient,
     ui::{
-        BadgeTone, Button, ButtonAppearance, ChatRowPreview, PANEL_RADIUS, Palette, TextInput,
-        TextInputChanged, TextRole, label,
-        popup::{MenuInput, menu_layer, menu_navigation, menu_surface, tooltip},
+        BadgeTone, Button, ButtonAppearance, ChatRowPreview, Icon, PANEL_RADIUS, Palette,
+        TextInput, TextInputChanged, TextRole, label,
+        popup::{MenuInput, menu_layer, menu_navigation, menu_surface, submenu_layer, tooltip},
     },
 };
 
@@ -54,7 +54,7 @@ mod search;
 
 pub(super) use activity::ActivityNavigation;
 use folder_dialog::FolderDialog;
-use folder_menu::{RowAction, RowActions};
+use folder_menu::{RowAction, RowActions, RowOption};
 use folder_rail::FolderRail;
 pub(super) use folders::FolderIntent;
 use folders::FolderPane;
@@ -589,7 +589,15 @@ impl Sidebar {
             menu.selected = active
                 .row_actions(menu.key, false, cx)
                 .into_iter()
-                .find(|action| action.enabled)
+                .find(|action| {
+                    action.enabled
+                        && !matches!(
+                            &action.action,
+                            RowAction::Catalog(catalog_actions::CatalogAction::ChatNotifications(
+                                _,
+                            ))
+                        )
+                })
                 .map(|action| action.action);
             self.menu_scroll.set_offset(point(px(0.), px(0.)));
             active.menu = Some(menu);
@@ -631,13 +639,9 @@ impl Sidebar {
                 } else {
                     None
                 };
-                if matches!(action, Some(RowAction::Assign | RowAction::Back)) {
-                    menu.folders = matches!(action, Some(RowAction::Assign));
-                    menu.selected = active
-                        .row_actions(menu.key, menu.folders, cx)
-                        .into_iter()
-                        .find(|choice| choice.enabled)
-                        .map(|choice| choice.action);
+                if matches!(action, Some(RowAction::Assign)) {
+                    menu.folders = !menu.folders;
+                    menu.selected = Some(RowAction::Assign);
                     active.menu = Some(menu);
                     self.menu_scroll.set_offset(point(px(0.), px(0.)));
                     cx.notify();
@@ -650,7 +654,6 @@ impl Sidebar {
                     return;
                 }
                 let session = active.session.clone();
-                let primary = active.menu_intent(menu.key).and_then(|(_, intent)| intent);
                 active.menu = None;
                 if let Some(focus) = active
                     .focus
@@ -663,11 +666,6 @@ impl Sidebar {
                 }
                 cx.notify();
                 match action {
-                    Some(RowAction::Open) => {
-                        if let Some(intent) = primary {
-                            self.activate(&session, intent, cx);
-                        }
-                    }
                     Some(RowAction::Command(command)) => {
                         self.send_folder_command(command, false, cx)
                     }
@@ -698,6 +696,7 @@ impl Sidebar {
     ) -> Stateful<Div> {
         let origin = active.session.clone();
         let keyboard_origin = origin.clone();
+        let context_origin = origin.clone();
         row.key_context("CatalogRow")
             .on_mouse_down(
                 MouseButton::Right,
@@ -723,18 +722,43 @@ impl Sidebar {
                 };
                 let menu = RowMenu {
                     key,
-                    anchor: point(bounds.left(), bounds.bottom()),
+                    anchor: point(bounds.right(), bounds.center().y),
                     selected: None,
                     folders: false,
                 };
                 view.open_row_menu(&keyboard_origin, menu, window, cx);
             }))
+            .on_key_down(cx.listener(move |view, event: &gpui::KeyDownEvent, window, cx| {
+                    let event_key = &event.keystroke;
+                    if event.is_held
+                        || event_key.modifiers.modified()
+                        || !matches!(event_key.key.as_str(), "contextmenu" | "menu")
+                    {
+                        return;
+                    }
+                    let Some(bounds) = view
+                        .active
+                        .as_ref()
+                        .filter(|active| active.session == context_origin)
+                        .and_then(|active| active.bounds.borrow().get(&key).copied())
+                    else {
+                        return;
+                    };
+                    cx.stop_propagation();
+                    let menu = RowMenu {
+                        key,
+                        anchor: point(bounds.right(), bounds.center().y),
+                        selected: None,
+                        folders: false,
+                    };
+                    view.open_row_menu(&context_origin, menu, window, cx);
+                }))
             .tooltip(move |_, app| tooltip(palette, title.clone(), app))
     }
 
     /// Рисует главное меню или список папок, сохраняя тот же фокус.
     fn row_menu(
-        actions: RowActions,
+        actions: &RowActions,
         menu: &RowMenu,
         origin: &AccountSession,
         viewport: Size<Pixels>,
@@ -743,6 +767,23 @@ impl Sidebar {
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         let target = cx.entity().downgrade();
+        let notification_count = actions
+            .iter()
+            .take_while(|entry| {
+                matches!(
+                    &entry.action,
+                    RowAction::Catalog(catalog_actions::CatalogAction::ChatNotifications(_))
+                )
+            })
+            .count();
+        let notification_actions = &actions[..notification_count];
+        let menu_actions: Vec<_> = actions[notification_count..]
+            .iter()
+            .filter(|entry| !is_folder_assignment(&entry.action))
+            .collect();
+        let menu_key = menu.key;
+        let assignments = menu.folders;
+        let keyboard_selected = menu.selected.clone();
         menu_surface("catalog-menu", palette, viewport, px(248.), px(320.))
             .debug_selector(|| "catalog-menu".into())
             .overflow_y_scroll()
@@ -751,17 +792,104 @@ impl Sidebar {
                 cx.stop_propagation();
                 view.menu_input(MenuInput::Close, window, cx);
             }))
-            .children(actions.into_iter().enumerate().map(|(index, action)| {
-                let choice = action.action;
+            .when(notification_count > 0, |menu| {
+                let heading = AppPreferences::read_for(cx, &origin.owner)
+                    .language
+                    .tr("channel.notifications");
+                menu.child(label(palette, TextRole::Caption, heading).px_2().pt_1())
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .gap(px(4.))
+                            .px_1()
+                            .pb_1()
+                            .children(notification_actions.iter().enumerate().map(
+                                |(index, action)| {
+                                    let choice = action.action.clone();
+                                    let selected = action.current;
+                                    let highlighted = keyboard_selected.as_ref() == Some(&choice);
+                                    let enabled = action.enabled;
+                                    let title = action.title.clone();
+                                    let source = origin.clone();
+                                    let key = menu_key;
+                                    let icon = match &action.action {
+                                        RowAction::Catalog(
+                                            catalog_actions::CatalogAction::ChatNotifications(
+                                                workspace_core::messenger::details::StreamNotificationMode::AllMessages,
+                                            ),
+                                        ) => Icon::Bell,
+                                        RowAction::Catalog(
+                                            catalog_actions::CatalogAction::ChatNotifications(
+                                                workspace_core::messenger::details::StreamNotificationMode::MentionsOnly,
+                                            ),
+                                        ) => Icon::At,
+                                        _ => Icon::BellOff,
+                                    };
+                                    let mut button = Button::new(
+                                        ("catalog-notification", index),
+                                        "",
+                                    );
+                                    button.icon = Some(icon);
+                                    button.appearance = if selected || highlighted {
+                                        ButtonAppearance::Neutral
+                                    } else {
+                                        ButtonAppearance::Ghost
+                                    };
+                                    button.disabled = !enabled && !selected;
+                                    let target = target.clone();
+                                    button
+                                        .render(palette, None, move |window, app| {
+                                            let _ = target.update(app, |view, cx| {
+                                                let Some(active) = view
+                                                    .active
+                                                    .as_mut()
+                                                    .filter(|active| active.session == source)
+                                                else {
+                                                    return;
+                                                };
+                                                let Some(menu) = active.menu.as_mut().filter(|menu| {
+                                                    menu.key == key && menu.folders == assignments
+                                                }) else {
+                                                    return;
+                                                };
+                                                menu.selected = Some(choice.clone());
+                                                view.menu_input(MenuInput::Select, window, cx);
+                                            });
+                                        })
+                                        .flex_1()
+                                        .tooltip(move |_, app| tooltip(palette, title.clone(), app))
+                                        .debug_selector(move || {
+                                            format!("catalog-notification-{index}")
+                                        })
+                                },
+                            )),
+                    )
+            })
+            .children(menu_actions.iter().enumerate().map(|(index, action)| {
+                let choice = action.action.clone();
                 let selected = menu.selected.as_ref() == Some(&choice);
                 let source = origin.clone();
-                let key = menu.key;
-                let assignments = menu.folders;
-                let mut button = Button::new(("catalog-menu-item", index), action.title);
+                let key = menu_key;
+                let mut button = Button::new(("catalog-menu-item", index), action.title.clone());
                 button.appearance = ButtonAppearance::Ghost;
+                button.icon = Some(match &choice {
+                    RowAction::Assign => Icon::Folder,
+                    RowAction::Command(FolderCommand::Pin { .. }) => Icon::Pin,
+                    RowAction::Command(FolderCommand::Remove { .. }) => Icon::Check,
+                    RowAction::Command(FolderCommand::Add { .. }) => Icon::Folder,
+                    RowAction::Command(_) => Icon::Info,
+                    RowAction::Catalog(catalog_actions::CatalogAction::MarkRead) => Icon::DoneAll,
+                    RowAction::Catalog(catalog_actions::CatalogAction::Contact) => Icon::Account,
+                    RowAction::Catalog(catalog_actions::CatalogAction::Members) => Icon::Group,
+                    RowAction::Catalog(catalog_actions::CatalogAction::NewTopic) => Icon::Add,
+                    RowAction::Catalog(catalog_actions::CatalogAction::Rename) => Icon::Stylus,
+                    RowAction::Catalog(catalog_actions::CatalogAction::Archive) => Icon::Folder,
+                    _ => Icon::Info,
+                });
                 button.disabled = !action.enabled;
                 let target = target.clone();
-                button
+                let item = button
                     .render(palette, None, move |window, app| {
                         let _ = target.update(app, |view, cx| {
                             let Some(active) = view
@@ -790,13 +918,153 @@ impl Sidebar {
                         row.bg(palette.card_selected)
                     })
                     .debug_selector(move || {
-                        if index == 0 {
+                        if index == 0 && notification_count == 0 {
                             "catalog-menu-action".into()
                         } else {
-                            format!("catalog-menu-item-{index}")
+                            format!("catalog-menu-item-{}", index + notification_count)
                         }
+                    });
+                div()
+                    .w_full()
+                    .when(action.separator, |row| {
+                        row.child(div().mx_2().my_1().h(px(1.)).bg(palette.border))
                     })
+                    .child(item)
             }))
+    }
+
+    /// Рисует список папок рядом с основным контекстным меню.
+    fn folder_submenu(
+        actions: &[RowOption],
+        menu: &RowMenu,
+        origin: &AccountSession,
+        viewport: Size<Pixels>,
+        palette: Palette,
+        scroll: &ScrollHandle,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let target = cx.entity().downgrade();
+        let key = menu.key;
+        let assignments = menu.folders;
+        let selected = menu.selected.clone();
+        menu_surface("catalog-folder-submenu", palette, viewport, px(220.), px(320.))
+            .debug_selector(|| "catalog-folder-submenu".into())
+            .overflow_y_scroll()
+            .track_scroll(scroll)
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
+            .children(actions.iter().enumerate().map(|(index, action)| {
+                let choice = action.action.clone();
+                let selected = selected.as_ref() == Some(&choice);
+                let source = origin.clone();
+                let target = target.clone();
+                let mut button = Button::new(
+                    ("catalog-folder-option", index),
+                    action.title.clone(),
+                );
+                button.appearance = ButtonAppearance::Ghost;
+                button.disabled = !action.enabled;
+                button.icon = Some(if matches!(
+                    &choice,
+                    RowAction::Command(FolderCommand::Remove { .. })
+                ) {
+                    Icon::Check
+                } else {
+                    Icon::Folder
+                });
+                button
+                    .render(palette, None, move |window, app| {
+                        let _ = target.update(app, |view, cx| {
+                            let Some(active) = view
+                                .active
+                                .as_mut()
+                                .filter(|active| active.session == source)
+                            else {
+                                return;
+                            };
+                            let Some(menu) = active
+                                .menu
+                                .as_mut()
+                                .filter(|menu| menu.key == key && menu.folders == assignments)
+                            else {
+                                return;
+                            };
+                            menu.selected = Some(choice.clone());
+                            view.menu_input(MenuInput::Select, window, cx);
+                        });
+                    })
+                    .w_full()
+                    .justify_start()
+                    .when(action.enabled && selected, |row| {
+                        row.bg(palette.card_selected)
+                    })
+                    .debug_selector(move || format!("catalog-folder-option-{index}"))
+            }))
+    }
+
+    /// Располага соседнее меню напротив пункта назначения с учётом краёв окна.
+    fn folder_submenu_anchor(
+        actions: &RowActions,
+        menu: &RowMenu,
+        viewport: Size<Pixels>,
+    ) -> Point<Pixels> {
+        let notification_count = actions
+            .iter()
+            .take_while(|entry| {
+                matches!(
+                    &entry.action,
+                    RowAction::Catalog(catalog_actions::CatalogAction::ChatNotifications(_))
+                )
+            })
+            .count();
+        let folder_index = actions
+            .iter()
+            .position(|entry| entry.action == RowAction::Assign)
+            .unwrap_or(notification_count);
+        let main_items = actions
+            .iter()
+            .filter(|entry| !is_folder_assignment(&entry.action))
+            .count();
+        let separators = actions
+            .iter()
+            .take(folder_index)
+            .filter(|entry| entry.separator)
+            .count();
+        let main_height = (px(48.)
+            + px(main_items.saturating_sub(notification_count) as f32 * 32.)
+            + px(separators as f32 * 10.))
+            .min((viewport.height - px(8.)).max(px(0.)));
+        let main_left = menu
+            .anchor
+            .x
+            .min((viewport.width - px(252.)).max(px(4.)))
+            .max(px(4.));
+        let main_top = menu
+            .anchor
+            .y
+            .min((viewport.height - main_height - px(4.)).max(px(4.)))
+            .max(px(4.));
+        let submenu_left = if main_left + px(252.) + px(224.) <= viewport.width - px(4.) {
+            main_left + px(252.)
+        } else {
+            (main_left - px(224.)).max(px(4.))
+        };
+        let row_index = folder_index.saturating_sub(notification_count);
+        let row_top = main_top
+            + px(8.)
+            + px(48.)
+            + px(row_index as f32 * 32.)
+            + px(separators as f32 * 10.);
+        let submenu_height = actions
+            .iter()
+            .filter(|entry| is_folder_assignment(&entry.action))
+            .count()
+            .min(10) as f32
+            * 32.
+            + 8.;
+        point(
+            submenu_left,
+            row_top.min((viewport.height - px(submenu_height) - px(4.)).max(px(4.))),
+        )
     }
 
     /// Выполняет действие только для видимой строки в том же входе и поколении.
@@ -1515,11 +1783,11 @@ impl Render for Sidebar {
             .when_some(active.menu.as_ref(), |panel, menu| {
                 let viewport = window.viewport_size();
                 let actions = active.row_actions(menu.key, menu.folders, cx);
-                menu_navigation(panel, &self.menu_focus, cx, Self::menu_input).children(menu_layer(
+                let mut layers = menu_layer(
                     viewport,
                     menu.anchor,
                     Self::row_menu(
-                        actions,
+                        &actions,
                         menu,
                         &active.session,
                         viewport,
@@ -1527,10 +1795,43 @@ impl Render for Sidebar {
                         &self.menu_scroll,
                         cx,
                     ),
-                ))
+                )
+                .into_iter()
+                .collect::<Vec<_>>();
+                if menu.folders {
+                    let options: Vec<RowOption> = actions
+                        .iter()
+                        .filter(|entry| is_folder_assignment(&entry.action))
+                        .cloned()
+                        .collect();
+                    if !options.is_empty() {
+                        let anchor = Self::folder_submenu_anchor(&actions, menu, viewport);
+                        layers.push(submenu_layer(
+                            anchor,
+                            Self::folder_submenu(
+                                &options,
+                                menu,
+                                &active.session,
+                                viewport,
+                                palette,
+                                &self.menu_scroll,
+                                cx,
+                            ),
+                        ));
+                    }
+                }
+                menu_navigation(panel, &self.menu_focus, cx, Self::menu_input).children(layers)
             });
         self.with_folder_rail(panel)
     }
+}
+
+/// Опознаёт строки добавления и удаления в раскрытом списке папок.
+fn is_folder_assignment(action: &RowAction) -> bool {
+    matches!(
+        action,
+        RowAction::Command(FolderCommand::Add { .. } | FolderCommand::Remove { .. })
+    )
 }
 
 /// Оформляет загрузку, ошибку и пустой каталог в одинаковой области под поиском.

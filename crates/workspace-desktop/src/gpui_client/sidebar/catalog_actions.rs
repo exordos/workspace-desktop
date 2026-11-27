@@ -34,6 +34,7 @@ pub(super) enum CatalogAction {
     TopicNotifications(TopicNotificationMode), // Задать исключение для темы.
     MarkRead,                                  // Прочитать разговор или только выбранную тему.
     Contact,                                   // Открыть профиль собеседника.
+    Members,                                   // Открыть сведения и участников канала.
     NewTopic,                                  // Запросить название новой темы.
     Rename,                                    // Запросить новое название канала или темы.
     ToggleDone,                                // Переключить завершённость темы.
@@ -106,6 +107,13 @@ pub(super) fn actions_for_chat(
             CatalogAction::Contact,
             editable,
         ));
+    } else {
+        actions.push(entry(
+            language,
+            "channel.members",
+            CatalogAction::Members,
+            editable,
+        ));
     }
     if !chat.direct {
         actions.push(entry(
@@ -121,12 +129,14 @@ pub(super) fn actions_for_chat(
         CatalogAction::NewTopic,
         editable,
     ));
-    actions.push(entry(
+    let mut archive = entry(
         language,
         "desktop.sidebar.actions.archive",
         CatalogAction::Archive,
         editable,
-    ));
+    );
+    archive.separator = true;
+    actions.push(archive);
     actions
 }
 
@@ -218,12 +228,14 @@ fn setting(
     chosen: bool,
     enabled: bool,
 ) -> super::folder_menu::RowOption {
-    let title = if chosen {
+    let title = if chosen && !matches!(action, CatalogAction::ChatNotifications(_)) {
         format!("✓  {title}")
     } else {
         title.to_owned()
     };
-    option(title, RowAction::Catalog(action), enabled && !chosen)
+    let mut option = option(title, RowAction::Catalog(action), enabled && !chosen);
+    option.current = chosen;
+    option
 }
 
 impl Active {
@@ -287,7 +299,8 @@ impl Sidebar {
             CatalogAction::NewTopic
             | CatalogAction::Rename
             | CatalogAction::Archive
-            | CatalogAction::Contact => {
+            | CatalogAction::Contact
+            | CatalogAction::Members => {
                 let Some(chat) = active.chat(stream_id) else {
                     return;
                 };
@@ -317,6 +330,21 @@ impl Sidebar {
                         };
                         ContactPanel::open(&host, runtime.clone(), request, window, cx);
                     }
+                    return;
+                }
+                if action == CatalogAction::Members {
+                    let click = Preferences::read_for(cx, &session.owner).chat_click;
+                    cx.emit(SidebarAction::OpenChatDetails {
+                        route: ChatRoute {
+                            owner: session.owner.clone(),
+                            scope: HistoryScope {
+                                stream_id,
+                                topic_id: chat_topic(chat, click),
+                            },
+                            entry: ChatEntry::Latest,
+                        },
+                        generation: session.generation,
+                    });
                     return;
                 }
                 let mode = match action {
@@ -515,7 +543,7 @@ mod tests {
                     StreamNotificationMode::AllMessages,
                 ))
                 && !entry.enabled
-                && entry.title.starts_with("✓")
+                && entry.current
         }));
     }
 

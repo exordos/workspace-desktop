@@ -102,7 +102,9 @@ fn initialize(cx: &mut TestAppContext) -> Harness<'_> {
                     Recorded::Open(route.clone(), *generation)
                 }
                 SidebarAction::RetryCatalog(session) => Recorded::Retry(session.clone()),
-                SidebarAction::OpenActivity { .. } | SidebarAction::OpenCreatedTopic { .. } => {
+                SidebarAction::OpenActivity { .. }
+                | SidebarAction::OpenCreatedTopic { .. }
+                | SidebarAction::OpenChatDetails { .. } => {
                     return;
                 }
             };
@@ -653,7 +655,7 @@ fn row_menu_uses_navigation_and_ignores_click_through(cx: &mut TestAppContext) {
     ui.simulate_keystrokes("escape");
     ui.simulate_keystrokes("shift-f10");
     enter(ui);
-    assert_eq!(events.borrow().as_slice(), &[open(&a, 1, None)]);
+    assert!(events.borrow().is_empty());
 
     let last_row = ui
         .debug_bounds("catalog-chat-00000000-0000-0000-0000-000000000009")
@@ -668,10 +670,15 @@ fn row_menu_uses_navigation_and_ignores_click_through(cx: &mut TestAppContext) {
         popup.right() <= px(696.) && popup.bottom() <= px(596.),
         "{popup:?}"
     );
-    click(ui, "catalog-menu-action");
-    enter(ui);
-    assert_eq!(events.borrow().as_slice(), &[open(&a, 1, None)]);
-    ui.update(|window, app| assert!(sidebar.read(app).menu_focus.is_focused(window)));
+    click(ui, "catalog-notification-1");
+    assert!(events.borrow().is_empty());
+    ui.update(|window, app| {
+        assert!(sidebar.read(app).active.as_ref().unwrap().menu.is_none());
+        assert!(
+            sidebar.read(app).active.as_ref().unwrap().focus[&RowKey::Chat(Uuid::from_u128(9))]
+                .is_focused(window)
+        );
+    });
 
     let b_catalog = catalog(
         &b,
@@ -685,7 +692,7 @@ fn row_menu_uses_navigation_and_ignores_click_through(cx: &mut TestAppContext) {
         assert!(active.search.read(app).is_focused(window));
     });
     enter(ui);
-    assert_eq!(events.borrow().as_slice(), &[open(&a, 1, None)]);
+    assert!(events.borrow().is_empty());
 }
 
 /// Проверяет разные маршруты строки и превью, а также независимую стрелку канала.

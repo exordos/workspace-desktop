@@ -120,6 +120,20 @@ pub(in crate::gpui_client) fn menu_layer(
     ]
 }
 
+/// Размещает вложенное меню поверх основного без второго блокирующего слоя.
+pub(in crate::gpui_client) fn submenu_layer(
+    anchor: Point<Pixels>,
+    surface: Stateful<Div>,
+) -> Deferred {
+    deferred(
+        anchored()
+            .position(anchor)
+            .snap_to_window_with_margin(MARGIN)
+            .child(surface),
+    )
+    .with_priority(3)
+}
+
 /// Показывает полную подпись на фоне всплывающих панелей.
 struct Tooltip {
     palette: Palette,   // Цвета текущего окна.

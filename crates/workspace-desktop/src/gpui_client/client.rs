@@ -35,8 +35,8 @@ use super::{
     },
     avatars::AvatarImages,
     contracts::{
-        AccountSession, AccountSnapshot, ChatEntry, ConversationAddress, NotificationRouteError,
-        RuntimeEvent, RuntimeExit, ShellAction, SidebarAction,
+        AccountSession, AccountSnapshot, ChatEntry, ChatRoute, ConversationAddress,
+        NotificationRouteError, RuntimeEvent, RuntimeExit, ShellAction, SidebarAction,
     },
     conversation::{
         Conversation, DetailsProfileAction, DetailsProfileIntent, HistoryTargetCleared,
@@ -122,6 +122,7 @@ pub(super) struct Client {
     idle: Option<preference_runtime::IdleSession>, // Таймер автовыхода для выбранного входа.
     places: preference_runtime::Places, // Маршруты навигации назад и вперёд выбранного входа.
     conversation: Option<Entity<Conversation>>, // Экран актуального адреса, если он открыт.
+    pending_sidebar_details: Option<(ChatRoute, SessionGeneration)>, // Сведения после смены разговора.
     message_navigation: Option<MessageNavigation>, // Последний переход по UUID или его ошибка.
     favorites_load: Option<FavoritesLoad>, // Запрос или ошибка ещё не открытого чата с собой.
     activity_drafts: Entity<ActivityDrafts>, // Список черновиков и действия для одного видимого входа.
@@ -240,7 +241,26 @@ impl Client {
             {
                 return;
             }
-            client.handle_action(ShellAction::Sidebar(action.clone()), cx);
+            let details_route = match action {
+                SidebarAction::OpenChatDetails { route, generation } => {
+                    Some((route.clone(), *generation))
+                }
+                _ => None,
+            };
+            let shell_action = details_route.as_ref().map_or_else(
+                || ShellAction::Sidebar(action.clone()),
+                |(route, generation)| {
+                    ShellAction::Sidebar(SidebarAction::OpenChat {
+                        route: route.clone(),
+                        generation: *generation,
+                    })
+                },
+            );
+            client.handle_action(shell_action, cx);
+            if let Some((route, generation)) = details_route {
+                client.pending_sidebar_details = Some((route, generation));
+                cx.notify();
+            }
         });
 
         Self {
@@ -253,6 +273,7 @@ impl Client {
             idle: None,
             places: preference_runtime::Places::default(),
             conversation: None,
+            pending_sidebar_details: None,
             encrypted_channel: None,
             key_response_scan: None,
             message_navigation: None,
@@ -574,6 +595,31 @@ impl Client {
         self.prune_message_navigation(cx);
         self.record_place();
         cx.notify();
+    }
+
+    /// Открывает сведения после того, как оболочка создала разговор для выбранного канала.
+    fn open_pending_sidebar_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((route, generation)) = self.pending_sidebar_details.take() else {
+            return;
+        };
+        if self
+            .shell
+            .selected()
+            .is_none_or(|session| session.generation != generation)
+            || !self
+                .shell
+                .conversation()
+                .is_some_and(|address| address.route == route)
+        {
+            return;
+        }
+        if let Some(conversation) = &self.conversation {
+            conversation.update(cx, |conversation, cx| {
+                if !conversation.details_active(cx) {
+                    conversation.toggle_details(window, cx);
+                }
+            });
+        }
     }
 
     /// Меняет экран истории, передавая UUID, если переход начался из черновиков.
@@ -1146,6 +1192,7 @@ impl Render for Client {
         self.sync_profile_avatar(cx);
         self.sync_profile_details(cx);
         RightPanel::restore_focus(&self.right_panel, window, cx);
+        self.open_pending_sidebar_details(window, cx);
         self.open_requested_new_channel(window, cx);
         self.open_requested_profile(window, cx);
         self.open_requested_details_profile(window, cx);

@@ -158,6 +158,10 @@ pub enum SidebarAction {
         route: ChatRoute,              // Маршрут, выбранный мышью или клавиатурой.
         generation: SessionGeneration, // Поколение входа, чей каталог показан в момент выбора.
     },
+    OpenChatDetails {
+        route: ChatRoute,              // Разговор, сведения которого нужно показать.
+        generation: SessionGeneration, // Поколение входа, чей каталог показан при выборе.
+    },
     OpenCreatedTopic {
         session: AccountSession, // Вход, который получил подтверждение создания.
         stream_id: Uuid,          // UUID разговора, из меню которого создали тему.
