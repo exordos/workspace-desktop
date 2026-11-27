@@ -262,7 +262,7 @@ pub(super) fn run(
         let address = open_chat(&client, ui, peer_b);
         click(ui, "workspace-composer-editor");
         ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(text.clone())));
-        ui.simulate_keystrokes("cmd-v");
+        ui.simulate_keystrokes("secondary-v");
         ui.run_until_parked();
         click(ui, "conversation-send");
         let mut id = None;

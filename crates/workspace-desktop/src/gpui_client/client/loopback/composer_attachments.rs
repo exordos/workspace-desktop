@@ -147,7 +147,7 @@ fn composer_paste_unlink_and_send_use_workspace_file_api(cx: &mut TestAppContext
         |ui| ui.debug_bounds("composer-attach-file").is_some(),
     );
     click(ui, "workspace-composer-editor");
-    ui.simulate_keystrokes("cmd-v");
+    ui.simulate_keystrokes("secondary-v");
     until(
         ui,
         "сервер принял первое тело, квитанция ожидается",
@@ -163,7 +163,7 @@ fn composer_paste_unlink_and_send_use_workspace_file_api(cx: &mut TestAppContext
         ui.debug_bounds("composer-attachment-ready-0").is_some()
     });
     click(ui, "workspace-composer-editor");
-    ui.simulate_keystrokes("cmd-v");
+    ui.simulate_keystrokes("secondary-v");
     until(ui, "обе карточки готовы", |ui| {
         wire.uploaded.load(Ordering::SeqCst) == 2
             && ui.debug_bounds("composer-attachment-ready-1").is_some()
@@ -187,7 +187,7 @@ fn composer_paste_unlink_and_send_use_workspace_file_api(cx: &mut TestAppContext
         "готовое фото вставлено в текст",
         |ui| ui.debug_bounds("composer-attachment-in-text-0").is_some(),
     );
-    ui.simulate_keystrokes("cmd-a cmd-c");
+    ui.simulate_keystrokes("secondary-a secondary-c");
     ui.update(|_, app| {
         let copied = app.read_from_clipboard().unwrap().text().unwrap();
         assert!(copied.ends_with(".png"));

@@ -1,8 +1,12 @@
 //! Хранит настройку прямого подключения и выбирает сетевой интерфейс macOS при запуске.
 
-use std::{io, path::Path, ptr};
+use std::path::Path;
+#[cfg(target_os = "macos")]
+use std::{io, ptr};
 
+#[cfg(target_os = "macos")]
 use gpui::App;
+#[cfg(target_os = "macos")]
 use system_configuration::{
     core_foundation::{
         array::CFArray,
@@ -15,9 +19,11 @@ use system_configuration::{
 };
 use workspace_core::workspace_direct::WorkspaceRoute;
 
+#[cfg(target_os = "macos")]
 use super::{FILE, Preferences, read_file};
 
 /// Читает общий переключатель независимо от активного аккаунта.
+#[cfg(target_os = "macos")]
 pub(in crate::gpui_client) fn enabled(app: &App) -> bool {
     app.try_global::<Preferences>()
         .and_then(|store| store.values.get(&None))
@@ -26,6 +32,7 @@ pub(in crate::gpui_client) fn enabled(app: &App) -> bool {
 }
 
 /// Атомарно сохраняет обратное значение в общую запись профиля.
+#[cfg(target_os = "macos")]
 pub(in crate::gpui_client) fn toggle(app: &mut App) -> io::Result<()> {
     let enabled = !enabled(app);
     let mut values = app
@@ -37,6 +44,7 @@ pub(in crate::gpui_client) fn toggle(app: &mut App) -> io::Result<()> {
 }
 
 /// Восстанавливает маршрут для HTTPS и WebSocket из того же файла, что читает окно настроек.
+#[cfg(target_os = "macos")]
 pub(in crate::gpui_client) fn load_route(profile: &Path) -> WorkspaceRoute {
     if !saved_enabled(profile) {
         return WorkspaceRoute::default();
@@ -51,7 +59,14 @@ pub(in crate::gpui_client) fn load_route(profile: &Path) -> WorkspaceRoute {
     WorkspaceRoute::default()
 }
 
+/// Оставляет выбор маршрута операционной системе, пока нет адаптера сетевого интерфейса.
+#[cfg(not(target_os = "macos"))]
+pub(in crate::gpui_client) fn load_route(_: &Path) -> WorkspaceRoute {
+    WorkspaceRoute::default()
+}
+
 /// Читает сохранённый переключатель без доступа к открытому окну.
+#[cfg(target_os = "macos")]
 fn saved_enabled(profile: &Path) -> bool {
     read_file(&profile.join(FILE))
         .get(&None)
@@ -60,12 +75,14 @@ fn saved_enabled(profile: &Path) -> bool {
 }
 
 /// Читает текущую конфигурацию macOS для выбора интерфейса.
+#[cfg(target_os = "macos")]
 fn preferred_interface() -> Option<String> {
     let store = open_store()?;
     select_interface(|path| network_state(&store, path))
 }
 
 /// Выбирает основной физический интерфейс или активный сервис в порядке macOS.
+#[cfg(target_os = "macos")]
 fn select_interface(
     state_at: impl Fn(&str) -> Option<CFDictionary<CFString, CFType>>,
 ) -> Option<String> {
@@ -102,6 +119,7 @@ fn select_interface(
 }
 
 /// Открывает только чтение сетевого состояния и допускает отказ SystemConfiguration.
+#[cfg(target_os = "macos")]
 fn open_store() -> Option<SCDynamicStore> {
     let name = CFString::new("Workspace Desktop");
     // Имя живёт до конца вызова. Системное хранилище не использует callback или контекст.
@@ -118,6 +136,7 @@ fn open_store() -> Option<SCDynamicStore> {
 }
 
 /// Читает целиком запись сетевого сервиса или состояния системы.
+#[cfg(target_os = "macos")]
 fn network_state(store: &SCDynamicStore, path: &str) -> Option<CFDictionary<CFString, CFType>> {
     let dictionary = store.get(path)?.downcast_into::<CFDictionary>()?;
     // У словаря из CFPropertyList строковые ключи и значения CF произвольного типа.
@@ -127,6 +146,7 @@ fn network_state(store: &SCDynamicStore, path: &str) -> Option<CFDictionary<CFSt
 }
 
 /// Принимает имена сетевых интерфейсов Wi-Fi и Ethernet, которые macOS задаёт как enN.
+#[cfg(target_os = "macos")]
 fn physical_interface(state: &CFDictionary<CFString, CFType>, key: &str) -> Option<String> {
     let name = state
         .find(CFString::new(key))?
@@ -136,7 +156,7 @@ fn physical_interface(state: &CFDictionary<CFString, CFType>, key: &str) -> Opti
     (!number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())).then_some(name)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 

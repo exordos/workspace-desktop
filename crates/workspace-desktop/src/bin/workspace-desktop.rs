@@ -1,7 +1,7 @@
 //! Разбирает параметры аккаунтов и запускает штатный клиент Workspace Desktop на GPUI.
 
 /// Запускает окно с выбранными аккаунтом и подписями или возвращает понятную ошибку.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn main() -> std::process::ExitCode {
     use std::process::ExitCode;
     use workspace_desktop::gpui_client;
@@ -39,7 +39,7 @@ fn main() -> std::process::ExitCode {
 }
 
 /// Сохраняет параметры выбора и подписей действующего окна Workspace.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn parse_options(mut args: &[String]) -> Option<workspace_desktop::gpui_client::Options> {
     use workspace_core::context::AccountId;
 
@@ -61,10 +61,10 @@ fn parse_options(mut args: &[String]) -> Option<workspace_desktop::gpui_client::
 }
 
 /// Печатает только записи GPUI-клиента с идентификаторами операций и безопасными статусами.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 struct DesktopLog;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 impl log::Log for DesktopLog {
     /// Исключает сетевые библиотеки и сообщения core, которые могут включать ответ сервера.
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
@@ -84,9 +84,9 @@ impl log::Log for DesktopLog {
     fn flush(&self) {}
 }
 
-/// Сообщает, что для оконного клиента нужна macOS.
-#[cfg(not(target_os = "macos"))]
+/// Сообщает об отсутствии оконного бэкенда на этой ОС.
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn main() -> std::process::ExitCode {
-    eprintln!("Клиент Workspace Desktop на GPUI запускается на macOS");
+    eprintln!("Клиент Workspace Desktop на GPUI запускается на macOS, Windows и Linux");
     std::process::ExitCode::FAILURE
 }

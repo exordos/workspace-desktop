@@ -9,6 +9,7 @@ pub mod contracts;
 pub mod conversation;
 mod i18n;
 mod message_preview;
+#[cfg(target_os = "macos")]
 mod notification_audio;
 pub mod platform_window;
 mod preferences;
@@ -77,6 +78,7 @@ fn run_in(
     runtime: RuntimeClient,
     events: RuntimeEvents,
 ) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
     platform_window::macos::disable_state_restoration();
     let failed = Rc::new(Cell::new(false));
     let startup_failure = Rc::clone(&failed);
@@ -85,6 +87,7 @@ fn run_in(
     application.run(move |app| {
         bind_keys(app);
         preferences::Preferences::install(&profile, app);
+        #[cfg(target_os = "macos")]
         bind_native_theme(app);
         composer::install_toolbar_preferences(&profile, app);
         let window_options = WindowPlatform::window_options(&profile, app);
@@ -115,6 +118,7 @@ fn run_in(
             .detach();
         });
         Client::install_settings_input(&client, app);
+        #[cfg(target_os = "macos")]
         if let Some(main) = objc2_foundation::MainThreadMarker::new() {
             let (changed, mut changes) = tokio::sync::mpsc::channel(1);
             let observer =
@@ -183,6 +187,7 @@ fn refresh_on_appearance(window: &Window) {
 }
 
 /// Синхронизирует нативное оформление на старте и при смене выбора или активного входа.
+#[cfg(target_os = "macos")]
 fn bind_native_theme(app: &mut App) {
     use preferences::Preferences;
 

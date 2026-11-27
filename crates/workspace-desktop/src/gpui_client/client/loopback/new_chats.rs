@@ -229,7 +229,7 @@ fn choose_peer(client: &Entity<Client>, ui: &mut VisualTestContext) {
 /// Вставляет текст в настоящее активное поле формы или редактора.
 fn paste(ui: &mut VisualTestContext, value: &str) {
     ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(value.to_string())));
-    ui.simulate_keystrokes("cmd-v");
+    ui.simulate_keystrokes("secondary-v");
     ui.run_until_parked();
 }
 

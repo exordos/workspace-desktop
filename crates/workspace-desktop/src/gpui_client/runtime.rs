@@ -57,7 +57,11 @@ use super::contracts::{
 use super::preferences::workspace_direct;
 use super::test_profile::{MemorySecrets, TestLogin};
 use crate::platform::chat_keys::{ProfileChatKeys, device_id};
-use crate::platform::{JsonAccountStore, MacKeychain, state_directory};
+#[cfg(target_os = "macos")]
+use crate::platform::MacKeychain;
+#[cfg(not(target_os = "macos"))]
+use crate::platform::protected::ProfileSecrets;
+use crate::platform::{JsonAccountStore, state_directory};
 
 use folders::{FolderPreferenceStore, folder_snapshot, send_folder_state};
 
@@ -672,7 +676,11 @@ impl WorkerParts {
         let secrets: Arc<dyn SecretStore> = if isolated {
             Arc::new(MemorySecrets::default())
         } else {
-            Arc::new(MacKeychain)
+            #[cfg(target_os = "macos")]
+            let secrets = Arc::new(MacKeychain);
+            #[cfg(not(target_os = "macos"))]
+            let secrets = Arc::new(ProfileSecrets::new(&directory));
+            secrets
         };
         let auth = Auth::new(
             Arc::new(WorkspaceIamHttp::with_route(route.clone())),
@@ -687,7 +695,7 @@ impl WorkerParts {
             match device_id(&directory) {
                 Ok(device_id) => Some(ProfileEncryption {
                     engine: Arc::new(MessageEncryption::new(
-                        Arc::new(ProfileChatKeys::keychain()),
+                        Arc::new(ProfileChatKeys::open(&directory)),
                     )),
                     device_id,
                     active: Mutex::default(),

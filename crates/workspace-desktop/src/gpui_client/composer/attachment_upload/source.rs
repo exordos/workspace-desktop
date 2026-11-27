@@ -3,10 +3,14 @@
 use std::{
     fs::{Metadata, OpenOptions},
     io::{Cursor, Read},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 
 use gpui::Image;
 use uuid::Uuid;
@@ -30,22 +34,38 @@ pub(super) enum Source {
 /// Версия локального файла, которая обнаруживает замену и изменение байтов во время чтения.
 #[derive(PartialEq, Eq)]
 pub(super) struct FileFingerprint {
+    #[cfg(unix)]
     device: u64,         // Диск, на котором находится файл.
+    #[cfg(unix)]
     inode: u64,          // Идентификатор записи на диске.
     bytes: u64,          // Размер файла до чтения.
+    #[cfg(unix)]
     edited: (i64, i64),  // Время записи содержимого в секундах и наносекундах.
+    #[cfg(unix)]
     changed: (i64, i64), // Время изменения записи файловой системы в секундах и наносекундах.
+    #[cfg(windows)]
+    created: u64, // Время создания файла в единицах FILETIME.
+    #[cfg(windows)]
+    written: u64, // Время изменения содержимого в единицах FILETIME.
 }
 
 impl FileFingerprint {
     /// Снимает признаки версии с пути или открытого дескриптора.
     fn new(metadata: &Metadata) -> Self {
         Self {
+            #[cfg(unix)]
             device: metadata.dev(),
+            #[cfg(unix)]
             inode: metadata.ino(),
             bytes: metadata.len(),
+            #[cfg(unix)]
             edited: (metadata.mtime(), metadata.mtime_nsec()),
+            #[cfg(unix)]
             changed: (metadata.ctime(), metadata.ctime_nsec()),
+            #[cfg(windows)]
+            created: metadata.creation_time(),
+            #[cfg(windows)]
+            written: metadata.last_write_time(),
         }
     }
 }
@@ -106,12 +126,12 @@ fn read_attachment(
     if metadata.len() > max {
         return Err(TOO_LARGE);
     }
-    // Подмена пути между проверкой и open не должна остановить поток на FIFO.
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|_| READ_FAILED)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    // На Unix подмена пути между проверкой и open не должна остановить поток на FIFO.
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+    let mut file = options.open(path).map_err(|_| READ_FAILED)?;
     let opened = file.metadata().map_err(|_| READ_FAILED)?;
     let current = FileFingerprint::new(&metadata);
     if !opened.is_file() || FileFingerprint::new(&opened) != current {

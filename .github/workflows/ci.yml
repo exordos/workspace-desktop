@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Architecture lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo check-architecture
+
+  test:
+    name: Tests (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo test --locked --workspace --no-default-features
+
+  macos:
+    name: macOS app (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: x86_64
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            arch: arm64
+    env:
+      RUSTUP_TOOLCHAIN: stable-${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install ${{ env.RUSTUP_TOOLCHAIN }} --profile minimal
+      - run: cargo build --locked --release --target ${{ matrix.target }} -p workspace-desktop --bin workspace-desktop
+      - name: Bundle and verify the app
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          app="$(sh scripts/bundle-workspace-desktop-macos.sh "target/$TARGET/release/workspace-desktop")"
+          codesign --verify --strict "$app"
+          executable="$app/Contents/MacOS/workspace-desktop"
+          lipo "$executable" -verify_arch "$ARCH"
+          "$executable" --help
+          ditto -c -k --keepParent "$app" "workspace-desktop-macos-$ARCH.zip"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: workspace-desktop-macos-${{ matrix.arch }}.zip
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+
+  linux:
+    name: Linux app (x64)
+    needs: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/build-linux-package
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: workspace-desktop-linux-x64.tar.gz
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    name: Windows app (x64)
+    needs: lint
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
+      - name: Build and verify the executable
+        shell: pwsh
+        run: |
+          $sdkBin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/bin'
+          $fxc = Get-ChildItem (Join-Path $sdkBin '10.*/x64/fxc.exe') -File |
+            Sort-Object { [version]$_.Directory.Parent.Name } -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe was not found' }
+          $env:GPUI_FXC_PATH = $fxc.FullName
+          cargo +stable-x86_64-pc-windows-msvc build --locked --release --target x86_64-pc-windows-msvc -p workspace-desktop --bin workspace-desktop
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = 'target/x86_64-pc-windows-msvc/release/workspace-desktop.exe'
+          $archive = 'workspace-desktop-windows-x64.zip'
+          Compress-Archive -LiteralPath $exe -DestinationPath $archive
+          $verify = Join-Path $env:RUNNER_TEMP 'workspace-desktop-windows-x64'
+          Expand-Archive -LiteralPath $archive -DestinationPath $verify
+          $packagedExe = Join-Path $verify 'workspace-desktop.exe'
+          $stream = [System.IO.File]::OpenRead($packagedExe)
+          try {
+            $header = [System.IO.BinaryReader]::new($stream)
+            $stream.Position = 0x3c
+            $stream.Position = $header.ReadUInt32()
+            if ($header.ReadUInt32() -ne 0x4550 -or $header.ReadUInt16() -ne 0x8664) {
+              throw 'Expected an x64 PE executable'
+            }
+          } finally {
+            $stream.Dispose()
+          }
+          $helpText = & $packagedExe --help
+          if ($LASTEXITCODE -ne 0 -or $helpText -notlike 'Usage: workspace-desktop *') {
+            throw 'The packaged Windows executable failed the smoke test'
+          }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: workspace-desktop-windows-x64.zip
+          archive: false
+          if-no-files-found: error
+          retention-days: 14

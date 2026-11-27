@@ -46,7 +46,7 @@ fn server_and_credentials_keep_their_own_fields_and_focus(cx: &mut TestAppContex
         );
     });
 
-    ui.simulate_keystrokes("cmd-a");
+    ui.simulate_keystrokes("secondary-a");
     ui.simulate_input("https://workspace.example.com/");
     ui.simulate_keystrokes("enter");
     ui.run_until_parked();
@@ -137,7 +137,7 @@ fn registration_link_belongs_to_the_current_server(cx: &mut TestAppContext) {
 
     ui.simulate_keystrokes("escape");
     ui.run_until_parked();
-    ui.simulate_keystrokes("cmd-a");
+    ui.simulate_keystrokes("secondary-a");
     ui.simulate_input("https://127.0.0.1:1");
     ui.simulate_keystrokes("enter");
     wait_for(ui, "sign-in-register");
@@ -192,7 +192,7 @@ fn wrong_otp_can_be_retried_before_entering_selected_project(cx: &mut TestAppCon
     assert!(ui.debug_bounds("sign-in-otp").is_some());
 
     ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string("123 456".into())));
-    ui.simulate_keystrokes("cmd-v enter");
+    ui.simulate_keystrokes("secondary-v enter");
     wait_for(ui, "sign-in-project-1");
     for _ in 0..2 {
         ui.simulate_keystrokes("tab");

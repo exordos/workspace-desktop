@@ -3721,7 +3721,7 @@ mod selection_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod time_tests {
     use super::*;
     use crate::gpui_client::conversation::history_fixtures::fixture_rows;

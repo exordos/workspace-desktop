@@ -747,7 +747,7 @@ fn early_input_is_restored_after_restart_with_older_draft(cx: &mut TestAppContex
         |ui| ui.debug_bounds("workspace-composer-editor").is_some(),
     );
     click(ui, "workspace-composer-editor");
-    ui.simulate_keystrokes("cmd-a");
+    ui.simulate_keystrokes("secondary-a");
     ui.simulate_input("Новый вариант");
     switch_topic(ui);
     ready_text(

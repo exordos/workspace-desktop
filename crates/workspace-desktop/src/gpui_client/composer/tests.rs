@@ -275,7 +275,7 @@ fn click(ui: &mut VisualTestContext, selector: &'static str) {
 fn paste(ui: &mut VisualTestContext, text: &str) {
     click(ui, "workspace-composer-editor");
     ui.update(|_, app| app.write_to_clipboard(ClipboardItem::new_string(text.into())));
-    ui.simulate_keystrokes("cmd-a cmd-v");
+    ui.simulate_keystrokes("secondary-a secondary-v");
     ui.run_until_parked();
 }
 
@@ -633,7 +633,7 @@ fn composer_text_menu_dismisses_outside_and_disables_during_save(cx: &mut TestAp
     allow(&requests, Ok(TOPIC), ui);
     paste(ui, "Черновик");
 
-    ui.simulate_keystrokes("enter cmd-a shift-f10");
+    ui.simulate_keystrokes("enter secondary-a shift-f10");
     let attempt = next(&requests.save, "сохранение черновика под открытым меню");
     assert!(ui.debug_bounds("composer-text-menu").is_some());
     click(ui, "composer-text-cut");

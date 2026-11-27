@@ -1606,11 +1606,11 @@ fn protected_quote_excerpt_stays_out_of_clipboard_and_editor_after_original_key_
             .read(app);
         composer.tested_edit_active() && composer.draft(app) == safe
     }));
-    ui.simulate_keystrokes("cmd-a cmd-c");
+    ui.simulate_keystrokes("secondary-a secondary-c");
     assert_eq!(clipboard(ui).as_deref(), Some(safe.as_str()));
-    ui.simulate_keystrokes("cmd-a cmd-x");
+    ui.simulate_keystrokes("secondary-a secondary-x");
     assert_eq!(clipboard(ui).as_deref(), Some(safe.as_str()));
-    ui.simulate_keystrokes("cmd-v");
+    ui.simulate_keystrokes("secondary-v");
     ui.simulate_input("\n\nПравка");
     click(ui, "conversation-send");
     let wire = server.state.protected_wire.as_ref().unwrap();
@@ -1931,7 +1931,7 @@ fn encrypted_composer_and_key_exchange_use_authenticated_wire(cx: &mut TestAppCo
             })
         },
     );
-    ui.simulate_keystrokes("cmd-a");
+    ui.simulate_keystrokes("secondary-a");
     ui.simulate_input("marker after editing");
     click(ui, "conversation-send");
     until(

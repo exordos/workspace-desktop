@@ -17,7 +17,7 @@ fn secret_input_keeps_password_out_of_display_and_clipboard(cx: &mut TestAppCont
     ui.run_until_parked();
     let bounds = ui.debug_bounds("test-password").expect("видимое поле");
     ui.simulate_click(bounds.center(), Modifiers::none());
-    ui.simulate_keystrokes("cmd-v");
+    ui.simulate_keystrokes("secondary-v");
     ui.update(|window, app| {
         app.write_to_clipboard(ClipboardItem::new_string("содержимое буфера".into()));
         input.update(app, |view, cx| {
@@ -35,7 +35,7 @@ fn secret_input_keeps_password_out_of_display_and_clipboard(cx: &mut TestAppCont
             assert_eq!(view.text_for_range(0..4, &mut adjusted, window, cx), None);
         });
     });
-    ui.simulate_keystrokes("cmd-a cmd-c cmd-x");
+    ui.simulate_keystrokes("secondary-a secondary-c secondary-x");
     ui.read(|app| {
         let clipboard = app.read_from_clipboard().and_then(|item| item.text());
         assert_eq!(clipboard.as_deref(), Some("содержимое буфера"));

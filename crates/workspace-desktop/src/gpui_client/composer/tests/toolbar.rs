@@ -9,7 +9,7 @@ fn toolbar_formats_text_without_submitting_or_disturbing_ime(cx: &mut TestAppCon
     publish(&requests, Load::Open(ChatEntry::Latest), vec![], vec![], ui);
     allow(&requests, Ok(TOPIC), ui);
     paste(ui, "Отбор 🧩");
-    ui.simulate_keystrokes("cmd-a");
+    ui.simulate_keystrokes("secondary-a");
     let compact_field = ui.debug_bounds("conversation-composer-field").unwrap();
     let compact_send = ui.debug_bounds("conversation-send").unwrap();
     let compact_toggle = ui.debug_bounds("composer-toolbar-toggle").unwrap();
@@ -87,7 +87,7 @@ fn toolbar_formats_text_without_submitting_or_disturbing_ime(cx: &mut TestAppCon
     assert_eq!(multiline_send.bottom(), multiline_field.bottom());
     assert_eq!(multiline_send.size, compact_send.size);
 
-    ui.simulate_keystrokes("cmd-a");
+    ui.simulate_keystrokes("secondary-a");
     click(ui, "composer-format-link");
     ui.simulate_keystrokes("x");
     assert_eq!(draft(&view, ui), "[**Отбор 🧩**\nh](x)");
@@ -172,7 +172,7 @@ fn narrow_toolbar_scrolls_focused_actions_and_keeps_reading_anchor(cx: &mut Test
     };
     let initial_y = y(ui);
     paste(ui, "один\nдва");
-    ui.simulate_keystrokes("cmd-a");
+    ui.simulate_keystrokes("secondary-a");
     click(ui, "composer-toolbar-toggle");
     assert_eq!(y(ui), initial_y);
     let viewport = ui.debug_bounds("composer-toolbar").unwrap();

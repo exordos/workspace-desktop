@@ -55,7 +55,7 @@ pub(in crate::gpui_client) const SHORTCUT_GROUPS: [&[Shortcut]; 3] = [
         Shortcut {
             id: "navigation.chatSearch",
             title: "hotkeys.actions.navigation.chatSearch",
-            binding: Some("cmd-k"),
+            binding: Some("secondary-k"),
         },
         Shortcut {
             id: "navigation.folderList",
@@ -72,17 +72,17 @@ pub(in crate::gpui_client) const SHORTCUT_GROUPS: [&[Shortcut]; 3] = [
         Shortcut {
             id: "interface.help",
             title: "hotkeys.actions.interface.help",
-            binding: Some("cmd-/"),
+            binding: Some("secondary-/"),
         },
         Shortcut {
             id: "interface.sidebar",
             title: "hotkeys.actions.interface.sidebar",
-            binding: Some("cmd-\\"),
+            binding: Some("secondary-\\"),
         },
         Shortcut {
             id: "interface.infoPanel",
             title: "hotkeys.actions.interface.infoPanel",
-            binding: Some("cmd-."),
+            binding: Some("secondary-."),
         },
         Shortcut {
             id: "interface.quoteMessage",
@@ -99,22 +99,22 @@ pub(in crate::gpui_client) const SHORTCUT_GROUPS: [&[Shortcut]; 3] = [
         Shortcut {
             id: "composer.bold",
             title: "hotkeys.actions.composer.bold",
-            binding: Some("cmd-b"),
+            binding: Some("secondary-b"),
         },
         Shortcut {
             id: "composer.italic",
             title: "hotkeys.actions.composer.italic",
-            binding: Some("cmd-i"),
+            binding: Some("secondary-i"),
         },
         Shortcut {
             id: "composer.strike",
             title: "hotkeys.actions.composer.strike",
-            binding: Some("shift-cmd-x"),
+            binding: Some("shift-secondary-x"),
         },
         Shortcut {
             id: "composer.code",
             title: "hotkeys.actions.composer.code",
-            binding: Some("cmd-e"),
+            binding: Some("secondary-e"),
         },
     ],
 ];
@@ -139,7 +139,7 @@ pub(in crate::gpui_client) const FIXED: [Shortcut; 5] = [
     Shortcut {
         id: "fixed.editing",
         title: "hotkeys.fixed.editing",
-        binding: Some("cmd-c"),
+        binding: Some("secondary-c"),
     },
     Shortcut {
         id: "fixed.focusZones",
@@ -264,7 +264,7 @@ pub(in crate::gpui_client) fn matching(
         })
 }
 
-/// Показывает сочетание в короткой записи macOS.
+/// Показывает сочетание в короткой записи текущей платформы.
 pub(in crate::gpui_client) fn format(binding: &str) -> String {
     let Ok(key) = Keystroke::parse(binding) else {
         return binding.into();
@@ -289,14 +289,15 @@ pub(in crate::gpui_client) fn format(binding: &str) -> String {
         "space" => "Space".into(),
         key => key.to_uppercase(),
     };
+    #[cfg(target_os = "macos")]
+    let modifiers = ["⌃", "⌥", "⇧", "⌘", "fn"];
+    #[cfg(not(target_os = "macos"))]
+    let modifiers = ["Ctrl", "Alt", "Shift", "Super", "Fn"];
     [
-        (control, "⌃"),
-        (alt, "⌥"),
-        (shift, "⇧"),
-        (platform, "⌘"),
-        (function, "fn"),
+        control, alt, shift, platform, function,
     ]
     .into_iter()
+    .zip(modifiers)
     .filter_map(|(active, glyph)| active.then_some(glyph))
     .chain(std::iter::once(key_label.as_str()))
     .collect::<Vec<_>>()
@@ -317,12 +318,12 @@ mod tests {
             Err(BindingError::Reserved)
         );
         assert_eq!(
-            validate(search, "cmd-b", &settings),
+            validate(search, "secondary-b", &settings),
             Err(BindingError::Conflict)
         );
         assert_eq!(validate(search, "ctrl-shift-j", &settings), Ok(()));
         settings.hotkeys.insert(search.id.into(), None);
-        assert!(matching(&Keystroke::parse("cmd-k").unwrap(), &settings).is_none());
+        assert!(matching(&Keystroke::parse("secondary-k").unwrap(), &settings).is_none());
         settings
             .hotkeys
             .insert(search.id.into(), Some("alt-j".into()));

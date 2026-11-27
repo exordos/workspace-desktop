@@ -1,4 +1,4 @@
-//! Подключает ключи чата к связке ключей macOS и хранит UUID локального устройства.
+//! Подключает ключи чата к защищённому хранилищу ОС и хранит UUID локального устройства.
 //! Изолированный профиль использует отдельное хранилище в памяти.
 
 use std::{
@@ -9,6 +9,7 @@ use std::{
     sync::Mutex,
 };
 
+#[cfg(target_os = "macos")]
 use security_framework::passwords::{get_generic_password, set_generic_password};
 use uuid::Uuid;
 use workspace_core::{
@@ -20,10 +21,14 @@ use workspace_core::{
 };
 use zeroize::Zeroizing;
 
+#[cfg(not(target_os = "macos"))]
+use super::protected::ProtectedRecords;
+
 mod record;
 use record::{ChatRecord, Pending};
 
 const SERVICE: &str = "com.workspace.desktop.chat-keys";
+#[cfg(target_os = "macos")]
 const ITEM_NOT_FOUND: i32 = -25300;
 
 /// Возвращает стабильный UUID профиля. Вызывать под блокировкой открытого профиля.
@@ -64,7 +69,7 @@ impl<'a> From<&'a ChatKeyAddress> for Scope<'a> {
 }
 
 impl Scope<'_> {
-    /// Кодирует адрес Keychain с сохранением границ полей, независимо от символов в имени.
+    /// Кодирует адрес записи с сохранением границ полей, независимо от символов в имени.
     fn account(self) -> Result<String, KeyStoreError> {
         serde_json::to_string(&(
             "v1",
@@ -82,8 +87,11 @@ impl Scope<'_> {
 
 /// Реальная и изолированная платформенная реализации одной защищённой записи.
 enum Records {
-    Keychain,
-    Memory(HashMap<String, Zeroizing<Vec<u8>>>), // Изолированный профиль не пишет в Keychain и файлы.
+    #[cfg(target_os = "macos")]
+    Keychain, // Системная служба Keychain для ключей чатов.
+    #[cfg(not(target_os = "macos"))]
+    Protected(ProtectedRecords), // Защищённые записи текущего пользователя ОС.
+    Memory(HashMap<String, Zeroizing<Vec<u8>>>), // Тестовый профиль держит ключи только в памяти.
 }
 
 impl Records {
@@ -91,6 +99,9 @@ impl Records {
     fn read(&self, account: &str) -> Result<Option<Zeroizing<Vec<u8>>>, KeyStoreError> {
         match self {
             Self::Memory(current) => Ok(current.get(account).cloned()),
+            #[cfg(not(target_os = "macos"))]
+            Self::Protected(records) => records.read(account).map_err(|_| KeyStoreError),
+            #[cfg(target_os = "macos")]
             Self::Keychain => match get_generic_password(SERVICE, account) {
                 Ok(value) => Ok(Some(Zeroizing::new(value))),
                 Err(error) if error.code() == ITEM_NOT_FOUND => Ok(None),
@@ -106,6 +117,9 @@ impl Records {
                 current.insert(account, data);
                 Ok(())
             }
+            #[cfg(not(target_os = "macos"))]
+            Self::Protected(records) => records.write(&account, &data).map_err(|_| KeyStoreError),
+            #[cfg(target_os = "macos")]
             Self::Keychain => {
                 set_generic_password(SERVICE, &account, &data).map_err(|_| KeyStoreError)
             }
@@ -123,15 +137,24 @@ impl Records {
 
 /// Системный адаптер, который сериализует изменения внутри открытого процесса профиля.
 pub(crate) struct ProfileChatKeys {
-    records: Mutex<Records>, // Одна блокировка покрывает read, изменение и атомарную запись Keychain.
+    records: Mutex<Records>, // Одна блокировка покрывает чтение, изменение и запись.
 }
 
 impl ProfileChatKeys {
     /// Подключает отдельную службу Keychain для шифрования чатов.
+    #[cfg(target_os = "macos")]
     pub(crate) fn keychain() -> Self {
         Self {
             records: Mutex::new(Records::Keychain),
         }
+    }
+
+    /// Подключает обычное защищённое хранилище для ключей текущего профиля.
+    pub(crate) fn open(_profile: &Path) -> Self {
+        #[cfg(target_os = "macos")]
+        return Self::keychain();
+        #[cfg(not(target_os = "macos"))]
+        Self { records: Mutex::new(Records::Protected(ProtectedRecords::new(_profile, SERVICE))) }
     }
 
     /// Подключает тот же формат в отдельной памяти временного или тестового профиля.
@@ -520,6 +543,7 @@ mod tests {
     /// Проверяет запись, повторное открытие и удаление в настоящей связке ключей.
     #[test]
     #[ignore = "требует разблокированную связку ключей macOS"]
+    #[cfg(target_os = "macos")]
     fn keychain_roundtrip_uses_isolated_address() {
         struct TestItem(String);
         impl Drop for TestItem {

@@ -344,6 +344,7 @@ fn extreme_photo_ratio_uses_bounded_frame(cx: &mut TestAppContext) {
 }
 
 /// Показывает первый кадр видео до клика и открывает проигрыватель из того же кэша.
+#[cfg(target_os = "macos")]
 #[gpui::test]
 fn video_attachment_shows_poster_and_plays_from_core_cache(cx: &mut TestAppContext) {
     cx.update(bind_keys);
