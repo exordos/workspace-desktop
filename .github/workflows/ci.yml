@@ -3,6 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -12,7 +15,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
   lint:
@@ -141,3 +144,43 @@ jobs:
           archive: false
           if-no-files-found: error
           retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' && github.ref_type == 'tag' && github.event.created
+    needs: [lint, test, macos, linux, windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: workspace-desktop-*
+          path: release-assets
+          merge-multiple: true
+          skip-decompress: true
+      - name: Create the release with all four packages
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          options=(--verify-tag --title "Workspace Desktop $RELEASE_TAG")
+          if [[ "$(git cat-file -t "refs/tags/$RELEASE_TAG")" == tag ]]; then
+            options+=(--notes-from-tag)
+          else
+            options+=(--generate-notes)
+          fi
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            options+=(--prerelease --latest=false)
+          fi
+          gh release create "$RELEASE_TAG" "${options[@]}" \
+            'release-assets/workspace-desktop-linux-x64.tar.gz#Linux x64' \
+            'release-assets/workspace-desktop-windows-x64.zip#Windows x64' \
+            'release-assets/workspace-desktop-macos-x86_64.zip#macOS Intel x64' \
+            'release-assets/workspace-desktop-macos-arm64.zip#macOS ARM64'
