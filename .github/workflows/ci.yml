@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main, CI]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Formatting and architecture
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --component rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo check-architecture
+
+  test:
+    name: Tests (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    env:
+      RUSTUP_TOOLCHAIN: stable-${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install ${{ env.RUSTUP_TOOLCHAIN }} --profile minimal
+      - run: cargo test --locked --workspace --no-default-features --target ${{ matrix.target }}
+
+  macos:
+    name: macOS app (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: x86_64
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            arch: arm64
+    env:
+      RUSTUP_TOOLCHAIN: stable-${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install ${{ env.RUSTUP_TOOLCHAIN }} --profile minimal
+      - run: cargo build --locked --release --target ${{ matrix.target }} -p workspace-desktop --bin workspace-desktop
+      - name: Bundle and verify the app
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          app="$(sh scripts/bundle-workspace-desktop-macos.sh "target/$TARGET/release/workspace-desktop")"
+          codesign --verify --strict "$app"
+          executable="$app/Contents/MacOS/workspace-desktop"
+          lipo -verify_arch "$ARCH" "$executable"
+          "$executable" --help
+          ditto -c -k --keepParent "$app" "workspace-desktop-macos-$ARCH.zip"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: workspace-desktop-macos-${{ matrix.arch }}.zip
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
