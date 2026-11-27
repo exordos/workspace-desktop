@@ -1,3 +1,8 @@
 [workspace]
 members = ["crates/workspace-core", "crates/workspace-desktop"]
+exclude = ["third_party/xattr-0.2.3"]
 resolver = "3"
+
+[patch.crates-io]
+# GPUI 0.2.2 подтягивает xattr 0.2, где Linux использовал удалённый псевдоним ENOATTR.
+xattr = { path = "third_party/xattr-0.2.3" }

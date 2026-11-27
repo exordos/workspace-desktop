@@ -381,6 +381,9 @@ impl Render for General {
             settings.separate_call_window,
             settings.idle_timeout,
         );
+        // Берём значения до того, как построение строк запросит изменяемый контекст.
+        #[cfg(target_os = "macos")]
+        let (notification_sound, dock_bounce) = (settings.notification_sound, settings.dock_bounce);
         let shortcuts = self.row(
             Row {
                 id: "profile-hotkeys",
@@ -451,20 +454,25 @@ impl Render for General {
                 (
                     lang.tr("settings.notificationSound"),
                     None,
-                    Some(sound_name(lang, settings.notification_sound)),
+                    Some(sound_name(lang, notification_sound)),
                 ),
                 Icon::VolumeUp,
                 palette,
                 cx,
             ))
-            .children(self.options(Section::Sound, sound_options(lang, settings.notification_sound), palette, cx))
+            .children(self.options(
+                Section::Sound,
+                sound_options(lang, notification_sound),
+                palette,
+                cx,
+            ))
             .child(self.switch(
                 (
                     "profile-dock-bounce",
                     lang.tr("settings.dockBounce"),
                     Icon::DesktopWindows,
                 ),
-                settings.dock_bounce,
+                dock_bounce,
                 palette,
                 cx,
                 |value| value.dock_bounce = !value.dock_bounce,
