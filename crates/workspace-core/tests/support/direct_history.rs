@@ -127,7 +127,12 @@ fn legacy_encrypted_message(user: &str, ciphertext: &str) -> Value {
 
 /// Принимает один HTTPS-запрос и возвращает данные только для токена B.
 async fn reply(socket: TcpStream, tls: TlsAcceptor, api: Arc<HistoryApi>) {
-    let mut socket = BufReader::new(tls.accept(socket).await.unwrap());
+    let mut socket = match tls.accept(socket).await {
+        Ok(socket) => BufReader::new(socket),
+        // При остановке синхронизации клиент может закрыть ещё не готовое соединение.
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return,
+        Err(error) => panic!("ошибка TLS на тестовом сервере истории: {error}"),
+    };
     let mut line = String::new();
     socket.read_line(&mut line).await.unwrap();
     let method = line.split_whitespace().next().unwrap().to_owned();
