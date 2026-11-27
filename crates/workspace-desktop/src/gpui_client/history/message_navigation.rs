@@ -5,7 +5,11 @@ use gpui::{Context, EventEmitter};
 use uuid::Uuid;
 use workspace_core::storage::HistoryScope;
 
-use super::{Conversation, MessageHistoryError, references::ReferenceSource};
+use super::{
+    Conversation, MessageHistoryError,
+    protected_quotes::{QuoteSlot, QuoteText},
+    references::ReferenceSource,
+};
 use crate::gpui_client::{contracts::ConversationAddress, runtime::RuntimeClient};
 
 /// Действие пользователя в текущей ленте, которое оболочка может принять или отменить.
@@ -30,6 +34,17 @@ enum Source {
         target: Uuid, // Оригинал, на который ведёт заголовок пересылки.
     },
     Reference(ReferenceSource), // Исходная ссылка или разрешение на чтение защищённого тела.
+    OrdinaryQuote {
+        row: Uuid,       // Сообщение, в котором расположена цитата.
+        caption: bool,   // Цитата находится в подписи вложения.
+        position: usize, // Позиция цитаты в теле или подписи.
+        target: Uuid,    // UUID оригинала этой цитаты.
+    },
+    ProtectedQuote {
+        slot: QuoteSlot,   // Точная позиция цитаты в защищённом сообщении.
+        access: QuoteText, // Отзываемый доступ к цитирующему и исходному сообщениям.
+        target: Uuid,      // UUID оригинала, проверенный вместе с токеном доступа.
+    },
 }
 
 impl MessageNavigationSource {
@@ -43,11 +58,32 @@ impl MessageNavigationSource {
         Self(Source::Reference(source))
     }
 
+    /// Запоминает точную позицию обычной цитаты для проверки после сетевого ожидания.
+    fn ordinary_quote(row: Uuid, caption: bool, position: usize, target: Uuid) -> Self {
+        Self(Source::OrdinaryQuote {
+            row,
+            caption,
+            position,
+            target,
+        })
+    }
+
+    /// Сохраняет отзывный доступ к точной защищённой цитате.
+    fn protected_quote(slot: QuoteSlot, access: QuoteText, target: Uuid) -> Self {
+        Self(Source::ProtectedQuote {
+            slot,
+            access,
+            target,
+        })
+    }
+
     /// Возвращает источник для отмены перехода при правке или удалении сообщения.
     pub(in crate::gpui_client) fn row(&self) -> Uuid {
         match &self.0 {
             Source::Forward { row, .. } => *row,
             Source::Reference(source) => source.row(),
+            Source::OrdinaryQuote { row, .. } => *row,
+            Source::ProtectedQuote { slot, .. } => slot.message,
         }
     }
 
@@ -58,6 +94,27 @@ impl MessageNavigationSource {
                 view.has_access() && view.viewport.has_forward_source(*row, *target)
             }
             Source::Reference(source) => source.is_current(view),
+            Source::OrdinaryQuote {
+                row,
+                caption,
+                position,
+                target,
+            } => {
+                view.has_access()
+                    && view
+                        .viewport
+                        .has_quote_source(*row, *caption, *position, *target)
+            }
+            Source::ProtectedQuote {
+                slot,
+                access,
+                target,
+            } => {
+                view.has_access()
+                    && view.encryption.as_ref().is_some_and(|encryption| {
+                        encryption.quotes.has_current_source(*slot, access, *target)
+                    })
+            }
         }
     }
 }
@@ -77,6 +134,39 @@ impl Conversation {
                 source,
             });
         }
+    }
+
+    /// Открывает оригинал обычной цитаты, только если её точный слот ещё не изменился.
+    pub(super) fn open_history_quote(
+        &self,
+        row: Uuid,
+        caption: bool,
+        position: usize,
+        target: Uuid,
+        cx: &mut Context<Self>,
+    ) {
+        self.emit_message_target(
+            target,
+            MessageNavigationSource::ordinary_quote(row, caption, position, target),
+            cx,
+        );
+    }
+
+    /// Открывает оригинал защищённой цитаты с токеном, который повторно проверяется после ожиданий.
+    pub(super) fn open_protected_quote(
+        &self,
+        slot: QuoteSlot,
+        access: QuoteText,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = access.current_source() else {
+            return;
+        };
+        self.emit_message_target(
+            target,
+            MessageNavigationSource::protected_quote(slot, access, target),
+            cx,
+        );
     }
 }
 

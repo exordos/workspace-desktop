@@ -2,6 +2,8 @@
   "a11y.hidePanel": "Скрыть панель",
   "attachmentCard.unnamedFile": "Файл",
   "call.call": "Позвонить",
+  "call.messageTitle": "Звонок",
+  "call.untitledRoom": "Название звонка",
   "channel.addMembers": "Добавить участников",
   "channel.allowMembersToShareKeys": "Разрешить участникам делиться ключами",
   "channel.channelName": "Название канала",

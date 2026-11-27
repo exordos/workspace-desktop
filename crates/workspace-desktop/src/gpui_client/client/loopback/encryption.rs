@@ -782,6 +782,161 @@ fn bulk_key_grants_use_persisted_requests_from_other_topics(cx: &mut TestAppCont
     );
 }
 
+/// Проверяет клик и Enter по защищённой цитате, затем отзыв ключа её оригинала.
+#[gpui::test]
+fn protected_history_quote_click_enter_and_key_revocation(cx: &mut TestAppContext) {
+    const QUOTE: &str = "history-protected-quote-00000000-0000-0000-0000-0000000000ba-0";
+    const TARGET_MARK: &str = "history-message-mark-00000000-0000-0000-0000-0000000000bc";
+    cx.update(bind_keys);
+    let server = Server::serve(Received {
+        direct_encrypted: AtomicBool::new(true),
+        protected_wire: Some(ProtectedWire {
+            presentation: true,
+            ..Default::default()
+        }),
+        ..Received::default()
+    });
+    let profile = tempfile::tempdir().unwrap();
+    let (runtime, events) =
+        start_runtime(profile.path(), saved_account(&server, USER, Uuid::nil()));
+    let (client, ui) =
+        cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
+    ui.update(|_, app| {
+        let subscription = events.attach(&client, app, Client::handle_runtime);
+        client.update(app, |client, cx| client.attach(subscription, cx));
+        Client::install_settings_input(&client, app);
+    });
+    ui.simulate_resize(size(px(1150.), px(900.)));
+    until(
+        ui,
+        "каталог получил закрытое превью",
+        |ui| {
+            ui.debug_bounds("catalog-encrypted-preview-locked")
+                .is_some()
+        },
+    );
+    click(ui, CHAT_ROW);
+    until(
+        ui,
+        "защищённая история открылась",
+        |ui| ui.debug_bounds(LOCKED_A).is_some(),
+    );
+    let (engine, activation) = ui.read(|app| {
+        runtime
+            .message_encryption(&client.read(app).shell.selected().unwrap().clone())
+            .unwrap()
+    });
+    let stream = STREAM.parse().unwrap();
+    let key = GroupKey::from_bytes([7; 32]);
+    engine
+        .save_key(&activation, stream, KEY.parse().unwrap(), &key)
+        .unwrap();
+    engine
+        .save_key(&activation, stream, OTHER_KEY.parse().unwrap(), &key)
+        .unwrap();
+    until(
+        ui,
+        "оригинал цитаты подтверждён ключом",
+        |ui| {
+            ui.debug_bounds(QUOTE).is_some()
+                && ui.read(|app| {
+                    client.read(app).conversation.as_ref().is_some_and(|view| {
+                        view.read(app)
+                            .tested_protected_quote_text(SEALED_A)
+                            .is_some()
+                    })
+                })
+        },
+    );
+    let source_route = ui.read(|app| client.read(app).shell.conversation().unwrap().clone());
+
+    // Клик должен открыть конкретный оригинал защищённой цитаты.
+    click_protected(ui, QUOTE);
+    until(ui, "клик отметил UUID оригинала", |ui| {
+        ui.debug_bounds(TARGET_MARK).is_some()
+    });
+    ui.simulate_keystrokes("alt-left");
+    until(
+        ui,
+        "Back вернул к цитате и снял отметку",
+        |ui| ui.debug_bounds(QUOTE).is_some() && ui.debug_bounds(TARGET_MARK).is_none(),
+    );
+    assert_eq!(
+        ui.read(|app| client.read(app).shell.conversation().unwrap().clone()),
+        source_route
+    );
+
+    // Переводим фокус с редактора на заголовок защищённой цитаты.
+    let stale_quote_point = ui.debug_bounds(QUOTE).unwrap().center();
+    click(ui, "workspace-composer-editor");
+    ui.simulate_keystrokes("shift-tab shift-tab");
+    ui.run_until_parked();
+    ui.simulate_keystrokes("enter");
+    ui.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("enter").unwrap(),
+    });
+    until(
+        ui,
+        "Enter отметил UUID того же оригинала",
+        |ui| ui.debug_bounds(TARGET_MARK).is_some(),
+    );
+    let stale_navigation = std::rc::Rc::new(std::cell::Cell::new(false));
+    let observed_navigation = std::rc::Rc::clone(&stale_navigation);
+    ui.update(|_, app| {
+        client.update(app, |client, cx| {
+            let conversation = client.conversation.as_ref().unwrap();
+            cx.subscribe(
+                conversation,
+                move |_, _, _: &crate::gpui_client::conversation::OpenMessageTarget, _| {
+                    observed_navigation.set(true);
+                },
+            )
+            .detach();
+        });
+    });
+    engine
+        .remove_key(&activation, stream, OTHER_KEY.parse().unwrap())
+        .unwrap();
+    until(
+        ui,
+        "отзыв ключа закрыл содержимое защищённой цитаты",
+        |ui| {
+            ui.read(|app| {
+                client.read(app).conversation.as_ref().is_some_and(|view| {
+                    view.read(app)
+                        .tested_protected_quote_text(SEALED_A)
+                        .is_none()
+                })
+            })
+        },
+    );
+    // Повторный клик по прежнему месту уже не должен открыть защищённый оригинал.
+    ui.simulate_mouse_move(stale_quote_point, None, Modifiers::none());
+    ui.update(|window, app| window.draw(app).clear());
+    ui.simulate_mouse_down(
+        stale_quote_point,
+        gpui::MouseButton::Left,
+        Modifiers::none(),
+    );
+    ui.update(|window, app| window.draw(app).clear());
+    ui.simulate_mouse_up(
+        stale_quote_point,
+        gpui::MouseButton::Left,
+        Modifiers::none(),
+    );
+    ui.run_until_parked();
+    assert!(!stale_navigation.get());
+    assert_eq!(
+        ui.read(|app| client.read(app).shell.conversation().unwrap().clone()),
+        source_route,
+        "после отзыва ключа переход не меняется"
+    );
+    assert_eq!(
+        futures::executor::block_on(runtime.shutdown()),
+        RuntimeExit::Clean
+    );
+}
+
 /// Проверяет зависимости одного защищённого бабла, каталога и штатного просмотрщика.
 #[gpui::test]
 fn protected_presentation_uses_exact_quote_file_and_sidebar_keys(cx: &mut TestAppContext) {

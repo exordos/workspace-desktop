@@ -41,7 +41,7 @@ pub(super) struct Frame {
     pub(super) kind: MediaKind,    // Источник пикселей и вид заглушки.
     pub(super) name: SharedString, // Имя файла для заглушки ошибки.
     pub(super) language: Language, // Язык аккаунта для текста ошибки.
-    pub(super) tile: Tile,         // Пропорции кадрирования и скругления плитки в пузыре.
+    pub(super) tile: Tile,         // Пропорции, режим кадрирования и скругления плитки.
 }
 
 /// Кадр и состояние текущей попытки для одного места в ленте.
@@ -88,7 +88,11 @@ impl Frame {
             Some(Ok(image)) => {
                 let preview = img(ImageSource::Render(image.clone()))
                     .size_full()
-                    .object_fit(ObjectFit::Cover)
+                    .object_fit(if self.tile.crop {
+                        ObjectFit::Cover
+                    } else {
+                        ObjectFit::Contain
+                    })
                     .debug_selector(move || {
                         if video {
                             "history-video-preview".into()
@@ -215,14 +219,18 @@ impl Thumbnails {
         if let Some(index) = entries.iter().position(|(stored, _)| *stored == key)
             && let Some((_, entry)) = entries.remove(index)
         {
-            if entry.read(app).frame.tile.corners != frame.tile.corners {
-                entry.update(app, |thumbnail, cx| {
-                    thumbnail.frame.tile.corners = frame.tile.corners;
-                    cx.notify();
-                });
+            let previous_tile = entry.read(app).frame.tile;
+            if previous_tile.ratio == frame.tile.ratio && previous_tile.crop == frame.tile.crop {
+                if previous_tile.corners != frame.tile.corners {
+                    entry.update(app, |thumbnail, cx| {
+                        thumbnail.frame.tile.corners = frame.tile.corners;
+                        cx.notify();
+                    });
+                }
+                entries.push_back((key, entry.clone()));
+                return entry.into_any_element();
             }
-            entries.push_back((key, entry.clone()));
-            return entry.into_any_element();
+            entry.update(app, Thumbnail::retire);
         }
         let placeholder = frame.render(None, palette);
         placeholder
@@ -264,6 +272,7 @@ impl Thumbnails {
         let slots = self.slots.clone();
         let kind = frame.kind;
         let ratio = frame.tile.ratio;
+        let crop = frame.tile.crop;
         let entry = cx.new(|cx: &mut Context<Thumbnail>| {
             let task = cx.spawn(async move |entry, cx| {
                 let Ok(_slot) = slots.acquire().await else {
@@ -278,7 +287,7 @@ impl Thumbnails {
                             .open_media(&services.sync, &load.access, key.message, key.file)
                             .await
                             .map_err(|_| PictureError::Unavailable)?;
-                        tokio::task::spawn_blocking(move || decode_frame(file, kind, ratio))
+                        tokio::task::spawn_blocking(move || decode_frame(file, kind, ratio, crop))
                             .await
                             .map_err(|_| PictureError::Unavailable)?
                     })
@@ -309,8 +318,14 @@ fn decode_frame(
     mut file: MediaFile,
     kind: MediaKind,
     ratio: f32,
+    crop: bool,
 ) -> Result<Arc<RenderImage>, PictureError> {
-    let image = crop_to_tile(decode_pixels(&mut file, kind)?, ratio);
+    let image = decode_pixels(&mut file, kind)?;
+    let image = if crop {
+        crop_to_tile(image, ratio)
+    } else {
+        image
+    };
     file.with_valid_access(|| render_image(image))
         .map_err(|_| PictureError::Unavailable)
 }

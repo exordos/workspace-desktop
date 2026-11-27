@@ -95,6 +95,7 @@
   "desktop.messenger.history.requestReplacementKey": "Запросить замену ключа",
   "desktop.messenger.history.retryDeclinedFragmentRequest": "Запрос отклонён. Повторить",
   "desktop.messenger.history.sourceUnavailable": "Исходное сообщение недоступно",
+  "desktop.messenger.history.openOriginal": "Открыть исходное сообщение",
   "desktop.messenger.history.waitingForKey": "Ожидаем ключ",
   "desktop.messenger.history.waitingForKeyReply": "Ожидаем ответа на запрос",
   "desktop.messenger.participant": "Участник",

@@ -26,6 +26,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::context::OwnerContext;
+use crate::messenger::references::media_references;
 
 use super::{HistoryScope, Storage, StorageError};
 
@@ -146,11 +147,25 @@ impl From<rusqlite::Error> for MediaCacheError {
 /// Короткоживущий снимок условий, взятый до сетевого запроса.
 #[derive(Clone, Debug)]
 pub(crate) struct MediaWriteFence {
-    owner: String,       // Кодированный полный OwnerContext.
-    scope: HistoryScope, // Фактическое размещение сообщения в истории.
-    key: MediaKey,       // Цель, для которой был начат запрос.
-    reference: i64,      // Версия ссылки, исчезает при изменении или удалении.
-    version: i64,        // Сумма монотонных ревизий владельца, области и файла.
+    owner: String,                  // Кодированный полный OwnerContext.
+    scope: HistoryScope,            // Фактическое размещение сообщения в истории.
+    key: MediaKey,                  // Цель, для которой был начат запрос.
+    reference: MediaReferenceFence, // Подтверждённая ссылка или точный снимок очереди.
+    version: i64,                   // Сумма монотонных ревизий владельца, области и файла.
+}
+
+/// Источник права на вложение во время загрузки или чтения копии.
+#[derive(Clone, Debug)]
+enum MediaReferenceFence {
+    History {
+        id: i64, // Версия подтверждённой ссылки в истории.
+    },
+    Outbox {
+        owner: OwnerContext, // Полный владелец строки очереди.
+        message_id: Uuid,    // Публичный UUID размещения, по которому очередь станет историей.
+        markdown: String,    // Точный обычный снимок, где найдена прямая ссылка.
+        kind: MediaKind,     // Вид вложения из этой ссылки.
+    },
 }
 
 /// Данные физической копии и её опознаватель, общий для диска и индекса.
@@ -547,11 +562,12 @@ impl MediaCache {
         key: MediaKey,
     ) -> Result<MediaWriteFence, MediaCacheError> {
         let connection = self.connection()?;
-        let owner = owner_key(owner);
+        let owner_context = owner;
+        let owner = owner_key(owner_context);
         let file = key.file_id.to_string();
-        let (reference, topic) = connection
+        let history_reference = connection
             .query_row(
-                "SELECT id, topic FROM messenger_media_refs WHERE owner = ?1 AND stream = ?2
+                "SELECT id, topic, kind FROM messenger_media_refs WHERE owner = ?1 AND stream = ?2
                  AND (?3 IS NULL OR topic = ?3) AND message = ?4 AND file = ?5
                  ORDER BY id LIMIT 1",
                 params![
@@ -561,13 +577,60 @@ impl MediaCache {
                     source.message_id.to_string(),
                     file
                 ],
-                |row| Ok((row.get(0)?, optional_uuid_column(row, 1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        optional_uuid_column(row, 1)?,
+                        MediaKind::read(row.get(2)?)?,
+                    ))
+                },
             )
-            .optional()?
-            .ok_or(MediaCacheError::Unavailable)?;
-        let scope = HistoryScope {
-            stream_id: source.scope.stream_id,
-            topic_id: topic,
+            .optional()?;
+        let (reference, scope) = if let Some((id, topic, _kind)) = history_reference {
+            (
+                MediaReferenceFence::History { id },
+                HistoryScope {
+                    stream_id: source.scope.stream_id,
+                    topic_id: topic,
+                },
+            )
+        } else {
+            let Some(topic_id) = source.scope.topic_id else {
+                return Err(MediaCacheError::Unavailable);
+            };
+            let markdown = connection
+                .query_row(
+                    "SELECT markdown FROM messenger_outbox
+                     WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
+                       AND project_id = ?4 AND user_id = ?5 AND public_id = ?6
+                       AND stream_id = ?7 AND topic_id = ?8 AND ciphertext IS NULL",
+                    params![
+                        owner_context.account_id.0,
+                        owner_context.server,
+                        owner_context.organization_id,
+                        owner_context.project_id,
+                        owner_context.user_id,
+                        source.message_id.as_bytes(),
+                        source.scope.stream_id.as_bytes(),
+                        topic_id.as_bytes(),
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or(MediaCacheError::Unavailable)?;
+            let link = media_references(&markdown)
+                .into_iter()
+                .find(|reference| reference.file_id == key.file_id)
+                .ok_or(MediaCacheError::Unavailable)?;
+            (
+                MediaReferenceFence::Outbox {
+                    owner: (*owner_context).clone(),
+                    message_id: source.message_id,
+                    markdown,
+                    kind: link.kind,
+                },
+                source.scope,
+            )
         };
         Ok(MediaWriteFence {
             version: version(&connection, &owner, &file, scope)?,
@@ -728,11 +791,14 @@ impl MediaCache {
             }
             None => {
                 let id = staged.id.to_string();
-                let reference_kind: i64 = transaction.query_row(
-                    "SELECT kind FROM messenger_media_refs WHERE id = ?1",
-                    [fence.reference],
-                    |row| row.get(0),
-                )?;
+                let reference_kind = match &fence.reference {
+                    MediaReferenceFence::History { id } => transaction.query_row(
+                        "SELECT kind FROM messenger_media_refs WHERE id = ?1",
+                        [*id],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    MediaReferenceFence::Outbox { kind, .. } => *kind as i64,
+                };
                 let kind = type_from_mime(metadata.mime.as_deref())
                     .map_or(reference_kind, |kind| kind as i64);
                 let final_path = self.disk.object_path(staged.id);
@@ -829,18 +895,87 @@ impl MediaCache {
 impl MediaWriteFence {
     /// Сравнивает ссылку и версии с актуальным состоянием в той же транзакции.
     fn is_current(&self, connection: &Connection) -> rusqlite::Result<bool> {
-        Ok(self.version
-            == version(
+        if self.version
+            != version(
                 connection,
                 &self.owner,
                 &self.key.file_id.to_string(),
                 self.scope,
             )?
-            && connection.query_row(
+        {
+            return Ok(false);
+        }
+        match &self.reference {
+            MediaReferenceFence::History { id } => connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM messenger_media_refs WHERE id = ?1)",
-                [self.reference],
-                |row| row.get::<_, bool>(0),
-            )?)
+                [id],
+                |row| row.get(0),
+            ),
+            MediaReferenceFence::Outbox {
+                owner,
+                message_id,
+                markdown,
+                kind,
+            } => {
+                let topic = self.scope.topic_id.map(|id| id.to_string());
+                let Some(topic_id) = self.scope.topic_id else {
+                    return Ok(false);
+                };
+                let in_outbox: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM messenger_outbox
+                     WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
+                       AND project_id = ?4 AND user_id = ?5 AND public_id = ?6
+                       AND stream_id = ?7 AND topic_id = ?8 AND ciphertext IS NULL
+                       AND markdown = ?9)",
+                    params![
+                        owner.account_id.0,
+                        owner.server,
+                        owner.organization_id,
+                        owner.project_id,
+                        owner.user_id,
+                        message_id.as_bytes(),
+                        self.scope.stream_id.as_bytes(),
+                        topic_id.as_bytes(),
+                        markdown,
+                    ],
+                    |row| row.get(0),
+                )?;
+                if in_outbox {
+                    return Ok(true);
+                }
+                // Подтверждение удаляет очередь в одной транзакции с созданием истории.
+                let history_match: bool = connection.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM messenger_media_refs AS ref
+                        JOIN sync_messages AS message
+                          ON message.account_id = ?1 AND message.server = ?2
+                         AND message.organization_id = ?3 AND message.project_id = ?4
+                         AND message.user_id = ?5 AND message.message_id = ref.message
+                        WHERE ref.owner = ?6 AND ref.stream = ?7 AND ref.topic IS ?8
+                          AND ref.message = ?9 AND ref.file = ?10 AND ref.kind = ?11
+                          AND message.text = ?12 AND message.encryption_key_id IS NULL
+                          AND message.author_id = ?13
+                    )",
+                    params![
+                        owner.account_id.0,
+                        owner.server,
+                        owner.organization_id,
+                        owner.project_id,
+                        owner.user_id,
+                        self.owner,
+                        self.scope.stream_id.to_string(),
+                        topic,
+                        message_id.to_string(),
+                        self.key.file_id.to_string(),
+                        *kind as i64,
+                        markdown,
+                        owner.user_id,
+                    ],
+                    |row| row.get(0),
+                )?;
+                Ok(history_match)
+            }
+        }
     }
 }
 
@@ -908,13 +1043,18 @@ impl MediaReader {
 
     /// Проверяет, что именно эта копия и исходная ссылка ещё доступны.
     pub(crate) fn is_current(&self) -> Result<bool, MediaCacheError> {
-        Ok(self.cache.connection()?.query_row(
-            "SELECT EXISTS(SELECT 1 FROM messenger_media_refs AS ref
-             JOIN messenger_media_objects AS object ON object.owner = ref.owner AND object.file = ref.file
-             WHERE ref.id = ?1 AND object.id = ?2 AND object.pending = 0)",
-            params![self.fence.reference, self.object.id.to_string()],
-            |row| row.get(0),
-        )?)
+        let connection = self.cache.connection()?;
+        Ok(self.fence.is_current(&connection)?
+            && connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messenger_media_objects
+                 WHERE id = ?1 AND owner = ?2 AND file = ?3 AND pending = 0)",
+                params![
+                    self.object.id.to_string(),
+                    self.fence.owner,
+                    self.fence.key.file_id.to_string()
+                ],
+                |row| row.get(0),
+            )?)
     }
 }
 

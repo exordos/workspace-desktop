@@ -1,4 +1,4 @@
-//! Открывает вложение подтверждённого зашифрованного сообщения.
+//! Открывает вложение из подтверждённого или ожидающего зашифрованного сообщения.
 //! Сверяет ссылку в расшифрованном теле и держит временные байты только до конца чтения.
 
 use std::{fs::File, io, io::Read, pin::pin, sync::Arc};
@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::{ActiveGeneration, Service},
-    context::OwnerContext,
+    context::{OwnerContext, SessionGeneration},
     messenger::{
         MessengerSource,
         encryption::{EncryptionActivation, MessageReadPermission},
@@ -17,7 +17,7 @@ use crate::{
         references::media_references,
     },
     storage::{
-        HistoryScope, MessageBody, Storage,
+        HistoryScope, MessageBody, PreparedSend, PreparedSendBody, Storage,
         media::{MediaMetadata, MediaTempFile},
     },
     sync::{ProtectedFilePermit, QuoteOriginPermit, Sync},
@@ -28,6 +28,7 @@ use super::{MediaFile, MediaFileReader, OpenMediaError, receive_original};
 /// Байты в файле без имени и без индекса ссылок, привязанные к разрешению оригинала.
 pub(super) struct ProtectedMediaFile {
     storage: Arc<Storage>,          // Локальные версии истории и доступа.
+    generation: SessionGeneration,  // Вход, под которым было открыто вложение.
     source: ProtectedMediaSource,   // Исходная строка и её связь с обычным файлом.
     permit: ProtectedPreviewPermit, // Доступ к файлу, исходнику и цитирующей строке, если она есть.
     metadata: MediaMetadata,        // Имя и тип, полученные из обычного файлового API.
@@ -35,12 +36,13 @@ pub(super) struct ProtectedMediaFile {
     staged: MediaTempFile,          // Удаляет временный путь при освобождении.
 }
 
-/// Разрешение получено либо от строки в открытой истории, либо от подтверждённой цитаты.
+/// Разрешение получено от сообщения в истории, очереди или подтверждённой цитаты.
 enum FileReadPermission {
     History {
         origin: Box<QuoteOriginPermit>, // Точная версия сообщения с вложением.
         key: MessageReadPermission,     // Локальный ключ, которым прочитали его тело.
     },
+    Outbox(MessageReadPermission), // Ключ точного зашифрованного снимка очереди.
     Quote(Box<ProtectedQuoteMediaPermit>), // Версии сообщений и ключей цитаты и оригинала.
 }
 
@@ -51,6 +53,7 @@ impl FileReadPermission {
             Self::History { origin, key } => {
                 origin.with_current(|| key.with_current(read)).flatten()
             }
+            Self::Outbox(key) => key.with_current(read),
             Self::Quote(quote) => quote.with_current_under_auth(read),
         }
     }
@@ -60,16 +63,16 @@ impl FileReadPermission {
 #[derive(Clone)]
 pub struct ProtectedPreviewPermit(Arc<ProtectedPreviewAccess>); // Общие версии без владения профилем.
 
-/// Версии, которые достаточно сверить в памяти перед отрисовкой.
+/// Источник и разрешения, которые проверяются перед показом кадра.
 struct ProtectedPreviewAccess {
-    session: ActiveGeneration,  // Поколение Auth без владения авторизацией.
-    file: ProtectedFilePermit,  // Версия UUID файла до следующего серверного изменения.
-    source: FileReadPermission, // Разрешения на сообщения и ключи, из которых получили ссылку.
+    session: ActiveGeneration,      // Поколение Auth без владения авторизацией.
+    file: ProtectedFilePermit,      // Версия UUID файла до следующего серверного изменения.
+    permission: FileReadPermission, // Разрешения на сообщения и ключи, из которых получили ссылку.
 }
 
 impl ProtectedPreviewPermit {
     /// Разрешает краткий показ пока действуют вход, файл, сообщения и ключи.
-    /// Замыкание не обращается к Core, диску или сети.
+    /// Вызывается из отрисовки и проверяет только уже захваченные разрешения.
     pub fn with_current<T>(&self, read: impl FnOnce() -> T) -> Option<T> {
         self.0
             .session
@@ -81,26 +84,64 @@ impl ProtectedPreviewPermit {
     fn with_current_under_auth<T>(&self, read: impl FnOnce() -> T) -> Option<T> {
         self.0
             .file
-            .with_current(|| self.0.source.with_current(read))
+            .with_current(|| self.0.permission.with_current(read))
             .flatten()
     }
 }
 
-/// Версии оригинала и файла перед загрузкой без добавления ссылки в индекс.
+/// Версии источника и файла перед загрузкой без добавления ссылки в индекс.
+#[derive(Clone)]
 struct ProtectedMediaSource {
-    scope: HistoryScope,     // Фактическое размещение исходного сообщения.
-    message_id: Uuid,        // Исходная строка вложения.
-    file_id: Uuid,           // UUID запрашиваемого файла.
-    quote: QuoteSourceFence, // Версии оригинала и права чтения.
-    file_revision: i64,      // Версия отзыва или замены файла.
+    scope: HistoryScope,          // Фактическое размещение исходного сообщения.
+    message_id: Uuid,             // Исходная строка вложения.
+    file_id: Uuid,                // UUID запрашиваемого файла.
+    origin: ProtectedOriginFence, // Точный снимок очереди или версия истории.
+    file_revision: i64,           // Версия отзыва или замены файла.
+}
+
+/// Отслеживает тот источник, который дал доступ к зашифрованному телу.
+#[derive(Clone)]
+enum ProtectedOriginFence {
+    History(QuoteSourceFence), // Подтверждённая строка и её ревизия.
+    Outbox {
+        owner: OwnerContext,           // Полный владелец ожидающей строки.
+        generation: SessionGeneration, // Вход, под которым расшифровали снимок.
+        snapshot: PreparedSend,        // Точный шифротекст, ключ, устройство и размещение.
+        access_revision: i64,          // Версия отзыва исходной темы.
+    },
 }
 
 impl ProtectedMediaSource {
-    /// Сверяет правку оригинала и отзыв права файла перед передачей байтов.
-    fn verify(&self, storage: &Storage, owner: &OwnerContext) -> Result<(), OpenMediaError> {
-        let current = QuoteSourceFence::capture(storage, owner, self.scope, self.message_id)
-            .map_err(quote_media_error)?;
-        if current == self.quote
+    /// Сверяет исходную строку, отзыв доступа и версию файла перед передачей байтов.
+    fn verify(
+        &self,
+        storage: &Storage,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+    ) -> Result<(), OpenMediaError> {
+        let origin_current = match &self.origin {
+            ProtectedOriginFence::History(expected) => {
+                let current =
+                    QuoteSourceFence::capture(storage, owner, self.scope, self.message_id)
+                        .map_err(quote_media_error)?;
+                current == *expected
+            }
+            ProtectedOriginFence::Outbox {
+                owner: expected_owner,
+                generation: expected_generation,
+                snapshot,
+                access_revision,
+            } => {
+                expected_owner == owner
+                    && *expected_generation == generation
+                    && snapshot.public_id == self.message_id
+                    && snapshot.stream_id == self.scope.stream_id
+                    && Some(snapshot.topic_id) == self.scope.topic_id
+                    && storage.media_access_revision(owner, self.scope)? == *access_revision
+                    && storage.encrypted_send_for_media_is_current(owner, snapshot)?
+            }
+        };
+        if origin_current
             && storage.media_file_revision(owner, self.scope, self.file_id)? == self.file_revision
         {
             return Ok(());
@@ -138,7 +179,7 @@ impl ProtectedMediaFile {
             )
         };
         self.source
-            .verify(&self.storage, owner)
+            .verify(&self.storage, owner, self.generation)
             .map_err(|_| revoked())?;
         self.permit
             .with_current_under_auth(read)
@@ -234,48 +275,120 @@ impl MessengerSource {
         auth.with_active_generation(owner, generation, || access.verify(sync))??;
         let mut keys = profile.keys.subscribe();
         let mut selection = profile.keys.observe_selection();
-        let (original, fence) = self
-            .quote_original_with_fence(sync, owner, generation, expected_scope, message_id)
-            .await
-            .map_err(quote_media_error)?;
-        let scope = HistoryScope {
-            stream_id: original.stream_id,
-            topic_id: Some(original.topic_id),
-        };
-        let (source, file, direct_origin) =
+        let storage = sync.storage();
+        let pending = if let Some(scope) =
+            expected_scope.filter(|scope| *scope == access.scope && scope.topic_id.is_some())
+        {
             auth.with_active_generation(owner, generation, || -> Result<_, OpenMediaError> {
                 access.verify(sync)?;
-                let storage = sync.storage();
-                if QuoteSourceFence::capture(storage, owner, scope, message_id)
-                    .map_err(quote_media_error)?
-                    != fence
-                    || !storage.quote_source_matches(owner, &original)?
-                {
-                    return Err(OpenMediaError::Unavailable);
-                }
-                let direct_origin = match quoting.as_ref() {
-                    Some(quote) if quote.matches_source(&original) => None,
-                    Some(_) => return Err(OpenMediaError::Unavailable),
-                    None => Some(
-                        sync.capture_quote_origin(owner, generation, &original)
-                            .ok_or(OpenMediaError::Unavailable)?,
-                    ),
-                };
-                let source = ProtectedMediaSource {
-                    scope,
-                    message_id,
-                    file_id,
-                    quote: fence,
-                    file_revision: storage.media_file_revision(owner, scope, file_id)?,
-                };
-                // Версия файла и разрешение относятся к одной завершённой записи истории.
-                let file = sync.capture_protected_file(owner, file_id);
-                Ok((source, file, direct_origin))
-            })??;
+                Ok(storage.encrypted_send_for_media(owner, scope, message_id)?)
+            })??
+        } else {
+            None
+        };
+        let (scope, body, source, file, direct_origin) = if let Some(snapshot) = pending {
+            if snapshot.public_id != message_id
+                || Some(snapshot.stream_id) != expected_scope.map(|scope| scope.stream_id)
+                || expected_scope.and_then(|scope| scope.topic_id) != Some(snapshot.topic_id)
+            {
+                return Err(OpenMediaError::Unavailable);
+            }
+            let PreparedSendBody::Encrypted {
+                key_id,
+                ciphertext,
+                device_id,
+            } = &snapshot.body
+            else {
+                return Err(OpenMediaError::Unavailable);
+            };
+            if *device_id != session.device_id {
+                return Err(OpenMediaError::Unavailable);
+            }
+            let scope = HistoryScope {
+                stream_id: snapshot.stream_id,
+                topic_id: Some(snapshot.topic_id),
+            };
+            let (source, file) = auth.with_active_generation(
+                owner,
+                generation,
+                || -> Result<_, OpenMediaError> {
+                    access.verify(sync)?;
+                    let access_revision = storage.media_access_revision(owner, scope)?;
+                    if !storage.encrypted_send_for_media_is_current(owner, &snapshot)? {
+                        return Err(OpenMediaError::Unavailable);
+                    }
+                    let source = ProtectedMediaSource {
+                        scope,
+                        message_id,
+                        file_id,
+                        origin: ProtectedOriginFence::Outbox {
+                            owner: owner.clone(),
+                            generation,
+                            snapshot: snapshot.clone(),
+                            access_revision,
+                        },
+                        file_revision: storage.media_file_revision(owner, scope, file_id)?,
+                    };
+                    let file = sync.capture_protected_file(owner, file_id);
+                    Ok((source, file))
+                },
+            )??;
+            (
+                scope,
+                MessageBody::Encrypted {
+                    key_id: *key_id,
+                    ciphertext: ciphertext.clone(),
+                },
+                source,
+                file,
+                None,
+            )
+        } else {
+            let (original, fence) = self
+                .quote_original_with_fence(sync, owner, generation, expected_scope, message_id)
+                .await
+                .map_err(quote_media_error)?;
+            let scope = HistoryScope {
+                stream_id: original.stream_id,
+                topic_id: Some(original.topic_id),
+            };
+            let (source, file, direct_origin) = auth.with_active_generation(
+                owner,
+                generation,
+                || -> Result<_, OpenMediaError> {
+                    access.verify(sync)?;
+                    if QuoteSourceFence::capture(storage, owner, scope, message_id)
+                        .map_err(quote_media_error)?
+                        != fence
+                        || !storage.quote_source_matches(owner, &original)?
+                    {
+                        return Err(OpenMediaError::Unavailable);
+                    }
+                    let direct_origin = match quoting.as_ref() {
+                        Some(quote) if quote.matches_source(&original) => None,
+                        Some(_) => return Err(OpenMediaError::Unavailable),
+                        None => Some(
+                            sync.capture_quote_origin(owner, generation, &original)
+                                .ok_or(OpenMediaError::Unavailable)?,
+                        ),
+                    };
+                    let source = ProtectedMediaSource {
+                        scope,
+                        message_id,
+                        file_id,
+                        origin: ProtectedOriginFence::History(fence),
+                        file_revision: storage.media_file_revision(owner, scope, file_id)?,
+                    };
+                    let file = sync.capture_protected_file(owner, file_id);
+                    Ok((source, file, direct_origin))
+                },
+            )??;
+            (scope, original.body, source, file, direct_origin)
+        };
         let permission = match (quoting, direct_origin) {
             (Some(quote), _) => FileReadPermission::Quote(Box::new(quote)),
-            (None, Some(origin)) => {
-                let MessageBody::Encrypted { key_id, ciphertext } = original.body else {
+            (None, origin) => {
+                let MessageBody::Encrypted { key_id, ciphertext } = body else {
                     return Err(OpenMediaError::Unavailable);
                 };
                 let engine = Arc::clone(&profile.keys);
@@ -294,22 +407,27 @@ impl MessengerSource {
                 .await
                 .map_err(|_| OpenMediaError::Unavailable)?
                 .ok_or(OpenMediaError::Unavailable)?;
-                FileReadPermission::History {
-                    origin: Box::new(origin),
-                    key,
+                match origin {
+                    Some(origin) => FileReadPermission::History {
+                        origin: Box::new(origin),
+                        key,
+                    },
+                    None if matches!(&source.origin, ProtectedOriginFence::Outbox { .. }) => {
+                        FileReadPermission::Outbox(key)
+                    }
+                    None => return Err(OpenMediaError::Unavailable),
                 }
             }
-            (None, None) => return Err(OpenMediaError::Unavailable),
         };
         let permit = ProtectedPreviewPermit(Arc::new(ProtectedPreviewAccess {
             session: auth.active_generation(owner, generation),
             file,
-            source: permission,
+            permission,
         }));
         let check = || {
             auth.with_active_generation(owner, generation, || {
                 access.verify(sync)?;
-                source.verify(sync.storage(), owner)?;
+                source.verify(sync.storage(), owner, generation)?;
                 if permit.with_current_under_auth(|| ()).is_none() {
                     return Err(OpenMediaError::Unavailable);
                 }
@@ -352,6 +470,7 @@ impl MessengerSource {
             generation,
             reader: MediaFileReader::Protected(ProtectedMediaFile {
                 storage: Arc::clone(sync.storage()),
+                generation,
                 source,
                 permit,
                 metadata,

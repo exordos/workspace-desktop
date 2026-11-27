@@ -25,7 +25,7 @@ use super::{
 };
 use crate::gpui_client::{
     preferences::Language,
-    ui::{Icon, Palette, TextRole, popup::tooltip, text_role},
+    ui::{BUBBLE_TAIL_BREAK, Icon, Palette, TextRole, popup::tooltip, text_role},
 };
 use crate::platform::message_time::{format_local_time, format_local_time_zone};
 
@@ -224,6 +224,7 @@ pub(super) struct InlineRender<'a> {
     pub conversation: Option<&'a WeakEntity<Conversation>>, // Владелец действий ссылки.
     pub names: &'a MentionNames, // Уже известные имена старых упоминаний.
     pub selection: Option<InlineSelection<'a>>, // Общая координата выделения открытого текста.
+    pub tail_suffix: Option<SharedString>, // Невидимый резерв времени после последнего символа.
 }
 
 /// Привязывает выделение видимых слов к точному исходному телу для цитирования.
@@ -301,8 +302,16 @@ impl InlineText {
             conversation,
             names,
             selection,
+            tail_suffix,
         } = input;
-        let (visible, targets) = self.compose(language, |user| names.get(user), true);
+        let source_length = self.source.len();
+        let (mut visible, targets) = self.compose(language, |user| names.get(user), true);
+        let tail_range = tail_suffix.map(|suffix| {
+            visible.push_str(BUBBLE_TAIL_BREAK);
+            let start = visible.len();
+            visible.push_str(&suffix);
+            start..visible.len()
+        });
         let visible = SharedString::from(visible);
         let selection_range = selection.as_ref().and_then(|selection| {
             let range = selection.controls.source_range(
@@ -312,11 +321,17 @@ impl InlineText {
             )?;
             Some(display_position(&targets, range.start)..display_position(&targets, range.end))
         });
-        let styled = StyledText::new(visible.clone()).with_highlights(highlight_ranges(
-            &targets,
-            palette,
-            selection_range.clone(),
-        ));
+        let mut highlights = highlight_ranges(&targets, palette, selection_range.clone());
+        if let Some(range) = tail_range {
+            highlights.push((
+                range,
+                gpui::HighlightStyle {
+                    color: Some(palette.text.opacity(0.)),
+                    ..Default::default()
+                },
+            ));
+        }
+        let styled = StyledText::new(visible.clone()).with_highlights(highlights);
         let layout = styled.layout().clone();
         let targets = Rc::new(targets);
         let hints = targets.clone();
@@ -376,7 +391,7 @@ impl InlineText {
                     controls.start_selection(
                         row,
                         body.clone(),
-                        offset + original_position(&click_map, byte),
+                        offset + original_position(&click_map, byte).min(source_length),
                         window,
                     );
                 })
@@ -386,7 +401,7 @@ impl InlineText {
                         drag.extend_selection(
                             row,
                             offset..=source_end,
-                            offset + original_position(&drag_map, byte),
+                            offset + original_position(&drag_map, byte).min(source_length),
                             window,
                         );
                     }
@@ -730,6 +745,7 @@ mod tests {
                     conversation: None,
                     names: &MentionNames::default(),
                     selection: None,
+                    tail_suffix: None,
                 });
                 self.layout = Some(layout);
                 gpui::div().w(px(100.)).child(inline)

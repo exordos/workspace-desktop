@@ -1,4 +1,4 @@
-//! Раскладывает фото и видео на всю ширину пузыря и скругляет только внешние углы.
+//! Раскладывает медиа по пузырю и скругляет только внешние углы.
 
 use gpui::{Corners, Div, Pixels, Stateful, div, prelude::*, px};
 use workspace_core::messenger::references::MediaReference;
@@ -8,11 +8,15 @@ use crate::gpui_client::ui::MESSAGE_BUBBLE_MAX_WIDTH;
 const GAP: Pixels = px(2.);
 const MAX_SINGLE_HEIGHT: Pixels = px(430.);
 const MAX_GROUP_HEIGHT: Pixels = px(520.);
+const MIN_PREVIEW_SIDE: Pixels = px(96.);
+const MIN_IMAGE_RATIO: f32 = 0.25;
+const MAX_IMAGE_RATIO: f32 = 4.;
 
 /// Пропорции кадра и скругления конкретной плитки.
 #[derive(Clone, Copy)]
 pub(super) struct Tile {
-    pub(super) ratio: f32,               // Ширина к высоте после кадрирования.
+    pub(super) ratio: f32,               // Ширина к высоте рамки кадра.
+    pub(super) crop: bool,               // Нужно ли обрезать исходник, чтобы заполнить рамку.
     pub(super) corners: Corners<Pixels>, // Скругления со стороны внешних краёв пузыря.
 }
 
@@ -30,12 +34,31 @@ impl Tile {
 /// Позиция ссылки в исходном сообщении, нужная для действий по плитке.
 type Item = (usize, f32);
 
-/// Делит большую подборку на группы и рисует их в исходном порядке.
+/// Пределы рамки одиночного фото, вычисленные без размера исходных пикселей.
+struct SingleImageLayout {
+    ratio: f32,        // Пропорции рамки после ограничения крайних значений.
+    max_width: Pixels, // Ширина, при которой высота не превысит установленный предел.
+    crop: bool,        // Крайние пропорции требуют обрезки исходника.
+}
+
+/// Делит подборку на группы или подбирает ограниченную рамку для одиночного фото.
 pub(super) fn render(
     items: &[Item],
     corners: Corners<Pixels>,
+    single_image: bool,
     mut card: impl FnMut(usize, Tile) -> Stateful<Div>,
 ) -> Div {
+    if single_image && let [item] = items {
+        let layout = single_image_layout(item.1);
+        let tile = Tile {
+            ratio: layout.ratio,
+            crop: layout.crop,
+            corners,
+        };
+        let frame = card(item.0, tile).absolute().inset_0();
+        return sized_single_image(layout, frame);
+    }
+
     let mut album = div().w_full().flex().flex_col().gap(GAP);
     let groups = items.chunks(4);
     let last = groups.len().saturating_sub(1);
@@ -113,6 +136,7 @@ fn portrait_group(
     let outer_ratio = (first.1 / 0.6).clamp(min_ratio(MAX_GROUP_HEIGHT), 1.5);
     let left = Tile {
         ratio: outer_ratio * 0.6,
+        crop: true,
         corners: Corners {
             top_left: corners.top_left,
             bottom_left: corners.bottom_left,
@@ -139,6 +163,7 @@ fn portrait_group(
                 *position,
                 Tile {
                     ratio: right_ratio,
+                    crop: true,
                     corners,
                 },
             )
@@ -174,6 +199,7 @@ fn row(
         left,
         Tile {
             ratio: a_ratio * scale,
+            crop: true,
             corners: Corners {
                 top_left: corners.top_left,
                 bottom_left: corners.bottom_left,
@@ -185,6 +211,7 @@ fn row(
         right,
         Tile {
             ratio: b_ratio * scale,
+            crop: true,
             corners: Corners {
                 top_right: corners.top_right,
                 bottom_right: corners.bottom_right,
@@ -229,8 +256,45 @@ fn single(
 ) -> Div {
     sized(
         ratio,
-        card(position, Tile { ratio, corners }).absolute().inset_0(),
+        card(
+            position,
+            Tile {
+                ratio,
+                crop: true,
+                corners,
+            },
+        )
+        .absolute()
+        .inset_0(),
     )
+}
+
+/// Вычисляет рамку одиночного фото и обрезает только пропорции за пределами 1:4–4:1.
+fn single_image_layout(source_ratio: f32) -> SingleImageLayout {
+    let source_ratio = if source_ratio.is_finite() && source_ratio > 0. {
+        source_ratio
+    } else {
+        1.5
+    };
+    let ratio = source_ratio.clamp(MIN_IMAGE_RATIO, MAX_IMAGE_RATIO);
+    let max_width = (f32::from(MAX_SINGLE_HEIGHT) * ratio).min(f32::from(MESSAGE_BUBBLE_MAX_WIDTH));
+    SingleImageLayout {
+        ratio,
+        max_width: px(max_width),
+        crop: source_ratio != ratio,
+    }
+}
+
+/// Ограничивает фото по ширине и высоте, не растягивая его и сохраняя место для узких кадров.
+fn sized_single_image(layout: SingleImageLayout, child: impl IntoElement) -> Div {
+    let mut frame = div()
+        .w(layout.max_width)
+        .max_w_full()
+        .min_w(MIN_PREVIEW_SIDE)
+        .min_h(MIN_PREVIEW_SIDE)
+        .relative();
+    frame.style().aspect_ratio = Some(layout.ratio);
+    frame.child(child)
 }
 
 /// Резервирует высоту от доступной ширины до загрузки байтов.
@@ -249,11 +313,16 @@ fn weighted<E: Styled>(mut element: E, weight: f32) -> E {
 
 /// Читает пропорции из URL. Старые ссылки получают стабильное место в альбоме.
 pub(super) fn reference_ratio(reference: &MediaReference) -> f32 {
-    reference
+    let ratio = reference
         .metadata
         .width
         .zip(reference.metadata.height)
-        .map_or(1.5, |(width, height)| width as f32 / height as f32)
+        .map_or(1.5, |(width, height)| width as f32 / height as f32);
+    if ratio.is_finite() && ratio > 0. {
+        ratio
+    } else {
+        1.5
+    }
 }
 
 /// Сохраняет скругления верхнего ряда.
@@ -271,5 +340,37 @@ fn bottom(corners: Corners<Pixels>) -> Corners<Pixels> {
         top_left: px(0.),
         top_right: px(0.),
         ..corners
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ограничивает слишком длинные стороны и укладывает рамку в доступный пузырь.
+    #[test]
+    fn single_image_layout_limits_extreme_ratios_and_height() {
+        let portrait = single_image_layout(0.5);
+        assert_eq!(portrait.ratio, 0.5);
+        assert_eq!(portrait.max_width, px(215.));
+        assert!(!portrait.crop);
+
+        assert!(!single_image_layout(0.25).crop);
+        assert!(!single_image_layout(4.).crop);
+
+        let panorama = single_image_layout(100.);
+        assert_eq!(panorama.ratio, 4.);
+        assert_eq!(panorama.max_width, MESSAGE_BUBBLE_MAX_WIDTH);
+        assert!(panorama.crop);
+
+        let tall_strip = single_image_layout(0.01);
+        assert_eq!(tall_strip.ratio, 0.25);
+        assert_eq!(tall_strip.max_width, px(107.5));
+        assert!(tall_strip.crop);
+
+        let invalid = single_image_layout(f32::INFINITY);
+        assert_eq!(invalid.ratio, 1.5);
+        assert_eq!(invalid.max_width, px(645.));
+        assert!(!invalid.crop);
     }
 }

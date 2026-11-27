@@ -23,10 +23,7 @@ use super::{Conversation, State, inline_references::references, message_menu::Me
 use crate::gpui_client::{
     composer::{ReplyAction, ReplyQuote, ReplyText, short_reply_text},
     preferences::Language,
-    ui::{
-        Palette, QuoteSurface, TextRole, label, quote_frame,
-        text_role,
-    },
+    ui::{BUBBLE_TAIL_BREAK, Palette, QuoteSurface, TextRole, label, quote_frame, text_role},
 };
 
 /// Выделение одного проверенного снимка тела.
@@ -169,7 +166,31 @@ impl ReplyControls {
         body: &SharedString,
         palette: Palette,
     ) -> (Stateful<Div>, TextLayout) {
-        self.selectable_text(id, body, 0..body.len(), body.clone(), palette)
+        self.selectable_text(id, body, 0..body.len(), body.clone(), None, palette)
+    }
+
+    /// Добавляет невидимый резерв времени, оставляя мыши диапазон исходного тела.
+    pub(super) fn selectable_with_tail(
+        &self,
+        id: Uuid,
+        body: &SharedString,
+        tail_suffix: &str,
+        palette: Palette,
+    ) -> (Stateful<Div>, TextLayout) {
+        let mut visible = body.to_string();
+        visible.push_str(BUBBLE_TAIL_BREAK);
+        visible.push_str(tail_suffix);
+        self.selectable_text(
+            id,
+            body,
+            0..body.len(),
+            visible.into(),
+            Some(
+                body.len() + BUBBLE_TAIL_BREAK.len()
+                    ..body.len() + BUBBLE_TAIL_BREAK.len() + tail_suffix.len(),
+            ),
+            palette,
+        )
     }
 
     /// Показывает часть тела и сохраняет выделение в координатах исходного сообщения.
@@ -181,7 +202,33 @@ impl ReplyControls {
         visible: SharedString,
         palette: Palette,
     ) -> Stateful<Div> {
-        self.selectable_text(id, body, span, visible, palette).0
+        self.selectable_text(id, body, span, visible, None, palette)
+            .0
+    }
+
+    /// Добавляет резерв времени к последнему участку подписи, не меняя границы выделения.
+    pub(super) fn selectable_span_with_tail(
+        &self,
+        id: Uuid,
+        body: &SharedString,
+        span: Range<usize>,
+        visible: SharedString,
+        tail_suffix: &str,
+        palette: Palette,
+    ) -> Stateful<Div> {
+        let mut text = visible.to_string();
+        text.push_str(BUBBLE_TAIL_BREAK);
+        let tail_start = text.len();
+        text.push_str(tail_suffix);
+        self.selectable_text(
+            id,
+            body,
+            span,
+            text.into(),
+            Some(tail_start..tail_start + tail_suffix.len()),
+            palette,
+        )
+        .0
     }
 
     /// Возвращает текст и его фактическую разметку для выделения и фиксации позиции.
@@ -191,21 +238,37 @@ impl ReplyControls {
         body: &SharedString,
         span: Range<usize>,
         visible: SharedString,
+        tail_range: Option<Range<usize>>,
         palette: Palette,
     ) -> (Stateful<Div>, TextLayout) {
         let body = body.clone();
         let start = span.start;
         let end = span.end;
+        let displayed_body_end = tail_range.as_ref().map_or(visible.len(), |range| {
+            range.start.saturating_sub(BUBBLE_TAIL_BREAK.len())
+        });
         let range = self.source_range(id, &body, span);
-        let styled = StyledText::new(visible.clone()).with_highlights(range.map(|range| {
-            (
-                range,
+        let mut highlights = range
+            .map(|range| {
+                vec![(
+                    range,
+                    HighlightStyle {
+                        background_color: Some(palette.accent_soft),
+                        ..HighlightStyle::default()
+                    },
+                )]
+            })
+            .unwrap_or_default();
+        if let Some(tail_range) = tail_range {
+            highlights.push((
+                tail_range,
                 HighlightStyle {
-                    background_color: Some(palette.accent_soft),
+                    color: Some(palette.text.opacity(0.)),
                     ..HighlightStyle::default()
                 },
-            )
-        }));
+            ));
+        }
+        let styled = StyledText::new(visible.clone()).with_highlights(highlights);
         let layout = styled.layout().clone();
         let drag_layout = layout.clone();
         let mouse_layout = layout.clone();
@@ -222,7 +285,8 @@ impl ReplyControls {
             .debug_selector(move || format!("history-reply-body-{id}"))
             .cursor(gpui::CursorStyle::IBeam)
             .on_mouse_down(MouseButton::Left, move |event, window, cx| {
-                let index = start + byte_at(&mouse_layout, &visible, event.position);
+                let index = start
+                    + source_byte_at(&mouse_layout, &visible, event.position, displayed_body_end);
                 controls.start_selection(id, body.clone(), index, window);
                 cx.stop_propagation();
             })
@@ -245,7 +309,13 @@ impl ReplyControls {
             })
             .on_mouse_move(move |event, window, _| {
                 if event.dragging() {
-                    let index = start + byte_at(&drag_layout, &drag_visible, event.position);
+                    let index = start
+                        + source_byte_at(
+                            &drag_layout,
+                            &drag_visible,
+                            event.position,
+                            displayed_body_end,
+                        );
                     drag.extend_selection(id, start..=end, index, window);
                 }
             })
@@ -291,7 +361,6 @@ impl ReplyControls {
                 });
                 cx.stop_propagation();
             })
-
     }
 }
 
@@ -478,6 +547,21 @@ impl Conversation {
     }
 }
 
+/// Ограничивает позицию мыши последним байтом исходного текста перед хвостом.
+fn clamp_display_index(index: usize, body_end: usize) -> usize {
+    index.min(body_end)
+}
+
+/// Преобразует координату щелчка или drag в байт исходного текста до скрытого хвоста.
+fn source_byte_at(
+    layout: &TextLayout,
+    visible: &str,
+    position: Point<Pixels>,
+    body_end: usize,
+) -> usize {
+    clamp_display_index(byte_at(layout, visible, position), body_end)
+}
+
 /// Показывает доступную в истории цитату или честное пояснение при отсутствии источника.
 pub(super) fn history_quote(
     palette: Palette,
@@ -485,6 +569,7 @@ pub(super) fn history_quote(
     author: SharedString,
     snippet: SharedString,
     available: bool,
+    openable: bool,
     language: Language,
 ) -> Div {
     let body = div()
@@ -498,7 +583,11 @@ pub(super) fn history_quote(
             body.child(label(
                 palette,
                 TextRole::Caption,
-                language.tr("desktop.messenger.history.sourceUnavailable"),
+                language.tr(if openable {
+                    "desktop.messenger.history.openOriginal"
+                } else {
+                    "desktop.messenger.history.sourceUnavailable"
+                }),
             ))
         });
     quote_frame(
@@ -611,6 +700,16 @@ fn preview_block(
 mod tests {
     use super::*;
 
+    /// Клик и конец drag в невидимом хвосте остаются на конце исходного тела.
+    #[test]
+    fn selectable_tail_does_not_extend_the_source_range() {
+        let body_end = 12;
+        assert_eq!(clamp_display_index(5, body_end), 5);
+        assert_eq!(clamp_display_index(body_end, body_end), body_end);
+        assert_eq!(clamp_display_index(body_end + 1, body_end), body_end);
+        assert_eq!(clamp_display_index(body_end + 40, body_end), body_end);
+    }
+
     /// Переводит только служебные вставки, даже если автор набрал такую же русскую строку.
     #[test]
     fn reply_preview_translates_service_spans_only() {
@@ -626,5 +725,68 @@ mod tests {
                 "Зашифрованный фрагмент Зашифрованный фрагмент Пересланное сообщение"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "gpui-test"))]
+mod tail_selection_gpui_tests {
+    use gpui::{Context, Render, TestAppContext, div, px, size};
+
+    use super::*;
+    use crate::gpui_client::ui::{Palette, TextRole, text_role};
+
+    /// Держит GPUI-разметку видимого тела с невидимым хвостом для проверки координат.
+    struct TailSelectionProbe {
+        layout: Option<TextLayout>, // GPUI хранит фактическую геометрию после prepaint.
+        visible: SharedString,      // Тело, разделитель и скрытый хвост.
+    }
+
+    impl Render for TailSelectionProbe {
+        /// Показывает короткое тело и хвост, не создавая экран разговора.
+        fn render(
+            &mut self,
+            window: &mut gpui::Window,
+            cx: &mut Context<Self>,
+        ) -> impl IntoElement {
+            let palette = Palette::for_window(window, cx);
+            let text = StyledText::new(self.visible.clone());
+            self.layout = Some(text.layout().clone());
+            div().size_full().child(
+                text_role(palette, TextRole::Body)
+                    .debug_selector(|| "tail-selection-probe".into())
+                    .child(text),
+            )
+        }
+    }
+
+    /// Реальные позиции символа и хвоста дают drag-диапазон только исходного тела.
+    #[gpui::test]
+    fn click_and_drag_coordinates_on_tail_stay_inside_source_text(cx: &mut TestAppContext) {
+        let body = "body";
+        let suffix = "MMMMMMMM";
+        let mut visible = body.to_owned();
+        visible.push_str(BUBBLE_TAIL_BREAK);
+        let tail_start = visible.len();
+        visible.push_str(suffix);
+        let visible: SharedString = visible.into();
+        let (view, ui) = cx.add_window_view(|_, _| TailSelectionProbe {
+            layout: None,
+            visible: visible.clone(),
+        });
+        ui.simulate_resize(size(px(640.), px(240.)));
+        ui.run_until_parked();
+        ui.read(|app| {
+            let layout = view.read(app).layout.as_ref().unwrap();
+            let click_point = layout.position_for_index(body.len() - 1).unwrap();
+            let drag_point = layout
+                .position_for_index(tail_start + suffix.len() - 1)
+                .unwrap();
+            let click_index = source_byte_at(layout, &visible, click_point, body.len());
+            let drag_index = source_byte_at(layout, &visible, drag_point, body.len());
+            let selected = click_index.min(drag_index)..click_index.max(drag_index);
+            assert_eq!(click_index, body.len() - 1);
+            assert_eq!(drag_index, body.len());
+            assert_eq!(&body[selected], "y");
+        });
     }
 }

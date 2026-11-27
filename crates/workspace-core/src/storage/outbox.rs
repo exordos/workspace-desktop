@@ -265,6 +265,122 @@ pub(super) fn reject_revoked(
 }
 
 impl Storage {
+    /// Возвращает единственный зашифрованный снимок очереди точного размещения.
+    pub(crate) fn encrypted_send_for_media(
+        &self,
+        owner: &OwnerContext,
+        scope: HistoryScope,
+        public_id: Uuid,
+    ) -> Result<Option<PreparedSend>, StorageError> {
+        let Some(topic_id) = scope.topic_id else {
+            return Ok(None);
+        };
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut statement = connection.prepare(
+            "SELECT canonical_id, public_id, stream_id, topic_id, markdown,
+                    ciphertext, encryption_key_id, encryption_device_id
+             FROM messenger_outbox
+             WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
+               AND project_id = ?4 AND user_id = ?5 AND public_id = ?6
+               AND stream_id = ?7 AND topic_id = ?8
+             LIMIT 2",
+        )?;
+        let rows = statement.query_map(
+            params![
+                owner.account_id.0,
+                owner.server,
+                owner.organization_id,
+                owner.project_id,
+                owner.user_id,
+                public_id.as_bytes(),
+                scope.stream_id.as_bytes(),
+                topic_id.as_bytes(),
+            ],
+            read_prepared_send,
+        )?;
+        let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        if rows.len() != 1 {
+            return Ok(None);
+        }
+        let Some(snapshot) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        if !matches!(&snapshot.body, PreparedSendBody::Encrypted { .. }) {
+            return Ok(None);
+        }
+        Ok(Some(snapshot))
+    }
+
+    /// Сверяет исходный шифротекст с очередью или с точным подтверждением истории.
+    pub(crate) fn encrypted_send_for_media_is_current(
+        &self,
+        owner: &OwnerContext,
+        expected: &PreparedSend,
+    ) -> Result<bool, StorageError> {
+        let PreparedSendBody::Encrypted {
+            key_id,
+            ciphertext,
+            device_id,
+        } = &expected.body
+        else {
+            return Ok(false);
+        };
+        let Some(author_id) = owner.user_id.parse::<Uuid>().ok() else {
+            return Ok(false);
+        };
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let in_outbox: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messenger_outbox
+             WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
+               AND project_id = ?4 AND user_id = ?5 AND canonical_id = ?6
+               AND public_id = ?7 AND stream_id = ?8 AND topic_id = ?9
+               AND markdown = '' AND ciphertext = ?10 AND encryption_key_id = ?11
+               AND encryption_device_id = ?12)",
+            params![
+                owner.account_id.0,
+                owner.server,
+                owner.organization_id,
+                owner.project_id,
+                owner.user_id,
+                expected.canonical_id.as_bytes(),
+                expected.public_id.as_bytes(),
+                expected.stream_id.as_bytes(),
+                expected.topic_id.as_bytes(),
+                ciphertext,
+                key_id.as_bytes(),
+                device_id.as_bytes(),
+            ],
+            |row| row.get(0),
+        )?;
+        if in_outbox {
+            return Ok(true);
+        }
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_messages
+                 WHERE account_id = ?1 AND server = ?2 AND organization_id = ?3
+                   AND project_id = ?4 AND user_id = ?5 AND message_id = ?6
+                   AND stream_id = ?7 AND topic_id = ?8 AND text = ?9
+                   AND encryption_key_id = ?10 AND author_id = ?11
+                   AND key_service_payload IS NULL)",
+                params![
+                    owner.account_id.0,
+                    owner.server,
+                    owner.organization_id,
+                    owner.project_id,
+                    owner.user_id,
+                    expected.public_id.to_string(),
+                    expected.stream_id.to_string(),
+                    expected.topic_id.to_string(),
+                    ciphertext,
+                    key_id.to_string(),
+                    author_id.to_string(),
+                ],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     /// Сохраняет подтверждение HTTP только для подходящей строки утверждённого формата.
     pub(crate) fn confirm_http_send(
         &self,

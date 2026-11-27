@@ -33,12 +33,13 @@ struct Bubble {
 
 impl Render for Bubble {
     /// Собирает тело только для нового вида, размеров или исходных данных.
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         #[cfg(all(test, feature = "gpui-test"))]
         self.renders.set(self.renders.get() + 1);
         let (message, layout) = message_row(
             &self.row,
             self.palette,
+            window,
             self.peer.as_ref(),
             (&[], &HashMap::new()),
             &self.controls,

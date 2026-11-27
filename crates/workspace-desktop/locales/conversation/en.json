@@ -2,6 +2,8 @@
   "a11y.hidePanel": "Hide panel",
   "attachmentCard.unnamedFile": "File",
   "call.call": "Call",
+  "call.messageTitle": "Call",
+  "call.untitledRoom": "Call title",
   "channel.addMembers": "Add members",
   "channel.allowMembersToShareKeys": "Allow members to share keys",
   "channel.channelName": "Channel name",

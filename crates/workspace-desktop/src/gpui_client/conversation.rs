@@ -2460,6 +2460,15 @@ impl Conversation {
                                     })
                                     .unwrap_or_default(),
                                 jitsi: self.calls.settings().cloned(),
+                                jitsi_location: if self.heading.direct {
+                                    self.heading.chat.clone()
+                                } else {
+                                    self.heading
+                                        .topic
+                                        .as_ref()
+                                        .map(|topic| format!("# {topic}"))
+                                        .or_else(|| self.heading.chat.clone())
+                                },
                                 fragments,
                                 mention_names: self
                                     .details

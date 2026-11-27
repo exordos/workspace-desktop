@@ -763,6 +763,35 @@ fn visible_history_selects_only_incoming_group_avatars(cx: &mut TestAppContext) 
     assert!(!scrolled.contains(&group_author));
 }
 
+/// Длинная группа сохраняет один аватар на краю окна и возвращает его к последнему баблу.
+#[gpui::test]
+fn long_group_avatar_follows_visible_bottom(cx: &mut TestAppContext) {
+    let address = address(ChatEntry::Around(Uuid::from_u128(40)));
+    let (view, ui, requests) = scenario(cx, &address);
+    let page = window(address.route.scope, 1..80, HistoryEdge::End, HistoryEdge::End);
+    answer(request(&requests, Load::Open(ChatEntry::Around(Uuid::from_u128(40)))), page, ui);
+    ui.run_until_parked();
+
+    let avatars = (1..80).filter_map(|id| {
+        let selector = format!("history-avatar-{}", Uuid::from_u128(id));
+        ui.debug_bounds(Box::leak(selector.into_boxed_str())).map(|bounds| (id, bounds))
+    }).collect::<Vec<_>>();
+    assert_eq!(avatars.len(), 1, "Видимая группа показывает один аватар");
+    let viewport = ui.read(|app| view.read(app).viewport.list().viewport_bounds());
+    assert_eq!(avatars[0].1.bottom(), viewport.bottom() - px(12.));
+    assert!(ui.read(|app| view.read(app).viewport.tested_visible_avatars()).contains(&Uuid::from_u128(910)));
+
+    ui.update(|_, cx| view.update(cx, |view, cx| {
+        view.viewport.list().scroll_to(gpui::ListOffset { item_ix: 78, offset_in_item: px(0.) });
+        cx.notify();
+    }));
+    ui.run_until_parked();
+    let last = Uuid::from_u128(79);
+    let avatar = ui.debug_bounds("history-avatar-00000000-0000-0000-0000-00000000004f").expect("Аватар у конца группы");
+    let row = ui.read(|app| view.read(app).viewport.tested_bounds(last)).unwrap();
+    assert_eq!(avatar.bottom(), row.bottom());
+}
+
 /// Две строки меняют размер, а опора между ними удерживается уже в первом кадре.
 #[gpui::test]
 fn encrypted_history_keeps_reading_anchor_in_the_first_frame(cx: &mut TestAppContext) {
@@ -811,6 +840,71 @@ fn encrypted_history_keeps_reading_anchor_in_the_first_frame(cx: &mut TestAppCon
     });
     assert_eq!(y, new_y);
     assert!(new_height > height);
+}
+
+/// Сохраняет резерв времени в обычном абзаце после карточки цитаты.
+#[gpui::test]
+fn mixed_quote_and_terminal_paragraph_keep_inline_metadata(cx: &mut TestAppContext) {
+    let address = address(ChatEntry::Latest);
+    let (_, ui, requests) = scenario(cx, &address);
+    let mut page = window(
+        address.route.scope,
+        1..2,
+        HistoryEdge::End,
+        HistoryEdge::End,
+    );
+    let original = Uuid::from_u128(900);
+    page.messages[0].body = MessageBody::Markdown(
+        format!(
+            "[Участник](urn:quote:{original})\n\n{}",
+            "Последний обычный абзац. ".repeat(14)
+        )
+        .into(),
+    );
+    answer(request(&requests, Load::Open(ChatEntry::Latest)), page, ui);
+
+    let terminal = ui
+        .debug_bounds("message-terminal-tail-text")
+        .expect("последний текстовый блок получил резерв времени");
+    let body = ui.debug_bounds("message-body").unwrap();
+    let metadata = ui.debug_bounds("message-meta").unwrap();
+    assert!(
+        terminal.size.height >= px(30.),
+        "абзац должен переноситься: {terminal:?}"
+    );
+    assert_eq!(metadata.bottom(), body.bottom());
+    assert_eq!(metadata.right(), body.right());
+}
+
+/// Пересылка в теле не мешает резерву завершающего обычного абзаца.
+#[gpui::test]
+fn terminal_paragraph_after_forward_keeps_inline_metadata(cx: &mut TestAppContext) {
+    let address = address(ChatEntry::Latest);
+    let (_, ui, requests) = scenario(cx, &address);
+    let mut page = window(
+        address.route.scope,
+        1..2,
+        HistoryEdge::End,
+        HistoryEdge::End,
+    );
+    let original = Uuid::from_u128(901);
+    page.messages[0].body = MessageBody::Markdown(
+        format!(
+            "[Пересланное](urn:forward:{original}?snapshot=U2VjcmV0)\n\n{}",
+            "Последний обычный абзац. ".repeat(14)
+        )
+        .into(),
+    );
+    answer(request(&requests, Load::Open(ChatEntry::Latest)), page, ui);
+
+    let terminal = ui
+        .debug_bounds("message-terminal-tail-text")
+        .expect("после карточки пересылки есть завершающий абзац с резервом");
+    let body = ui.debug_bounds("message-body").unwrap();
+    let metadata = ui.debug_bounds("message-meta").unwrap();
+    assert!(terminal.size.height >= px(30.));
+    assert_eq!(metadata.bottom(), body.bottom());
+    assert_eq!(metadata.right(), body.right());
 }
 
 /// У хвоста дельта двух строк не пересобирает вид неподвижного обычного бабла.

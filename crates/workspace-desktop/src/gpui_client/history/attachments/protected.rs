@@ -276,8 +276,16 @@ impl ProtectedThumbnails {
         if let Some(index) = entries.iter().position(|(address, _)| *address == key)
             && let Some((_, entry)) = entries.remove(index)
         {
-            if entry.read(app).source.same_source(source) {
-                if entry.read(app).tile.map(|tile| tile.corners) != tile.map(|tile| tile.corners) {
+            let previous_tile = entry.read(app).tile;
+            let same_layout = match (previous_tile, tile) {
+                (Some(previous), Some(current)) => {
+                    previous.ratio == current.ratio && previous.crop == current.crop
+                }
+                (None, None) => true,
+                _ => false,
+            };
+            if entry.read(app).source.same_source(source) && same_layout {
+                if previous_tile.map(|tile| tile.corners) != tile.map(|tile| tile.corners) {
                     entry.update(app, |thumbnail, cx| {
                         thumbnail.tile = tile;
                         cx.notify();

@@ -63,6 +63,12 @@ impl JitsiSettings {
             .find_map(|link| self.meeting_link(&link.url))
     }
 
+    /// Ищет ссылку публичного Jitsi без обращения к настройкам организации.
+    pub fn recognize_public_invitation(markdown: &str) -> Option<JitsiJoinLink> {
+        let settings = Self(Url::parse("https://meet.jit.si/").ok()?);
+        settings.recognize_invitation(markdown)
+    }
+
     /// Проверяет точный источник и одно имя комнаты без произвольных параметров внешнего клиента.
     fn meeting_link(&self, raw: &str) -> Option<JitsiJoinLink> {
         let url = Url::parse(raw).ok()?;
@@ -180,6 +186,44 @@ pub struct ConfirmedJitsiJoin {
     link: JitsiJoinLink,              // Проверенный адрес в памяти короткой операции.
     auth: Auth,                       // Проверка поколения до системного действия.
     storage: Arc<Storage>,            // Локальные версии сообщения и доступа.
+}
+
+/// Разрешение открыть обычное сообщение с проверенной ссылкой Jitsi.
+pub struct ConfirmedPlainJitsiJoin {
+    owner: OwnerContext,           // Владелец открытого разговора.
+    generation: SessionGeneration, // Активное поколение входа.
+    expected: HistoryMessage,      // Точная серверная версия сообщения.
+    fence: QuoteSourceFence,       // Версии сообщения и доступа к теме.
+    link: JitsiJoinLink,           // Проверенная ссылка в памяти операции.
+    auth: Auth,                    // Проверяет поколение перед открытием.
+    storage: Arc<Storage>,         // Проверяет отзыв доступа и правку строки.
+}
+
+impl ConfirmedPlainJitsiJoin {
+    /// Передаёт адрес системному браузеру, пока сообщение и доступ не изменились.
+    pub fn with_url<T>(&self, open: impl FnOnce(&str) -> T) -> Option<T> {
+        let scope = HistoryScope {
+            stream_id: self.expected.stream_id,
+            topic_id: Some(self.expected.topic_id),
+        };
+        self.auth
+            .with_active_generation(&self.owner, self.generation, || {
+                let current =
+                    QuoteSourceFence::capture(&self.storage, &self.owner, scope, self.expected.id)
+                        .ok()?;
+                if current != self.fence
+                    || !self
+                        .storage
+                        .matches_markdown_edit(&self.owner, &self.expected)
+                        .ok()?
+                {
+                    return None;
+                }
+                Some(open(self.link.as_str()))
+            })
+            .ok()
+            .flatten()
+    }
 }
 
 impl ConfirmedJitsiJoin {
@@ -311,6 +355,62 @@ impl MessengerSource {
             expected: original,
             fence,
             permission: accepted.into_permission(),
+            link,
+            auth: sync.auth().clone(),
+            storage: Arc::clone(sync.storage()),
+        })
+    }
+
+    /// Подтверждает обычное сообщение и ссылку непосредственно перед открытием браузера.
+    pub async fn confirm_plain_jitsi_join(
+        &self,
+        sync: &Sync,
+        owner: &OwnerContext,
+        generation: SessionGeneration,
+        scope: HistoryScope,
+        expected: &HistoryMessage,
+    ) -> Result<ConfirmedPlainJitsiJoin, CallError> {
+        if !matches!(expected.body, MessageBody::Markdown(_))
+            || expected.stream_id != scope.stream_id
+            || scope
+                .topic_id
+                .is_some_and(|topic| topic != expected.topic_id)
+        {
+            return Err(CallError::Unavailable);
+        }
+        let settings = match self.jitsi_settings(sync, owner, generation).await {
+            Ok(settings) => Some(settings),
+            Err(CallError::Unavailable) => None,
+            Err(error) => return Err(error),
+        };
+        let (original, fence) = self
+            .quote_original_with_fence(
+                sync,
+                owner,
+                generation,
+                Some(HistoryScope {
+                    stream_id: expected.stream_id,
+                    topic_id: Some(expected.topic_id),
+                }),
+                expected.id,
+            )
+            .await?;
+        if !original.same_content(expected) {
+            return Err(CallError::Unavailable);
+        }
+        let MessageBody::Markdown(markdown) = &original.body else {
+            return Err(CallError::Unavailable);
+        };
+        let link = settings
+            .as_ref()
+            .and_then(|settings| settings.recognize_invitation(markdown))
+            .or_else(|| JitsiSettings::recognize_public_invitation(markdown))
+            .ok_or(CallError::Unavailable)?;
+        Ok(ConfirmedPlainJitsiJoin {
+            owner: owner.clone(),
+            generation,
+            expected: original,
+            fence,
             link,
             auth: sync.auth().clone(),
             storage: Arc::clone(sync.storage()),

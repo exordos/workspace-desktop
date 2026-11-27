@@ -1116,8 +1116,8 @@ fn decode_protected_thumbnail(
 ) -> Option<ProtectedPicture> {
     let pixels = inline::decode_pixels(&mut file, kind).ok()?;
     let pixels = match tile {
-        Some(tile) => inline::crop_to_tile(pixels, tile.ratio),
-        None => pixels,
+        Some(tile) if tile.crop => inline::crop_to_tile(pixels, tile.ratio),
+        _ => pixels,
     };
     let image = render_image(pixels);
     let permit = file.protected_preview_permit()?;

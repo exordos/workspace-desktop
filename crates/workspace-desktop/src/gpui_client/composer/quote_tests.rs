@@ -130,7 +130,13 @@ fn message_menu_keyboard_uses_an_enabled_item(cx: &mut TestAppContext) {
 #[gpui::test]
 fn hover_reply_opens_the_live_conversation_composer(cx: &mut TestAppContext) {
     let (view, ui, requests) = start(cx);
-    publish(&requests, Load::Open(ChatEntry::Latest), history(), vec![], ui);
+    publish(
+        &requests,
+        Load::Open(ChatEntry::Latest),
+        history(),
+        vec![],
+        ui,
+    );
     allow(&requests, Ok(TOPIC), ui);
     paste(ui, "Черновик ответа");
 
@@ -232,11 +238,21 @@ fn reply_selection_serializes_immutable_payload_and_preserves_new_tabs(cx: &mut 
     paste(ui, "Ответ А");
     choose(ui, MESSAGE, "history-reply-replace");
 
-    let body = ui
-        .debug_bounds("history-reply-body-00000000-0000-0000-0000-0000000007d3")
+    ui.debug_bounds("history-reply-body-00000000-0000-0000-0000-0000000007d3")
         .expect("тело сообщения");
-    let from = point(body.left() + px(1.), body.center().y);
-    let to = point(body.left() + body.size.width * 0.68, body.center().y);
+    let (from, to) = ui.update(|_, app| {
+        let layout = view
+            .read(app)
+            .viewport
+            .tested_text_layout(SECOND)
+            .expect("разметка исходного тела");
+        let first = layout.position_for_index(0).expect("начало текста");
+        let after_second = layout.position_for_index(2).expect("граница после ab");
+        (
+            first + point(px(1.), px(6.)),
+            after_second + point(px(1.), px(6.)),
+        )
+    });
     ui.simulate_mouse_down(from, MouseButton::Left, Modifiers::none());
     ui.run_until_parked();
     ui.simulate_mouse_move(to, MouseButton::Left, Modifiers::none());
@@ -460,4 +476,44 @@ fn incoming_quote_projects_only_recognized_references(cx: &mut TestAppContext) {
         quote.right() <= px(270.) && heading.right() <= quote.right(),
         "{quote:?} {heading:?}"
     );
+}
+
+/// Короткая цитата занимает всю ширину текста ответа и меняется вместе с окном.
+#[gpui::test]
+fn quote_fills_message_content_width(cx: &mut TestAppContext) {
+    let (_, ui, requests) = start(cx);
+    let link = quote::reference(OTHER, "Автор", Some("Да"));
+    publish(
+        &requests,
+        Load::Open(ChatEntry::Latest),
+        vec![server_message(
+            SECOND,
+            &format!(
+                "{link}\n\n{}",
+                "Длинный текст ответа для проверки ширины. ".repeat(8)
+            ),
+            true,
+            "01",
+        )],
+        vec![],
+        ui,
+    );
+    allow(&requests, Ok(TOPIC), ui);
+    for width in [900., 500.] {
+        ui.simulate_resize(size(px(width), px(600.)));
+        ui.run_until_parked();
+        let quote = ui
+            .debug_bounds("history-quote-00000000-0000-0000-0000-0000000007d3-0")
+            .unwrap();
+        let content = ui
+            .debug_bounds("history-quote-content-00000000-0000-0000-0000-0000000007d3")
+            .unwrap();
+        assert!(
+            (quote.size.width - content.size.width).abs() <= px(1.),
+            "{quote:?} {content:?}"
+        );
+        if width == 900. {
+            assert!(quote.size.width > px(312.), "{quote:?}");
+        }
+    }
 }

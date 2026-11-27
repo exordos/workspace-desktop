@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use gpui::{AnyElement, Context, IntoElement, div, prelude::*};
+use gpui::{AnyElement, ClickEvent, Context, IntoElement, WeakEntity, div, prelude::*, px};
 use uuid::Uuid;
 use workspace_core::{
     messenger::{encryption::ProtectedMessage, quote::ProtectedQuote},
@@ -23,7 +23,10 @@ use super::{
 };
 use crate::gpui_client::{
     preferences::Language,
-    ui::{Palette, QuoteSurface, TextRole, quote_frame, text_role},
+    ui::{
+        Palette, QuoteSurface, TextRole, activate_click, click_is_stationary, ellipsized_label,
+        quote_frame_with_header, text_role,
+    },
 };
 
 /// Исходная цитата под порядковым номером внутри конкретного сообщения.
@@ -72,6 +75,11 @@ impl QuoteText {
     /// Привязывает отложенный кадр к той же попытке разрешения цитаты.
     pub(super) fn same_location(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.mounted, &other.mounted)
+    }
+
+    /// Возвращает UUID оригинала, только пока действуют ключ и размещение цитаты.
+    pub(super) fn current_source(&self) -> Option<Uuid> {
+        self.with_current(|| self.source)
     }
 
     /// Показывает только допустимые UUID и типы файлов из целого оригинала.
@@ -205,6 +213,26 @@ impl ProtectedQuotes {
             })
             .collect()
     }
+
+    /// Проверяет, что токен всё ещё принадлежит той же позиции и тому же оригиналу.
+    pub(super) fn has_current_source(
+        &self,
+        slot: QuoteSlot,
+        expected: &QuoteText,
+        target: Uuid,
+    ) -> bool {
+        target != slot.message
+            && self.0.get(&slot).is_some_and(|entry| {
+                entry.source == target
+                    && Arc::ptr_eq(&entry.mounted, &expected.mounted)
+                    && entry
+                        .resolved
+                        .as_ref()
+                        .and_then(|resolved| resolved.content.as_ref())
+                        .is_some_and(|content| Arc::ptr_eq(content, &expected.content))
+                    && expected.current_source() == Some(target)
+            })
+    }
 }
 
 /// Использует общую рамку цитаты с отдельным отзываемым текстом.
@@ -215,6 +243,7 @@ pub(super) fn render_quote(
     slot: QuoteSlot,
     language: Language,
     media: Option<(&Cards, &mut gpui::App, Language)>,
+    conversation: Option<&WeakEntity<Conversation>>,
 ) -> AnyElement {
     let Some(projection) =
         projection.filter(|projection| projection.access.with_current(|| ()).is_some())
@@ -231,12 +260,56 @@ pub(super) fn render_quote(
     } else {
         "desktop.messenger.participant"
     });
-    let text = GuardedText::quote(projection.access.clone(), language.tr("composer.quote"));
-    let mut body = div()
+    let access = projection.access.clone();
+    let text = GuardedText::quote(access.clone(), language.tr("composer.quote"));
+    let title_palette = Palette {
+        text: palette.focus,
+        ..palette
+    };
+    let header = div()
         .flex()
         .flex_col()
         .gap_1()
+        .child(
+            ellipsized_label(title_palette, TextRole::Label, author)
+                .debug_selector(|| "quote-frame-heading".into()),
+        )
         .child(text_role(palette, TextRole::Body).child(text));
+    let header = if let Some(conversation) = conversation.cloned() {
+        let access = access.clone();
+        activate_click(
+            div()
+                .id(gpui::ElementId::named_usize(
+                    format!("history-protected-quote-open-{}", slot.message),
+                    slot.position,
+                ))
+                .border_1()
+                .border_color(gpui::transparent_black())
+                .rounded(px(4.))
+                .child(header),
+            None,
+            palette,
+            move |event: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                if click_is_stationary(event) {
+                    let _ = conversation.update(cx, |view, cx| {
+                        view.open_protected_quote(slot, access.clone(), cx)
+                    });
+                }
+            },
+        )
+        .debug_selector(move || {
+            format!("history-protected-quote-{}-{}", slot.message, slot.position)
+        })
+        .into_any_element()
+    } else {
+        header
+            .debug_selector(move || {
+                format!("history-protected-quote-{}-{}", slot.message, slot.position)
+            })
+            .into_any_element()
+    };
+    let mut body = div().flex().flex_col().gap_1();
     if let Some((cards, app, language)) = media {
         for (position, (file, kind)) in projection.access.attachments().into_iter().enumerate() {
             let key = AttachmentKey {
@@ -249,9 +322,12 @@ pub(super) fn render_quote(
                 body.child(cards.render_protected(attachment, kind, None, palette, language, app));
         }
     }
-    quote_frame(palette, surface, author, body)
+    quote_frame_with_header(palette, surface, header, body)
         .debug_selector(move || {
-            format!("history-protected-quote-{}-{}", slot.message, slot.position)
+            format!(
+                "history-protected-quote-frame-{}-{}",
+                slot.message, slot.position
+            )
         })
         .into_any_element()
 }

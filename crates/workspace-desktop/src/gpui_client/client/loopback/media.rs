@@ -18,6 +18,8 @@ pub(super) struct Fixture {
     gallery: bool,                    // Включает референсы обеих тем канала и четыре типа записей.
     video: bool,                      // Подменяет снимок коротким синтетическим роликом.
     album: bool,                      // Добавляет четыре кадра с портретом первым.
+    image_width: u32,                 // Ширина фото в метаданных ссылки.
+    image_height: u32,                // Высота фото в метаданных ссылки.
 }
 
 impl Fixture {
@@ -30,6 +32,8 @@ impl Fixture {
             gallery: false,
             video: false,
             album: false,
+            image_width: 600,
+            image_height: 1200,
         }
     }
 
@@ -107,7 +111,10 @@ impl Fixture {
         } else if self.video {
             link(600, 300)
         } else {
-            format!("Подпись к медиа\n\n{}", link(600, 1200))
+            format!(
+                "Подпись к медиа\n\n{}",
+                link(self.image_width, self.image_height)
+            )
         }
     }
 }
@@ -181,7 +188,9 @@ fn photo_attachment_reopens_through_core_cache(cx: &mut TestAppContext) {
         (media.left(), media.right()),
         (bubble.left(), bubble.right())
     );
+    assert!((dimensions.width - px(215.)).abs() <= px(1.));
     assert!((dimensions.height - px(430.)).abs() <= px(1.));
+    assert_eq!(bubble.size.width, dimensions.width);
     let photo = |ui: &mut VisualTestContext| {
         ui.read(|app| {
             client
@@ -273,6 +282,61 @@ fn photo_attachment_reopens_through_core_cache(cx: &mut TestAppContext) {
         |ui| photo(ui) == Some((false, false, false)) && ui.debug_bounds(ROW).is_some(),
     );
     assert_eq!(counts.downloads.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        futures::executor::block_on(runtime.shutdown()),
+        RuntimeExit::Clean
+    );
+}
+
+/// Укорачивает панораму до безопасной пропорции и оставляет её в пределах пузыря.
+#[gpui::test]
+fn extreme_photo_ratio_uses_bounded_frame(cx: &mut TestAppContext) {
+    let server = Server::serve(Received {
+        media: Some(Fixture {
+            image_width: 10_000,
+            image_height: 100,
+            ..Fixture::new()
+        }),
+        ..Received::default()
+    });
+    let profile = tempfile::tempdir().unwrap();
+    let (runtime, events) =
+        start_runtime(profile.path(), saved_account(&server, USER, Uuid::nil()));
+    let (client, ui) =
+        cx.add_window_view(|_, cx| Client::new(Options::default(), runtime.clone(), cx));
+    ui.update(|_, app| {
+        let subscription = events.attach(&client, app, Client::handle_runtime);
+        client.update(app, |client, cx| client.attach(subscription, cx));
+    });
+    ui.simulate_resize(size(px(1440.), px(900.)));
+    until(
+        ui,
+        "доступен синтетический чат",
+        |ui| ui.debug_bounds(CHAT_ROW).is_some(),
+    );
+    click(ui, CHAT_ROW);
+    until(
+        ui,
+        "панорама появилась в ленте",
+        |ui| ui.debug_bounds("history-attachment-preview").is_some(),
+    );
+
+    let media = ui.debug_bounds(CARD).unwrap();
+    let bubble = ui.debug_bounds("history-media-bubble").unwrap();
+    assert_eq!(media.size.width, bubble.size.width);
+    assert!(bubble.size.height >= media.size.height);
+    assert_eq!(media.size.width, px(680.));
+    assert!((media.size.height - px(170.)).abs() <= px(1.));
+    assert!(media.size.height <= px(430.));
+
+    let wide_width = media.size.width;
+    ui.simulate_resize(size(px(920.), px(900.)));
+    ui.run_until_parked();
+    let narrow = ui.debug_bounds(CARD).unwrap();
+    assert!(narrow.size.width < wide_width);
+    assert!(narrow.size.width <= px(680.));
+    assert!(narrow.size.height >= px(96.));
+    assert!(narrow.size.height <= px(430.));
     assert_eq!(
         futures::executor::block_on(runtime.shutdown()),
         RuntimeExit::Clean

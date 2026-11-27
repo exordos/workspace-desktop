@@ -167,6 +167,15 @@ impl ProtectedLayout {
         })
     }
 
+    /// Проверяет, что последний блок заканчивается обычным выбираемым текстом.
+    pub(super) fn has_terminal_text(&self) -> bool {
+        match self.0.last() {
+            Some(Part::Text(_)) => true,
+            Some(Part::RichText(parts)) => matches!(parts.last(), Some(InlinePart::Text(_))),
+            _ => false,
+        }
+    }
+
     /// Собирает те же роли текста, цитат и карточек, оставляя исходные строки в Core.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn render(
@@ -177,23 +186,38 @@ impl ProtectedLayout {
         own: bool,
         media: Option<(&Cards, &mut App, Language)>,
         separate_album: bool,
+        tail_suffix: Option<gpui::SharedString>,
         references: ProtectedReferenceControls<'_>,
         quote: impl Fn(usize, Palette, bool, Option<(&Cards, &mut App, Language)>) -> AnyElement,
     ) -> Div {
         let mut media = media;
         let mut content = div().flex().flex_col().min_w_0().max_w_full().gap_1();
         let mut quote_position = 0;
-        for part in &self.0 {
+        for (position, part) in self.0.iter().enumerate() {
+            let is_terminal = position + 1 == self.0.len();
             let item = match part {
-                Part::Text(range) => text_role(palette, TextRole::Body)
-                    .min_w_0()
-                    .max_w_full()
-                    .child(GuardedText::range(access.clone(), range.clone()))
-                    .into_any_element(),
-                Part::RichText(parts) => {
-                    render_reference_line(id, access, palette, parts, &references)
+                Part::Text(range) => {
+                    let text = match (is_terminal, tail_suffix.clone()) {
+                        (true, Some(suffix)) => {
+                            GuardedText::range_with_tail(access.clone(), range.clone(), suffix)
+                        }
+                        _ => GuardedText::range(access.clone(), range.clone()),
+                    };
+                    text_role(palette, TextRole::Body)
+                        .min_w_0()
+                        .max_w_full()
+                        .child(text)
                         .into_any_element()
                 }
+                Part::RichText(parts) => render_reference_line(
+                    id,
+                    access,
+                    palette,
+                    parts,
+                    is_terminal.then(|| tail_suffix.clone()).flatten(),
+                    &references,
+                )
+                .into_any_element(),
                 Part::Quote(_) => {
                     let media = media
                         .as_mut()
@@ -283,6 +307,7 @@ fn render_reference_line(
     access: &Arc<ProtectedMessage>,
     palette: Palette,
     parts: &[InlinePart],
+    tail_suffix: Option<gpui::SharedString>,
     controls: &ProtectedReferenceControls<'_>,
 ) -> Div {
     div()
@@ -290,13 +315,22 @@ fn render_reference_line(
         .flex_wrap()
         .min_w_0()
         .max_w_full()
-        .children(parts.iter().map(|part| {
+        .children(parts.iter().enumerate().map(|(position, part)| {
+            let is_terminal = position + 1 == parts.len();
             match part {
-                InlinePart::Text(range) => text_role(palette, TextRole::Body)
-                    .min_w_0()
-                    .max_w_full()
-                    .child(GuardedText::range(access.clone(), range.clone()))
-                    .into_any_element(),
+                InlinePart::Text(range) => {
+                    let text = match (is_terminal, tail_suffix.clone()) {
+                        (true, Some(suffix)) => {
+                            GuardedText::range_with_tail(access.clone(), range.clone(), suffix)
+                        }
+                        _ => GuardedText::range(access.clone(), range.clone()),
+                    };
+                    text_role(palette, TextRole::Body)
+                        .min_w_0()
+                        .max_w_full()
+                        .child(text)
+                        .into_any_element()
+                }
                 InlinePart::Reference(range, kind) => {
                     let is_time = matches!(kind, ReferenceKind::Time);
                     let item = text_role(palette, TextRole::Body)
@@ -391,6 +425,7 @@ pub(super) fn unavailable_quote(palette: Palette, own: bool, language: Language)
         own,
         language.tr("composer.quote").into(),
         "".into(),
+        false,
         false,
         language,
     )

@@ -26,10 +26,13 @@ pub use content::{
     Avatar, AvatarPresence, AvatarSize, BadgeTone, ChatRow, ChatRowPreview, DeliveryMark,
     MessageBubble, mention_badge, unread_badge,
 };
-pub(in crate::gpui_client) use content::{BubbleContent, calendar_date_label, profile_joined_date};
+pub(in crate::gpui_client) use content::{
+    BUBBLE_TAIL_BREAK, BubbleContent, calendar_date_label, profile_joined_date,
+};
 pub use controls::{Button, ButtonAppearance, FieldAppearance, field};
 pub(in crate::gpui_client) use controls::{
-    activate, rounded_surface_corners, sidebar_item, switch_indicator,
+    activate, activate_click, click_is_stationary, rounded_surface_corners, sidebar_item,
+    switch_indicator,
 };
 pub use conversation_notice::ConversationNotice;
 pub use date_time::{

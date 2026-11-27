@@ -8,10 +8,10 @@ use std::{
 };
 
 use gpui::{
-    Animation, AnyElement, App, AvailableSpace, Bounds, Div, Hsla, ImageSource, IntoElement,
-    ListAlignment, ListOffset, ListState, MouseButton, Pixels, Point, RenderOnce, SharedString,
-    Stateful, StyledText, TextLayout, WeakEntity, Window, canvas, div, ease_in_out, list, point,
-    prelude::*, px, size,
+    Animation, AnyElement, App, AvailableSpace, Bounds, Div, HighlightStyle, Hsla, ImageSource,
+    IntoElement, ListAlignment, ListOffset, ListState, MouseButton, Pixels, Point, RenderOnce,
+    SharedString, Stateful, StyledText, TextLayout, WeakEntity, Window, canvas, div, ease_in_out,
+    list, point, prelude::*, px, rgb, rgba, size,
 };
 use uuid::Uuid;
 use workspace_core::{
@@ -46,6 +46,10 @@ use super::{
 mod body;
 use body::{Body, BodyPart, ForwardBody};
 
+#[path = "floating_avatar.rs"]
+mod floating_avatar;
+use floating_avatar::FloatingAvatar;
+
 #[path = "paging.rs"]
 mod paging;
 pub(super) use paging::PageNeed;
@@ -66,8 +70,8 @@ use crate::gpui_client::{
     preferences::Language,
     ui::{
         Avatar, BubbleContent, Button, DeliveryMark, Icon, MessageBubble, Palette, QuoteSurface,
-        TextRole, activate, animation::Motion, ellipsized_label, label, label_width,
-        quote_frame_with_header, text_role,
+        TextRole, activate, activate_click, animation::Motion, click_is_stationary,
+        ellipsized_label, label, label_width, quote_frame_with_header, text_role,
     },
 };
 
@@ -90,7 +94,7 @@ struct Row {
     service: Option<KeyServiceRow>, // Видимая часть служебного сообщения без криптографического тела.
     retry_send: Option<Uuid>, // Канонический UUID защищённой попытки, которую можно повторить.
     plain_text: bool,         // Обычное текстовое содержимое без зависимости от других строк.
-    media: Vec<MediaReference>, // Прямые вложения подтверждённой строки.
+    media: Vec<MediaReference>, // Прямые вложения подтверждённой строки или очереди.
     time: RowTime,            // Время сервера или ключ пояснения очереди.
     delivery: Option<DeliveryMark>, // Состояние отправки исходящей строки.
     starts_day: bool,         // Над этой строкой виден новый день.
@@ -156,8 +160,8 @@ pub(super) struct HistoryControls {
     pub pending_reads: HashSet<Uuid>, // Строки, до которых сейчас идёт серверная отметка.
     pub read_motion: Option<Motion>,  // Общая настройка импульса, None у стенда без Core.
     pub reply: Option<ReplyControls>, // Выделение текста и меню подтверждённых строк.
-    pub quick_reply: bool, // Готовый обычный редактор позволяет показать быструю кнопку.
-    pub quick_hidden: bool, // Активное контекстное меню закрывает быстрые действия.
+    pub quick_reply: bool,            // Готовый обычный редактор позволяет показать быструю кнопку.
+    pub quick_hidden: bool,           // Активное контекстное меню закрывает быстрые действия.
     pub reactions: Option<ReactionControls>, // Состояние реакций в текущем разговоре.
     pub conversation: Option<WeakEntity<Conversation>>, // Повтор расшифровки в открытом экране.
     pub edit_protected: bool,         // Штатный редактор подтвердил защищённую запись в этой теме.
@@ -169,7 +173,8 @@ pub(super) struct HistoryControls {
     pub fragments: Option<FragmentRuntime>, // Рабочая сессия для спойлеров обычного Markdown.
     pub mention_names: MentionNames,        // Уже известные имена старых упоминаний с одним UUID.
     pub jitsi: Option<Arc<JitsiSettings>>, // Проверенный сервер конференций для карточек этой истории.
-    pub locale: Language,                  // Язык подписей открытой истории.
+    pub jitsi_location: Option<String>, // Подпись темы, канала или собеседника в карточке звонка.
+    pub locale: Language,               // Язык подписей открытой истории.
 }
 
 impl Row {
@@ -198,11 +203,24 @@ impl Row {
             && self.confirmed() == other.confirmed()
     }
 
-    /// Возвращает автора строки, возле которой рисуется фото входящей группы.
+    /// Возвращает автора входящей строки для загрузки фото видимой группы.
     fn avatar_author(&self) -> Option<Uuid> {
-        self.author
-            .filter(|id| !self.own && self.ends_group && !id.is_nil())
+        self.author.filter(|id| !self.own && !id.is_nil())
     }
+}
+
+/// Проверяет карточку звонка, у которой нет колонки аватара.
+fn call_invitation(row: &Row, controls: &HistoryControls) -> Option<String> {
+    (row.encrypted.is_none() && row.service.is_none())
+        .then(|| {
+            controls
+                .jitsi
+                .as_ref()
+                .and_then(|settings| settings.recognize_invitation(&row.body.text))
+                .or_else(|| JitsiSettings::recognize_public_invitation(&row.body.text))
+                .map(|link| link.as_str().to_owned())
+        })
+        .flatten()
 }
 
 /// Что должен показать список после принятия снимка.
@@ -265,12 +283,12 @@ pub(super) struct Viewport {
     unread_marker: Option<Uuid>, // UUID, полученный из подтверждённого окна истории.
     measure: Option<Measurement>, // Следующее измерение после замены снимка.
     message_center: Rc<Cell<Option<MessageCenter>>>, // Одно выставление цели до отрисовки.
-    marked_message: Option<MessageCenter>,        // Строка с временной отметкой перехода.
+    marked_message: Option<MessageCenter>, // Строка с временной отметкой перехода.
     edit_anchor: Option<EditAnchor>, // Поправка внутри текста опоры для следующего кадра.
     reflow_anchor: Rc<Cell<Option<ReflowAnchor>>>, // Опора между сменами ширины без жеста.
     ordinary_views: Rc<RefCell<TextRows>>, // Представления обычных баблов рядом с E2EE.
     pub(super) fragment_views: FragmentViews, // Отдельные элементы спойлеров со своим состоянием.
-    time_zone: String,               // Пояс, в котором рассчитаны даты текущих строк.
+    time_zone: String,   // Пояс, в котором рассчитаны даты текущих строк.
     prepared_bodies: HashMap<Uuid, CachedBody>, // Подготовка последних снимков текущего разговора.
 }
 
@@ -309,6 +327,35 @@ impl Viewport {
         self.index
             .get(&id)
             .is_some_and(|&index| self.rows[index].confirmed())
+    }
+
+    /// Проверяет точную цитату в подтверждённой строке тела или подписи.
+    pub(super) fn has_quote_source(
+        &self,
+        row: Uuid,
+        caption: bool,
+        position: usize,
+        target: Uuid,
+    ) -> bool {
+        if row == target {
+            return false;
+        }
+        let Some(source) = self.index.get(&row).map(|&index| &self.rows[index]) else {
+            return false;
+        };
+        if !source.confirmed() || source.encrypted.is_some() || source.service.is_some() {
+            return false;
+        }
+        let parts = if caption {
+            source
+                .body
+                .caption
+                .as_ref()
+                .map(|caption| caption.parts.as_slice())
+        } else {
+            Some(source.body.parts.as_slice())
+        };
+        matches!(parts.and_then(|parts| parts.get(position)), Some(BodyPart::Quote { id, .. }) if *id == target)
     }
 
     /// Сохраняет подтверждённый разделитель для следующего применения набора строк.
@@ -747,7 +794,9 @@ impl Viewport {
 
     /// Проверяет, осталась ли строка видимой после закрытия защищённого просмотра.
     pub(super) fn has_visible_message(&self, id: Uuid) -> bool {
-        self.painted.borrow().get(&id)
+        self.painted
+            .borrow()
+            .get(&id)
             .is_some_and(|bounds| bounds.intersects(&self.list.viewport_bounds()))
     }
 
@@ -857,11 +906,12 @@ impl Viewport {
             let controls = controls.clone();
             let images = images.clone();
             let fragments = self.fragment_views.clone();
-            Rc::new(move |row: &Row, app: &mut App| {
+            Rc::new(move |row: &Row, window: &mut Window, app: &mut App| {
                 let photo = row.avatar_author().and_then(|id| images.get(&id).cloned());
                 message_row(
                     row,
                     palette,
+                    window,
                     peer.as_ref(),
                     (&rows, &row_index),
                     &controls,
@@ -897,7 +947,7 @@ impl Viewport {
                         );
                         let offset = centered_offset(&rows, target, bounds.size.height, |index| {
                             let row = &rows[index];
-                            let (element, _) = message(row, app);
+                            let (element, _) = message(row, window, app);
                             row_container(row, palette, locale)
                                 .child(element)
                                 .into_any_element()
@@ -938,8 +988,8 @@ impl Viewport {
                         return;
                     };
                     let measured = target.and_then(|target| {
-                        let offset = target.measure(bounds.size.width, window, app, |app| {
-                            let (message, text) = message(row, app);
+                        let offset = target.measure(bounds.size.width, window, app, |window, app| {
+                            let (message, text) = message(row, window, app);
                             (row_container(row, palette, locale).child(message), text)
                         })?;
                         Some((target, offset))
@@ -972,7 +1022,7 @@ impl Viewport {
             .inset_0()
         };
         let rows = self.rows.clone();
-        let items = list(self.list.clone(), move |index, _, app| {
+        let items = list(self.list.clone(), move |index, window, app| {
             let row = &rows[index];
             let id = row.id;
             let painted = painted.clone();
@@ -981,6 +1031,11 @@ impl Viewport {
             let measurement = measurement.clone();
             let measured_line = measured_line.clone();
             let list_state = list_state.clone();
+            let floating_avatar = (!row.own && call_invitation(row, &controls).is_none()).then(|| {
+                let mut avatar = Avatar::from_initials(peer.as_ref().map(|peer| peer.initials.clone()).unwrap_or_default());
+                avatar.image = row.avatar_author().and_then(|id| images.get(&id).cloned());
+                FloatingAvatar { id, avatar, palette, ends_group: row.ends_group }
+            });
             let (message, text_layout) = if memoize && row.plain_text {
                 let photo = row.avatar_author().and_then(|id| images.get(&id).cloned());
                 let bubble = ordinary_views.borrow_mut().bubble(BubbleInput {
@@ -988,10 +1043,11 @@ impl Viewport {
                 }, app);
                 (bubble.element, RenderedText::Cached(bubble.layout))
             } else {
-                let (message, layout) = message(row, app);
+                let (message, layout) = message(row, window, app);
                 (message.into_any_element(), RenderedText::Fresh(layout))
             };
             row_container(row, palette, locale)
+                .children(floating_avatar)
                 .child(div().relative().w_full().when(marked_message == Some(id), |row| {
                     row.rounded_md()
                         .bg(palette.accent.opacity(0.18))
@@ -1374,10 +1430,11 @@ struct RowBodyExtras<'a> {
 fn message_row(
     row: &Row,
     palette: Palette,
+    window: &Window,
     peer: Option<&PeerLabel>,
     history: (&[Row], &HashMap<Uuid, usize>),
     controls: &HistoryControls,
-    photo: Option<ImageSource>,
+    _photo: Option<ImageSource>,
     mut extras: RowBodyExtras<'_>,
 ) -> (Div, Option<TextLayout>) {
     let author = peer.map_or_else(
@@ -1398,11 +1455,6 @@ fn message_row(
             ..palette
         }
     };
-    let confirmed = controls
-        .reply
-        .as_ref()
-        .filter(|_| row.confirmed() && row.service.is_none());
-    let reply = confirmed.filter(|_| row.encrypted.is_none() && !row.body.text.trim().is_empty());
     let bubble = MessageBubble {
         author: (!row.own && row.starts_group).then_some(author),
         body: row.body.text.clone(),
@@ -1410,6 +1462,32 @@ fn message_row(
         own: row.own,
         delivery: row.delivery,
     };
+    let readable_for_reactions = match row.encrypted.as_ref() {
+        None => true,
+        Some(EncryptedPresentation::Ready(text)) => text.with_current(|| ()).is_some(),
+        Some(EncryptedPresentation::Locked | EncryptedPresentation::Failed) => false,
+    };
+    let confirmed_message = row.confirmed() && row.service.is_none();
+    let reactions = controls
+        .reactions
+        .as_ref()
+        .filter(|_| confirmed_message && readable_for_reactions);
+    let chips = reactions.map_or_else(Vec::new, |reactions| {
+        reaction_chips(id, reactions, palette, controls.locale)
+    });
+    let has_reaction_chips = !chips.is_empty();
+    let tail_reserve =
+        bubble.tail_reserve_without_reactions(bubble_palette, window, has_reaction_chips);
+    let tail_suffix = tail_reserve
+        .as_ref()
+        .map(|reserve| SharedString::from(reserve.suffix().to_owned()));
+    let call_link = call_invitation(row, controls);
+    let is_call_bubble = call_link.is_some();
+    let confirmed = controls
+        .reply
+        .as_ref()
+        .filter(|_| row.confirmed() && row.service.is_none());
+    let reply = confirmed.filter(|_| row.encrypted.is_none() && !row.body.text.trim().is_empty());
     let protected_album = match &row.encrypted {
         Some(EncryptedPresentation::Ready(text))
             if extras.media.is_some_and(Cards::shows_protected_inline)
@@ -1433,15 +1511,43 @@ fn message_row(
             .map(|(index, reference)| (index, media_album::reference_ratio(reference)))
             .collect()
     };
+    // Ограниченную рамку применяем только к единственному фото, не к видео или плитке альбома.
+    let single_image = if let [item] = media.as_slice() {
+        if let Some((_, layout)) = protected_album {
+            layout
+                .album_file(item.0)
+                .is_some_and(|(_, kind)| kind == workspace_core::storage::media::MediaKind::Image)
+        } else {
+            row.media.get(item.0).is_some_and(|reference| {
+                reference.kind == workspace_core::storage::media::MediaKind::Image
+            })
+        }
+    } else {
+        false
+    };
     let (rows, index) = history;
     let mut text_layout = None;
+    let mut has_inline_tail = false;
     let mut readable = false;
-    let content = if let Some(state) = &row.encrypted {
+    let content = if call_link.is_some() {
+        None
+    } else if let Some(state) = &row.encrypted {
         let text = match state {
             EncryptedPresentation::Ready(text) if text.with_current(|| ()).is_some() => {
                 readable = true;
                 let separate_album = protected_album.is_some() && !media.is_empty();
                 let mut has_body = true;
+                let terminal_text = controls
+                    .protected
+                    .get(&id)
+                    .is_none_or(|layout| layout.has_terminal_text());
+                let protected_tail = terminal_text
+                    .then(|| tail_suffix.clone())
+                    .flatten()
+                    .filter(|_| {
+                        text.with_body(|body| !body.ends_with('\n') && !body.ends_with('\r'))
+                            .unwrap_or(false)
+                    });
                 let body = if let Some(layout) = controls.protected.get(&id) {
                     has_body = !separate_album || layout.has_footer();
                     layout.render(
@@ -1454,6 +1560,7 @@ fn message_row(
                             .zip(extras.app.as_deref_mut())
                             .map(|(cards, app)| (cards, app, controls.locale)),
                         separate_album,
+                        protected_tail.clone(),
                         ProtectedReferenceControls {
                             conversation: controls.conversation.as_ref(),
                             language: controls.locale,
@@ -1471,39 +1578,60 @@ fn message_row(
                                 slot,
                                 controls.locale,
                                 media,
+                                controls.conversation.as_ref(),
                             )
                         },
                     )
                 } else {
+                    let protected = match protected_tail.clone() {
+                        Some(suffix) => ProtectedText(text.clone()).with_tail_suffix(suffix),
+                        None => ProtectedText(text.clone()).into_element(),
+                    };
                     text_role(bubble_palette, TextRole::Body)
                         .min_w_0()
                         .max_w_full()
-                        .child(ProtectedText(text.clone()))
+                        .child(protected)
                 };
-                let call = row
-                    .confirmed()
-                    .then(|| {
-                        join_card(
-                            id,
-                            text,
-                            controls.jitsi.as_deref(),
-                            controls.conversation.as_ref(),
-                            bubble_palette,
-                            controls.locale,
-                        )
+                let call = text
+                    .with_body(|markdown| {
+                        controls
+                            .jitsi
+                            .as_deref()
+                            .and_then(|settings| settings.recognize_invitation(markdown))
+                            .or_else(|| JitsiSettings::recognize_public_invitation(markdown))
+                            .map(|link| call_room_name(link.as_str(), controls.locale))
                     })
                     .flatten();
-                if let Some(call) = call {
+                if let Some(room) = call {
+                    let join = join_card(
+                        id,
+                        text,
+                        controls.jitsi.as_deref(),
+                        controls.conversation.as_ref(),
+                        bubble_palette,
+                        controls.locale,
+                        row.confirmed(),
+                    );
+                    let card = call_card(
+                        bubble_palette,
+                        row.own,
+                        controls.locale.tr("call.messageTitle").into(),
+                        room,
+                        controls.jitsi_location.clone(),
+                        row.time.caption(controls.locale),
+                        row.delivery,
+                        join,
+                    );
                     Some(
                         div()
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .children(has_body.then_some(body))
-                            .child(call)
+                            .child(card)
                             .into_any_element(),
                     )
                 } else {
+                    has_inline_tail = protected_tail.is_some();
                     has_body.then(|| body.into_any_element())
                 }
             }
@@ -1528,8 +1656,23 @@ fn message_row(
             .caption
             .as_ref()
             .expect("подпись для строки с медиа");
+        let caption_tail_suffix = prepared
+            .parts
+            .last()
+            .is_some_and(|part| matches!(part, BodyPart::Text(_) | BodyPart::Inline(_)))
+            .then(|| {
+                (!prepared.text.ends_with('\n') && !prepared.text.ends_with('\r'))
+                    .then(|| tail_suffix.as_ref())
+                    .flatten()
+            })
+            .flatten();
+        has_inline_tail = caption_tail_suffix.is_some();
         let caption = if let Some(reply) = reply.filter(|_| row.body.selectable_caption()) {
-            caption.children(prepared.spans.iter().map(|span| {
+            let span_count = prepared.spans.len();
+            caption.children(prepared.spans.iter().enumerate().map(|(position, span)| {
+                let tail_suffix = (position + 1 == span_count)
+                    .then(|| caption_tail_suffix.cloned())
+                    .flatten();
                 if let Some(inline) = &span.inline {
                     inline
                         .render(InlineRender {
@@ -1543,6 +1686,7 @@ fn message_row(
                             language: controls.locale,
                             conversation: controls.conversation.as_ref(),
                             names: &controls.mention_names,
+                            tail_suffix,
                             selection: Some(InlineSelection {
                                 controls: reply,
                                 body: &row.body.text,
@@ -1551,28 +1695,49 @@ fn message_row(
                         })
                         .0
                 } else {
-                    reply.selectable_span(
-                        id,
-                        &row.body.text,
-                        span.range.clone(),
-                        span.text.clone(),
-                        bubble_palette,
-                    )
+                    match tail_suffix.as_deref() {
+                        Some(suffix) => reply.selectable_span_with_tail(
+                            id,
+                            &row.body.text,
+                            span.range.clone(),
+                            span.text.clone(),
+                            suffix,
+                            bubble_palette,
+                        ),
+                        None => reply.selectable_span(
+                            id,
+                            &row.body.text,
+                            span.range.clone(),
+                            span.text.clone(),
+                            bubble_palette,
+                        ),
+                    }
                 }
             }))
         } else {
-            let content = quote_content(
+            let structured = quote_content(
                 row,
-                &prepared.parts,
+                true,
                 bubble_palette,
                 palette.accent,
+                caption_tail_suffix.cloned(),
                 peer,
                 (rows, index),
                 FragmentContent::new(controls, extras.fragments, extras.app.as_deref_mut()),
-            )
-            .or_else(|| {
+            );
+            has_inline_tail = caption_tail_suffix.is_some() && !prepared.text.trim().is_empty();
+            let content = structured.or_else(|| {
                 (!prepared.text.trim().is_empty()).then(|| {
-                    label(bubble_palette, TextRole::Body, prepared.text.clone()).into_any_element()
+                    if caption_tail_suffix.is_some() {
+                        tail_text_content(
+                            bubble_palette,
+                            &prepared.text,
+                            caption_tail_suffix.unwrap(),
+                        )
+                    } else {
+                        label(bubble_palette, TextRole::Body, prepared.text.clone())
+                            .into_any_element()
+                    }
                 })
             });
             caption.children(content)
@@ -1608,6 +1773,10 @@ fn message_row(
         }
     } else {
         if let [BodyPart::Inline(text)] = row.body.parts.as_slice() {
+            let tail_suffix = (!row.body.text.ends_with('\n') && !row.body.text.ends_with('\r'))
+                .then(|| tail_suffix.clone())
+                .flatten();
+            has_inline_tail = tail_suffix.is_some();
             let (body, layout) = text.render(InlineRender {
                 id: SharedString::from(format!("history-inline-{id}-0")).into(),
                 row: id,
@@ -1615,6 +1784,7 @@ fn message_row(
                 language: controls.locale,
                 conversation: controls.conversation.as_ref(),
                 names: &controls.mention_names,
+                tail_suffix,
                 selection: reply.map(|controls| InlineSelection {
                     controls,
                     body: &row.body.text,
@@ -1624,11 +1794,39 @@ fn message_row(
             text_layout = Some(layout);
             Some(body.into_any_element())
         } else if row.body.plain() && !row.body.text.trim().is_empty() {
+            let reserve = (!row.body.text.ends_with('\n') && !row.body.text.ends_with('\r'))
+                .then(|| tail_reserve.as_ref())
+                .flatten();
+            has_inline_tail = reserve.is_some();
             let (body, layout) = if let Some(controls) = reply {
-                let (body, layout) = controls.selectable(id, &row.body.text, bubble_palette);
+                let (body, layout) = match reserve {
+                    Some(reserve) => controls.selectable_with_tail(
+                        id,
+                        &row.body.text,
+                        reserve.suffix(),
+                        bubble_palette,
+                    ),
+                    None => controls.selectable(id, &row.body.text, bubble_palette),
+                };
                 (body.min_w_0().max_w_full().into_any_element(), layout)
             } else {
-                let text = StyledText::new(row.body.text.clone());
+                let visible = reserve.map_or_else(
+                    || row.body.text.clone(),
+                    |reserve| reserve.append(&row.body.text),
+                );
+                let text = StyledText::new(visible.clone());
+                let text = if reserve.is_some() {
+                    text.with_highlights([(
+                        row.body.text.len() + crate::gpui_client::ui::BUBBLE_TAIL_BREAK.len()
+                            ..visible.len(),
+                        HighlightStyle {
+                            color: Some(bubble_palette.text.opacity(0.)),
+                            ..Default::default()
+                        },
+                    )])
+                } else {
+                    text
+                };
                 let layout = text.layout().clone();
                 (
                     text_role(bubble_palette, TextRole::Body)
@@ -1642,15 +1840,29 @@ fn message_row(
             text_layout = Some(layout);
             Some(body)
         } else {
-            quote_content(
+            let terminal_tail = row
+                .body
+                .parts
+                .last()
+                .is_some_and(|part| matches!(part, BodyPart::Text(_) | BodyPart::Inline(_)))
+                .then(|| {
+                    (!row.body.text.ends_with('\n') && !row.body.text.ends_with('\r'))
+                        .then(|| tail_suffix.clone())
+                        .flatten()
+                })
+                .flatten();
+            let content = quote_content(
                 row,
-                &row.body.parts,
+                false,
                 bubble_palette,
                 palette.accent,
+                terminal_tail.clone(),
                 peer,
                 (rows, index),
                 FragmentContent::new(controls, extras.fragments, extras.app.as_deref_mut()),
-            )
+            );
+            has_inline_tail = content.is_some() && terminal_tail.is_some();
+            content
         }
     };
     let accessory = extras.accessory.or_else(|| {
@@ -1662,18 +1874,11 @@ fn message_row(
                 controls.locale.tr("message.retrySend"),
             )
             .render(bubble_palette, None, move |_, cx| {
-                let _ = conversation
-                    .update(cx, |view, cx| view.retry_protected_send(canonical, cx));
+                let _ =
+                    conversation.update(cx, |view, cx| view.retry_protected_send(canonical, cx));
             })
             .into_any_element(),
         )
-    });
-    let confirmed_message = row.confirmed() && row.service.is_none();
-    let reactions = controls.reactions.as_ref().filter(|_| {
-        confirmed_message && (row.encrypted.is_none() || readable)
-    });
-    let chips = reactions.map_or_else(Vec::new, |reactions| {
-        reaction_chips(id, reactions, palette, controls.locale)
     });
     let parts = row
         .body
@@ -1683,7 +1888,11 @@ fn message_row(
         .map_or(row.body.parts.as_slice(), |caption| {
             caption.parts.as_slice()
         });
-    let (content, accessory) = if content.is_some() && has_forward_cards(parts) {
+    let inline_tail = has_inline_tail && !has_reaction_chips;
+    let (content, accessory) = if content.is_some()
+        && has_forward_cards(parts)
+        && !inline_tail
+    {
         (
             content.map(|content| BubbleContent::Blocks {
                 content,
@@ -1713,7 +1922,19 @@ fn message_row(
             ),
             (existing, strip) => existing.or(strip),
         };
-        (content.map(BubbleContent::Inline), accessory)
+        (
+            content.map(|content| {
+                if inline_tail {
+                    BubbleContent::InlineTail(content)
+                } else {
+                    BubbleContent::Blocks {
+                        content,
+                        reactions: Vec::new(),
+                    }
+                }
+            }),
+            accessory,
+        )
     };
     let commands = (!controls.quick_hidden && confirmed_message)
         .then(|| quick_command(row, controls, reply.is_some(), readable))
@@ -1721,10 +1942,14 @@ fn message_row(
         .into_iter()
         .collect::<Vec<_>>();
     let reserve_reaction_corner = reactions.is_some();
-    let reactions = reactions.filter(|_| !controls.quick_hidden).and_then(|reactions| {
-        let target = reactions.clone();
-        QuickReactions::new(reactions.quick(id), move |emoji, cx| target.toggle(id, emoji, cx))
-    });
+    let reactions = reactions
+        .filter(|_| !controls.quick_hidden)
+        .and_then(|reactions| {
+            let target = reactions.clone();
+            QuickReactions::new(reactions.quick(id), move |emoji, cx| {
+                target.toggle(id, emoji, cx)
+            })
+        });
     let has_reactions = reactions.is_some();
     let show_quick_actions = !commands.is_empty() || has_reactions;
     let overlay = show_quick_actions.then(|| {
@@ -1741,10 +1966,28 @@ fn message_row(
             })
             .into_any_element()
     });
-    let mut bubble = if let Some(cards) = extras.media.filter(|_| !media.is_empty()) {
+    let mut bubble = if let Some(url) = call_link {
+        let room = call_room_name(&url, controls.locale);
+        let expected_body = row.body.text.clone();
+        call_bubble(
+            bubble_palette,
+            row.own,
+            controls.locale.tr("call.messageTitle").into(),
+            room,
+            controls.jitsi_location.clone(),
+            row.time.caption(controls.locale),
+            row.delivery,
+            row.confirmed(),
+            id,
+            expected_body,
+            controls.conversation.clone(),
+            accessory,
+            overlay,
+        )
+    } else if let Some(cards) = extras.media.filter(|_| !media.is_empty()) {
         let corners =
             bubble.media_corners(row.ends_group, content.is_some() || accessory.is_some());
-        let album = media_album::render(&media, corners, |position, tile| {
+        let album = media_album::render(&media, corners, single_image, |position, tile| {
             let app = extras
                 .app
                 .as_deref_mut()
@@ -1784,12 +2027,22 @@ fn message_row(
             bubble_palette,
             album,
             content,
+            single_image,
             row.ends_group,
             accessory,
             overlay,
         )
     } else {
-        bubble.render_with_content(bubble_palette, content, row.ends_group, accessory, overlay)
+        bubble.render_with_content(
+            bubble_palette,
+            content,
+            row.ends_group,
+            accessory,
+            overlay,
+            parts
+                .iter()
+                .any(|part| matches!(part, BodyPart::Quote { .. })),
+        )
     }
     .debug_selector(move || format!("history-message-{id}"));
     if row.delivery == Some(DeliveryMark::Unknown) {
@@ -1807,17 +2060,13 @@ fn message_row(
         .flex()
         .items_end()
         .gap_2()
-        .when(!row.own, |view| {
-            let avatar = peer.map(|peer| peer.initials.clone()).unwrap_or_default();
-            view.child(div().w(px(40.)).flex_none().when(row.ends_group, |slot| {
-                let mut avatar = Avatar::from_initials(avatar);
-                avatar.image = photo;
-                slot.child(
-                    avatar
-                        .render(palette)
-                        .debug_selector(move || format!("history-avatar-{id}")),
-                )
-            }))
+        .when(!row.own && !is_call_bubble, |view| {
+            view.child(
+                div()
+                    .w(px(40.))
+                    .flex_none()
+                    .when(row.ends_group, |slot| slot.min_h(px(40.))),
+            )
         })
         .child(
             div()
@@ -1825,11 +2074,190 @@ fn message_row(
                 .min_w_0()
                 // Место для колонки остаётся у угла пузыря и при скрытой панели.
                 .when(reserve_reaction_corner, |slot| {
-                    if row.own { slot.pl(px(20.)) } else { slot.pr(px(20.)) }
+                    if row.own {
+                        slot.pl(px(20.))
+                    } else {
+                        slot.pr(px(20.))
+                    }
                 })
                 .child(bubble),
         );
     (message, text_layout)
+}
+
+/// Рисует карточку звонка в сообщении и оставляет метаданные справа в нижней строке.
+fn call_bubble(
+    palette: Palette,
+    own: bool,
+    title: SharedString,
+    room: String,
+    location: Option<String>,
+    time: Option<SharedString>,
+    delivery: Option<DeliveryMark>,
+    confirmed: bool,
+    id: Uuid,
+    expected_body: SharedString,
+    conversation: Option<WeakEntity<Conversation>>,
+    accessory: Option<AnyElement>,
+    overlay: Option<AnyElement>,
+) -> Div {
+    let card = call_card(palette, own, title, room, location, time, delivery, None);
+    let card = div()
+        .relative()
+        .flex()
+        .flex_col()
+        .child(card)
+        .children(accessory)
+        .children(overlay);
+    let card = if confirmed {
+        let mouse_target = conversation.clone();
+        let mouse_body = expected_body.clone();
+        card.id((gpui::ElementId::Uuid(id), "jitsi-call-card"))
+            .map(|element| element.focusable())
+            .tab_stop(true)
+            .cursor_pointer()
+            .on_click(move |_, _, app| {
+                if let Some(target) = &mouse_target {
+                    let body = mouse_body.clone();
+                    let _ = target.update(app, |view, cx| view.join_plain_call(id, &body, cx));
+                }
+            })
+    } else {
+        card.id((gpui::ElementId::Uuid(id), "jitsi-call-card"))
+    };
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .when(own, |row| row.justify_end())
+        .child(card)
+}
+
+/// Рисует общую лицевую часть карточки звонка и при необходимости действие входа.
+fn call_card(
+    palette: Palette,
+    own: bool,
+    title: SharedString,
+    room: String,
+    location: Option<String>,
+    time: Option<SharedString>,
+    delivery: Option<DeliveryMark>,
+    join: Option<AnyElement>,
+) -> Div {
+    let card_palette = Palette {
+        text: rgb(0xffffff).into(),
+        text_secondary: rgba(0xffffff4d).into(),
+        text_muted: rgba(0xffffff4d).into(),
+        message_time: rgba(0xffffff80).into(),
+        accent: palette.presence_online,
+        ..palette
+    };
+    let status = delivery.filter(|_| own).map(|state| match state {
+        DeliveryMark::Pending | DeliveryMark::Unknown => {
+            Icon::Pending.element(px(16.), card_palette.message_time)
+        }
+        DeliveryMark::Sent => Icon::Check.element(px(16.), card_palette.message_time),
+        DeliveryMark::Delivered => Icon::DoneAll.element(px(16.), card_palette.message_time),
+        DeliveryMark::Read => Icon::DoneAll.element(px(16.), palette.presence_online),
+        DeliveryMark::Failed => Icon::Error.element(px(16.), card_palette.message_time),
+    });
+    let metadata = (time.is_some() || status.is_some()).then(|| {
+        div()
+            .ml_auto()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(4.))
+            .children(time.map(|time| {
+                label(card_palette, TextRole::Caption, time)
+                    .text_color(card_palette.message_time)
+                    .text_size(px(14.))
+                    .line_height(px(16.))
+            }))
+            .children(status)
+    });
+    let mut first_line = div()
+        .flex()
+        .min_w_0()
+        .items_center()
+        .gap_x(px(6.))
+        .child(
+            label(card_palette, TextRole::Label, title)
+                .text_color(palette.presence_online)
+                .flex_none(),
+        )
+        .child(ellipsized_label(card_palette, TextRole::Label, room).flex_shrink());
+    if let Some(location) = location.filter(|name| !name.trim().is_empty()) {
+        first_line = first_line
+            .child(
+                div()
+                    .w(px(3.))
+                    .h(px(16.))
+                    .rounded(px(2.))
+                    .bg(rgb(0xf458d2))
+                    .flex_none(),
+            )
+            .child(
+                ellipsized_label(card_palette, TextRole::Caption, location)
+                    .text_color(card_palette.text_muted)
+                    .text_size(px(14.))
+                    .line_height(px(16.))
+                    .flex_shrink(),
+            );
+    }
+    first_line = first_line
+        .child(div().flex_1().min_w_0())
+        .child(Icon::Phone.element(px(18.), palette.presence_online));
+    let mut card = div()
+        .flex()
+        .flex_col()
+        .justify_between()
+        .gap_y(px(4.))
+        .w(px(353.))
+        .max_w_full()
+        .h(if join.is_some() { px(108.) } else { px(76.) })
+        .min_w_0()
+        .p(px(12.))
+        .rounded(px(8.))
+        .rounded_bl(if own { px(8.) } else { px(0.) })
+        .rounded_br(if own { px(0.) } else { px(8.) })
+        .bg(rgb(0x1c2b20))
+        .child(first_line)
+        .child(
+            div()
+                .flex()
+                .min_w_0()
+                .items_center()
+                .justify_end()
+                .children(metadata),
+        )
+        .debug_selector(|| "history-jitsi-call-card".into());
+    if let Some(join) = join {
+        card = card.child(join);
+    }
+    card
+}
+
+/// Берёт имя комнаты из проверенного URL и заменяет разделители пробелами.
+fn call_room_name(url: &str, locale: Language) -> String {
+    let room = url
+        .split_once("//")
+        .and_then(|(_, path)| path.split_once('/').map(|(_, path)| path))
+        .unwrap_or_default()
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_matches('/');
+    let name = room
+        .replace(['-', '_'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if name.is_empty() {
+        locale.tr("call.untitledRoom").to_string()
+    } else {
+        name
+    }
 }
 
 /// Соединяет плитку с открытием файла и меню изображения по её исходной позиции.
@@ -1880,35 +2308,57 @@ fn attachment_card(
 }
 
 /// Выбирает команду для открытого текста или запроса ключа у закрытого сообщения.
-fn quick_command(row: &Row, controls: &HistoryControls, plain_reply: bool, readable: bool) -> Option<QuickCommand> {
+fn quick_command(
+    row: &Row,
+    controls: &HistoryControls,
+    plain_reply: bool,
+    readable: bool,
+) -> Option<QuickCommand> {
     let id = row.id;
     let conversation = controls.conversation.clone()?;
     let locale = controls.locale;
     match &row.encrypted {
         Some(EncryptedPresentation::Ready(access)) if readable && controls.edit_protected => {
             let access = access.clone();
-            Some(QuickCommand::on_hover("reply-protected-message", locale.tr("message.reply"), move |window, cx| {
-                let _ = conversation.update(cx, |view, cx| {
-                    view.reply_to_protected_body(id, access.clone(), window, cx)
-                });
-            }))
+            Some(QuickCommand::on_hover(
+                "reply-protected-message",
+                locale.tr("message.reply"),
+                move |window, cx| {
+                    let _ = conversation.update(cx, |view, cx| {
+                        view.reply_to_protected_body(id, access.clone(), window, cx)
+                    });
+                },
+            ))
         }
         Some(state) if !readable && controls.key_device.is_some() => {
             let (action, name, caption) = if matches!(state, EncryptedPresentation::Failed) {
-                (KeyAction::Recover, "recover-protected-key", locale.tr("desktop.messenger.history.requestReplacementKey"))
+                (
+                    KeyAction::Recover,
+                    "recover-protected-key",
+                    locale.tr("desktop.messenger.history.requestReplacementKey"),
+                )
             } else {
-                (KeyAction::Request, "request-protected-key", locale.tr("e2ee.requestMessageKey"))
+                (
+                    KeyAction::Request,
+                    "request-protected-key",
+                    locale.tr("e2ee.requestMessageKey"),
+                )
             };
             let disabled = pending_key(controls.key_actions.get(&id));
-            Some(QuickCommand::on_hover(name, caption, move |_, cx| {
-                let _ = conversation.update(cx, |view, cx| view.key_action(id, action, cx));
-            }).always(Icon::ChatLock, disabled))
+            Some(
+                QuickCommand::on_hover(name, caption, move |_, cx| {
+                    let _ = conversation.update(cx, |view, cx| view.key_action(id, action, cx));
+                })
+                .always(Icon::ChatLock, disabled),
+            )
         }
-        None if plain_reply && controls.quick_reply => {
-            Some(QuickCommand::on_hover("history-reply", locale.tr("message.reply"), move |window, cx| {
+        None if plain_reply && controls.quick_reply => Some(QuickCommand::on_hover(
+            "history-reply",
+            locale.tr("message.reply"),
+            move |window, cx| {
                 let _ = conversation.update(cx, |view, cx| view.quick_reply(id, window, cx));
-            }))
-        }
+            },
+        )),
         _ => None,
     }
 }
@@ -1961,8 +2411,10 @@ fn encrypted_placeholder(
                 let _ = conversation.update(cx, |view, cx| view.retry_encrypted(id, cx));
             })
         }))
-        .children(key_action_explanation(controls.key_actions.get(&id), locale)
-            .map(|text| label(palette, TextRole::Caption, text)))
+        .children(
+            key_action_explanation(controls.key_actions.get(&id), locale)
+                .map(|text| label(palette, TextRole::Caption, text)),
+        )
         .into_any_element()
 }
 
@@ -1997,16 +2449,26 @@ fn key_action_row(
             );
         }
     }
-    row.children(key_action_explanation(status, locale).map(|text| label(palette, TextRole::Caption, text)))
+    row.children(
+        key_action_explanation(status, locale).map(|text| label(palette, TextRole::Caption, text)),
+    )
 }
 
 /// Блокирует новый запрос до окончания уже начатой операции.
 fn pending_key(status: Option<&KeyActionState>) -> bool {
-    matches!(status, Some(KeyActionState::Running(_) | KeyActionState::Waiting(_) | KeyActionState::ReplySent(_)))
+    matches!(
+        status,
+        Some(
+            KeyActionState::Running(_) | KeyActionState::Waiting(_) | KeyActionState::ReplySent(_)
+        )
+    )
 }
 
 /// Подписывает ход обмена ключами для строки запроса или закрытого сообщения.
-fn key_action_explanation(status: Option<&KeyActionState>, locale: Language) -> Option<&'static str> {
+fn key_action_explanation(
+    status: Option<&KeyActionState>,
+    locale: Language,
+) -> Option<&'static str> {
     match status {
         Some(KeyActionState::Running(_)) => Some(locale.tr("message.sending")),
         Some(KeyActionState::Waiting(_)) => {
@@ -2110,7 +2572,13 @@ impl<'a> FragmentContent<'a> {
     }
 
     /// Выдаёт текстовым элементам разные ключи внутри одного сообщения.
-    fn inline(&mut self, row: Uuid, text: &InlineText, palette: Palette) -> AnyElement {
+    fn inline(
+        &mut self,
+        row: Uuid,
+        text: &InlineText,
+        palette: Palette,
+        tail_suffix: Option<SharedString>,
+    ) -> AnyElement {
         let id = SharedString::from(format!("history-inline-{row}-{}", self.inline_index));
         self.inline_index += 1;
         text.render(InlineRender {
@@ -2121,6 +2589,7 @@ impl<'a> FragmentContent<'a> {
             conversation: self.conversation,
             names: self.mention_names,
             selection: None,
+            tail_suffix,
         })
         .0
         .into_any_element()
@@ -2152,16 +2621,50 @@ impl<'a> FragmentContent<'a> {
     }
 }
 
+/// Добавляет скрытый резерв времени к терминальному обычному текстовому блоку.
+fn tail_text_content(palette: Palette, text: &str, suffix: &str) -> AnyElement {
+    let mut visible = String::with_capacity(
+        text.len() + suffix.len() + crate::gpui_client::ui::BUBBLE_TAIL_BREAK.len(),
+    );
+    visible.push_str(text);
+    visible.push_str(crate::gpui_client::ui::BUBBLE_TAIL_BREAK);
+    let tail_start = visible.len();
+    visible.push_str(suffix);
+    let visible: SharedString = visible.into();
+    let styled = StyledText::new(visible.clone()).with_highlights([(
+        tail_start..visible.len(),
+        HighlightStyle {
+            color: Some(palette.text.opacity(0.)),
+            ..Default::default()
+        },
+    )]);
+    text_role(palette, TextRole::Body)
+        .min_w_0()
+        .max_w_full()
+        .child(styled)
+        .debug_selector(|| "message-terminal-tail-text".into())
+        .into_any_element()
+}
+
 /// Ставит спойлеры рядом с открытыми кусками и оставляет цитаты отдельными блоками.
 fn quote_content(
     row: &Row,
-    blocks: &[BodyPart],
+    caption: bool,
     palette: Palette,
     quote_accent: Hsla,
+    tail_suffix: Option<SharedString>,
     peer: Option<&PeerLabel>,
     (rows, index): (&[Row], &HashMap<Uuid, usize>),
     mut fragments: FragmentContent<'_>,
 ) -> Option<gpui::AnyElement> {
+    let blocks = if caption {
+        row.body
+            .caption
+            .as_ref()
+            .map_or(&[][..], |caption| caption.parts.as_slice())
+    } else {
+        row.body.parts.as_slice()
+    };
     if !row.body.has_fragments && matches!(blocks, [BodyPart::Text(_)]) {
         return None;
     }
@@ -2169,17 +2672,34 @@ fn quote_content(
         .flex()
         .flex_col()
         .min_w_0()
-        .when(!has_forward_cards(blocks), |body| body.w(px(312.)))
+        .when(!has_forward_cards(blocks), |body| body.w_full())
         .max_w_full()
-        .gap_1();
+        .gap_1()
+        .debug_selector(move || format!("history-quote-content-{}", row.id));
     let mut flow = FragmentFlow::default();
     let id = row.id;
     for (position, block) in blocks.iter().enumerate() {
+        let is_terminal = position + 1 == blocks.len();
         match block {
             BodyPart::Text(text) => {
-                flow.text(label(palette, TextRole::Body, text.clone()).min_w_0())
+                let text_element = if is_terminal {
+                    tail_suffix.as_ref().map_or_else(
+                        || label(palette, TextRole::Body, text.clone()).min_w_0().into_any_element(),
+                        |suffix| tail_text_content(palette, text, suffix),
+                    )
+                } else {
+                    label(palette, TextRole::Body, text.clone())
+                        .min_w_0()
+                        .into_any_element()
+                };
+                flow.text(text_element)
             }
-            BodyPart::Inline(text) => flow.text(fragments.inline(id, text, palette)),
+            BodyPart::Inline(text) => flow.text(fragments.inline(
+                id,
+                text,
+                palette,
+                is_terminal.then(|| tail_suffix.clone()).flatten(),
+            )),
             BodyPart::Preview(preview) => flow.text(
                 label(
                     palette,
@@ -2238,17 +2758,46 @@ fn quote_content(
                     })
                     .or_else(|| source.map(|source| source.body.excerpt(fragments.locale)))
                     .unwrap_or_default();
-                body = body.child(
-                    history_quote(
+                let openable = row.confirmed()
+                    && row.encrypted.is_none()
+                    && row.service.is_none()
+                    && *source_id != id
+                    && fragments.conversation.is_some();
+                let target = *source_id;
+                let quote = history_quote(
+                    palette,
+                    row.own,
+                    author,
+                    snippet,
+                    source.is_some(),
+                    openable,
+                    fragments.locale,
+                )
+                .debug_selector(move || format!("history-quote-{id}-{position}"));
+                let quote = match fragments.conversation.cloned().filter(|_| openable) {
+                    Some(conversation) => activate_click(
+                        quote
+                            .id(gpui::ElementId::named_usize(
+                                format!("open-history-quote-{id}-{caption}"),
+                                position,
+                            ))
+                            .border_1()
+                            .border_color(gpui::transparent_black()),
+                        None,
                         palette,
-                        row.own,
-                        author,
-                        snippet,
-                        source.is_some(),
-                        fragments.locale,
+                        move |event, _, cx| {
+                            cx.stop_propagation();
+                            if click_is_stationary(event) {
+                                let _ = conversation.update(cx, |view, cx| {
+                                    view.open_history_quote(id, caption, position, target, cx)
+                                });
+                            }
+                        },
                     )
-                    .debug_selector(move || format!("history-quote-{id}-{position}")),
-                );
+                    .into_any_element(),
+                    None => quote.into_any_element(),
+                };
+                body = body.child(quote);
             }
         }
     }
@@ -2312,7 +2861,7 @@ fn forward_card(
             BodyPart::Text(text) => {
                 flow.text(label(palette, TextRole::Body, text.clone()).min_w_0());
             }
-            BodyPart::Inline(text) => flow.text(fragments.inline(id, text, palette)),
+            BodyPart::Inline(text) => flow.text(fragments.inline(id, text, palette, None)),
             BodyPart::Preview(preview) => flow.text(
                 label(
                     palette,
@@ -2562,25 +3111,25 @@ fn build_rows(
                                 | DeliveryStatus::Rejected(_)
                         ))
                     .then_some(entry.snapshot.canonical_id);
+                    let (body, media) = prepare_row_body(
+                        prepared,
+                        entry.snapshot.public_id,
+                        entry.snapshot.body.markdown().unwrap_or_default(),
+                        false,
+                        encrypted,
+                    );
                     Row {
                         id,
                         own: true,
                         author: user,
                         topic: entry.snapshot.topic_id,
                         date: None,
-                        body: prepare_row_body(
-                            prepared,
-                            entry.snapshot.public_id,
-                            entry.snapshot.body.markdown().unwrap_or_default(),
-                            false,
-                            encrypted,
-                        )
-                        .0,
+                        body,
                         encrypted: state,
                         service: None,
                         retry_send,
                         plain_text: false,
-                        media: Vec::new(),
+                        media,
                         time: RowTime::Pending(delivery_caption_key(entry.status)),
                         delivery: Some(match entry.status {
                             DeliveryStatus::Waiting | DeliveryStatus::Sending => {
@@ -2627,7 +3176,7 @@ fn prepare_row_body(
     }) {
         return (previous.body.clone(), previous.media.clone());
     }
-    let media = if confirmed && !encrypted {
+    let media = if !encrypted {
         media_references(text)
     } else {
         Vec::new()

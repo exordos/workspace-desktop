@@ -2,7 +2,7 @@
 
 use gpui::{
     AnyElement, App, Corners, Div, ElementId, FocusHandle, Hsla, ImageSource, ObjectFit, Pixels,
-    SharedString, Stateful, Window, div, img, prelude::*, px, rgba,
+    SharedString, Stateful, Window, div, img, prelude::*, px, relative, rgba,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -16,10 +16,13 @@ use super::{
     controls::activate,
     label,
     theme::{
-        CONTROL_BORDER, MESSAGE_BUBBLE_MAX_WIDTH, MESSAGE_BUBBLE_RADIUS, PANEL_RADIUS, SURFACE_RADIUS,
-        ellipsized_label,
+        CONTROL_BORDER, MESSAGE_BUBBLE_RADIUS, PANEL_RADIUS, SURFACE_RADIUS, ellipsized_label,
+        label_width,
     },
 };
+
+/// Невидимая точка переноса перед резервом времени.
+pub(in crate::gpui_client) const BUBBLE_TAIL_BREAK: &str = "\u{200b}";
 
 /// Показывает календарную дату из ISO-строки Workspace на языке профиля.
 pub(in crate::gpui_client) fn profile_joined_date(
@@ -482,8 +485,10 @@ pub struct MessageBubble {
 }
 
 /// Определяет раскладку тела бабла или подписи под медиа.
+#[allow(dead_code)]
 pub(in crate::gpui_client) enum BubbleContent {
-    Inline(AnyElement), // Текст допускает время в своей последней строке.
+    Inline(AnyElement),     // Текст может перейти на безопасную строку времени.
+    InlineTail(AnyElement), // Текст содержит невидимый резерв после последнего символа.
     Blocks {
         content: AnyElement,        // Самостоятельные карточки занимают всю ширину тела.
         reactions: Vec<AnyElement>, // Кнопки и время укладываются одним потоком.
@@ -494,16 +499,39 @@ impl BubbleContent {
     /// Расставляет содержимое и время в выбранной раскладке.
     fn render(self, metadata: Option<Div>) -> Div {
         match self {
-            Self::Inline(content) => message_body(content, metadata),
+            Self::Inline(content) => message_body(content, metadata, false),
+            Self::InlineTail(content) => message_body(content, metadata, true),
             Self::Blocks { content, reactions } => message_blocks(content, reactions, metadata),
         }
+    }
+}
+
+/// Невидимый хвост текста, который оставляет место для времени только в последней строке.
+pub(in crate::gpui_client) struct BubbleTailReserve {
+    suffix: SharedString, // Невидимые символы с шириной не меньше метаданных.
+}
+
+impl BubbleTailReserve {
+    /// Возвращает строку, добавляемую после последнего символа содержимого.
+    pub(in crate::gpui_client) fn suffix(&self) -> &str {
+        &self.suffix
+    }
+
+    /// Добавляет резерв к отображаемому тексту, не меняя исходное тело.
+    pub(in crate::gpui_client) fn append(&self, text: &str) -> SharedString {
+        let mut visible =
+            String::with_capacity(text.len() + self.suffix.len() + BUBBLE_TAIL_BREAK.len());
+        visible.push_str(text);
+        visible.push_str(BUBBLE_TAIL_BREAK);
+        visible.push_str(&self.suffix);
+        visible.into()
     }
 }
 
 impl MessageBubble {
     /// Рисует отдельный пузырь и переносит длинное сообщение по доступной ширине.
     pub fn render(self, palette: Palette) -> Div {
-        self.render_with_content(palette, None, true, None, None)
+        self.render_with_content(palette, None, true, None, None, false)
     }
 
     /// Укладывает подготовленное тело и прикрепляет наложение к общему пузырю.
@@ -514,13 +542,14 @@ impl MessageBubble {
         ends_group: bool,
         accessory: Option<AnyElement>,
         overlay: Option<AnyElement>,
+        full_width: bool,
     ) -> Div {
         let metadata = self.metadata(palette, false);
         let body = match content {
             Some(content) => content.render(metadata),
-            None => message_body(self.plain_body(palette), metadata),
+            None => message_body(self.plain_body(palette), metadata, false),
         };
-        self.render_frame(palette, body, ends_group, accessory, overlay)
+        self.render_frame(palette, body, ends_group, accessory, overlay, full_width)
     }
 
     /// Расставляет скругления только на углах, где медиа совпадает с краем пузыря.
@@ -541,12 +570,13 @@ impl MessageBubble {
         corners
     }
 
-    /// Прижимает медиа к краям пузыря, а подпись и имя рисует с обычными отступами.
+    /// Прижимает медиа к краям пузыря, а одиночное фото позволяет ужать бабл до рамки.
     pub(in crate::gpui_client) fn render_with_media(
         self,
         palette: Palette,
         media: Div,
         caption: Option<BubbleContent>,
+        shrink_to_media: bool,
         ends_group: bool,
         accessory: Option<AnyElement>,
         overlay: Option<AnyElement>,
@@ -560,7 +590,7 @@ impl MessageBubble {
         };
         let bubble = self
             .surface(palette, ends_group)
-            .w_full()
+            .when(!shrink_to_media, |bubble| bubble.w_full())
             .children(
                 self.author_label(palette)
                     .map(|author| author.px(px(12.)).pt(px(8.)).pb_1()),
@@ -576,14 +606,23 @@ impl MessageBubble {
                     .debug_selector(|| "history-media-time".into())
             })))
             .children(caption.map(|caption| {
+                let has_tail = matches!(caption, BubbleContent::InlineTail(_));
                 let caption = match caption {
                     // Интерактивный текст не задаёт ширину сам, поэтому отдаём ему свободное место.
                     BubbleContent::Inline(content) => BubbleContent::Inline(
                         div().flex_1().min_w_0().child(content).into_any_element(),
                     ),
+                    BubbleContent::InlineTail(content) => BubbleContent::InlineTail(
+                        div().flex_1().min_w_0().child(content).into_any_element(),
+                    ),
                     blocks => blocks,
                 };
-                caption.render(caption_metadata).px(px(12.)).py(px(8.))
+                let rendered = caption.render(caption_metadata);
+                if has_tail {
+                    div().px(px(12.)).py(px(8.)).child(rendered)
+                } else {
+                    rendered.px(px(12.)).py(px(8.))
+                }
             }))
             .children(accessory.map(|accessory| {
                 div()
@@ -612,9 +651,11 @@ impl MessageBubble {
         ends_group: bool,
         accessory: Option<AnyElement>,
         overlay: Option<AnyElement>,
+        full_width: bool,
     ) -> Div {
         let bubble = self
             .surface(palette, ends_group)
+            .when(full_width, |bubble| bubble.w_full())
             .px(px(12.))
             .py(px(8.))
             .children(self.author_label(palette))
@@ -655,15 +696,67 @@ impl MessageBubble {
                         .map(|time| label(palette, TextRole::Caption, time).text_color(color)),
                 )
                 .children(status)
+                .debug_selector(|| "message-meta".into())
         })
+    }
+
+    /// Подбирает невидимый хвост по фактической ширине времени и статуса отправки.
+    pub(in crate::gpui_client) fn tail_reserve(
+        &self,
+        palette: Palette,
+        window: &Window,
+    ) -> Option<BubbleTailReserve> {
+        let time_width = self
+            .time
+            .as_ref()
+            .map(|time| label_width(palette, TextRole::Caption, time, window));
+        let status = self.own.then_some(self.delivery).flatten();
+        if time_width.is_none() && status.is_none() {
+            return None;
+        }
+        let reserve_width = time_width.unwrap_or(px(0.))
+            + status.map_or(px(0.), |_| px(16.))
+            + if time_width.is_some() && status.is_some() {
+                px(4.)
+            } else {
+                px(0.)
+            };
+        // Буквы задают измеримую ширину и не схлопываются как пробелы в конце строки.
+        let reserve_glyph = SharedString::from("M");
+        let glyph_width = label_width(palette, TextRole::Body, &reserve_glyph, window);
+        if glyph_width <= px(0.) {
+            return None;
+        }
+        let mut count = (f32::from(reserve_width / glyph_width).ceil() as usize).max(1);
+        let mut suffix = reserve_glyph.repeat(count);
+        while label_width(palette, TextRole::Body, &suffix.clone().into(), window) < reserve_width {
+            count += 1;
+            suffix = reserve_glyph.repeat(count);
+        }
+        Some(BubbleTailReserve {
+            suffix: suffix.into(),
+        })
+    }
+
+    /// Оставляет резерв только когда время останется внутри пузыря.
+    pub(in crate::gpui_client) fn tail_reserve_without_reactions(
+        &self,
+        palette: Palette,
+        window: &Window,
+        has_reaction_chips: bool,
+    ) -> Option<BubbleTailReserve> {
+        (!has_reaction_chips)
+            .then(|| self.tail_reserve(palette, window))
+            .flatten()
     }
 
     /// Ограничивает ширину сообщения и подставляет цвет отправителя.
     fn surface(&self, palette: Palette, ends_group: bool) -> Div {
         message_bubble_surface(self.own, ends_group)
             .relative()
-            .max_w(MESSAGE_BUBBLE_MAX_WIDTH)
+            .max_w(relative(0.88))
             .min_w_0()
+            .debug_selector(|| "message-bubble-surface".into())
             .bg(if self.own {
                 palette.message_own
             } else {
@@ -693,7 +786,15 @@ impl MessageBubble {
 }
 
 /// Размещает подпись и время в одной строке, когда для них достаточно места.
-fn message_body(content: impl IntoElement, metadata: Option<Div>) -> Div {
+fn message_body(content: impl IntoElement, metadata: Option<Div>, has_tail: bool) -> Div {
+    if has_tail {
+        return div()
+            .relative()
+            .min_w_0()
+            .child(content)
+            .children(metadata.map(|time| time.absolute().right_0().bottom_0()))
+            .debug_selector(|| "message-body".into());
+    }
     div()
         .flex()
         .flex_wrap()
@@ -761,6 +862,269 @@ mod radius_tests {
     use super::*;
 
     #[cfg(feature = "gpui-test")]
+    /// На широком окне пузырь использует 88% строки без потолка в 680 px.
+    #[gpui::test]
+    fn message_bubble_width_scales_on_ultrawide_windows(cx: &mut gpui::TestAppContext) {
+        /// Рисует длинный текст, чтобы ширину задавал предел пузыря.
+        struct WideMessage {
+            own: bool,          // Направление проверяемого сообщения.
+            body: SharedString, // Текст, задающий естественную ширину пузыря.
+            media: bool,        // Включает пример медиа вместо текстового содержимого.
+        }
+        impl gpui::Render for WideMessage {
+            /// Собирает сообщение в ширине окна для измерения общего компонента.
+            fn render(
+                &mut self,
+                window: &mut gpui::Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                let palette = Palette::for_window(window, cx);
+                let bubble = MessageBubble {
+                    author: None,
+                    body: self.body.clone(),
+                    time: Some("10:32".into()),
+                    own: self.own,
+                    delivery: Some(DeliveryMark::Read),
+                };
+                let rendered = if self.media {
+                    bubble.render_with_media(
+                        palette,
+                        div()
+                            .w(px(2400.))
+                            .max_w_full()
+                            .h(px(100.))
+                            .debug_selector(|| "wide-message-media".into()),
+                        None,
+                        false,
+                        true,
+                        None,
+                        None,
+                    )
+                } else {
+                    bubble.render(palette)
+                };
+                div()
+                    .size_full()
+                    .child(rendered.debug_selector(|| "wide-message-row".into()))
+            }
+        }
+
+        let (view, ui) = cx.add_window_view(|_, _| WideMessage {
+            own: true,
+            body: "Широкое сообщение. ".repeat(120).into(),
+            media: false,
+        });
+        ui.simulate_resize(gpui::size(px(2400.), px(900.)));
+        ui.run_until_parked();
+        for own in [true, false] {
+            ui.update(|_, app| {
+                view.update(app, |message, cx| {
+                    message.own = own;
+                    cx.notify();
+                });
+            });
+            ui.run_until_parked();
+            let row = ui.debug_bounds("wide-message-row").unwrap();
+            let bubble = ui.debug_bounds("message-bubble-surface").unwrap();
+            assert!(bubble.size.width > px(680.), "направление own={own}");
+            assert!(
+                bubble.size.width <= row.size.width * 0.88 + px(1.),
+                "направление own={own}: bubble={:?}, row={:?}",
+                bubble.size,
+                row.size
+            );
+        }
+
+        ui.update(|_, app| {
+            view.update(app, |message, cx| {
+                message.body = "Привет".into();
+                cx.notify();
+            });
+        });
+        ui.run_until_parked();
+        let short = ui.debug_bounds("message-bubble-surface").unwrap();
+        assert!(short.size.width < px(680.), "короткое сообщение: {short:?}");
+
+        ui.update(|_, app| {
+            view.update(app, |message, cx| {
+                message.media = true;
+                cx.notify();
+            });
+        });
+        ui.run_until_parked();
+        let row = ui.debug_bounds("wide-message-row").unwrap();
+        let bubble = ui.debug_bounds("message-bubble-surface").unwrap();
+        let media = ui.debug_bounds("wide-message-media").unwrap();
+        assert!(bubble.size.width <= row.size.width * 0.88 + px(1.));
+        assert!(media.size.width <= bubble.size.width + px(1.));
+
+        ui.update(|_, app| {
+            view.update(app, |message, cx| {
+                message.media = false;
+                message.body = "Широкое сообщение. ".repeat(120).into();
+                cx.notify();
+            });
+        });
+        ui.simulate_resize(gpui::size(px(760.), px(900.)));
+        ui.run_until_parked();
+        let row = ui.debug_bounds("wide-message-row").unwrap();
+        let bubble = ui.debug_bounds("message-bubble-surface").unwrap();
+        assert!(bubble.size.width <= row.size.width * 0.88 + px(1.));
+    }
+
+    #[cfg(feature = "gpui-test")]
+    /// Время занимает зарезервированное место внизу последней строки текста.
+    #[gpui::test]
+    fn message_tail_reserve_keeps_metadata_on_the_last_text_line(cx: &mut gpui::TestAppContext) {
+        /// Показывает длинный текст с невидимым резервом хвоста.
+        struct TailMessage {
+            layout: Option<gpui::TextLayout>, // Разметка текста с хвостом из последнего кадра.
+            tail_start: usize,                // Начало невидимого резерва в отображаемом тексте.
+            tail_end: usize,                  // Последний байтовый индекс резерва.
+            body_end: usize,                  // Конец исходного текста до резерва.
+        }
+
+        impl gpui::Render for TailMessage {
+            /// Собирает тот же текстовый пузырь, который использует история.
+            fn render(
+                &mut self,
+                window: &mut gpui::Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                let palette = Palette::for_window(window, cx);
+                let message = MessageBubble {
+                    author: None,
+                    body: "Текст ".repeat(19).trim_end().to_owned().into(),
+                    time: Some("10:32".into()),
+                    own: true,
+                    delivery: Some(DeliveryMark::Read),
+                };
+                let reserve = message.tail_reserve(palette, window).unwrap();
+                let body = "Текст ".repeat(19).trim_end().to_owned();
+                let visible = reserve.append(&body);
+                self.tail_start = body.len() + BUBBLE_TAIL_BREAK.len();
+                self.tail_end = visible.len() - 1;
+                self.body_end = body.len();
+                let styled = gpui::StyledText::new(visible.clone()).with_highlights([(
+                    body.len() + BUBBLE_TAIL_BREAK.len()..visible.len(),
+                    gpui::HighlightStyle {
+                        color: Some(palette.text.opacity(0.)),
+                        ..Default::default()
+                    },
+                )]);
+                self.layout = Some(styled.layout().clone());
+                let content = super::super::text_role(palette, TextRole::Body)
+                    .min_w_0()
+                    .max_w_full()
+                    .child(styled)
+                    .debug_selector(|| "message-tail-text".into())
+                    .into_any_element();
+                div().size_full().child(message.render_with_content(
+                    palette,
+                    Some(BubbleContent::InlineTail(content)),
+                    true,
+                    None,
+                    None,
+                    false,
+                ))
+            }
+        }
+
+        let (view, ui) = cx.add_window_view(|_, _| TailMessage {
+            layout: None,
+            tail_start: 0,
+            tail_end: 0,
+            body_end: 0,
+        });
+        ui.simulate_resize(gpui::size(px(250.), px(640.)));
+        ui.run_until_parked();
+        let body = ui.debug_bounds("message-tail-text").unwrap();
+        let meta = ui.debug_bounds("message-meta").unwrap();
+        let bubble = ui.debug_bounds("message-bubble-surface").unwrap();
+        ui.read(|app| {
+            let layout = view.read(app).layout.as_ref().unwrap();
+            assert!(layout.wrapped_text().lines().count() > 1);
+            assert!(layout.wrapped_text().ends_with('M'));
+            let tail = layout
+                .position_for_index(view.read(app).tail_start)
+                .unwrap();
+            let tail_end = layout
+                .position_for_index(view.read(app).tail_end)
+                .unwrap();
+            let last_body = layout
+                .position_for_index(view.read(app).body_end - 1)
+                .unwrap();
+            assert!(
+                tail.y > last_body.y,
+                "хвост должен перенестись: {tail:?}, {last_body:?}, body={body:?}, bubble={bubble:?}"
+            );
+            assert!(
+                tail.y - last_body.y <= layout.line_height() + px(1.),
+                "хвост должен занять ровно следующую строку: {tail:?}, {last_body:?}"
+            );
+            assert_eq!(tail_end.y, tail.y, "резерв должен занимать одну строку");
+        });
+        assert_eq!(meta.bottom(), body.bottom());
+        assert_eq!(meta.right(), body.right());
+        assert!(meta.top() >= body.bottom() - px(20.));
+    }
+
+    #[cfg(feature = "gpui-test")]
+    /// Реальная полоса реакций переводит время в footer без скрытого резерва.
+    #[gpui::test]
+    fn narrow_reaction_footer_does_not_keep_tail_reserve(cx: &mut gpui::TestAppContext) {
+        struct ReactionMessage;
+        impl gpui::Render for ReactionMessage {
+            /// Рисует короткое сообщение и чип реакции в узком окне.
+            fn render(
+                &mut self,
+                window: &mut gpui::Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                let palette = Palette::for_window(window, cx);
+                let message = MessageBubble {
+                    author: None,
+                    body: "Коротко".into(),
+                    time: Some("10:32".into()),
+                    own: false,
+                    delivery: None,
+                };
+                let chip = div()
+                    .h(px(22.))
+                    .px(px(6.))
+                    .child("👍 1")
+                    .debug_selector(|| "test-reaction-chip".into())
+                    .into_any_element();
+                let reactions = vec![chip];
+                let reserve =
+                    message.tail_reserve_without_reactions(palette, window, !reactions.is_empty());
+                assert!(reserve.is_none());
+                let content = super::super::text_role(palette, TextRole::Body)
+                    .child("Коротко")
+                    .debug_selector(|| "reaction-footer-body".into())
+                    .into_any_element();
+                message.render_with_content(
+                    palette,
+                    Some(BubbleContent::Blocks { content, reactions }),
+                    true,
+                    None,
+                    None,
+                    false,
+                )
+            }
+        }
+
+        let (_, ui) = cx.add_window_view(|_, _| ReactionMessage);
+        ui.simulate_resize(gpui::size(px(350.), px(400.)));
+        ui.run_until_parked();
+        let body = ui.debug_bounds("reaction-footer-body").unwrap();
+        let metadata = ui.debug_bounds("message-block-footer-time").unwrap();
+        let chip = ui.debug_bounds("test-reaction-chip").unwrap();
+        assert!(metadata.top() >= body.bottom());
+        assert!(chip.top() >= body.bottom());
+    }
+
+    #[cfg(feature = "gpui-test")]
     /// Короткая подпись под широким медиа остаётся в одной строке рядом со временем.
     #[gpui::test]
     fn media_caption_keeps_available_width(cx: &mut gpui::TestAppContext) {
@@ -774,6 +1138,22 @@ mod radius_tests {
                 cx: &mut gpui::Context<Self>,
             ) -> impl IntoElement {
                 let palette = Palette::for_window(window, cx);
+                let message = MessageBubble {
+                    author: None,
+                    body: "".into(),
+                    time: Some("10:32".into()),
+                    own: false,
+                    delivery: None,
+                };
+                let reserve = message.tail_reserve(palette, window).unwrap();
+                let visible = reserve.append("Отец");
+                let caption_text = gpui::StyledText::new(visible.clone()).with_highlights([(
+                    "Отец".len() + BUBBLE_TAIL_BREAK.len()..visible.len(),
+                    gpui::HighlightStyle {
+                        color: Some(palette.text.opacity(0.)),
+                        ..Default::default()
+                    },
+                )]);
                 let caption = div()
                     .flex()
                     .flex_col()
@@ -784,23 +1164,14 @@ mod radius_tests {
                         super::super::text_role(palette, TextRole::Body)
                             .min_w_0()
                             .max_w_full()
-                            .child(gpui::InteractiveText::new(
-                                "link",
-                                gpui::StyledText::new("Отец"),
-                            ))
+                            .child(caption_text)
                             .debug_selector(|| "caption-text".into()),
                     );
-                MessageBubble {
-                    author: None,
-                    body: "".into(),
-                    time: Some("10:32".into()),
-                    own: false,
-                    delivery: None,
-                }
-                .render_with_media(
+                message.render_with_media(
                     palette,
                     div().w(px(400.)).h(px(100.)),
-                    Some(BubbleContent::Inline(caption.into_any_element())),
+                    Some(BubbleContent::InlineTail(caption.into_any_element())),
+                    false,
                     true,
                     None,
                     None,
@@ -809,10 +1180,14 @@ mod radius_tests {
         }
         let (_, ui) = cx.add_window_view(|_, _| CaptionExample);
         let text = ui.debug_bounds("caption-text").unwrap();
+        let body = ui.debug_bounds("message-body").unwrap();
+        let meta = ui.debug_bounds("message-meta").unwrap();
         assert!(
             text.size.width > px(30.) && text.size.height < px(30.),
             "Подпись перенеслась по буквам: {text:?}"
         );
+        assert_eq!(meta.bottom(), body.bottom());
+        assert_eq!(meta.right(), body.right());
     }
 
     /// Проверяет четыре формы пузыря по направлению и месту сообщения в группе.

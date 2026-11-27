@@ -15,7 +15,8 @@ use super::super::{
 use crate::platform::message_time::format_local_time_zone;
 use gpui::{
     App, AvailableSpace, Bounds, Element, ElementId, GlobalElementId, InspectorElementId,
-    IntoElement, LayoutId, Pixels, Size, Style, TextAlign, WhiteSpace, Window, WrappedLine,
+    IntoElement, LayoutId, Pixels, SharedString, Size, Style, TextAlign, WhiteSpace, Window,
+    WrappedLine,
 };
 use workspace_core::messenger::{
     catalog::ProtectedSidebarSummary,
@@ -25,6 +26,7 @@ use workspace_core::messenger::{
 use zeroize::Zeroizing;
 
 use crate::gpui_client::preferences::Language;
+use crate::gpui_client::ui::BUBBLE_TAIL_BREAK;
 
 /// Отзывный материал сообщения для постановки в layout текущего кадра.
 pub(in crate::gpui_client) struct ProtectedText(pub Arc<ProtectedMessage>); // Core проверяет сессию и версию ключа.
@@ -32,6 +34,7 @@ pub(in crate::gpui_client) struct ProtectedText(pub Arc<ProtectedMessage>); // C
 /// Текст с разрешением, которое проверяется при реальном замере и выводе глифов.
 pub(in crate::gpui_client) struct GuardedText {
     source: TextSource, // Снимок либо его байтовый диапазон, действующие только вместе с разрешением.
+    tail_suffix: Option<SharedString>, // Невидимое место под время последней строки обычного тела.
 }
 
 /// Общие источники отзываемого текста. Открытая строка не становится полем GPUI Entity.
@@ -131,6 +134,7 @@ impl GuardedText {
                 names,
                 zone: false,
             },
+            tail_suffix: None,
         }
     }
 
@@ -148,6 +152,7 @@ impl GuardedText {
                 names: MentionNames::default(),
                 zone: true,
             },
+            tail_suffix: None,
         }
     }
 
@@ -155,6 +160,7 @@ impl GuardedText {
     pub(in crate::gpui_client) fn fragment(access: Arc<AcceptedDecryption>) -> Self {
         Self {
             source: TextSource::Fragment(access),
+            tail_suffix: None,
         }
     }
 
@@ -165,6 +171,7 @@ impl GuardedText {
                 access,
                 placeholder,
             },
+            tail_suffix: None,
         }
     }
     /// Отображает только выбранный диапазон без создания постоянной копии Markdown.
@@ -174,6 +181,19 @@ impl GuardedText {
     ) -> Self {
         Self {
             source: TextSource::Body(access, Some(range)),
+            tail_suffix: None,
+        }
+    }
+
+    /// Добавляет невидимый резерв к проверенному диапазону защищённого тела.
+    pub(in crate::gpui_client) fn range_with_tail(
+        access: Arc<ProtectedMessage>,
+        range: Range<usize>,
+        suffix: SharedString,
+    ) -> Self {
+        Self {
+            source: TextSource::Body(access, Some(range)),
+            tail_suffix: Some(suffix),
         }
     }
 
@@ -185,6 +205,17 @@ impl GuardedText {
     ) -> Self {
         Self {
             source: TextSource::Sidebar { access, mounted, locale },
+            tail_suffix: None,
+        }
+    }
+}
+
+impl ProtectedText {
+    /// Добавляет резерв времени к обычному защищённому телу в рамках того же разрешения.
+    pub(in crate::gpui_client) fn with_tail_suffix(self, suffix: SharedString) -> GuardedText {
+        GuardedText {
+            source: TextSource::Body(self.0, None),
+            tail_suffix: Some(suffix),
         }
     }
 }
@@ -203,6 +234,7 @@ impl IntoElement for ProtectedText {
     fn into_element(self) -> Self::Element {
         GuardedText {
             source: TextSource::Body(self.0, None),
+            tail_suffix: None,
         }
     }
 }
@@ -253,6 +285,7 @@ impl Element for GuardedText {
         };
         let prepared = frame.lines.clone();
         let access = self.source.clone();
+        let tail_suffix = self.tail_suffix.clone();
         let layout =
             window.request_measured_layout(Style::default(), move |known, available, window, _| {
                 let width = if style.white_space == WhiteSpace::Normal {
@@ -267,10 +300,20 @@ impl Element for GuardedText {
                 prepared.clear();
                 access
                     .with_text(|text| {
+                        let mut shaped = Zeroizing::new(text.to_owned());
+                        let mut runs = vec![style.to_run(text.len())];
+                        if let Some(suffix) = &tail_suffix {
+                            shaped.push_str(BUBBLE_TAIL_BREAK);
+                            shaped.push_str(suffix);
+                            let tail_len = BUBBLE_TAIL_BREAK.len() + suffix.len();
+                            let mut tail_run = style.to_run(tail_len);
+                            tail_run.color = style.color.opacity(0.);
+                            runs.push(tail_run);
+                        }
                         let Ok(lines) = window.text_system().shape_text(
-                            text.to_owned().into(),
+                            SharedString::new(shaped.as_str()),
                             font_size,
-                            &[style.to_run(text.len())],
+                            &runs,
                             width,
                             style.line_clamp,
                         ) else {
@@ -344,7 +387,7 @@ impl Element for GuardedText {
 mod tests {
     use std::cell::Cell;
 
-    use gpui::{Context, Render, TestAppContext, canvas, px, size};
+    use gpui::{Context, Render, TestAppContext, canvas, div, prelude::*, px, size};
     use uuid::Uuid;
     use workspace_core::{
         context::{AccountId, OwnerContext, SessionGeneration},
@@ -353,8 +396,121 @@ mod tests {
         },
     };
 
+    use super::super::super::protected_body::{ProtectedLayout, ProtectedReferenceControls};
     use super::*;
     use crate::platform::chat_keys::ProfileChatKeys;
+    use crate::gpui_client::ui::{
+        BubbleContent, DeliveryMark, MessageBubble, Palette, TextRole, text_role,
+    };
+
+    /// Показывает защищённое тело с резервом времени внутри отзываемого текстового элемента.
+    struct ProtectedTailView {
+        holder: Arc<ProtectedMessage>, // Текст доступен только пока действует его ключ.
+    }
+
+    impl Render for ProtectedTailView {
+        /// Собирает защищённое сообщение тем же общим баблом, что и открытый текст.
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let palette = Palette::for_window(window, cx);
+            let message = MessageBubble {
+                author: None,
+                body: "".into(),
+                time: Some("10:32".into()),
+                own: true,
+                delivery: Some(DeliveryMark::Read),
+            };
+            let suffix = message
+                .tail_reserve(palette, window)
+                .expect("у сообщения есть время и статус")
+                .suffix()
+                .to_owned()
+                .into();
+            let layout = self
+                .holder
+                .with_body(ProtectedLayout::parse)
+                .expect("тело всё ещё доступно");
+            let names = MentionNames::default();
+            let protected = layout.render(
+                Uuid::from_u128(777),
+                &self.holder,
+                palette,
+                true,
+                None,
+                false,
+                Some(suffix),
+                ProtectedReferenceControls {
+                    conversation: None,
+                    language: Language::En,
+                    names: &names,
+                },
+                |_, _, _, _| div().into_any_element(),
+            );
+            let body = text_role(palette, TextRole::Body)
+                .min_w_0()
+                .max_w_full()
+                .child(protected)
+                .debug_selector(|| "protected-tail-body".into());
+            div().size_full().child(message.render_with_content(
+                palette,
+                Some(BubbleContent::InlineTail(body.into_any_element())),
+                true,
+                None,
+                None,
+                false,
+            ))
+        }
+    }
+
+    /// Оставляет метаданные у последней защищённой строки, измеренной под тем же ключом.
+    #[gpui::test]
+    fn protected_text_tail_keeps_metadata_at_the_body_edge(cx: &mut TestAppContext) {
+        let engine = Arc::new(MessageEncryption::new(Arc::new(
+            ProfileChatKeys::temporary(),
+        )));
+        let activation = engine
+            .select_session(Some(EncryptionSession {
+                owner: OwnerContext {
+                    account_id: AccountId("test".into()),
+                    server: "https://workspace.test".into(),
+                    organization_id: "org".into(),
+                    project_id: "project".into(),
+                    user_id: "owner".into(),
+                },
+                generation: SessionGeneration(1),
+                device_id: Uuid::from_u128(42),
+            }))
+            .unwrap();
+        let stream = "10000000-0000-4000-8000-000000000005".parse().unwrap();
+        let key = "10000000-0000-4000-8000-000000000080".parse().unwrap();
+        engine
+            .save_key(&activation, stream, key, &GroupKey::from_bytes([7; 32]))
+            .unwrap();
+        // Публичный синтетический вектор не содержит реальных пользовательских данных.
+        let encoded = "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM1BE3iAOkrgJ3KRf/RmAQZdeFqucTcLZYqkvZLUm+5hT2YqTPupmbNHVCmw77C/ZSMcN1WTelv3nhrIi1blpcecnNKAV8=";
+        let holder = Arc::new(
+            engine
+                .accept(
+                    engine
+                        .prepare(&activation, stream, key)
+                        .unwrap()
+                        .decrypt(encoded),
+                )
+                .unwrap(),
+        );
+        assert!(holder.with_body(|text| text.len() > 40).unwrap());
+        let (_, ui) = cx.add_window_view(|_, _| ProtectedTailView { holder });
+        ui.simulate_resize(size(px(250.), px(640.)));
+        ui.run_until_parked();
+        let body = ui.debug_bounds("message-body").unwrap();
+        let protected = ui.debug_bounds("protected-tail-body").unwrap();
+        let meta = ui.debug_bounds("message-meta").unwrap();
+        assert!(
+            protected.size.height >= px(30.),
+            "текст должен перенестись: {protected:?}"
+        );
+        assert_eq!(meta.bottom(), body.bottom());
+        assert_eq!(meta.right(), body.right());
+    }
 
     /// Измеряет элемент после того, как рабочий ключ уже успели удалить.
     struct MeasureProbe {
@@ -369,13 +525,22 @@ mod tests {
     impl Render for MeasureProbe {
         /// Проводит обе фазы в одном кадре, чтобы порядок операций был управляемым.
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let mut element = ProtectedText(self.holder.clone()).into_element();
+            let element = self
+                .holder
+                .with_body(|text| 0..text.len())
+                .map(|range| {
+                    GuardedText::range_with_tail(self.holder.clone(), range, "MMMMM".into())
+                });
+            let mut element = element;
             let engine = self.engine.clone();
             let activation = self.activation.clone();
             let (stream, key) = (self.stream, self.key);
             let observed = self.observed_lines.clone();
             canvas(
                 move |_, window, cx| {
+                    let Some(element) = element.as_mut() else {
+                        return;
+                    };
                     // Canvas упорядочивает реальный request_layout и Taffy measure в одном кадре.
                     let (layout, frame) = element.request_layout(None, None, window, cx);
                     engine.remove_key(&activation, stream, key).unwrap();

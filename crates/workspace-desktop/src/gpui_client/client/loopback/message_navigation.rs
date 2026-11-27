@@ -13,7 +13,7 @@ const LINK_DENIED: &str = "history-inline-00000000-0000-0000-0000-00000000008b-0
 const FORWARD_DELAYED: &str =
     "forward-original-00000000-0000-0000-0000-00000000008c-00000000-0000-0000-0000-0000000001c2";
 const LINK_REMOTE: &str = "history-inline-00000000-0000-0000-0000-00000000008d-0";
-const LATEST_ROW: u128 = 141;
+const LATEST_ROW: u128 = 142;
 const DENIED: Uuid = Uuid::from_u128(400);
 const DELAYED: Uuid = Uuid::from_u128(450);
 const REMOTE: Uuid = Uuid::from_u128(500);
@@ -31,6 +31,7 @@ pub(super) struct Fixture {
     release_older: Mutex<Option<oneshot::Receiver<()>>>, // Удерживает запрос до нового клика.
     delayed_page_sent: AtomicBool, // Сервер закончил обработку задержанной страницы.
     forward_reactions: bool, // Показывает серверные счётчики на карточке для проверки нижней строки.
+    quote_navigation: bool,  // Добавляет две разные цитаты только в сценарий их перехода.
 }
 
 impl Fixture {
@@ -56,7 +57,12 @@ impl Fixture {
             return Some(response);
         }
         if query_value(request, "stream_uuid") != Some(CHANNEL) {
-            let rows = (FIRST_ROW..=LATEST_ROW)
+            let latest = if self.quote_navigation {
+                LATEST_ROW
+            } else {
+                LATEST_ROW - 1
+            };
+            let rows = (FIRST_ROW..=latest)
                 .rev()
                 .map(|number| self.direct_row(number, user, peer))
                 .collect();
@@ -92,7 +98,7 @@ impl Fixture {
         Some(json_response(StatusCode::OK, Value::Array(rows)))
     }
 
-    /// Собирает хвост лички, включая ссылки в последних сообщениях и цель выше экрана.
+    /// Собирает хвост лички, включая ссылки и две цитаты с разными UUID.
     fn direct_row(&self, number: u128, user: &str, peer: &str) -> Value {
         let content = match number {
             138 => format!(
@@ -109,6 +115,9 @@ impl Fixture {
             }
             .to_markdown(),
             141 => format!("[Сообщение из канала](urn:message:{REMOTE})"),
+            142 => {
+                format!("[Первая цитата](urn:quote:{FAST})\n\n[Вторая цитата](urn:quote:{REMOTE})")
+            }
             _ => format!("Строка лички {number}"),
         };
         let mut row = json!({
@@ -122,6 +131,96 @@ impl Fixture {
         }
         row
     }
+}
+
+/// Клик и клавиатурная активация цитаты открывают её UUID через общий переход истории.
+#[gpui::test]
+fn history_quote_click_and_enter_open_their_own_targets(cx: &mut TestAppContext) {
+    const FIRST_QUOTE: &str = "history-quote-00000000-0000-0000-0000-00000000008e-0";
+    const SECOND_QUOTE: &str = "history-quote-00000000-0000-0000-0000-00000000008e-1";
+    let server = Server::serve(Received {
+        message_navigation: Some(Fixture {
+            quote_navigation: true,
+            remote_ready: AtomicBool::new(true),
+            ..Fixture::default()
+        }),
+        topic: Some(TopicAcceptance::default()),
+        ..Received::default()
+    });
+    let profile = tempfile::tempdir().unwrap();
+    let (client, ui, runtime) = open_source(cx, &server, profile.path());
+    let fixture = server.state.message_navigation.as_ref().unwrap();
+    until(ui, "видны обе цитаты", |ui| {
+        ui.debug_bounds(FIRST_QUOTE).is_some() && ui.debug_bounds(SECOND_QUOTE).is_some()
+    });
+
+    // Перетаскивание по карточке остаётся выделением и не открывает цель.
+    let first = ui.debug_bounds(FIRST_QUOTE).unwrap().center();
+    ui.simulate_mouse_move(first, None, Modifiers::none());
+    ui.update(|window, app| window.draw(app).clear());
+    ui.simulate_mouse_down(first, gpui::MouseButton::Left, Modifiers::none());
+    ui.update(|window, app| window.draw(app).clear());
+    ui.simulate_mouse_move(
+        gpui::point(first.x + px(18.), first.y),
+        None,
+        Modifiers::none(),
+    );
+    ui.simulate_mouse_up(
+        gpui::point(first.x + px(18.), first.y),
+        gpui::MouseButton::Left,
+        Modifiers::none(),
+    );
+    ui.run_until_parked();
+    assert!(ui.debug_bounds(MARK_FAST).is_none());
+
+    // Из редактора Shift+Tab переводит фокус на последнюю цитату списка, Enter её активирует.
+    click(ui, "workspace-composer-editor");
+    ui.simulate_keystrokes("shift-tab");
+    ui.run_until_parked();
+    ui.simulate_keystrokes("enter");
+    ui.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("enter").unwrap(),
+    });
+    until(
+        ui,
+        "Enter открыл UUID второй цитаты",
+        |ui| {
+            ui.read(|app| {
+                client.read(app).shell.conversation().is_some_and(|route| {
+                    route.route.entry == crate::gpui_client::contracts::ChatEntry::Around(REMOTE)
+                        && route.route.scope.stream_id.to_string() == CHANNEL
+                        && route
+                            .route
+                            .scope
+                            .topic_id
+                            .map(|id| id.to_string())
+                            .as_deref()
+                            == Some(CHANNEL_TOPIC)
+                })
+            }) && ui.debug_bounds(MARK_REMOTE).is_some()
+        },
+    );
+    assert!(fixture.pages.lock().unwrap().contains(&(REMOTE, false)));
+    assert!(fixture.pages.lock().unwrap().contains(&(REMOTE, true)));
+    assert!(fixture.anchor_reads.lock().unwrap().contains(&REMOTE));
+
+    ui.simulate_keystrokes("alt-left");
+    until(
+        ui,
+        "Назад вернул к обеим цитатам",
+        |ui| ui.debug_bounds(FIRST_QUOTE).is_some() && ui.debug_bounds(SECOND_QUOTE).is_some(),
+    );
+    click_link(ui, FIRST_QUOTE);
+    until(
+        ui,
+        "клик первой цитаты отметил загруженную цель",
+        |ui| ui.debug_bounds(MARK_FAST).is_some(),
+    );
+    assert!(!fixture.anchor_reads.lock().unwrap().contains(&FAST));
+    assert_eq!(
+        futures::executor::block_on(runtime.shutdown()),
+        RuntimeExit::Clean
+    );
 }
 
 /// Даёт соседям и цели точные сведения одной темы канала.

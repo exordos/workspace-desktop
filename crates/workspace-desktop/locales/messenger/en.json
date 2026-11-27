@@ -91,6 +91,7 @@
   "desktop.messenger.history.requestReplacementKey": "Request a replacement key",
   "desktop.messenger.history.retryDeclinedFragmentRequest": "Request declined. Try again",
   "desktop.messenger.history.sourceUnavailable": "Original message unavailable",
+  "desktop.messenger.history.openOriginal": "Open original message",
   "desktop.messenger.history.waitingForKey": "Waiting for key",
   "desktop.messenger.history.waitingForKeyReply": "Awaiting a key reply",
   "desktop.messenger.participant": "Participant",

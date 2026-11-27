@@ -9,10 +9,14 @@ use gpui::{
 use uuid::Uuid;
 use workspace_core::{
     messenger::{
-        calls::{CallError, DeliveredJitsiCall, DeliveredPlainJitsiCall, JitsiSettings},
+        calls::{
+            CallError, ConfirmedPlainJitsiJoin, DeliveredJitsiCall, DeliveredPlainJitsiCall,
+            JitsiSettings,
+        },
         encryption::ProtectedMessage,
     },
     runtime::SourceError,
+    storage::MessageBody,
 };
 
 use super::{Conversation, State, action, encryption::EncryptedPresentation, heading::icon_button};
@@ -380,6 +384,67 @@ impl Conversation {
         }));
     }
 
+    /// Проверяет обычную строку и её настройки перед открытием ссылки в браузере.
+    pub(super) fn join_plain_call(
+        &mut self,
+        id: Uuid,
+        expected_body: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.calls.join_task.is_some() || !self.has_access() {
+            return;
+        }
+        let (Some(runtime), State::Ready(window)) = (self.calls.runtime.clone(), &self.state)
+        else {
+            return;
+        };
+        let Some(row) = window
+            .messages
+            .iter()
+            .find(|message| message.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        if !matches!(&row.body, MessageBody::Markdown(markdown) if markdown == expected_body) {
+            return;
+        }
+        let address = self.address.clone();
+        self.calls.failed = false;
+        self.calls.join_task = Some(cx.spawn(async move |target, cx| {
+            let reply = runtime
+                .conversation(address, move |services, address| async move {
+                    services
+                        .messenger
+                        .confirm_plain_jitsi_join(
+                            &services.sync,
+                            &address.route.owner,
+                            address.generation,
+                            address.route.scope,
+                            &row,
+                        )
+                        .await
+                })
+                .await;
+            let _ = target.update(cx, |view, cx| {
+                let Some(result) = reply.for_current(Some(&view.address)) else {
+                    return;
+                };
+                view.calls.join_task.take();
+                if view.has_access() {
+                    view.calls.failed = result
+                        .ok()
+                        .and_then(Result::ok)
+                        .and_then(|call: ConfirmedPlainJitsiJoin| {
+                            call.with_url(|url| cx.open_url(url))
+                        })
+                        .is_none();
+                    view.refresh_call_controls(cx);
+                }
+            });
+        }));
+    }
+
     /// Берёт уже подтверждённое назначение из того же редактора.
     fn send_topic_for_call(&self, cx: &App) -> Option<Uuid> {
         let composer = self.sending.as_ref()?.view.read(cx);
@@ -404,7 +469,7 @@ impl Conversation {
     }
 }
 
-/// Добавляет действие входа, сохраняя только ссылку на отзывное представление сообщения.
+/// Показывает звонок для открытого текста, а действие включает после подтверждения строки.
 pub(super) fn join_card(
     id: Uuid,
     text: &Arc<ProtectedMessage>,
@@ -412,10 +477,14 @@ pub(super) fn join_card(
     conversation: Option<&WeakEntity<Conversation>>,
     palette: Palette,
     locale: Language,
+    confirmed: bool,
 ) -> Option<AnyElement> {
-    let settings = settings?;
     let target = conversation?.clone();
-    if text.with_body(|markdown| settings.recognize_invitation(markdown).is_some()) != Some(true) {
+    let is_invitation = text.with_body(|markdown| {
+        settings.is_some_and(|settings| settings.recognize_invitation(markdown).is_some())
+            || JitsiSettings::recognize_public_invitation(markdown).is_some()
+    });
+    if is_invitation != Some(true) {
         return None;
     }
     let expected = Arc::clone(text);
@@ -424,6 +493,7 @@ pub(super) fn join_card(
         locale.tr("message.joinCall"),
     );
     button.icon = Some(Icon::Phone);
+    button.disabled = !confirmed;
     Some(
         button
             .render(palette, None, move |_, app| {

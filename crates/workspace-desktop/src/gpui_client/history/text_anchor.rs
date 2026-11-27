@@ -133,14 +133,16 @@ impl LineTarget {
         width: Pixels,
         window: &mut Window,
         app: &mut App,
-        row: impl FnOnce(&mut App) -> (gpui::Div, Option<TextLayout>),
+        row: impl FnOnce(&mut Window, &mut App) -> (gpui::Div, Option<TextLayout>),
     ) -> Option<Pixels> {
-        let (row, layout) = row(app);
-        let layout = layout?;
-        let mut row = row.into_any_element();
         // Такой же пробный проход GPUI делает при автопрокрутке. Хитбоксы пробной
         // строки удаляются из кадра, а окончательный список сразу рисуется со сдвигом.
         let result: Result<(), Option<Pixels>> = window.transact(|window| {
+            let (row, layout) = row(window, app);
+            let Some(layout) = layout else {
+                return Err(None);
+            };
+            let mut row = row.into_any_element();
             row.prepaint_as_root(
                 point(px(0.), px(0.)),
                 size(AvailableSpace::Definite(width), AvailableSpace::MinContent),

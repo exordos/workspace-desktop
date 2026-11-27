@@ -1,8 +1,8 @@
 //! Кнопка, индикатор переключателя и оболочка поля с общими состояниями оформления.
 
 use gpui::{
-    App, Div, ElementId, FocusHandle, Hsla, IntoElement, PathBuilder, Pixels, SharedString,
-    Stateful, Window, canvas, div, point, prelude::*, px, rgb,
+    App, ClickEvent, Div, ElementId, FocusHandle, Hsla, IntoElement, PathBuilder, Pixels,
+    SharedString, Stateful, Window, canvas, div, point, prelude::*, px, rgb,
 };
 
 use super::{
@@ -169,7 +169,7 @@ pub(in crate::gpui_client) fn activate(
 }
 
 /// Сохраняет тип клика у тех элементов, которые управляют переходом фокуса.
-fn activate_click(
+pub(in crate::gpui_client) fn activate_click(
     element: Stateful<Div>,
     focus: Option<&FocusHandle>,
     palette: Palette,
@@ -187,6 +187,16 @@ fn activate_click(
         })
         .cursor_pointer()
         .on_click(on_activate)
+}
+
+/// Не считает длинное движение мыши обычным нажатием.
+pub(in crate::gpui_client) fn click_is_stationary(event: &ClickEvent) -> bool {
+    let ClickEvent::Mouse(event) = event else {
+        return true;
+    };
+    let dx = (event.up.position.x - event.down.position.x).abs();
+    let dy = (event.up.position.y - event.down.position.y).abs();
+    dx <= px(2.) && dy <= px(2.)
 }
 
 /// Рисует переключатель 36 × 20 px. Нажатиями и фокусом владеет вызывающая строка.
